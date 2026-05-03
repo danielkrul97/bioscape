@@ -1,0 +1,29 @@
+[package]
+name = "bioscape"
+version = "0.0.1"
+edition = "2021"
+description = "TBD"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "bioscape"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bioscape"
+path = "src/main.rs"
+
+[dependencies]
+rand = "0.9"
+rayon = "1"
+wgpu = { version = "23", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+pollster = { version = "0.4", optional = true }
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+
+[dev-dependencies]
+indicatif = "0.18"
+textplots = "0.8"
