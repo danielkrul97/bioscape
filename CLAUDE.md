@@ -2,7 +2,26 @@
 
 Cílem výzkumného projektu Bioscape je vytvořit simulaci evoluce, abych pochopil, jak vzniká inteligence. Projekt je napsán v Rustu. Výpočty se provádějí jak na CPU, tak na GPU.
 
-**Architektura:** TBD
+**Architektura:**
+
+- **Engine:** Bevy 0.18 (ECS, 2D rendering přes wgpu). `default-features = false` plus ručně vybraný feature set bez `bevy_gilrs` a `audio` — projekt nepotřebuje gamepad ani zvuk a tahle volba odstraňuje závislost na systémových `libudev-dev` / `libasound2-dev`.
+- **Split kódu:**
+  - `src/lib.rs` — čistá simulační logika (`Cell`, `step()`, …), bez Bevy. Pojede i headless (batch experimenty s `indicatif`/`textplots` v dev-deps).
+  - `src/main.rs` — Bevy app, který drží svět v ECS a synchronizuje `Cell` stav s `Transform`em.
+- **GPU:** Bevy táhne wgpu interně pro rendering. Pro vlastní compute kernely je v `Cargo.toml` opt-in feature `gpu` (přímý `wgpu` + `bytemuck` + `pollster`).
+- **Dev smyčka:** `cargo run --features dev` zapne `bevy/dynamic_linking` pro rychlou inkrementální iteraci po prvním buildu.
+
+**Zdroj pravdy pro biologii a evoluci:** Pokud prompt řeší evoluční mechanismy, genotyp/fenotyp, selekci, fitness, mutace nebo podobné koncepty, primárně čerpej z `docs/` — odráží to specifický framing tohoto výzkumu. Generické znalosti z tréninku použij jen jako doplněk a při konfliktu s `docs/` na to upozorni.
+
+# Vývoj
+
+- Vývoj vedeme po sprintech.
+- 10 sprintů = jeden markdown dokument v `docs/sprints/`.
+- Pojmenování: `NNN-MMM-slug.md`, kde `NNN` a `MMM` jsou zero-padded čísla prvního a posledního sprintu v souboru a `slug` je krátký název shrnující téma té desítky sprintů (např. `001-010-bootstrap.md`, `011-020-genome.md`).
+- Každý sprint v dokumentu má sekci `## Sprint NN — krátký slug` se třemi řádky:
+  - **Cíl:** co chceme za sprint dosáhnout.
+  - **Výstup:** co reálně vzniklo (může odkazovat na commity / soubory).
+  - **Poznámky:** volitelné — pozorování, slepé uličky, otázky do dalších sprintů.
 
 # Code style
 
