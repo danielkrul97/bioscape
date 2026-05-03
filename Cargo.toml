@@ -13,7 +13,35 @@ path = "src/lib.rs"
 name = "bioscape"
 path = "src/main.rs"
 
+# Trimmed Bevy feature set: skips `bevy_gilrs` (libudev) and `audio` (alsa)
+# so we don't need system packages for an evolution sim that uses neither.
 [dependencies]
+bevy = { version = "0.18", default-features = false, features = [
+    # `default_app` minus nothing
+    "async_executor",
+    "bevy_asset",
+    "bevy_input_focus",
+    "bevy_log",
+    "bevy_state",
+    "bevy_window",
+    "custom_cursor",
+    "reflect_auto_register",
+    # `default_platform` minus `bevy_gilrs` and `webgl2` (we're native, not WASM)
+    "std",
+    "bevy_winit",
+    "default_font",
+    "multi_threaded",
+    "x11",
+    "wayland",
+    "sysinfo_plugin",
+    # 2D rendering stack (sprites, core pipeline, gizmos, post-process)
+    "2d_bevy_render",
+    # Texture decoding for whenever we add textured cells
+    "png",
+    "tonemapping_luts",
+    # `tonemapping_luts` pulls in zstd; pick the pure-Rust backend.
+    "zstd_rust",
+] }
 rand = "0.9"
 rayon = "1"
 wgpu = { version = "23", optional = true }
@@ -23,7 +51,17 @@ pollster = { version = "0.4", optional = true }
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+# Speeds up incremental rebuilds during development.
+# Run with: cargo run --features dev
+dev = ["bevy/dynamic_linking"]
 
 [dev-dependencies]
 indicatif = "0.18"
 textplots = "0.8"
+
+# Bevy recommended dev profile: fast compile for our code, optimized deps for runtime.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
