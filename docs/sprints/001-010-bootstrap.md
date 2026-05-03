@@ -252,3 +252,23 @@ Bootstrap fáze projektu: minimální 2D scéna → fixed-tick simulační clock
   - Food entity nejsou v gridu (zatím). `cell_eats_food` a `cells_brain_act` (food query) zůstávají O(N×M). Při M >> 1k přibude food grid samostatným sprintem.
   - Při GRID_CELL_SIZE = 100 a vision_radius do ~80 funguje 1-buněčný padding. Pokud by mutace pushla vision_radius nad 200, queries by ztrácely vzdálenější cíle — `neighbors_within` to řeší dynamicky `ceil(r / cell_size)` bucketů.
   - Carrion na stejném místě → 2 food particles překryté. Random offset rozprostře vizuálně. Při low population a hodně smrtech vznikne food cluster — atraktor pro hladovějící cells.
+
+## Sprint 10 — energy-rebalance
+
+- **Cíl:** opravit extinction-by-default zděděnou ze Sprintu 08. Random brainy v plně maximalizovaném okně mají energetickou bilanci ~ −41 energie/gen → vyhynou za ~20 gen, **selekce se nikdy nezapne**, protože nikdo nedosáhne reprodukčního prahu.
+  - **Příčina:** `FOOD_COUNT_TARGET = 300` zůstal z fixního světa 800×800 (Sprint 05). Po Sprintu 08 (max. okno) se world area ztrojnásobila, hustota jídla klesla na ~1.5×10⁻⁴ food/unit² — random walk encounter rate je pod prahem nutnosti.
+  - **Fix A: food density škáluje se světem.** `FOOD_COUNT_TARGET` jako fixní konstanta **mizí**, nahrazena `WORLD_UNITS_PER_FOOD = 2000.0` (cíl ~5×10⁻⁴ density). Helper `food_target(extent) -> usize` počítá živý cíl z aktuální world area. `setup` pre-spawne podle aktuálního targetu, `spawn_food` ho udržuje dynamicky.
+  - **Fix B: snížené metabolic costs.**
+    - `ENERGY_COST_PER_DISTANCE: 0.1 → 0.05` (movement levnější)
+    - `VISION_COST_PER_RADIUS: 0.05 → 0.02` (vize levnější — beztoho stojí za to, aby cell vůbec uměla orientovat)
+  - **Cílová bilance:** typická random buňka (speed 30, vision 50) ve full HD okně:
+    - Cost: movement 15 + vision 10 = 25/gen
+    - Příjem: ~2.4 food/gen × 20 = 48/gen
+    - **Net +23/gen** → reprodukční práh za ~4 gen, selekce se rozjede.
+- **Konstanty po změně:** `WORLD_UNITS_PER_FOOD = 2000.0`, `ENERGY_COST_PER_DISTANCE = 0.05`, `VISION_COST_PER_RADIUS = 0.02`.
+- **Výstup:**
+  - `src/main.rs`: konstanta `FOOD_COUNT_TARGET = 300` zmizela, nahrazena `WORLD_UNITS_PER_FOOD = 2000.0`. Helper `food_target(extent: &WorldExtent) -> usize` počítá cíl jako `area / WORLD_UNITS_PER_FOOD`. `setup` a `spawn_food` čtou dynamický cíl. `ENERGY_COST_PER_DISTANCE` 0.1 → 0.05; `VISION_COST_PER_RADIUS` 0.05 → 0.02.
+- **Poznámky:**
+  - Při zmenšení okna cíl food klesne, ale stávající food se nedespawnuje (přechod přirozeně sníží sám sebou jejich konzumací).
+  - Random brainy jsou zatím "v plusu", ale slabé food-trackery přežívají snadno. Selekční tlak na lepší trackery je mírný — pokud po sprintu uvidíme, že `spd_avg` / `vis_avg` neukazují směrový posun, ladíme dál.
+  - Stejný balanční problém se může vrátit po dalších evolučních změnách (víc inputs, hidden layer brain, energie pro brain ops). Empirické ladění bude průběžné.

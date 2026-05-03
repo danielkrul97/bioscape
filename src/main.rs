@@ -1,10 +1,13 @@
+mod cell_material;
+
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::mesh::MeshTag;
 use bevy::prelude::*;
-use bevy::sprite_render::AlphaMode2d;
 use bevy::window::WindowResized;
-use bioscape::{Cell, Food, MutationConfig, SimClock, BRAIN_INPUTS};
+use bioscape::{Cell, Food, MutationConfig, PhysicsConfig, SimClock, SmellField, BRAIN_INPUTS};
+use cell_material::{pack_cell_tag, CellMaterial, CellMaterialPlugin};
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const CELL_RADIUS: f32 = 5.0;
 const FOOD_RADIUS: f32 = 2.5;
@@ -12,10 +15,12 @@ const INITIAL_CELLS: usize = 200;
 const FIXED_TIMESTEP_HZ: f64 = 60.0;
 const TICKS_PER_GENERATION: u64 = 600;
 const GENERATIONS_PER_EPOCH: u64 = 100;
-const ENERGY_COST_PER_DISTANCE: f32 = 0.1;
-const VISION_COST_PER_RADIUS: f32 = 0.05;
+const DRAG_COEFFICIENT: f32 = 0.005;
+const ANGULAR_DRAG: f32 = 1.0;
+const ENERGY_COST_PER_V_SQ: f32 = 0.0008;
+const VISION_COST_PER_RADIUS: f32 = 0.02;
 const FOOD_VALUE: f32 = 20.0;
-const FOOD_COUNT_TARGET: usize = 300;
+const WORLD_UNITS_PER_FOOD: f32 = 3000.0;
 const FOOD_SPAWN_RATE: usize = 5;
 const EAT_RADIUS: f32 = 8.0;
 const REPRODUCE_THRESHOLD: f32 = 200.0;
@@ -23,12 +28,33 @@ const MAX_POPULATION: usize = 1000;
 const DEATH_FADE_TICKS: u32 = 30;
 const GRID_CELL_SIZE: f32 = 100.0;
 const CARRION_FOOD_COUNT: usize = 2;
+const BODY_COST_FACTOR: f32 = 0.8;
+const SIZE_RATIO_THRESHOLD: f32 = 1.3;
+const PREDATION_DRAIN_PER_TICK: f32 = 3.0;
+const PREDATION_GAIN_PER_TICK: f32 = 1.5;
+const CYCLE_GEN_PERIOD: u64 = 50;
+const CYCLE_AMPLITUDE: f32 = 0.3;
+const SMELL_GRID_RES: usize = 128;
+const SMELL_DIFFUSION: f32 = 0.15;
+const SMELL_DECAY: f32 = 0.3;
+const SMELL_PER_FOOD: f32 = 1.0;
+const SMELL_SAMPLE_EPSILON: f32 = 10.0;
+const SMELL_NORMALIZATION_GAIN: f32 = 0.5;
+const MAX_SPAWN_ATTEMPTS: usize = 5;
 const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_speed: 3.0,
     sigma_hue: 5.0,
     sigma_vision: 3.0,
     sigma_turn_rate: 0.3,
+    sigma_body_size: 0.05,
     sigma_brain: 0.2,
+};
+const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
+    drag: DRAG_COEFFICIENT,
+    angular_drag: ANGULAR_DRAG,
+    energy_cost_per_v_sq: ENERGY_COST_PER_V_SQ,
+    vision_cost_per_radius: VISION_COST_PER_RADIUS,
+    body_cost_factor: BODY_COST_FACTOR,
 };
 
 #[derive(Component)]
@@ -63,24 +89,30 @@ impl WorldExtent {
 #[derive(Resource, Debug)]
 struct Clock(SimClock);
 
-type GridBuckets = HashMap<(i32, i32), Vec<(Entity, [f32; 2])>>;
+#[derive(Resource, Debug, Clone, Copy)]
+struct FoodDensityFactor(f32);
 
-#[derive(Resource)]
-struct CellGrid {
-    cell_size: f32,
-    buckets: GridBuckets,
-}
-
-impl Default for CellGrid {
+impl Default for FoodDensityFactor {
     fn default() -> Self {
-        Self {
-            cell_size: GRID_CELL_SIZE,
-            buckets: HashMap::new(),
-        }
+        Self(1.0)
     }
 }
 
-impl CellGrid {
+type Bucket = Vec<(Entity, [f32; 2])>;
+
+struct SpatialGrid {
+    cell_size: f32,
+    buckets: HashMap<(i32, i32), Bucket>,
+}
+
+impl SpatialGrid {
+    fn new(cell_size: f32) -> Self {
+        Self {
+            cell_size,
+            buckets: HashMap::new(),
+        }
+    }
+
     fn key_of(&self, pos: [f32; 2]) -> (i32, i32) {
         (
             (pos[0] / self.cell_size).floor() as i32,
@@ -89,25 +121,53 @@ impl CellGrid {
     }
 
     fn rebuild<I: IntoIterator<Item = (Entity, [f32; 2])>>(&mut self, items: I) {
-        self.buckets.clear();
+        // Preserve bucket Vec capacities across ticks — population and food
+        // count are roughly stable, so reusing allocations beats clearing the
+        // whole HashMap.
+        for bucket in self.buckets.values_mut() {
+            bucket.clear();
+        }
         for (e, pos) in items {
             let key = self.key_of(pos);
             self.buckets.entry(key).or_default().push((e, pos));
         }
     }
 
-    fn neighbors_within(&self, pos: [f32; 2], radius: f32) -> Vec<(Entity, [f32; 2])> {
+    fn for_each_in_radius<F: FnMut(Entity, [f32; 2])>(
+        &self,
+        pos: [f32; 2],
+        radius: f32,
+        mut f: F,
+    ) {
         let r_cells = (radius / self.cell_size).ceil() as i32;
         let (cx, cy) = self.key_of(pos);
-        let mut out = Vec::new();
         for dx in -r_cells..=r_cells {
             for dy in -r_cells..=r_cells {
                 if let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy)) {
-                    out.extend(bucket.iter().copied());
+                    for &(e, p) in bucket {
+                        f(e, p);
+                    }
                 }
             }
         }
-        out
+    }
+}
+
+#[derive(Resource)]
+struct CellGrid(SpatialGrid);
+
+impl Default for CellGrid {
+    fn default() -> Self {
+        Self(SpatialGrid::new(GRID_CELL_SIZE))
+    }
+}
+
+#[derive(Resource)]
+struct FoodGrid(SpatialGrid);
+
+impl Default for FoodGrid {
+    fn default() -> Self {
+        Self(SpatialGrid::new(GRID_CELL_SIZE))
     }
 }
 
@@ -119,6 +179,12 @@ struct FoodMesh(Handle<Mesh>);
 
 #[derive(Resource)]
 struct FoodMaterial(Handle<ColorMaterial>);
+
+#[derive(Resource)]
+struct CellMaterialHandle(Handle<CellMaterial>);
+
+#[derive(Resource)]
+struct SmellResource(SmellField);
 
 #[derive(Message, Debug, Clone, Copy)]
 struct GenerationEnded {
@@ -141,6 +207,7 @@ fn main() {
                 ..default()
             }),
             FrameTimeDiagnosticsPlugin::default(),
+            CellMaterialPlugin,
         ))
         .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.08)))
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ))
@@ -149,6 +216,8 @@ fn main() {
             GENERATIONS_PER_EPOCH,
         )))
         .init_resource::<CellGrid>()
+        .init_resource::<FoodGrid>()
+        .init_resource::<FoodDensityFactor>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
         .add_systems(Startup, (setup, setup_stats_overlay, rebuild_cell_grid).chain())
@@ -156,12 +225,16 @@ fn main() {
             FixedUpdate,
             (
                 advance_clock,
+                update_food_density_cycle,
+                rebuild_food_grid,
+                update_smell_field,
                 cells_brain_act,
                 step_cells,
                 rebuild_cell_grid,
                 resolve_cell_collisions,
-                spawn_food,
+                cell_predates_on_neighbor,
                 cell_eats_food,
+                spawn_food,
                 cell_reproduces_on_threshold,
                 cell_dies_on_zero_energy,
                 tick_death_fade,
@@ -185,7 +258,8 @@ fn main() {
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut color_materials: ResMut<Assets<ColorMaterial>>,
+    mut cell_materials: ResMut<Assets<CellMaterial>>,
     mut window: Single<&mut Window>,
 ) {
     window.set_maximized(true);
@@ -198,22 +272,26 @@ fn setup(
 
     commands.spawn(Camera2d);
 
-    let cell_mesh = meshes.add(Circle::new(CELL_RADIUS));
+    let cell_mesh = meshes.add(teardrop_mesh(CELL_RADIUS));
     let food_mesh = meshes.add(Circle::new(FOOD_RADIUS));
-    let food_material = materials.add(Color::srgb(0.95, 0.95, 0.85));
+    let food_material = color_materials.add(Color::srgb(0.95, 0.95, 0.85));
+    let cell_material = cell_materials.add(CellMaterial::default());
 
     let mut rng = rand::rng();
     for _ in 0..INITIAL_CELLS {
         let cell = Cell::random(&mut rng, half);
-        let material = make_cell_material(&mut materials, cell.genome.color_hue);
         commands.spawn((
             CellEntity(cell),
             Mesh2d(cell_mesh.clone()),
-            MeshMaterial2d(material),
-            Transform::from_xyz(cell.position[0], cell.position[1], 0.0),
+            MeshMaterial2d(cell_material.clone()),
+            MeshTag(pack_cell_tag(cell.genome.color_hue, 1.0)),
+            Transform::from_xyz(cell.position[0], cell.position[1], 0.0)
+                .with_rotation(Quat::from_rotation_z(cell.heading))
+                .with_scale(Vec3::splat(cell.genome.body_size)),
         ));
     }
-    for _ in 0..FOOD_COUNT_TARGET {
+    let initial_food = food_target(&extent, 1.0);
+    for _ in 0..initial_food {
         let food = Food::random(&mut rng, half);
         commands.spawn((
             FoodEntity(food),
@@ -226,6 +304,8 @@ fn setup(
     commands.insert_resource(CellMesh(cell_mesh));
     commands.insert_resource(FoodMesh(food_mesh));
     commands.insert_resource(FoodMaterial(food_material));
+    commands.insert_resource(CellMaterialHandle(cell_material));
+    commands.insert_resource(SmellResource(SmellField::new(SMELL_GRID_RES, half)));
 }
 
 fn track_window_resize(
@@ -238,21 +318,64 @@ fn track_window_resize(
     }
 }
 
-fn hue_to_color(hue_deg: f32) -> Color {
-    Color::hsl(hue_deg, 0.75, 0.55)
+fn food_target(extent: &WorldExtent, factor: f32) -> usize {
+    let area = (2.0 * extent.half_x) * (2.0 * extent.half_y);
+    ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0)) as usize
 }
 
-fn make_cell_material(
-    materials: &mut Assets<ColorMaterial>,
-    hue_deg: f32,
-) -> Handle<ColorMaterial> {
-    // Explicit Blend so death fade-out alpha actually renders;
-    // ColorMaterial::From<Color> picks Opaque when color.alpha() == 1.0.
-    materials.add(ColorMaterial {
-        color: hue_to_color(hue_deg),
-        alpha_mode: AlphaMode2d::Blend,
-        ..default()
-    })
+fn update_food_density_cycle(
+    mut events: MessageReader<GenerationEnded>,
+    clock: Res<Clock>,
+    mut factor: ResMut<FoodDensityFactor>,
+) {
+    if events.read().next().is_none() {
+        return;
+    }
+    let phase = (clock.0.generation as f32 / CYCLE_GEN_PERIOD as f32) * std::f32::consts::TAU;
+    factor.0 = 1.0 + CYCLE_AMPLITUDE * phase.sin();
+}
+
+fn teardrop_mesh(radius: f32) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+
+    // Parametric teardrop, tip in +x: x = r·cos t, y = r·sin t · sin(t/2).
+    // Pointy at t=0, round bulb at t=π. Convex, so triangle fan from origin works.
+    let segments = 24;
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(segments + 1);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(segments + 1);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(segments + 1);
+
+    positions.push([0.0, 0.0, 0.0]);
+    normals.push([0.0, 0.0, 1.0]);
+    uvs.push([0.5, 0.5]);
+
+    for i in 0..segments {
+        let t = (i as f32 / segments as f32) * std::f32::consts::TAU;
+        let x = radius * t.cos();
+        let y = radius * t.sin() * (t * 0.5).sin();
+        positions.push([x, y, 0.0]);
+        normals.push([0.0, 0.0, 1.0]);
+        uvs.push([x / (2.0 * radius) + 0.5, y / (2.0 * radius) + 0.5]);
+    }
+
+    let mut indices: Vec<u32> = Vec::with_capacity(segments * 3);
+    for i in 0..segments {
+        let next = (i + 1) % segments;
+        indices.push(0);
+        indices.push((i + 1) as u32);
+        indices.push((next + 1) as u32);
+    }
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
 }
 
 fn advance_clock(
@@ -277,19 +400,34 @@ fn step_cells(
     let dt = time.delta_secs();
     let half = extent.as_array();
     for mut cell in &mut cells {
-        cell.0
-            .step(dt, half, ENERGY_COST_PER_DISTANCE, VISION_COST_PER_RADIUS);
+        cell.0.step(dt, half, &PHYSICS_CONFIG);
     }
+}
+
+fn update_smell_field(
+    time: Res<Time>,
+    foods: Query<&FoodEntity>,
+    mut smell: ResMut<SmellResource>,
+) {
+    let dt = time.delta_secs();
+    for food in &foods {
+        smell.0.add_source(food.0.position, SMELL_PER_FOOD * dt);
+    }
+    smell.0.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
 }
 
 fn cells_brain_act(
     time: Res<Time>,
-    grid: Res<CellGrid>,
+    cell_grid: Res<CellGrid>,
+    food_grid: Res<FoodGrid>,
+    smell: Res<SmellResource>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
-    foods: Query<&FoodEntity>,
 ) {
     let dt = time.delta_secs();
-    let food_positions: Vec<[f32; 2]> = foods.iter().map(|f| f.0.position).collect();
+    let body_sizes: HashMap<Entity, f32> = cells
+        .iter()
+        .map(|(e, c)| (e, c.0.genome.body_size))
+        .collect();
 
     for (entity, mut cell) in &mut cells {
         let pos = cell.0.position;
@@ -298,32 +436,33 @@ fn cells_brain_act(
 
         let mut nearest_food: Option<[f32; 2]> = None;
         let mut best_food_d2 = f32::MAX;
-        for fp in &food_positions {
+        food_grid.0.for_each_in_radius(pos, vision_r, |_, fp| {
             let dx = fp[0] - pos[0];
             let dy = fp[1] - pos[1];
             let d2 = dx * dx + dy * dy;
             if d2 <= vr2 && d2 < best_food_d2 {
                 best_food_d2 = d2;
-                nearest_food = Some(*fp);
+                nearest_food = Some(fp);
             }
-        }
+        });
 
-        let mut nearest_cell: Option<[f32; 2]> = None;
+        let mut nearest_cell: Option<(Entity, [f32; 2])> = None;
         let mut best_cell_d2 = f32::MAX;
-        for (other, other_pos) in grid.neighbors_within(pos, vision_r) {
+        cell_grid.0.for_each_in_radius(pos, vision_r, |other, other_pos| {
             if other == entity {
-                continue;
+                return;
             }
             let dx = other_pos[0] - pos[0];
             let dy = other_pos[1] - pos[1];
             let d2 = dx * dx + dy * dy;
             if d2 <= vr2 && d2 < best_cell_d2 {
                 best_cell_d2 = d2;
-                nearest_cell = Some(other_pos);
+                nearest_cell = Some((other, other_pos));
             }
-        }
+        });
 
         let max_speed = cell.0.genome.max_speed;
+        let my_size = cell.0.genome.body_size.max(0.01);
         let speed_norm =
             (cell.0.velocity[0].hypot(cell.0.velocity[1]) / max_speed).clamp(0.0, 1.0);
         let energy_norm = (cell.0.energy / REPRODUCE_THRESHOLD).clamp(0.0, 1.5);
@@ -333,68 +472,126 @@ fn cells_brain_act(
             inputs[0] = (target[0] - pos[0]) / vision_r;
             inputs[1] = (target[1] - pos[1]) / vision_r;
         }
-        if let Some(target) = nearest_cell {
+        if let Some((other_e, target)) = nearest_cell {
             inputs[2] = (target[0] - pos[0]) / vision_r;
             inputs[3] = (target[1] - pos[1]) / vision_r;
+            let other_size = body_sizes.get(&other_e).copied().unwrap_or(my_size);
+            inputs[6] = (other_size - my_size) / my_size;
         }
         inputs[4] = energy_norm;
         inputs[5] = speed_norm;
+        let grad = smell.0.gradient_at(pos, SMELL_SAMPLE_EPSILON);
+        inputs[7] = (grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
+        inputs[8] = (grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
 
         let outputs = cell.0.genome.brain.forward(&inputs);
         let turn_signal = outputs[0];
         let thrust_norm = (outputs[1] + 1.0) * 0.5;
 
-        let new_angle = cell.0.heading + turn_signal * cell.0.genome.turn_rate * dt;
-        let target_speed = thrust_norm * max_speed;
-        cell.0.heading = new_angle;
-        cell.0.velocity[0] = new_angle.cos() * target_speed;
-        cell.0.velocity[1] = new_angle.sin() * target_speed;
+        // Force-based dynamics: brain outputs torque + thrust, integrated into
+        // angular_velocity / velocity. Heading and position update in step
+        // (drag applies there too).
+        let body_size = cell.0.genome.body_size.max(0.01);
+        let turn_rate = cell.0.genome.turn_rate;
+        let ang_acc = turn_signal * turn_rate / body_size;
+        cell.0.angular_velocity += ang_acc * dt;
+
+        // a_max = DRAG · max_speed² / body_size → terminal v at full thrust
+        // = max_speed / sqrt(body_size). Big cells are sluggish AND have a
+        // lower top speed.
+        let a_max = DRAG_COEFFICIENT * max_speed * max_speed / body_size;
+        let a = thrust_norm * a_max;
+        let heading = cell.0.heading;
+        cell.0.velocity[0] += a * heading.cos() * dt;
+        cell.0.velocity[1] += a * heading.sin() * dt;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_food(
     foods: Query<(), With<FoodEntity>>,
     extent: Res<WorldExtent>,
+    factor: Res<FoodDensityFactor>,
+    cell_grid: Res<CellGrid>,
+    cells: Query<(Entity, &CellEntity)>,
     food_mesh: Res<FoodMesh>,
     food_material: Res<FoodMaterial>,
     mut commands: Commands,
 ) {
+    let target = food_target(&extent, factor.0);
     let count = foods.iter().count();
-    if count >= FOOD_COUNT_TARGET {
+    if count >= target {
         return;
     }
-    let to_spawn = (FOOD_COUNT_TARGET - count).min(FOOD_SPAWN_RATE);
+    let to_spawn = (target - count).min(FOOD_SPAWN_RATE);
     let mut rng = rand::rng();
     let half = extent.as_array();
-    for _ in 0..to_spawn {
-        let food = Food::random(&mut rng, half);
-        commands.spawn((
-            FoodEntity(food),
-            Mesh2d(food_mesh.0.clone()),
-            MeshMaterial2d(food_material.0.clone()),
-            Transform::from_xyz(food.position[0], food.position[1], -1.0),
-        ));
+    let body_sizes: HashMap<Entity, f32> = cells
+        .iter()
+        .map(|(e, c)| (e, c.0.genome.body_size))
+        .collect();
+    let broad_r = EAT_RADIUS * BROAD_PHASE_SIZE_BUDGET;
+
+    'spawn: for _ in 0..to_spawn {
+        for _ in 0..MAX_SPAWN_ATTEMPTS {
+            let candidate = Food::random(&mut rng, half);
+            let mut blocked = false;
+            cell_grid
+                .0
+                .for_each_in_radius(candidate.position, broad_r, |entity, cell_pos| {
+                    if blocked {
+                        return;
+                    }
+                    let size = body_sizes.get(&entity).copied().unwrap_or(1.0);
+                    let exclusion = EAT_RADIUS * size;
+                    let dx = candidate.position[0] - cell_pos[0];
+                    let dy = candidate.position[1] - cell_pos[1];
+                    if dx * dx + dy * dy < exclusion * exclusion {
+                        blocked = true;
+                    }
+                });
+            if !blocked {
+                commands.spawn((
+                    FoodEntity(candidate),
+                    Mesh2d(food_mesh.0.clone()),
+                    MeshMaterial2d(food_material.0.clone()),
+                    Transform::from_xyz(candidate.position[0], candidate.position[1], -1.0),
+                ));
+                continue 'spawn;
+            }
+        }
+        // All MAX_SPAWN_ATTEMPTS rolls fell inside someone's eat radius — skip
+        // this slot. Population is dense enough that the food world is at
+        // (ecological) saturation; we'll catch up later when cells move.
     }
 }
 
 fn cell_eats_food(
     mut cells: Query<&mut CellEntity, Without<Dying>>,
-    foods: Query<(Entity, &FoodEntity)>,
+    food_grid: Res<FoodGrid>,
     mut commands: Commands,
 ) {
-    let mut food_pool: Vec<(Entity, Food, bool)> =
-        foods.iter().map(|(e, f)| (e, f.0, false)).collect();
+    let mut eaten: HashSet<Entity> = HashSet::new();
 
     for mut cell in &mut cells {
-        for entry in food_pool.iter_mut() {
-            if entry.2 {
-                continue;
+        let pos = cell.0.position;
+        let eat_r = EAT_RADIUS * cell.0.genome.body_size;
+        let r2 = eat_r * eat_r;
+        let mut to_eat: Option<Entity> = None;
+        food_grid.0.for_each_in_radius(pos, eat_r, |food_e, food_pos| {
+            if to_eat.is_some() || eaten.contains(&food_e) {
+                return;
             }
-            if cell.0.try_eat(&entry.1, EAT_RADIUS, FOOD_VALUE) {
-                entry.2 = true;
-                commands.entity(entry.0).despawn();
-                break;
+            let dx = pos[0] - food_pos[0];
+            let dy = pos[1] - food_pos[1];
+            if dx * dx + dy * dy <= r2 {
+                to_eat = Some(food_e);
             }
+        });
+        if let Some(food_e) = to_eat {
+            cell.0.energy += FOOD_VALUE;
+            eaten.insert(food_e);
+            commands.entity(food_e).despawn();
         }
     }
 }
@@ -403,6 +600,7 @@ fn sync_transforms(mut cells: Query<(&CellEntity, &mut Transform)>) {
     for (cell, mut transform) in &mut cells {
         transform.translation.x = cell.0.position[0];
         transform.translation.y = cell.0.position[1];
+        transform.rotation = Quat::from_rotation_z(cell.0.heading);
     }
 }
 
@@ -478,6 +676,7 @@ fn setup_stats_overlay(mut commands: Commands) {
 fn update_stats_overlay(
     clock: Res<Clock>,
     time: Res<Time<Virtual>>,
+    density: Res<FoodDensityFactor>,
     diagnostics: Res<DiagnosticsStore>,
     cells: Query<&CellEntity, Without<Dying>>,
     foods: Query<(), With<FoodEntity>>,
@@ -492,50 +691,82 @@ fn update_stats_overlay(
     } else {
         format!("{}×", time.relative_speed())
     };
-    let speeds: Vec<f32> = cells.iter().map(|c| c.0.genome.max_speed).collect();
-    let visions: Vec<f32> = cells.iter().map(|c| c.0.genome.vision_radius).collect();
-    let turns: Vec<f32> = cells.iter().map(|c| c.0.genome.turn_rate).collect();
-    let energies: Vec<f32> = cells.iter().map(|c| c.0.energy).collect();
-    let cell_count = speeds.len();
+
+    // Single pass over the cells query — sum / sum_sq feed both mean and
+    // population variance without keeping per-cell Vecs around. f64 accum so
+    // sumsq - mean² doesn't lose precision once the population grows.
+    let mut count = 0usize;
+    let mut spd_sum = 0.0_f64;
+    let mut spd_sumsq = 0.0_f64;
+    let mut vis_sum = 0.0_f64;
+    let mut vis_sumsq = 0.0_f64;
+    let mut trn_sum = 0.0_f64;
+    let mut size_sum = 0.0_f64;
+    let mut size_sumsq = 0.0_f64;
+    let mut e_sum = 0.0_f64;
+    for c in &cells {
+        count += 1;
+        let s = c.0.genome.max_speed as f64;
+        let v = c.0.genome.vision_radius as f64;
+        let t = c.0.genome.turn_rate as f64;
+        let bs = c.0.genome.body_size as f64;
+        let e = c.0.energy as f64;
+        spd_sum += s;
+        spd_sumsq += s * s;
+        vis_sum += v;
+        vis_sumsq += v * v;
+        trn_sum += t;
+        size_sum += bs;
+        size_sumsq += bs * bs;
+        e_sum += e;
+    }
     let food_count = foods.iter().count();
-    let (spd_avg, spd_dev) = mean_stddev(&speeds);
-    let (vis_avg, vis_dev) = mean_stddev(&visions);
-    let (trn_avg, _) = mean_stddev(&turns);
-    let (e_avg, _) = mean_stddev(&energies);
+
+    let (spd_avg, spd_dev, vis_avg, vis_dev, trn_avg, size_avg, size_dev, e_avg) = if count == 0 {
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    } else {
+        let n = count as f64;
+        let spd_m = spd_sum / n;
+        let vis_m = vis_sum / n;
+        let size_m = size_sum / n;
+        (
+            spd_m,
+            ((spd_sumsq / n) - spd_m * spd_m).max(0.0).sqrt(),
+            vis_m,
+            ((vis_sumsq / n) - vis_m * vis_m).max(0.0).sqrt(),
+            trn_sum / n,
+            size_m,
+            ((size_sumsq / n) - size_m * size_m).max(0.0).sqrt(),
+            e_sum / n,
+        )
+    };
 
     let mut text = text.into_inner();
     text.0 = format!(
-        "tick    {}\ngen     {}\nepoch   {}\nspeed   {}\ncells   {}\nfood    {}\nfps     {:.0}\nspd_avg {:.1}\nspd_dev {:.2}\nvis_avg {:.1}\nvis_dev {:.2}\ntrn_avg {:.2}\ne_avg   {:.1}",
+        "tick     {}\ngen      {}\nepoch    {}\nspeed    {}\ncells    {}\nfood     {}\ndensity  {:.2}\nfps      {:.0}\nspd_avg  {:.1}\nspd_dev  {:.2}\nvis_avg  {:.1}\nvis_dev  {:.2}\ntrn_avg  {:.2}\nsize_avg {:.2}\nsize_dev {:.3}\ne_avg    {:.1}",
         clock.0.tick,
         clock.0.generation,
         clock.0.epoch,
         speed,
-        cell_count,
+        count,
         food_count,
+        density.0,
         fps,
         spd_avg,
         spd_dev,
         vis_avg,
         vis_dev,
         trn_avg,
+        size_avg,
+        size_dev,
         e_avg,
     );
-}
-
-fn mean_stddev(values: &[f32]) -> (f32, f32) {
-    if values.is_empty() {
-        return (0.0, 0.0);
-    }
-    let n = values.len() as f32;
-    let mean = values.iter().sum::<f32>() / n;
-    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
-    (mean, variance.sqrt())
 }
 
 fn cell_reproduces_on_threshold(
     mut cells: Query<&mut CellEntity, Without<Dying>>,
     cell_mesh: Res<CellMesh>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    cell_material: Res<CellMaterialHandle>,
     mut commands: Commands,
 ) {
     let current_pop = cells.iter().count();
@@ -563,6 +794,7 @@ fn cell_reproduces_on_threshold(
                 direction.cos() * child_genome.max_speed,
                 direction.sin() * child_genome.max_speed,
             ],
+            angular_velocity: 0.0,
             energy: cell.0.energy,
             heading: direction,
             genome: child_genome,
@@ -571,13 +803,16 @@ fn cell_reproduces_on_threshold(
     }
 
     let mesh = cell_mesh.0.clone();
+    let material = cell_material.0.clone();
     for cell in to_spawn {
-        let material = make_cell_material(&mut materials, cell.genome.color_hue);
         commands.spawn((
             CellEntity(cell),
             Mesh2d(mesh.clone()),
-            MeshMaterial2d(material),
-            Transform::from_xyz(cell.position[0], cell.position[1], 0.0),
+            MeshMaterial2d(material.clone()),
+            MeshTag(pack_cell_tag(cell.genome.color_hue, 1.0)),
+            Transform::from_xyz(cell.position[0], cell.position[1], 0.0)
+                .with_rotation(Quat::from_rotation_z(cell.heading))
+                .with_scale(Vec3::splat(cell.genome.body_size)),
         ));
     }
 }
@@ -618,44 +853,106 @@ fn rebuild_cell_grid(
     mut grid: ResMut<CellGrid>,
     cells: Query<(Entity, &CellEntity), Without<Dying>>,
 ) {
-    grid.rebuild(cells.iter().map(|(e, c)| (e, c.0.position)));
+    grid.0.rebuild(cells.iter().map(|(e, c)| (e, c.0.position)));
+}
+
+fn rebuild_food_grid(
+    mut grid: ResMut<FoodGrid>,
+    foods: Query<(Entity, &FoodEntity)>,
+) {
+    grid.0.rebuild(foods.iter().map(|(e, f)| (e, f.0.position)));
+}
+
+// Generous broad-phase upper bound on "other" body_size — captures candidates
+// even when neighbors are oversized. Narrow-phase uses the actual pair sum.
+const BROAD_PHASE_SIZE_BUDGET: f32 = 3.0;
+
+fn cell_predates_on_neighbor(
+    grid: Res<CellGrid>,
+    mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+) {
+    let body_sizes: HashMap<Entity, f32> = cells
+        .iter()
+        .map(|(e, c)| (e, c.0.genome.body_size))
+        .collect();
+
+    let mut energy_changes: HashMap<Entity, f32> = HashMap::new();
+
+    for (entity_a, cell_a) in &cells {
+        let pos_a = cell_a.0.position;
+        let size_a = cell_a.0.genome.body_size;
+        let broad_r = CELL_RADIUS * (size_a + BROAD_PHASE_SIZE_BUDGET);
+
+        grid.0.for_each_in_radius(pos_a, broad_r, |entity_b, pos_b| {
+            if entity_b == entity_a {
+                return;
+            }
+            let Some(&size_b) = body_sizes.get(&entity_b) else {
+                return;
+            };
+            if size_a < SIZE_RATIO_THRESHOLD * size_b {
+                return;
+            }
+            let pair_r = CELL_RADIUS * (size_a + size_b);
+            let pair_r2 = pair_r * pair_r;
+            let dx = pos_a[0] - pos_b[0];
+            let dy = pos_a[1] - pos_b[1];
+            let d2 = dx * dx + dy * dy;
+            if d2 >= pair_r2 {
+                return;
+            }
+            *energy_changes.entry(entity_a).or_insert(0.0) += PREDATION_GAIN_PER_TICK;
+            *energy_changes.entry(entity_b).or_insert(0.0) -= PREDATION_DRAIN_PER_TICK;
+        });
+    }
+
+    for (entity, delta) in energy_changes {
+        if let Ok((_, mut cell)) = cells.get_mut(entity) {
+            cell.0.energy += delta;
+        }
+    }
 }
 
 fn resolve_cell_collisions(
     grid: Res<CellGrid>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
 ) {
-    let positions: HashMap<Entity, [f32; 2]> =
-        cells.iter().map(|(e, c)| (e, c.0.position)).collect();
-    let collision_r = 2.0 * CELL_RADIUS;
-    let collision_r2 = collision_r * collision_r;
-    let mut adjustments: HashMap<Entity, [f32; 2]> = HashMap::new();
+    let body_sizes: HashMap<Entity, f32> = cells
+        .iter()
+        .map(|(e, c)| (e, c.0.genome.body_size))
+        .collect();
+    let mut deltas: Vec<(Entity, [f32; 2])> = Vec::new();
 
-    for (&entity_a, &pos_a) in &positions {
+    for (entity_a, cell_a) in &cells {
+        let pos_a = cell_a.0.position;
+        let size_a = cell_a.0.genome.body_size;
+        let broad_r = CELL_RADIUS * (size_a + BROAD_PHASE_SIZE_BUDGET);
         let mut delta = [0.0_f32, 0.0_f32];
-        for (entity_b, _grid_pos) in grid.neighbors_within(pos_a, collision_r) {
+        grid.0.for_each_in_radius(pos_a, broad_r, |entity_b, pos_b| {
             if entity_b == entity_a {
-                continue;
+                return;
             }
-            let Some(&pos_b) = positions.get(&entity_b) else {
-                continue;
+            let Some(&size_b) = body_sizes.get(&entity_b) else {
+                return;
             };
+            let pair_r = CELL_RADIUS * (size_a + size_b);
+            let pair_r2 = pair_r * pair_r;
             let dx = pos_a[0] - pos_b[0];
             let dy = pos_a[1] - pos_b[1];
             let d2 = dx * dx + dy * dy;
-            if d2 < collision_r2 && d2 > 0.0 {
+            if d2 < pair_r2 && d2 > 0.0 {
                 let d = d2.sqrt();
-                let overlap = collision_r - d;
+                let overlap = pair_r - d;
                 delta[0] += (dx / d) * overlap * 0.5;
                 delta[1] += (dy / d) * overlap * 0.5;
             }
-        }
+        });
         if delta != [0.0, 0.0] {
-            adjustments.insert(entity_a, delta);
+            deltas.push((entity_a, delta));
         }
     }
 
-    for (entity, delta) in adjustments {
+    for (entity, delta) in deltas {
         if let Ok((_, mut cell)) = cells.get_mut(entity) {
             cell.0.position[0] += delta[0];
             cell.0.position[1] += delta[1];
@@ -664,21 +961,24 @@ fn resolve_cell_collisions(
 }
 
 fn tick_death_fade(
-    mut dying: Query<(Entity, &mut Dying, &mut Transform, &MeshMaterial2d<ColorMaterial>)>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut dying: Query<(
+        Entity,
+        &mut Dying,
+        &CellEntity,
+        &mut Transform,
+        &mut MeshTag,
+    )>,
     mut commands: Commands,
 ) {
-    for (entity, mut d, mut transform, mat_handle) in &mut dying {
+    for (entity, mut d, cell, mut transform, mut tag) in &mut dying {
         if d.ticks_left == 0 {
             commands.entity(entity).despawn();
             continue;
         }
         d.ticks_left -= 1;
         let progress = d.ticks_left as f32 / DEATH_FADE_TICKS as f32;
-        transform.scale = Vec3::splat(progress);
-        if let Some(mat) = materials.get_mut(&mat_handle.0) {
-            mat.color = mat.color.with_alpha(progress);
-        }
+        transform.scale = Vec3::splat(cell.0.genome.body_size * progress);
+        tag.0 = pack_cell_tag(cell.0.genome.color_hue, progress);
     }
 }
 
