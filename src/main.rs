@@ -1,7 +1,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::image::Image;
-use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bioscape::{
@@ -30,14 +30,22 @@ const FOOD_RADIUS: f32 = 2.5;
 const DEATH_FADE_TICKS: u32 = 30;
 const GRID_CELL_SIZE: f32 = 100.0;
 const CAMERA_ZOOM_STEP: f32 = 0.1;
-const CAMERA_ZOOM_MIN: f32 = 0.1;
-const CAMERA_ZOOM_MAX: f32 = 10.0;
 // Sprint 35: z-osa aktivovaná, mírný 3D layer.
 const SIMULATION_HALF: [f32; 3] = [960.0, 540.0, 2.0];
-// Sprint 36: aerial Camera3d view. Camera nahoru po +Z na výšce sufficient,
-// aby celá xy plochá scéna se vešla do FoV při fov=π/3 (=60°).
-// half_y / tan(fov/2) = 540 / tan(30°) ≈ 935. S marginem volíme 1500.
-const CAMERA_HEIGHT_INITIAL: f32 = 1500.0;
+// Sprint 36: orbit Camera3d. State drží `OrbitCamera` resource — distance od
+// target, yaw/pitch v sim z-up frame. Default tilted view (pitch ≈ 55°)
+// ukazuje cells jako 3D body, ne ploché kola.
+const CAMERA_DISTANCE_INITIAL: f32 = 1800.0;
+const CAMERA_PITCH_INITIAL: f32 = 0.95; // ~55° from xy plane
+const CAMERA_DISTANCE_MIN: f32 = 100.0;
+const CAMERA_DISTANCE_MAX: f32 = 8000.0;
+/// Pitch clamp tight near ±π/2 — `looking_at` s up vektorem +Z degeneruje při
+/// pohledu kolmo dolů. 0.05 rad ≈ 2.9° margin.
+const CAMERA_PITCH_MIN: f32 = 0.05;
+const CAMERA_PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
+/// Mouse drag → orbit angle delta. Tuned pro 1080p screen — full screen drag
+/// = ~π rotace.
+const ORBIT_SENSITIVITY: f32 = 0.005;
 
 #[derive(Component)]
 struct CellEntity(Cell);
@@ -175,6 +183,42 @@ struct FoodMaterial(Handle<StandardMaterial>);
 #[derive(Resource, Default)]
 struct LineageMaterials(HashMap<u64, Handle<StandardMaterial>>);
 
+/// Sprint 36 orbit camera state. Camera obíhá kolem `target` ve sférických
+/// souřadnicích (yaw + pitch + distance). Yaw je rotace kolem world Z (sim
+/// vertical), pitch je elevace nad xy plochou (0 = horizon, π/2 = top-down).
+/// Camera Transform se přepočítá z těchto polí každý frame v `update_orbit_camera`.
+#[derive(Resource, Debug, Clone, Copy)]
+struct OrbitCamera {
+    target: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+}
+
+impl Default for OrbitCamera {
+    fn default() -> Self {
+        Self {
+            target: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: CAMERA_PITCH_INITIAL,
+            distance: CAMERA_DISTANCE_INITIAL,
+        }
+    }
+}
+
+impl OrbitCamera {
+    fn transform(&self) -> Transform {
+        let cos_p = self.pitch.cos();
+        let offset = Vec3::new(
+            -self.yaw.sin() * cos_p,
+            -self.yaw.cos() * cos_p,
+            self.pitch.sin(),
+        ) * self.distance;
+        let pos = self.target + offset;
+        Transform::from_translation(pos).looking_at(self.target, Vec3::Z)
+    }
+}
+
 #[derive(Resource)]
 struct SmellResource(SmellField);
 
@@ -211,6 +255,7 @@ fn main() {
         ))
         .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.08)))
         .init_resource::<LineageMaterials>()
+        .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
         .insert_resource(Clock(SimClock::new(
             TICKS_PER_GENERATION,
@@ -250,8 +295,10 @@ fn main() {
             Update,
             (
                 speed_input,
-                camera_zoom,
-                camera_pan,
+                camera_orbit_input,
+                camera_zoom_input,
+                camera_pan_input,
+                update_orbit_camera_transform,
                 sync_transforms,
                 log_clock_events,
                 toggle_stats_overlay,
@@ -279,15 +326,15 @@ fn setup(
     };
     commands.insert_resource(extent);
 
-    // Sprint 36: Camera3d nahoru po +Z, looking at origin. Bevy 0.18 Camera3d
-    // má default perspective projection. `IsDefaultUiCamera` říká bevy_ui_render
-    // ať použije tuto kameru pro UI overlay — bez toho by Bevy spawnul vlastní
-    // UI kameru bez render graph konfigurace (warning "Entity X has Camera but
-    // no render graph").
+    // Sprint 36: Camera3d s `IsDefaultUiCamera` markerem (UI overlay routes
+    // přes hlavní kameru, ne přes auto-spawned UI kameru bez render graph).
+    // Initial transform z OrbitCamera default — `update_orbit_camera_transform`
+    // ji přepisuje z OrbitCamera state každý frame.
+    let initial_orbit = OrbitCamera::default();
     commands.spawn((
         Camera3d::default(),
         IsDefaultUiCamera,
-        Transform::from_xyz(0.0, 0.0, CAMERA_HEIGHT_INITIAL).looking_at(Vec3::ZERO, Vec3::Y),
+        initial_orbit.transform(),
     ));
 
     // Ambient + DirectionalLight pro 3D scénu. Bevy 0.18 typické hodnoty:
@@ -849,13 +896,57 @@ fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>)
     }
 }
 
-/// Sprint 36: Camera3d pan v xy-plochy přes WASD/arrow klávesy. Mouse motion
-/// resp. middle-drag se v 3D pohledu typicky hodí na orbit (rotace), takže
-/// pan necháme klávesnicovou.
-fn camera_pan(
+/// Sprint 36: middle-mouse drag rotuje kamerou kolem `target` (orbit).
+/// Horizontální delta → yaw, vertical delta → pitch (clamped). Sensitivity
+/// `ORBIT_SENSITIVITY` ladí — full screen drag ≈ π rad.
+fn camera_orbit_input(
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut motion: MessageReader<MouseMotion>,
+    mut orbit: ResMut<OrbitCamera>,
+) {
+    if !buttons.pressed(MouseButton::Middle) {
+        // Drop accumulated motion when not actively dragging — jinak by
+        // se delta nasčítaly a po stisku middle by kamera skočila.
+        motion.clear();
+        return;
+    }
+    let mut delta = Vec2::ZERO;
+    for ev in motion.read() {
+        delta += ev.delta;
+    }
+    if delta == Vec2::ZERO {
+        return;
+    }
+    orbit.yaw = (orbit.yaw + delta.x * ORBIT_SENSITIVITY).rem_euclid(std::f32::consts::TAU);
+    orbit.pitch =
+        (orbit.pitch + delta.y * ORBIT_SENSITIVITY).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
+}
+
+/// Sprint 36: mouse wheel zoom — adjustuje `OrbitCamera.distance`. Exponential
+/// step zachová stejný relativní zoom feel napříč rozsahem.
+fn camera_zoom_input(mut wheel: MessageReader<MouseWheel>, mut orbit: ResMut<OrbitCamera>) {
+    let mut scroll = 0.0_f32;
+    for ev in wheel.read() {
+        scroll += match ev.unit {
+            MouseScrollUnit::Line => ev.y,
+            MouseScrollUnit::Pixel => ev.y / 50.0,
+        };
+    }
+    if scroll == 0.0 {
+        return;
+    }
+    let factor = (-scroll * CAMERA_ZOOM_STEP).exp();
+    orbit.distance =
+        (orbit.distance * factor).clamp(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
+}
+
+/// Sprint 36: WASD/šipky pannují `OrbitCamera.target` v xy-plochy ve frame
+/// kamery (W = posun "do scény", A = doleva). Pan rychlost ∝ distance
+/// (víc zoomout = rychlejší pan), takže feel je konzistentní napříč zoom.
+fn camera_pan_input(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
-    camera: Single<&mut Transform, With<Camera3d>>,
+    mut orbit: ResMut<OrbitCamera>,
 ) {
     let mut delta = Vec2::ZERO;
     if keys.pressed(KeyCode::ArrowLeft) || keys.pressed(KeyCode::KeyA) {
@@ -873,35 +964,27 @@ fn camera_pan(
     if delta == Vec2::ZERO {
         return;
     }
-    let mut transform = camera.into_inner();
-    // Pan rychlost ∝ camera Z výšce (víc zoomout = rychlejší pan).
-    let speed = transform.translation.z.abs() * 0.5;
-    transform.translation.x += delta.x * speed * time.delta_secs();
-    transform.translation.y += delta.y * speed * time.delta_secs();
+    let speed = orbit.distance * 0.5 * time.delta_secs();
+    // Pan v rovině xy podle yaw orientace kamery: forward (do scény) je směr,
+    // kterým camera kouká po xy projekci. Right = ⊥ k forwardu v xy.
+    let cos_y = orbit.yaw.cos();
+    let sin_y = orbit.yaw.sin();
+    let forward_xy = Vec2::new(sin_y, cos_y);
+    let right_xy = Vec2::new(cos_y, -sin_y);
+    let world_xy = forward_xy * delta.y + right_xy * delta.x;
+    orbit.target.x += world_xy.x * speed;
+    orbit.target.y += world_xy.y * speed;
 }
 
-/// Sprint 36: zoom přes mouse wheel — adjustuje camera Z distance. Bližší
-/// kamera = větší cells na obrazovce. Clamp brání tomu aby kamera prošla
-/// scénou nebo se ztratila daleko.
-fn camera_zoom(
-    mut wheel: MessageReader<MouseWheel>,
+/// Sprint 36: aplikuje OrbitCamera state na Camera3d Transform. Běží každý
+/// frame po input systemech, takže input změny se okamžitě projeví ve
+/// view matici.
+fn update_orbit_camera_transform(
+    orbit: Res<OrbitCamera>,
     camera: Single<&mut Transform, With<Camera3d>>,
 ) {
-    let mut scroll = 0.0_f32;
-    for ev in wheel.read() {
-        scroll += match ev.unit {
-            MouseScrollUnit::Line => ev.y,
-            MouseScrollUnit::Pixel => ev.y / 50.0,
-        };
-    }
-    if scroll == 0.0 {
-        return;
-    }
     let mut transform = camera.into_inner();
-    let factor = (-scroll * CAMERA_ZOOM_STEP).exp();
-    let new_z = (transform.translation.z * factor)
-        .clamp(CAMERA_HEIGHT_INITIAL * CAMERA_ZOOM_MIN, CAMERA_HEIGHT_INITIAL * CAMERA_ZOOM_MAX);
-    transform.translation.z = new_z;
+    *transform = orbit.transform();
 }
 
 fn log_clock_events(
