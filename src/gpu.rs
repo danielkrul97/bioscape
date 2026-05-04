@@ -1473,7 +1473,7 @@ impl CellsGpu {
             16,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         );
-        drop(mk);
+        let _ = mk;
         Self {
             device,
             queue,
@@ -2324,6 +2324,7 @@ pub struct MotorGpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
     params_buf: wgpu::Buffer,
@@ -2627,6 +2628,7 @@ pub struct StepGpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
     params_buf: wgpu::Buffer,

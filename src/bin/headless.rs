@@ -141,9 +141,6 @@ struct GpuFullState {
     brain: BrainGpu,
     hebbian: HebbianGpu,
     brownian: BrownianGpu,
-    /// Persistent buffer reward signal pro Hebbian. CPU plní per-tick podle
-    /// `eat_food` events; GPU Hebbian pass čte při `compute_persistent`.
-    rewards_scratch: Vec<f32>,
 }
 
 impl World {
@@ -1507,7 +1504,6 @@ fn main() {
                 brain,
                 hebbian,
                 brownian,
-                rewards_scratch: Vec::new(),
             })
         };
         match init() {

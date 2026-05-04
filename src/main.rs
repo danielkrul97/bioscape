@@ -22,6 +22,8 @@ const DIAG_SMELL: DiagnosticPath = DiagnosticPath::const_new("sim/smell_field_ms
 const DIAG_PHEROMONE: DiagnosticPath = DiagnosticPath::const_new("sim/pheromone_field_ms");
 const DIAG_GRID_REBUILD: DiagnosticPath = DiagnosticPath::const_new("sim/grid_rebuild_ms");
 const DIAG_SYNC_TRANSFORMS: DiagnosticPath = DiagnosticPath::const_new("sim/sync_transforms_ms");
+const DIAG_TICKS_PER_FRAME: DiagnosticPath = DiagnosticPath::const_new("sim/ticks_per_frame");
+const DIAG_RENDER_OVERHEAD: DiagnosticPath = DiagnosticPath::const_new("sim/render_overhead_ms");
 use bioscape::{
     reject_food_for_richness, Cell, Food, Phenotype, SimClock, SmellField, SpatialGrid, WorldMap,
     ATTACK_THRESHOLD, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
@@ -188,10 +190,6 @@ impl CellSlotMap {
 
     fn len(&self) -> usize {
         self.slot_to_entity.len()
-    }
-
-    fn capacity(&self) -> usize {
-        self.slot_to_entity.capacity()
     }
 }
 
