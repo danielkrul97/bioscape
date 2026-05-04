@@ -280,11 +280,13 @@ fn setup(
     commands.insert_resource(extent);
 
     // Sprint 36: Camera3d nahoru po +Z, looking at origin. Bevy 0.18 Camera3d
-    // má default perspective projection — explicitní Projection by konfliktoval
-    // s render graph wiringem. Sim z-osa = vertical; up vektor pro look_at
-    // volíme +Y aby horizontální xy plocha byla "stage".
+    // má default perspective projection. `IsDefaultUiCamera` říká bevy_ui_render
+    // ať použije tuto kameru pro UI overlay — bez toho by Bevy spawnul vlastní
+    // UI kameru bez render graph konfigurace (warning "Entity X has Camera but
+    // no render graph").
     commands.spawn((
         Camera3d::default(),
+        IsDefaultUiCamera,
         Transform::from_xyz(0.0, 0.0, CAMERA_HEIGHT_INITIAL).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
