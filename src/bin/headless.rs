@@ -7,22 +7,17 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    Cell, Food, Genome, Phenotype, SimClock, SmellField, WorldMap, ATTACK_THRESHOLD,
-    BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
-    BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
-    CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DAMAGE_NORMALIZATION_GAIN,
-    DENSITY_NORM_COUNT, DILUTION_K, DRAG_COEFFICIENT,
-    reject_food_for_richness,
+    reject_food_for_richness, Cell, Food, SimClock, SmellField, WorldMap, ATTACK_THRESHOLD,
+    BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K,
     EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH, HAZARD_AMP,
     HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
-    MATING_PHEROMONE_THRESHOLD, MATING_RADIUS,
-    MAX_POPULATION, MAX_SPAWN_ATTEMPTS, MUTATION_CONFIG, PHEROMONE_BASELINE_EMIT,
-    PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
-    PHEROMONE_GRID_RES, PHEROMONE_NORMALIZATION_GAIN, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
+    MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
+    PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
-    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD,
-    SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP,
-    WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
+    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
+    TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
+    WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -229,93 +224,26 @@ impl World {
                 }
             }
 
-            let cell = &mut self.cells[i];
-            let max_speed = cell.genome.max_speed;
-            let my_radius = cell.phenotype.effective_radius().max(0.01);
-            // Sprint 32: 2D hypot (vz=0). hypot ≠ naive sqrt(a²+b²) bit-by-bit,
-            // takže pro CSV identity zůstává hypot. Sprint 33 přejde na 3D.
-            let speed_norm =
-                (cell.velocity[0].hypot(cell.velocity[1]) / max_speed).clamp(0.0, 1.0);
-            let energy_norm = (cell.energy / REPRODUCE_THRESHOLD).clamp(0.0, 1.5);
-
-            let mut inputs = [0.0_f32; BRAIN_INPUTS];
-            if let Some(target) = best_food {
-                inputs[0] = (target[0] - pos[0]) / vision_r;
-                inputs[1] = (target[1] - pos[1]) / vision_r;
-                inputs[15] = (target[2] - pos[2]) / vision_r;
-            }
-            if let Some((other, other_radius)) = best_cell {
-                inputs[2] = (other[0] - pos[0]) / vision_r;
-                inputs[3] = (other[1] - pos[1]) / vision_r;
-                inputs[6] = (other_radius - my_radius) / my_radius;
-                inputs[16] = (other[2] - pos[2]) / vision_r;
-            }
-            inputs[4] = energy_norm;
-            inputs[5] = speed_norm;
-            // Sprint 32: SmellField/PheromoneField stále 2D; projekce přes xy.
-            // Sprint 35 promění je na 3D Jacobi a tahle projekce zmizí.
+            // Sprint 40: gradient field samples + sensors struct, pak shared
+            // populate_brain_inputs. Pre-refactor zde bylo ~50 řádků inputs[].
             let pos_xy = [pos[0], pos[1]];
-            let grad = self.smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
-            inputs[7] = (grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
-            inputs[8] = (grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
-            // inputs[17] = smell_grad_z stays 0 (Sprint 35 unlock).
-            // Sprint 33: heading_x, _y nově xy projekce 3D forward (násobeno
-            // cos(pitch)). Pro pitch=0 redukuje na pre-Sprint-33 (cos(yaw),
-            // sin(yaw)). heading_z = sin(pitch).
-            let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
-            inputs[9] = fwd[0];
-            inputs[10] = fwd[1];
-            inputs[18] = fwd[2];
-            let pgrad = self.pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
-            inputs[11] = (pgrad[0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-            inputs[12] = (pgrad[1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-            // inputs[19] = pheromone_grad_z stays 0 (Sprint 35 unlock).
-            // Sprint 29 quorum sensing: počet viditelných sousedů normovaný
-            // přes DENSITY_NORM_COUNT, saturován tanhem do [0, 1). Brain dostává
-            // skalární info o lokálním zalidnění bez emise (= bez predator
-            // exploit Sprintu 24).
-            inputs[13] = (neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
-            // Sprint 30: damage signál z minulého ticku. Predation/hazard během
-            // minulého ticku přidaly do `damage_accum`; teď to brain čte a
-            // resetuje. „Damage" je výhradně nedobrovolná ztráta — voluntární
-            // cost (movement, morph, vision, attack) sem nepatří, cell o nich
-            // ví přes outputs/energy. Reset až po čtení = klasický 1-tick delay
-            // jako u pheromone/recurrent (žádný self-feedback).
-            inputs[14] = (cell.damage_accum * DAMAGE_NORMALIZATION_GAIN).tanh();
-            cell.damage_accum = 0.0;
-            // Sprint 28: recurrent kanál — předchozí hidden activations jsou
-            // input pro tento tick. Krátkodobá paměť, brain se přes mutace +
-            // Hebbian může naučit ji použít. Při t=0 je `last_hidden` všechno
-            // zero (init v Cell::random / reproduce), takže první tick je
-            // identický s feed-forward — paměť nabíhá od ticku 1.
-            inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
-                .copy_from_slice(&cell.last_hidden[..BRAIN_RECURRENT]);
+            let smell_grad = self.smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
+            let pheromone_grad = self.pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+            let sensors = bioscape::BrainSensors {
+                nearest_food: best_food,
+                nearest_cell: best_cell,
+                neighbors_in_vision,
+                smell_grad,
+                pheromone_grad,
+            };
 
+            let cell = &mut self.cells[i];
+            let inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
             let (hidden, outputs) = cell.genome.brain.forward_with_state(&inputs);
             cell.last_inputs = inputs;
             cell.last_hidden = hidden;
             cell.last_outputs = outputs;
-            let turn_signal = outputs[0];
-            let thrust_norm = (outputs[1] + 1.0) * 0.5;
-            // Sprint 35: pitch control aktivován — brain output[7] řídí
-            // pitch_velocity stejnou mechanikou jako turn_signal (yaw).
-            let pitch_signal = outputs[7];
-
-            let body_proxy = my_radius;
-            let turn_rate = cell.genome.turn_rate;
-            let ang_acc = turn_signal * turn_rate / body_proxy;
-            cell.angular_velocity += ang_acc * dt;
-            let pitch_acc = pitch_signal * turn_rate / body_proxy;
-            cell.pitch_velocity += pitch_acc * dt;
-
-            let a_max = DRAG_COEFFICIENT * max_speed * max_speed / body_proxy;
-            let a = thrust_norm * a_max;
-            // Sprint 33: pitch=0 stále, takže forward = (cos_y, sin_y, 0) —
-            // 3D-ready math přes forward_vector helper, ale fwd[2] = 0.
-            let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
-            cell.velocity[0] += a * fwd[0] * dt;
-            cell.velocity[1] += a * fwd[1] * dt;
-            cell.velocity[2] += a * fwd[2] * dt;
+            cell.apply_brain_motor(&outputs, dt);
         }
     }
 
@@ -566,13 +494,20 @@ impl World {
             return;
         }
         let budget = MAX_POPULATION - current_pop;
+        let fertile = self.collect_fertile();
+        self.fertile_ticks_gen += fertile.len() as u64;
+        let mating_r2 = self.mating_radius * self.mating_radius;
+        let matings = bioscape::pair_fertile(&fertile, mating_r2, budget);
+        let to_spawn = self.spawn_children_from_matings(&matings, rng);
+        self.births_gen += to_spawn.len() as u64;
+        self.cells.extend(to_spawn);
+    }
 
-        // Snapshot fertile (idx, position) — pair indices, not entities.
-        // Sprint 25: cells musí AKTIVNĚ emitovat pheromone (output[2] >
-        // threshold) aby byly fertile. Tiché cells nemůžou reprodukovat —
-        // selektuje proti free-riders na pheromone field.
-        let fertile: Vec<(usize, [f32; 3])> = self
-            .cells
+    /// Sprint 40: snapshot fertile cells. Sprint 25 mating gating: cells musí
+    /// AKTIVNĚ emitovat pheromone (output[2] > threshold) aby reprodukovaly —
+    /// selektuje proti free-riders na pheromone field.
+    fn collect_fertile(&self) -> Vec<(usize, [f32; 3])> {
+        self.cells
             .iter()
             .enumerate()
             .filter(|(_, c)| {
@@ -580,48 +515,18 @@ impl World {
                     && c.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
             })
             .map(|(i, c)| (i, c.position))
-            .collect();
-        self.fertile_ticks_gen += fertile.len() as u64;
+            .collect()
+    }
 
-        // Greedy O(N²) pairing on fertile indices.
-        let mut paired: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut matings: Vec<(usize, usize)> = Vec::new();
-        let mating_r2 = self.mating_radius * self.mating_radius;
-        for i_outer in 0..fertile.len() {
-            if matings.len() >= budget {
-                break;
-            }
-            let (a, pos_a) = fertile[i_outer];
-            if paired.contains(&a) {
-                continue;
-            }
-            let mut best: Option<(usize, f32)> = None;
-            for (j_outer, &(b, pos_b)) in fertile.iter().enumerate() {
-                if i_outer == j_outer {
-                    continue;
-                }
-                if paired.contains(&b) {
-                    continue;
-                }
-                let dx = pos_a[0] - pos_b[0];
-                let dy = pos_a[1] - pos_b[1];
-                let dz = pos_a[2] - pos_b[2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 <= mating_r2 && best.is_none_or(|(_, bd2)| d2 < bd2) {
-                    best = Some((b, d2));
-                }
-            }
-            if let Some((b, _)) = best {
-                paired.insert(a);
-                paired.insert(b);
-                matings.push((a, b));
-            }
-        }
-
-        let mut to_spawn: Vec<Cell> = Vec::new();
-        for (a, b) in matings {
-            // Borrow both cells mutably via split: one of them gets pulled out
-            // first, then the other from the remaining slice.
+    /// Sprint 40: split-borrow rodiče po indexu, halve energy, vyrobí dítě.
+    fn spawn_children_from_matings(
+        &mut self,
+        matings: &[(usize, usize)],
+        rng: &mut impl Rng,
+    ) -> Vec<Cell> {
+        let mut children = Vec::with_capacity(matings.len());
+        for &(a, b) in matings {
+            // Split-borrow: pull `hi`-indexed cell from right slice, `lo` z levé.
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
             let (left, right) = self.cells.split_at_mut(hi);
             let cell_lo = &mut left[lo];
@@ -631,46 +536,11 @@ impl World {
             } else {
                 (cell_hi, cell_lo)
             };
-
-            let energy_a = cell_a.energy * 0.5;
-            let energy_b = cell_b.energy * 0.5;
             cell_a.energy *= 0.5;
             cell_b.energy *= 0.5;
-
-            let child_genome = Genome::crossover(&cell_a.genome, &cell_b.genome, rng)
-                .mutate(rng, &MUTATION_CONFIG);
-
-            let direction = rng.random_range(0.0..std::f32::consts::TAU);
-            let mid_pos = [
-                (cell_a.position[0] + cell_b.position[0]) * 0.5,
-                (cell_a.position[1] + cell_b.position[1]) * 0.5,
-                (cell_a.position[2] + cell_b.position[2]) * 0.5,
-            ];
-            let child_phenotype = Phenotype::from_genome(&child_genome);
-            to_spawn.push(Cell {
-                position: mid_pos,
-                velocity: [
-                    direction.cos() * child_genome.max_speed,
-                    direction.sin() * child_genome.max_speed,
-                    0.0,
-                ],
-                angular_velocity: 0.0,
-                pitch_velocity: 0.0,
-                energy: energy_a + energy_b,
-                heading: direction,
-                pitch: 0.0,
-                lineage_id: cell_a.lineage_id,
-                lineage_birth_gen: cell_a.lineage_birth_gen,
-                last_inputs: [0.0; BRAIN_INPUTS],
-                last_hidden: [0.0; BRAIN_HIDDEN],
-                last_outputs: [0.0; BRAIN_OUTPUTS],
-                damage_accum: 0.0,
-                phenotype: child_phenotype,
-                genome: child_genome,
-            });
+            children.push(bioscape::make_mating_child(cell_a, cell_b, rng));
         }
-        self.births_gen += to_spawn.len() as u64;
-        self.cells.extend(to_spawn);
+        children
     }
 
     fn die_and_drop_carrion(&mut self, rng: &mut impl Rng) {

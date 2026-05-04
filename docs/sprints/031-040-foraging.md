@@ -199,7 +199,44 @@ Decade tématicky bipolární. **Sprint 31** rozšiřuje 2D ekosystém přes spa
 
 - **Recommended startup**: 200 gen × 5 seeds × current default = baseline. Pak 1-2 hyperparameter změny = prove principle.
 
-## Sprint 38+ — TBD
+## Sprint 40 — refactor + bug hunt
+
+- **Cíl:** rozbít špagetové funkce na menší logické části, dedupovat patterny mezi `main.rs` a `headless.rs`, najít chyby. **Žádný nový feature.** Acceptance: identical CSV trajectory seed=0 30 gen pre vs post (`diff -q` empty).
+
+  **Plán:**
+  - Phase 1 — extract shared helpers do `lib.rs`: `BrainSensors` struct, `populate_brain_inputs()`, `Cell::apply_brain_motor()`.
+  - Phase 2 — split `Cell::step` (106 řádků) do private metod: `integrate_kinematics`, `apply_anisotropic_drag`, `apply_angular_drag`, `apply_energy_costs`, `apply_world_bounce`. Public `step()` jen volá.
+  - Phase 3 — `cells_brain_act` (main, 126 řádků) a `brain_act` (headless, 142 řádků) zredukovány na ~25 řádků každá pomocí lib helperů.
+  - Phase 4 — split reproduce: `pair_fertile()` generic helper v lib (přes `Eq + Hash` Idx — usize i Entity), `make_mating_child()` lib helper. Headless `reproduce` rozdělen do `collect_fertile`/`spawn_children_from_matings`.
+  - Phase 5 — bug hunt during refactoring.
+  - Phase 6 — verify CSV identity + doc.
+
+- **Výstup:**
+  - `lib.rs`: nový `BrainSensors` struct, `populate_brain_inputs`, `pair_fertile`, `make_mating_child`. `Cell::step` split do 5 privátních metod, public `step` má 6 řádků. `Cell::apply_brain_motor` jako lib helper.
+  - `src/bin/headless.rs`: `brain_act` 142 → ~70 řádků (hlavní redukce v inputs[] populaci). `reproduce` 112 → 14 řádků s pomocnými metodami `collect_fertile` + `spawn_children_from_matings`.
+  - `src/main.rs`: `cells_brain_act` 126 → ~75 řádků (zbytek je grid lookup logika). `cell_reproduces_on_threshold` 118 → ~45 řádků.
+  - **Cleanup**: removed `SPIKE_RENDER_THRESHOLD` (dead const since Sprint 36 spike viz drop). Removed unused imports v obou binárkách (`BRAIN_INPUTS_SENSORY`, `BRAIN_RECURRENT`, `DAMAGE_NORMALIZATION_GAIN`, `DENSITY_NORM_COUNT`, `DRAG_COEFFICIENT`, `MAX_SPIKE_LENGTH`, `SMELL/PHEROMONE_NORMALIZATION_GAIN`, `Genome`, `MUTATION_CONFIG`, `Phenotype`, `BRAIN_HIDDEN`, `BRAIN_INPUTS`, `BRAIN_OUTPUTS`).
+  - 36/36 lib tests pass. CSV identity ověřena `diff -q /tmp/sprint40_baseline.csv /tmp/sprint40_p5.csv` → empty (byte-identical).
+
+- **Bugy nalezené během refactoringu:**
+  - **🐛 RNG draw order v `make_mating_child` extract**: helper původně volal `rng.random_range(...)` na direction PŘED `Genome::crossover/mutate`. Pre-refactor pořadí bylo opačné — crossover první. **Effect**: CSV trajectory se rozjela mezi gen 1 a 30 (final pop 448 vs baseline 611, ~73% odchylka). Indikátor: čistý refactor by neměl měnit CSV. Caught při P4 verify diff. **Fix**: helper přepořádán na původní `crossover → direction` sekvenci. Re-verify: `diff -q` empty.
+  - **💀 `SPIKE_RENDER_THRESHOLD` dead const**: definovaný v Sprint 26, používaný v původním custom WGSL shader pro suppression spike rendering pod threshold. Sprint 36 dropped custom shader → const už nikde nereferenced. Cleanup.
+  - **💀 Unused imports** v binárkách: ~13 importovaných položek z `bioscape` (BRAIN_INPUTS, MUTATION_CONFIG, atd.) přestalo být referencováno po extrakci helperů. Cleanup.
+
+- **Bugy zkontrolované, OK:**
+  - **Spike bonus 3D forward**: `spike_bonus_against` používá `forward_vector(yaw, pitch)` pro cosine angle. Pro pitch=0 redukuje na 2D (dz × 0 = 0). Pro pitch != 0 cos_angle správně zahrnuje dz. Žádný off-by-one.
+  - **Hebbian update na recurrent indices**: `Brain::hebbian_update` iteruje přes celé `last_inputs[BRAIN_INPUTS]`, `last_hidden[BRAIN_HIDDEN]`, `last_outputs[BRAIN_OUTPUTS]` bez hardcoded indexů. Recurrent slot shift v Sprint 33 a 39 invisible — všechny w1 řádky se aktualizují stejnou Hebbian pravidly.
+  - **Apply_food_gravity ordering**: tick chain je `step → apply_food_gravity → apply_hazards`. Food spawn z=−2 (s Sprint 38 sink) se nikdy neclampne pod world floor (max je v `Food::apply_gravity` `-world_half_z`). OK.
+  - **Carrion food spawn z position**: clamp `cell.position[2].clamp(-half[2], half[2])` se zabývá edge case kdy cell přesáhl bounds před bounce (bounce + carrion ve stejném ticku). OK.
+  - **`damage_accum` write/reset ordering**: predate + apply_hazards píší → brain_act čte + resetuje další tick. 1-tick delay sprint 30 dodržen.
+
+- **Poznámky:**
+  - **CSV identity test je strict regression net**: každá fáze refactoringu byla ověřena byte-identical CSV. Bug v `make_mating_child` RNG order způsobil dramatickou divergenci — pop 611 → 448 — která by se snadno pokazila jako "tuning artifact" kdyby refactor proběhl bez baseline. Striktní acceptance kritérium chrání před skrytými semantic změnami při strukturálních změnách.
+  - **Cell::step rozdělení** odhalilo, že 5 fází kódu mělo různé logické zodpovědnosti (kinematic integration, drag, angular drag, energy, bounce) — pre-refactor byly v jedné funkci s vnořenými komentáři. Po splitu je každá fáze test-friendlier (nemůžu na to teď psát unit testy bez deeper změn, ale infrastruktura je tam).
+  - **Generic `pair_fertile<I>`**: trait bound `I: Copy + Eq + Hash` umožňuje sdílet pairing mezi `usize` (headless idx) a Entity (renderer ECS). Bevy `Entity` implementuje obě traits.
+  - **Co Sprint 40 NEMĚNÍ**: žádné nové konstanty, žádné nové features, žádné renderer changes. Pouze internal restrukturalizace + dead code cleanup.
+
+## Sprint 41+ — TBD
 
 Možné směry po dokončení 3D substrátu:
 - **3D volumetric environment**: WorldMap → 64×64×16 3D value noise. SmellField → 32×32×16 3D Jacobi. Hazard + food richness 3D. Brain inputs[17] (smell_dz) a [19] (ph_dz) populated z 3D gradient.

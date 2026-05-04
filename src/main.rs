@@ -5,20 +5,15 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bioscape::{
-    reject_food_for_richness,
-    Cell, Food, Genome, Phenotype, SimClock, SmellField, WorldMap, ATTACK_THRESHOLD, BRAIN_HIDDEN,
-    BRAIN_INPUTS, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS, BRAIN_RECURRENT, CARRION_FOOD_COUNT,
-    CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DAMAGE_NORMALIZATION_GAIN,
-    DENSITY_NORM_COUNT, DILUTION_K,
-    DRAG_COEFFICIENT, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE,
-    GENERATIONS_PER_EPOCH, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS,
-    INITIAL_CELLS,
-    LEARNING_RATE, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
-    MUTATION_CONFIG, PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD,
-    PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES,
-    PHEROMONE_NORMALIZATION_GAIN, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK,
-    PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY,
-    SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
+    reject_food_for_richness, Cell, Food, Phenotype, SimClock, SmellField, WorldMap,
+    ATTACK_THRESHOLD, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
+    DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
+    HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
+    MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
+    PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
+    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
+    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
     TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
     WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
@@ -693,80 +688,24 @@ fn cells_brain_act(
                 }
             });
 
-        let max_speed = cell.0.genome.max_speed;
-        let my_radius = cell.0.phenotype.effective_radius().max(0.01);
-        // Sprint 32: 2D hypot pro CSV identity (vz=0). Sprint 33+ přejde na 3D.
-        let speed_norm =
-            (cell.0.velocity[0].hypot(cell.0.velocity[1]) / max_speed).clamp(0.0, 1.0);
-        let energy_norm = (cell.0.energy / REPRODUCE_THRESHOLD).clamp(0.0, 1.5);
-
-        let mut inputs = [0.0_f32; BRAIN_INPUTS];
-        if let Some(target) = nearest_food {
-            inputs[0] = (target[0] - pos[0]) / vision_r;
-            inputs[1] = (target[1] - pos[1]) / vision_r;
-            inputs[15] = (target[2] - pos[2]) / vision_r;
-        }
-        if let Some((target, other_radius)) = nearest_cell {
-            inputs[2] = (target[0] - pos[0]) / vision_r;
-            inputs[3] = (target[1] - pos[1]) / vision_r;
-            inputs[6] = (other_radius - my_radius) / my_radius;
-            inputs[16] = (target[2] - pos[2]) / vision_r;
-        }
-        inputs[4] = energy_norm;
-        inputs[5] = speed_norm;
-        // Sprint 32: SmellField + Pheromone stále 2D — projekce xy.
+        // Sprint 40: gradient samples + sensors struct, pak shared
+        // populate_brain_inputs + apply_brain_motor (lib helpers).
         let pos_xy = [pos[0], pos[1]];
-        let grad = smell.0.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
-        inputs[7] = (grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
-        inputs[8] = (grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
-        // Sprint 33: heading_x, _y nově xy projekce 3D forward; heading_z = sin(pitch).
-        let fwd = bioscape::forward_vector(cell.0.heading, cell.0.pitch);
-        inputs[9] = fwd[0];
-        inputs[10] = fwd[1];
-        inputs[18] = fwd[2];
-        let pgrad = pheromone.0.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
-        inputs[11] = (pgrad[0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-        inputs[12] = (pgrad[1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-        // Sprint 29 quorum sensing: počet viditelných sousedů normovaný přes
-        // DENSITY_NORM_COUNT, saturován tanhem do [0, 1).
-        inputs[13] = (neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
-        // Sprint 30: damage signál z minulého ticku (predace + hazard).
-        // Voluntární cost se nezapisuje. Reset na 0 hned po čtení = 1-tick
-        // delay bez self-feedback.
-        inputs[14] = (cell.0.damage_accum * DAMAGE_NORMALIZATION_GAIN).tanh();
-        cell.0.damage_accum = 0.0;
-        // Sprint 28: Elman recurrent feedback — předchozí tick `last_hidden`
-        // jako input. Při t=0 jsou všechno zero (Cell::random / reproduce
-        // init), takže první tick je identický s feed-forward; paměť nabíhá
-        // od ticku 1.
-        inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
-            .copy_from_slice(&cell.0.last_hidden[..BRAIN_RECURRENT]);
-
+        let smell_grad = smell.0.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
+        let pheromone_grad = pheromone.0.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+        let sensors = bioscape::BrainSensors {
+            nearest_food,
+            nearest_cell,
+            neighbors_in_vision,
+            smell_grad,
+            pheromone_grad,
+        };
+        let inputs = bioscape::populate_brain_inputs(&mut cell.0, &sensors, vision_r);
         let (hidden, outputs) = cell.0.genome.brain.forward_with_state(&inputs);
         cell.0.last_inputs = inputs;
         cell.0.last_hidden = hidden;
         cell.0.last_outputs = outputs;
-        let turn_signal = outputs[0];
-        let thrust_norm = (outputs[1] + 1.0) * 0.5;
-        // Sprint 35: pitch control aktivován.
-        let pitch_signal = outputs[7];
-
-        // Sprint 26: torque/thrust scaling teď používá effective_radius místo
-        // body_size. Pro length=width=s redukuje na původní semantiku.
-        let body_proxy = my_radius;
-        let turn_rate = cell.0.genome.turn_rate;
-        let ang_acc = turn_signal * turn_rate / body_proxy;
-        cell.0.angular_velocity += ang_acc * dt;
-        let pitch_acc = pitch_signal * turn_rate / body_proxy;
-        cell.0.pitch_velocity += pitch_acc * dt;
-
-        let a_max = DRAG_COEFFICIENT * max_speed * max_speed / body_proxy;
-        let a = thrust_norm * a_max;
-        // Sprint 33: pitch=0 → fwd[2]=0; 3D-ready math přes forward_vector helper.
-        let fwd = bioscape::forward_vector(cell.0.heading, cell.0.pitch);
-        cell.0.velocity[0] += a * fwd[0] * dt;
-        cell.0.velocity[1] += a * fwd[1] * dt;
-        cell.0.velocity[2] += a * fwd[2] * dt;
+        cell.0.apply_brain_motor(&outputs, dt);
     }
 }
 
@@ -1220,9 +1159,7 @@ fn cell_reproduces_on_threshold(
     }
     let budget = MAX_POPULATION - current_pop;
 
-    // Snapshot fertile cells (immutable iter on a mut query is fine).
-    // Sprint 25: cells musí AKTIVNĚ emitovat pheromone (output[2] >
-    // threshold) aby byly fertile.
+    // Sprint 40: extract collect/pair/spawn fáze. Pairing logika v lib helperu.
     let fertile: Vec<(Entity, [f32; 3])> = cells
         .iter()
         .filter(|(_, c)| {
@@ -1231,42 +1168,8 @@ fn cell_reproduces_on_threshold(
         })
         .map(|(e, c)| (e, c.0.position))
         .collect();
-
-    // Greedy O(N²) pairing on fertile pool only — typically a few dozen cells,
-    // so the cost is negligible compared to grid-scale work elsewhere.
-    let mut paired: HashSet<Entity> = HashSet::new();
-    let mut matings: Vec<(Entity, Entity)> = Vec::new();
     let mating_r2 = MATING_RADIUS * MATING_RADIUS;
-    for i in 0..fertile.len() {
-        if matings.len() >= budget {
-            break;
-        }
-        let (a, pos_a) = fertile[i];
-        if paired.contains(&a) {
-            continue;
-        }
-        let mut best: Option<(Entity, f32)> = None;
-        for (j, &(b, pos_b)) in fertile.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            if paired.contains(&b) {
-                continue;
-            }
-            let dx = pos_a[0] - pos_b[0];
-            let dy = pos_a[1] - pos_b[1];
-            let dz = pos_a[2] - pos_b[2];
-            let d2 = dx * dx + dy * dy + dz * dz;
-            if d2 <= mating_r2 && best.is_none_or(|(_, bd2)| d2 < bd2) {
-                best = Some((b, d2));
-            }
-        }
-        if let Some((b, _)) = best {
-            paired.insert(a);
-            paired.insert(b);
-            matings.push((a, b));
-        }
-    }
+    let matings = bioscape::pair_fertile(&fertile, mating_r2, budget);
 
     let mut rng = rand::rng();
     let mut to_spawn: Vec<Cell> = Vec::new();
@@ -1274,42 +1177,9 @@ fn cell_reproduces_on_threshold(
         let Ok([(_, mut cell_a), (_, mut cell_b)]) = cells.get_many_mut([a, b]) else {
             continue;
         };
-        let energy_a = cell_a.0.energy * 0.5;
-        let energy_b = cell_b.0.energy * 0.5;
         cell_a.0.energy *= 0.5;
         cell_b.0.energy *= 0.5;
-
-        let child_genome = Genome::crossover(&cell_a.0.genome, &cell_b.0.genome, &mut rng)
-            .mutate(&mut rng, &MUTATION_CONFIG);
-
-        let direction = rng.random_range(0.0..core::f32::consts::TAU);
-        let mid_pos = [
-            (cell_a.0.position[0] + cell_b.0.position[0]) * 0.5,
-            (cell_a.0.position[1] + cell_b.0.position[1]) * 0.5,
-            (cell_a.0.position[2] + cell_b.0.position[2]) * 0.5,
-        ];
-        let child_phenotype = Phenotype::from_genome(&child_genome);
-        to_spawn.push(Cell {
-            position: mid_pos,
-            velocity: [
-                direction.cos() * child_genome.max_speed,
-                direction.sin() * child_genome.max_speed,
-                0.0,
-            ],
-            angular_velocity: 0.0,
-            pitch_velocity: 0.0,
-            energy: energy_a + energy_b,
-            heading: direction,
-            pitch: 0.0,
-            lineage_id: cell_a.0.lineage_id,
-            lineage_birth_gen: cell_a.0.lineage_birth_gen,
-            last_inputs: [0.0; BRAIN_INPUTS],
-            last_hidden: [0.0; BRAIN_HIDDEN],
-            last_outputs: [0.0; BRAIN_OUTPUTS],
-            damage_accum: 0.0,
-            phenotype: child_phenotype,
-            genome: child_genome,
-        });
+        to_spawn.push(bioscape::make_mating_child(&cell_a.0, &cell_b.0, &mut rng));
     }
 
     let mesh = cell_mesh.0.clone();
