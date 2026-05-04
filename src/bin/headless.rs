@@ -7,21 +7,22 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    reject_food_for_richness, Cell, Food, SimClock, SmellField, WorldMap, ATTACK_THRESHOLD,
-    BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K,
-    EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH, HAZARD_AMP,
-    HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
-    MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_POPULATION,
-    MAX_SPAWN_ATTEMPTS,
-    PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
-    PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
-    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
-    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
-    TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
-    WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
+    reject_food_for_richness, Cell, Food, SimClock, SmellField, SpatialGrid, WorldMap,
+    ATTACK_THRESHOLD, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE,
+    CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE,
+    GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
+    HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
+    MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
+    PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
+    PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK,
+    PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY,
+    SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION,
+    WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED,
+    WORLD_UNITS_PER_FOOD,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 use std::env;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
@@ -36,6 +37,27 @@ use std::time::Instant;
 // je odložené.
 const WORLD_HALF: [f32; 3] = [960.0, 540.0, 2.0];
 
+/// Sprint 43: per-fáze accumulator (mikrosekundy). World::tick zvyšuje každou
+/// dobu a main je čte/resetuje per generation. Default je all-zero.
+#[derive(Debug, Default, Clone, Copy)]
+struct PhaseTimings {
+    update_smell: f64,
+    update_pheromone: f64,
+    brain_act: f64,
+    emit_pheromones: f64,
+    apply_morph: f64,
+    apply_brownian: f64,
+    step: f64,
+    apply_food_gravity: f64,
+    apply_hazards: f64,
+    resolve_collisions: f64,
+    predate: f64,
+    eat_food: f64,
+    spawn_food: f64,
+    reproduce: f64,
+    die_and_drop_carrion: f64,
+}
+
 struct World {
     cells: Vec<Cell>,
     foods: Vec<Food>,
@@ -44,13 +66,12 @@ struct World {
     smell: SmellField,
     pheromone: SmellField,
     map: WorldMap,
-    // Persistent scratch — sized like cells/foods, reused per tick to avoid
-    // hot-loop allocations.
-    positions_scratch: Vec<[f32; 3]>,
-    radii_scratch: Vec<f32>,
-    spike_lengths_scratch: Vec<f32>,
-    headings_scratch: Vec<f32>,
-    food_positions_scratch: Vec<[f32; 3]>,
+    // Sprint 43: spatial hashes pro broad-phase. Rebuild před fází, která
+    // neighbors používá — `cell_grid` před brain_act/resolve_collisions/predate,
+    // `food_grid` před brain_act/eat_food.
+    cell_grid: SpatialGrid<usize, f32>,
+    food_grid: SpatialGrid<usize, ()>,
+    // Persistent scratch — reused per tick to avoid hot-loop allocations.
     deltas_scratch: Vec<[f32; 3]>,
     energy_deltas_scratch: Vec<f32>,
     damage_deltas_scratch: Vec<f32>,
@@ -60,15 +81,25 @@ struct World {
     fertile_ticks_gen: u64,
     predation_events_gen: u64,
     mating_radius: f32,
+    // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
+    // může nastavit výš (potřeba pro bench při N > 1000).
+    max_population: usize,
+    bench_timings: PhaseTimings,
 }
 
 impl World {
-    fn new(rng: &mut impl Rng, map_seed: u64, mating_radius: f32) -> Self {
+    fn new(
+        rng: &mut impl Rng,
+        map_seed: u64,
+        mating_radius: f32,
+        initial_cells: usize,
+        max_population: usize,
+    ) -> Self {
         // Sprint 32: WorldMap a SmellField stále 2D — projekce xy. Sprint 35
         // promění je na 3D volumetric.
         let world_half_xy = [WORLD_HALF[0], WORLD_HALF[1]];
         let map = WorldMap::new(WORLD_MAP_RES, WORLD_MAP_BASE_RES, world_half_xy, map_seed);
-        let cells = (0..INITIAL_CELLS)
+        let cells = (0..initial_cells)
             .map(|i| Cell::random(rng, WORLD_HALF, i as u64, 0))
             .collect();
         let target = food_target(1.0);
@@ -95,11 +126,8 @@ impl World {
             smell: SmellField::new(SMELL_GRID_RES, world_half_xy),
             pheromone: SmellField::new(PHEROMONE_GRID_RES, world_half_xy),
             map,
-            positions_scratch: Vec::new(),
-            radii_scratch: Vec::new(),
-            spike_lengths_scratch: Vec::new(),
-            headings_scratch: Vec::new(),
-            food_positions_scratch: Vec::new(),
+            cell_grid: SpatialGrid::new(GRID_CELL_SIZE),
+            food_grid: SpatialGrid::new(GRID_CELL_SIZE),
             deltas_scratch: Vec::new(),
             energy_deltas_scratch: Vec::new(),
             damage_deltas_scratch: Vec::new(),
@@ -109,6 +137,8 @@ impl World {
             fertile_ticks_gen: 0,
             predation_events_gen: 0,
             mating_radius,
+            max_population,
+            bench_timings: PhaseTimings::default(),
         }
     }
 
@@ -121,21 +151,29 @@ impl World {
             self.density_factor = 1.0 + CYCLE_AMPLITUDE * phase.sin();
         }
 
-        self.update_smell(dt);
-        self.update_pheromone(dt);
-        self.brain_act(dt);
-        self.emit_pheromones(dt);
-        self.apply_morph(dt);
-        self.apply_brownian(rng, dt);
-        self.step(dt);
-        self.apply_food_gravity(dt);
-        self.apply_hazards(dt);
-        self.resolve_collisions();
-        self.predate();
-        self.eat_food();
-        self.spawn_food(rng);
-        self.reproduce(rng);
-        self.die_and_drop_carrion(rng);
+        macro_rules! timed {
+            ($field:ident, $call:expr) => {{
+                let _t = Instant::now();
+                $call;
+                self.bench_timings.$field += _t.elapsed().as_secs_f64() * 1e6;
+            }};
+        }
+
+        timed!(update_smell, self.update_smell(dt));
+        timed!(update_pheromone, self.update_pheromone(dt));
+        timed!(brain_act, self.brain_act(dt));
+        timed!(emit_pheromones, self.emit_pheromones(dt));
+        timed!(apply_morph, self.apply_morph(dt));
+        timed!(apply_brownian, self.apply_brownian(rng, dt));
+        timed!(step, self.step(dt));
+        timed!(apply_food_gravity, self.apply_food_gravity(dt));
+        timed!(apply_hazards, self.apply_hazards(dt));
+        timed!(resolve_collisions, self.resolve_collisions());
+        timed!(predate, self.predate());
+        timed!(eat_food, self.eat_food());
+        timed!(spawn_food, self.spawn_food(rng));
+        timed!(reproduce, self.reproduce(rng));
+        timed!(die_and_drop_carrion, self.die_and_drop_carrion(rng));
 
         transitions.generation_ended
     }
@@ -180,81 +218,87 @@ impl World {
     }
 
     fn brain_act(&mut self, dt: f32) {
-        self.positions_scratch.clear();
-        self.positions_scratch
-            .extend(self.cells.iter().map(|c| c.position));
-        self.radii_scratch.clear();
-        self.radii_scratch
-            .extend(self.cells.iter().map(|c| c.phenotype.effective_radius()));
-        self.food_positions_scratch.clear();
-        self.food_positions_scratch
-            .extend(self.foods.iter().map(|f| f.position));
-        let positions = &self.positions_scratch;
-        let radii = &self.radii_scratch;
-        let food_positions = &self.food_positions_scratch;
+        // Sprint 43: grid build O(N), neighbor query O(k) per cell, par_iter
+        // přes cells. Per-cell práce (sensor gather + brain forward + motor) je
+        // write-only do vlastní cell — par-safe bez reduction.
+        self.cell_grid.rebuild(
+            self.cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
+        );
+        self.food_grid.rebuild(
+            self.foods
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.position, ())),
+        );
 
-        for i in 0..self.cells.len() {
-            let pos = self.cells[i].position;
-            let vision_r = self.cells[i].genome.vision_radius;
-            let vr2 = vision_r * vision_r;
+        let cell_grid = &self.cell_grid;
+        let food_grid = &self.food_grid;
+        let smell = &self.smell;
+        let pheromone = &self.pheromone;
 
-            let mut best_food: Option<[f32; 3]> = None;
-            let mut best_food_d2 = f32::MAX;
-            for &fp in food_positions {
-                let dx = fp[0] - pos[0];
-                let dy = fp[1] - pos[1];
-                let dz = fp[2] - pos[2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 <= vr2 && d2 < best_food_d2 {
-                    best_food_d2 = d2;
-                    best_food = Some(fp);
-                }
-            }
+        self.cells
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, cell)| {
+                let pos = cell.position;
+                let vision_r = cell.genome.vision_radius;
+                let vr2 = vision_r * vision_r;
 
-            let mut best_cell: Option<([f32; 3], f32)> = None;
-            let mut best_cell_d2 = f32::MAX;
-            let mut neighbors_in_vision: u32 = 0;
-            for j in 0..self.cells.len() {
-                if j == i {
-                    continue;
-                }
-                let other_pos = positions[j];
-                let dx = other_pos[0] - pos[0];
-                let dy = other_pos[1] - pos[1];
-                let dz = other_pos[2] - pos[2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 <= vr2 {
-                    neighbors_in_vision += 1;
-                    if d2 < best_cell_d2 {
-                        best_cell_d2 = d2;
-                        best_cell = Some((other_pos, radii[j]));
+                let mut best_food: Option<[f32; 3]> = None;
+                let mut best_food_d2 = f32::MAX;
+                food_grid.for_each_in_radius(pos, vision_r, |_id, fp, ()| {
+                    let dx = fp[0] - pos[0];
+                    let dy = fp[1] - pos[1];
+                    let dz = fp[2] - pos[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 <= vr2 && d2 < best_food_d2 {
+                        best_food_d2 = d2;
+                        best_food = Some(fp);
                     }
-                }
-            }
+                });
 
-            // Sprint 40: gradient field samples + sensors struct, pak shared
-            // populate_brain_inputs. Pre-refactor zde bylo ~50 řádků inputs[].
-            let pos_xy = [pos[0], pos[1]];
-            let smell_grad = self.smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
-            let pheromone_grad = self.pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
-            let sensors = bioscape::BrainSensors {
-                nearest_food: best_food,
-                nearest_cell: best_cell,
-                neighbors_in_vision,
-                smell_grad,
-                pheromone_grad,
-            };
+                let mut best_cell: Option<([f32; 3], f32)> = None;
+                let mut best_cell_d2 = f32::MAX;
+                let mut neighbors_in_vision: u32 = 0;
+                cell_grid.for_each_in_radius(pos, vision_r, |id, op, oradius| {
+                    if id == i {
+                        return;
+                    }
+                    let dx = op[0] - pos[0];
+                    let dy = op[1] - pos[1];
+                    let dz = op[2] - pos[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 <= vr2 {
+                        neighbors_in_vision += 1;
+                        if d2 < best_cell_d2 {
+                            best_cell_d2 = d2;
+                            best_cell = Some((op, oradius));
+                        }
+                    }
+                });
 
-            let cell = &mut self.cells[i];
-            // Sprint 41: shell tlumí damage_accum před tím, než ho brain čte.
-            cell.apply_shell_absorb(dt);
-            let inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
-            let (hidden, outputs) = cell.genome.brain.forward_with_state(&inputs);
-            cell.last_inputs = inputs;
-            cell.last_hidden = hidden;
-            cell.last_outputs = outputs;
-            cell.apply_brain_motor(&outputs, dt);
-        }
+                let pos_xy = [pos[0], pos[1]];
+                let smell_grad = smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
+                let pheromone_grad = pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+                let sensors = bioscape::BrainSensors {
+                    nearest_food: best_food,
+                    nearest_cell: best_cell,
+                    neighbors_in_vision,
+                    smell_grad,
+                    pheromone_grad,
+                };
+
+                cell.apply_shell_absorb(dt);
+                let inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
+                let (hidden, outputs) = cell.genome.brain.forward_with_state(&inputs);
+                cell.last_inputs = inputs;
+                cell.last_hidden = hidden;
+                cell.last_outputs = outputs;
+                cell.apply_brain_motor(&outputs, dt);
+            });
     }
 
     fn step(&mut self, dt: f32) {
@@ -281,35 +325,52 @@ impl World {
     }
 
     fn resolve_collisions(&mut self) {
+        // Sprint 43: grid + rayon. Δ pro každé i je write-only do vlastního
+        // slotu. Max search radius = CELL_RADIUS × (radius_i + max_neighbor_r);
+        // vyhledáme přes effective_radius_i + GRID_CELL_SIZE konzervativně.
         let n = self.cells.len();
-        self.positions_scratch.clear();
-        self.positions_scratch
-            .extend(self.cells.iter().map(|c| c.position));
-        self.radii_scratch.clear();
-        self.radii_scratch
-            .extend(self.cells.iter().map(|c| c.phenotype.effective_radius()));
+        self.cell_grid.rebuild(
+            self.cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
+        );
         self.deltas_scratch.clear();
         self.deltas_scratch.resize(n, [0.0, 0.0, 0.0]);
-        for i in 0..n {
-            for j in 0..n {
-                if i == j {
-                    continue;
-                }
-                let pair_r = CELL_RADIUS * (self.radii_scratch[i] + self.radii_scratch[j]);
-                let pair_r2 = pair_r * pair_r;
-                let dx = self.positions_scratch[i][0] - self.positions_scratch[j][0];
-                let dy = self.positions_scratch[i][1] - self.positions_scratch[j][1];
-                let dz = self.positions_scratch[i][2] - self.positions_scratch[j][2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 < pair_r2 && d2 > 0.0 {
-                    let d = d2.sqrt();
-                    let overlap = pair_r - d;
-                    self.deltas_scratch[i][0] += (dx / d) * overlap * 0.5;
-                    self.deltas_scratch[i][1] += (dy / d) * overlap * 0.5;
-                    self.deltas_scratch[i][2] += (dz / d) * overlap * 0.5;
-                }
-            }
-        }
+
+        let cell_grid = &self.cell_grid;
+        let cells = &self.cells;
+        // Bound na search radius — 2× max radius v gridu by stačilo, ale
+        // GRID_CELL_SIZE je už ~64; používáme effective_radius_i × CELL_RADIUS × 2
+        // jako horní odhad (radius_j ≤ radius_i × ratio threshold). Pro jistotu
+        // bumpneme na CELL_RADIUS × max_axis × 2.
+        self.deltas_scratch
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, delta)| {
+                let pos_i = cells[i].position;
+                let radius_i = cells[i].phenotype.effective_radius();
+                let search_r = CELL_RADIUS * (radius_i + cells[i].phenotype.max_axis() * 2.0);
+                cell_grid.for_each_in_radius(pos_i, search_r, |id_j, pos_j, radius_j| {
+                    if id_j == i {
+                        return;
+                    }
+                    let pair_r = CELL_RADIUS * (radius_i + radius_j);
+                    let pair_r2 = pair_r * pair_r;
+                    let dx = pos_i[0] - pos_j[0];
+                    let dy = pos_i[1] - pos_j[1];
+                    let dz = pos_i[2] - pos_j[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < pair_r2 && d2 > 0.0 {
+                        let d = d2.sqrt();
+                        let overlap = pair_r - d;
+                        delta[0] += (dx / d) * overlap * 0.5;
+                        delta[1] += (dy / d) * overlap * 0.5;
+                        delta[2] += (dz / d) * overlap * 0.5;
+                    }
+                });
+            });
+
         for (cell, delta) in self.cells.iter_mut().zip(self.deltas_scratch.iter()) {
             cell.position[0] += delta[0];
             cell.position[1] += delta[1];
@@ -318,40 +379,47 @@ impl World {
     }
 
     fn predate(&mut self) {
+        // Sprint 43: cell_grid build (sdílený s brain_act ale tam refresh tickem
+        // později; rebuildujeme pro jistotu — pozice se mohly hnout v `step()`).
+        // Pass 1 (herd_counts): par_iter, write-only per i. Pass 2 (attack
+        // events): sekvenční, protože write na victim může kolidovat napříč
+        // attackers; grid lookup ale srazí cost na O(N·k).
         let n = self.cells.len();
-        self.positions_scratch.clear();
-        self.positions_scratch
-            .extend(self.cells.iter().map(|c| c.position));
-        self.radii_scratch.clear();
-        self.radii_scratch
-            .extend(self.cells.iter().map(|c| c.phenotype.effective_radius()));
-        self.spike_lengths_scratch.clear();
-        self.spike_lengths_scratch
-            .extend(self.cells.iter().map(|c| c.phenotype.spike_length));
-        self.headings_scratch.clear();
-        self.headings_scratch
-            .extend(self.cells.iter().map(|c| c.heading));
+        self.cell_grid.rebuild(
+            self.cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
+        );
         self.energy_deltas_scratch.clear();
         self.energy_deltas_scratch.resize(n, 0.0);
         self.damage_deltas_scratch.clear();
         self.damage_deltas_scratch.resize(n, 0.0);
-        // Sprint 29 selfish-herd: pre-compute count of neighbors within
-        // HERD_RADIUS for each cell. Used as dilution multiplier — predátor
-        // dostane menší gain z prey, která je obklopena hejnem.
+
         let herd_r2 = HERD_RADIUS * HERD_RADIUS;
-        let mut herd_counts: Vec<u32> = vec![0; n];
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let dx = self.positions_scratch[i][0] - self.positions_scratch[j][0];
-                let dy = self.positions_scratch[i][1] - self.positions_scratch[j][1];
-                let dz = self.positions_scratch[i][2] - self.positions_scratch[j][2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 < herd_r2 {
-                    herd_counts[i] += 1;
-                    herd_counts[j] += 1;
-                }
-            }
-        }
+        let cells = &self.cells;
+        let cell_grid = &self.cell_grid;
+        let herd_counts: Vec<u32> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let pos_i = cells[i].position;
+                let mut count = 0u32;
+                cell_grid.for_each_in_radius(pos_i, HERD_RADIUS, |id_j, pos_j, _| {
+                    if id_j == i {
+                        return;
+                    }
+                    let dx = pos_i[0] - pos_j[0];
+                    let dy = pos_i[1] - pos_j[1];
+                    let dz = pos_i[2] - pos_j[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < herd_r2 {
+                        count += 1;
+                    }
+                });
+                count
+            })
+            .collect();
+
         let mut events: u64 = 0;
         for i in 0..n {
             // Sprint 27: attack je opt-in přes brain. Bez aktivního signálu jsou
@@ -360,51 +428,51 @@ impl World {
             if attack_signal <= ATTACK_THRESHOLD {
                 continue;
             }
-            #[allow(clippy::needless_range_loop)]
-            for j in 0..n {
-                if i == j {
-                    continue;
-                }
-                let radius_a = self.radii_scratch[i];
-                let radius_b = self.radii_scratch[j];
-                if radius_a < SIZE_RATIO_THRESHOLD * radius_b {
-                    continue;
-                }
-                let pair_r = CELL_RADIUS * (radius_a + radius_b);
-                let pair_r2 = pair_r * pair_r;
-                let dx = self.positions_scratch[i][0] - self.positions_scratch[j][0];
-                let dy = self.positions_scratch[i][1] - self.positions_scratch[j][1];
-                let dz = self.positions_scratch[i][2] - self.positions_scratch[j][2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 < pair_r2 {
-                    let mut gain = PREDATION_GAIN_PER_TICK;
-                    let spike = self.spike_lengths_scratch[i];
-                    if spike > 0.0 && d2 > 0.0 {
-                        // Sprint 32: heading je 2D yaw, takže forward = (cos, sin, 0).
-                        // Cosine s 3D směrem k cíli — z-složka forwardu je 0,
-                        // takže příspěvek z dz × 0 zmizí. Sprint 33+ rozšíří
-                        // forward na full 3D unit vector přes pitch.
-                        let inv_d = 1.0 / d2.sqrt();
-                        let to_j_x = -dx * inv_d;
-                        let to_j_y = -dy * inv_d;
-                        let h = self.headings_scratch[i];
-                        let cos_angle = h.cos() * to_j_x + h.sin() * to_j_y;
-                        if cos_angle >= bioscape::SPIKE_DOT_THRESHOLD {
-                            gain += PREDATION_GAIN_PER_TICK
-                                * spike
-                                * bioscape::SPIKE_PREDATION_BONUS;
-                        }
+            let pos_i = self.cells[i].position;
+            let radius_a = self.cells[i].phenotype.effective_radius();
+            let spike = self.cells[i].phenotype.spike_length;
+            let heading = self.cells[i].heading;
+            // Search radius pro pair_r2 = CELL_RADIUS × (r_a + r_b). Bound na
+            // r_b ≤ MAX_BODY axis-y → konzervativně CELL_RADIUS × (r_a + max_axis).
+            let search_r = CELL_RADIUS * (radius_a + self.cells[i].phenotype.max_axis() * 2.0);
+            let mut victims: Vec<(usize, f32, f32, f32, f32)> = Vec::new();
+            self.cell_grid
+                .for_each_in_radius(pos_i, search_r, |j, pos_j, radius_b| {
+                    if j == i {
+                        return;
                     }
-                    // Sprint 29 dilution: gain × 1/(1 + K × n_neighbors_prey).
-                    // Drain prey beze změny — selfish-herd snižuje payoff lovu,
-                    // ne utrpení oběti.
-                    let dilution = 1.0 / (1.0 + DILUTION_K * herd_counts[j] as f32);
-                    gain *= dilution;
-                    self.energy_deltas_scratch[i] += gain;
-                    self.energy_deltas_scratch[j] -= PREDATION_DRAIN_PER_TICK;
-                    self.damage_deltas_scratch[j] += PREDATION_DRAIN_PER_TICK;
-                    events += 1;
+                    if radius_a < SIZE_RATIO_THRESHOLD * radius_b {
+                        return;
+                    }
+                    let pair_r = CELL_RADIUS * (radius_a + radius_b);
+                    let pair_r2 = pair_r * pair_r;
+                    let dx = pos_i[0] - pos_j[0];
+                    let dy = pos_i[1] - pos_j[1];
+                    let dz = pos_i[2] - pos_j[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 < pair_r2 {
+                        victims.push((j, dx, dy, dz, d2));
+                    }
+                });
+            for (j, dx, dy, dz, d2) in victims {
+                let mut gain = PREDATION_GAIN_PER_TICK;
+                if spike > 0.0 && d2 > 0.0 {
+                    let inv_d = 1.0 / d2.sqrt();
+                    let to_j_x = -dx * inv_d;
+                    let to_j_y = -dy * inv_d;
+                    let _ = dz;
+                    let cos_angle = heading.cos() * to_j_x + heading.sin() * to_j_y;
+                    if cos_angle >= bioscape::SPIKE_DOT_THRESHOLD {
+                        gain +=
+                            PREDATION_GAIN_PER_TICK * spike * bioscape::SPIKE_PREDATION_BONUS;
+                    }
                 }
+                let dilution = 1.0 / (1.0 + DILUTION_K * herd_counts[j] as f32);
+                gain *= dilution;
+                self.energy_deltas_scratch[i] += gain;
+                self.energy_deltas_scratch[j] -= PREDATION_DRAIN_PER_TICK;
+                self.damage_deltas_scratch[j] += PREDATION_DRAIN_PER_TICK;
+                events += 1;
             }
         }
         self.predation_events_gen += events;
@@ -420,25 +488,41 @@ impl World {
     }
 
     fn eat_food(&mut self) {
+        // Sprint 43: food_grid lookup místo full sweep. Sekvenční, protože
+        // despawn `Vec<Food>` je shared mutable + Hebbian update mutuje cell.
+        // Per-cell vidi jen kandidáty z 3³ buckets v `EAT_RADIUS × max_axis` —
+        // při typickém eat reach ~8 a GRID_CELL_SIZE=64 query overestimate je
+        // ~1 bucket → ~10 kandidátů max.
+        self.food_grid.rebuild(
+            self.foods
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.position, ())),
+        );
         self.eaten_scratch.clear();
         self.eaten_scratch.resize(self.foods.len(), false);
-        let eaten = &mut self.eaten_scratch;
-        for cell in &mut self.cells {
-            let mut ate = false;
-            for (flag, food) in eaten.iter_mut().zip(self.foods.iter()) {
-                if *flag {
-                    continue;
-                }
-                let value = FOOD_VALUE
-                    * food_multiplier(self.map.sample([food.position[0], food.position[1]]))
-                    * food.value_factor();
-                if cell.try_eat(food, EAT_RADIUS, value) {
-                    *flag = true;
-                    ate = true;
-                    break;
-                }
-            }
-            if ate {
+
+        for cell in self.cells.iter_mut() {
+            let pos = cell.position;
+            let search_r = EAT_RADIUS * cell.phenotype.max_axis();
+            let mut ate_idx: Option<usize> = None;
+            self.food_grid
+                .for_each_in_radius(pos, search_r, |idx, _fp, ()| {
+                    if ate_idx.is_some() || self.eaten_scratch[idx] {
+                        return;
+                    }
+                    let food = &self.foods[idx];
+                    let value = FOOD_VALUE
+                        * food_multiplier(
+                            self.map.sample([food.position[0], food.position[1]]),
+                        )
+                        * food.value_factor();
+                    if cell.try_eat(food, EAT_RADIUS, value) {
+                        ate_idx = Some(idx);
+                    }
+                });
+            if let Some(idx) = ate_idx {
+                self.eaten_scratch[idx] = true;
                 let last_inputs = cell.last_inputs;
                 let last_hidden = cell.last_hidden;
                 let last_outputs = cell.last_outputs;
@@ -451,8 +535,8 @@ impl World {
                 );
             }
         }
-        for j in (0..eaten.len()).rev() {
-            if eaten[j] {
+        for j in (0..self.eaten_scratch.len()).rev() {
+            if self.eaten_scratch[j] {
                 self.foods.swap_remove(j);
             }
         }
@@ -463,13 +547,21 @@ impl World {
         if self.foods.len() >= target {
             return;
         }
+        // Sprint 43: cell_grid pro exclusion check. Rebuild reuses bucket vec
+        // capacities; inner loop místo O(N) full sweep dělá O(k) per candidate.
+        // Bound search radius na EAT_RADIUS × MAX_BODY_LENGTH (max_axis nemůže
+        // přesáhnout MAX_BODY_LENGTH).
+        self.cell_grid.rebuild(
+            self.cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
+        );
         let to_spawn = (target - self.foods.len()).min(FOOD_SPAWN_RATE);
+        let max_search_r = EAT_RADIUS * bioscape::MAX_BODY_LENGTH;
         'spawn: for _ in 0..to_spawn {
             for _ in 0..MAX_SPAWN_ATTEMPTS {
                 let candidate = Food::random(rng, WORLD_HALF);
-                // Sprint 31: rejection sampling proti uniform distribution —
-                // bias k rich zonám. Spotřebovává retry budget, takže poor
-                // zone občas dostane jídlo (clustering, ne ostré biomy).
                 let richness = self
                     .map
                     .sample([candidate.position[0], candidate.position[1]]);
@@ -477,19 +569,19 @@ impl World {
                     continue;
                 }
                 let mut blocked = false;
-                for cell in &self.cells {
-                    // Sprint 41: max_axis je conservative bound pro ellipsoid
-                    // eat zónu — sféra effective_radius by missnula long axis
-                    // tip a food by se po spawnu hned snědlo.
-                    let exclusion = EAT_RADIUS * cell.phenotype.max_axis();
-                    let dx = candidate.position[0] - cell.position[0];
-                    let dy = candidate.position[1] - cell.position[1];
-                    let dz = candidate.position[2] - cell.position[2];
-                    if dx * dx + dy * dy + dz * dz < exclusion * exclusion {
-                        blocked = true;
-                        break;
-                    }
-                }
+                self.cell_grid
+                    .for_each_in_radius(candidate.position, max_search_r, |id, cell_pos, _r| {
+                        if blocked {
+                            return;
+                        }
+                        let exclusion = EAT_RADIUS * self.cells[id].phenotype.max_axis();
+                        let dx = candidate.position[0] - cell_pos[0];
+                        let dy = candidate.position[1] - cell_pos[1];
+                        let dz = candidate.position[2] - cell_pos[2];
+                        if dx * dx + dy * dy + dz * dz < exclusion * exclusion {
+                            blocked = true;
+                        }
+                    });
                 if !blocked {
                     self.foods.push(candidate);
                     continue 'spawn;
@@ -500,10 +592,10 @@ impl World {
 
     fn reproduce(&mut self, rng: &mut impl Rng) {
         let current_pop = self.cells.len();
-        if current_pop >= MAX_POPULATION {
+        if current_pop >= self.max_population {
             return;
         }
-        let budget = MAX_POPULATION - current_pop;
+        let budget = self.max_population - current_pop;
         let fertile = self.collect_fertile();
         self.fertile_ticks_gen += fertile.len() as u64;
         let mating_r2 = self.mating_radius * self.mating_radius;
@@ -734,27 +826,42 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let dmg_m = dmg_sum / nf;
     let noise_m = noise_sum / nf;
     // Sprint 29 spatial clustering metric: mean nearest-neighbor distance.
-    // Uniform reference v Full-HD světě (1920×1080) pro pop=N: 0.5·√(A/N) ≈
-    // 720/√N. Hodnoty výrazně pod referencí = clustering. n=1 dá 0 (degenerate);
-    // exclude se v interpretaci, zde zapíšeme NaN-safe 0.0 jen pro nepadnutí.
+    // Sprint 43: grid lookup s expanding radius. Začni na GRID_CELL_SIZE (=64),
+    // pokud nikdo není, double až po WORLD diagonal — typický nn dist je < 50,
+    // takže first try téměř vždy najde souseda.
     let nn_dist_m = if n >= 2 {
+        let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE);
+        grid.rebuild(
+            world
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.position, ())),
+        );
+        let world_diag = (4.0 * (WORLD_HALF[0] * WORLD_HALF[0] + WORLD_HALF[1] * WORLD_HALF[1]))
+            .sqrt();
         let mut sum = 0.0_f64;
         for i in 0..n {
-            let mut min_d2 = f32::MAX;
             let pi = world.cells[i].position;
-            for j in 0..n {
-                if i == j {
-                    continue;
-                }
-                let pj = world.cells[j].position;
-                let dx = pi[0] - pj[0];
-                let dy = pi[1] - pj[1];
-                let d2 = dx * dx + dy * dy;
-                if d2 < min_d2 {
-                    min_d2 = d2;
-                }
+            let mut min_d2 = f32::MAX;
+            let mut search_r = GRID_CELL_SIZE;
+            while min_d2 == f32::MAX && search_r <= world_diag {
+                grid.for_each_in_radius(pi, search_r, |j, pj, _| {
+                    if i == j {
+                        return;
+                    }
+                    let dx = pi[0] - pj[0];
+                    let dy = pi[1] - pj[1];
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < min_d2 {
+                        min_d2 = d2;
+                    }
+                });
+                search_r *= 2.0;
             }
-            sum += min_d2.sqrt() as f64;
+            if min_d2 < f32::MAX {
+                sum += min_d2.sqrt() as f64;
+            }
         }
         sum / nf
     } else {
@@ -818,9 +925,33 @@ fn main() {
         .get(5)
         .and_then(|s| s.parse().ok())
         .unwrap_or(MATING_RADIUS);
+    // Sprint 43: positional override pro initial cells / max population /
+    // rayon thread count. Default zachovává pre-Sprint-43 chování.
+    let initial_cells: usize = args
+        .get(6)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(INITIAL_CELLS);
+    let max_population: usize = args
+        .get(7)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_POPULATION);
+    let threads: usize = args
+        .get(8)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+
+    if threads > 0 {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global();
+    }
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut world = World::new(&mut rng, map_seed, mating_radius);
+    let mut world = World::new(&mut rng, map_seed, mating_radius, initial_cells, max_population);
 
     let file = std::fs::File::create(&out_path).expect("can't create output file");
     let mut log = BufWriter::new(file);
@@ -845,14 +976,16 @@ fn main() {
     eprintln!("noise_baseline (uniform-position mean over map): {:.4}", noise_baseline);
 
     eprintln!(
-        "headless: seed={} map_seed={} mating_radius={} max_gens={} out={} initial_cells={} initial_food={}",
+        "headless: seed={} map_seed={} mating_radius={} max_gens={} out={} initial_cells={} initial_food={} max_pop={} threads={}",
         seed,
         map_seed,
         mating_radius,
         max_gens,
         out_path,
         world.cells.len(),
-        world.foods.len()
+        world.foods.len(),
+        max_population,
+        rayon::current_num_threads()
     );
 
     let start = Instant::now();
@@ -860,6 +993,38 @@ fn main() {
         let gen_ended = world.tick(&mut rng);
         if gen_ended.is_some() {
             write_stats(&mut log, &world).unwrap();
+            // Sprint 43: po první dokončené generaci vypiš per-fáze timing
+            // (mikrosekundy total + průměr per tick). Reset accumulator.
+            if world.clock.generation == 1 {
+                let t = world.bench_timings;
+                let ticks = TICKS_PER_GENERATION as f64;
+                let dump = |name: &str, total_us: f64| {
+                    eprintln!(
+                        "phase={} n={} ticks={} us_total={:.1} us_avg={:.3}",
+                        name,
+                        world.cells.len(),
+                        TICKS_PER_GENERATION,
+                        total_us,
+                        total_us / ticks
+                    );
+                };
+                dump("update_smell", t.update_smell);
+                dump("update_pheromone", t.update_pheromone);
+                dump("brain_act", t.brain_act);
+                dump("emit_pheromones", t.emit_pheromones);
+                dump("apply_morph", t.apply_morph);
+                dump("apply_brownian", t.apply_brownian);
+                dump("step", t.step);
+                dump("apply_food_gravity", t.apply_food_gravity);
+                dump("apply_hazards", t.apply_hazards);
+                dump("resolve_collisions", t.resolve_collisions);
+                dump("predate", t.predate);
+                dump("eat_food", t.eat_food);
+                dump("spawn_food", t.spawn_food);
+                dump("reproduce", t.reproduce);
+                dump("die_and_drop_carrion", t.die_and_drop_carrion);
+                world.bench_timings = PhaseTimings::default();
+            }
             world.births_gen = 0;
             world.deaths_gen = 0;
             world.fertile_ticks_gen = 0;

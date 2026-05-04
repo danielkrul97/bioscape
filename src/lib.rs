@@ -6,6 +6,8 @@
 use core::f32::consts::TAU;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
+use std::hash::Hash;
 
 const HUE_RANGE: f32 = 360.0;
 const MIN_SPEED: f32 = 1.0;
@@ -1375,6 +1377,78 @@ impl WorldMap {
     }
 }
 
+/// Sprint 43: 3D uniform spatial hash. Generic přes `Id` (Bevy `Entity` v
+/// rendereru, `usize` v headless) a `P` (per-item payload, např. radius).
+///
+/// **Determinismus:** rebuild iteruje vstup v pořadí, ve kterém přijde, a Vec
+/// v každém bucketu drží push-order. `for_each_in_radius` iteruje 3³ buckets ve
+/// fixním (dx, dy, dz) pořadí; `HashMap::get(&key)` je lookup-deterministic.
+/// Caller, který předá rebuild items ve stable order (např. `cells.iter().enumerate()`),
+/// dostane reprodukovatelný traversal napříč runy. Floats z následných sumací
+/// nejsou bit-identical s O(N²) baseline kvůli jinému pořadí akumulace.
+pub struct SpatialGrid<Id: Copy + Eq + Hash, P: Copy> {
+    cell_size: f32,
+    buckets: HashMap<(i32, i32, i32), Vec<(Id, [f32; 3], P)>>,
+}
+
+impl<Id: Copy + Eq + Hash, P: Copy> SpatialGrid<Id, P> {
+    pub fn new(cell_size: f32) -> Self {
+        Self {
+            cell_size,
+            buckets: HashMap::new(),
+        }
+    }
+
+    fn key_of(&self, pos: [f32; 3]) -> (i32, i32, i32) {
+        (
+            (pos[0] / self.cell_size).floor() as i32,
+            (pos[1] / self.cell_size).floor() as i32,
+            (pos[2] / self.cell_size).floor() as i32,
+        )
+    }
+
+    /// Drops stale entries z předchozího rebuildu, ale zachová bucket Vec
+    /// kapacity — populace je per-tick relativně stabilní, takže reuse alokace
+    /// vyhrává nad clear() celé HashMap.
+    pub fn rebuild<I: IntoIterator<Item = (Id, [f32; 3], P)>>(&mut self, items: I) {
+        for bucket in self.buckets.values_mut() {
+            bucket.clear();
+        }
+        for (id, pos, payload) in items {
+            let key = self.key_of(pos);
+            self.buckets.entry(key).or_default().push((id, pos, payload));
+        }
+    }
+
+    /// Volá `f(id, pos, payload)` pro každý item v 3³ buckets okolo `pos`.
+    /// Caller musí narrow-phase distance test dělat sám (grid vrací overestimate).
+    pub fn for_each_in_radius<F: FnMut(Id, [f32; 3], P)>(
+        &self,
+        pos: [f32; 3],
+        radius: f32,
+        mut f: F,
+    ) {
+        let r_cells = (radius / self.cell_size).ceil() as i32;
+        let (cx, cy, cz) = self.key_of(pos);
+        for dx in -r_cells..=r_cells {
+            for dy in -r_cells..=r_cells {
+                for dz in -r_cells..=r_cells {
+                    if let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &(id, p, payload) in bucket {
+                            f(id, p, payload);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sprint 43: defaultní velikost buňky spatial gridu. ~1.3× max vision_radius
+/// (50). Větší = méně buckets, víc kandidátů per query; menší = víc buckets,
+/// méně kandidátů. Renderer v `main.rs` má svůj vlastní knob.
+pub const GRID_CELL_SIZE: f32 = 64.0;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SimClock {
     pub tick: u64,
@@ -2438,5 +2512,103 @@ mod tests {
         let child = make_mating_child(&cell_a, &cell_b, &mut rng);
         assert_eq!(child.age, 0);
         assert_eq!(child.reproduce_cooldown_ticks, 0);
+    }
+
+    #[test]
+    fn spatial_grid_finds_all_neighbors_in_radius() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let n = 1000;
+        let half: f32 = 500.0;
+        let points: Vec<(usize, [f32; 3], ())> = (0..n)
+            .map(|i| {
+                (
+                    i,
+                    [
+                        rng.random_range(-half..half),
+                        rng.random_range(-half..half),
+                        rng.random_range(-1.0..1.0),
+                    ],
+                    (),
+                )
+            })
+            .collect();
+
+        let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE);
+        grid.rebuild(points.iter().copied());
+
+        let query_pos = [0.0_f32, 0.0, 0.0];
+        let radius = 50.0_f32;
+        let r2 = radius * radius;
+
+        let mut brute: Vec<usize> = points
+            .iter()
+            .filter_map(|(i, p, _)| {
+                let dx = p[0] - query_pos[0];
+                let dy = p[1] - query_pos[1];
+                let dz = p[2] - query_pos[2];
+                if dx * dx + dy * dy + dz * dz <= r2 {
+                    Some(*i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        brute.sort();
+
+        let mut from_grid: Vec<usize> = Vec::new();
+        grid.for_each_in_radius(query_pos, radius, |id, p, _| {
+            let dx = p[0] - query_pos[0];
+            let dy = p[1] - query_pos[1];
+            let dz = p[2] - query_pos[2];
+            if dx * dx + dy * dy + dz * dz <= r2 {
+                from_grid.push(id);
+            }
+        });
+        from_grid.sort();
+
+        assert_eq!(
+            brute, from_grid,
+            "grid query missed or extra neighbors vs brute force"
+        );
+    }
+
+    #[test]
+    fn spatial_grid_rebuild_clears_old_buckets() {
+        let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(50.0);
+        grid.rebuild(vec![(0_usize, [0.0, 0.0, 0.0], ()), (1, [10.0, 10.0, 0.0], ())]);
+
+        let mut first: Vec<usize> = Vec::new();
+        grid.for_each_in_radius([0.0, 0.0, 0.0], 100.0, |id, _, _| first.push(id));
+        first.sort();
+        assert_eq!(first, vec![0, 1]);
+
+        grid.rebuild(vec![(2_usize, [200.0, 200.0, 0.0], ())]);
+        let mut second: Vec<usize> = Vec::new();
+        grid.for_each_in_radius([0.0, 0.0, 0.0], 100.0, |id, _, _| second.push(id));
+        assert!(
+            second.is_empty(),
+            "rebuild left stale entries near origin: {:?}",
+            second
+        );
+
+        let mut third: Vec<usize> = Vec::new();
+        grid.for_each_in_radius([200.0, 200.0, 0.0], 100.0, |id, _, _| third.push(id));
+        assert_eq!(third, vec![2]);
+    }
+
+    #[test]
+    fn spatial_grid_query_order_is_stable() {
+        let points: Vec<(usize, [f32; 3], ())> = (0..50)
+            .map(|i| (i, [i as f32 * 5.0, (i % 7) as f32 * 3.0, 0.0], ()))
+            .collect();
+        let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(20.0);
+        grid.rebuild(points.iter().copied());
+
+        let mut a: Vec<usize> = Vec::new();
+        grid.for_each_in_radius([100.0, 10.0, 0.0], 60.0, |id, _, _| a.push(id));
+        let mut b: Vec<usize> = Vec::new();
+        grid.for_each_in_radius([100.0, 10.0, 0.0], 60.0, |id, _, _| b.push(id));
+
+        assert_eq!(a, b, "two identical queries returned different order");
     }
 }

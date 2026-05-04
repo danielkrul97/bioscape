@@ -5,7 +5,7 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bioscape::{
-    reject_food_for_richness, Cell, Food, Phenotype, SimClock, SmellField, WorldMap,
+    reject_food_for_richness, Cell, Food, Phenotype, SimClock, SmellField, SpatialGrid, WorldMap,
     ATTACK_THRESHOLD, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
     DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
     HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
@@ -93,69 +93,8 @@ impl Default for FoodDensityFactor {
     }
 }
 
-type Bucket<P> = Vec<(Entity, [f32; 3], P)>;
-
-struct SpatialGrid<P: Copy> {
-    cell_size: f32,
-    buckets: HashMap<(i32, i32, i32), Bucket<P>>,
-}
-
-impl<P: Copy> SpatialGrid<P> {
-    fn new(cell_size: f32) -> Self {
-        Self {
-            cell_size,
-            buckets: HashMap::new(),
-        }
-    }
-
-    fn key_of(&self, pos: [f32; 3]) -> (i32, i32, i32) {
-        (
-            (pos[0] / self.cell_size).floor() as i32,
-            (pos[1] / self.cell_size).floor() as i32,
-            (pos[2] / self.cell_size).floor() as i32,
-        )
-    }
-
-    fn rebuild<I: IntoIterator<Item = (Entity, [f32; 3], P)>>(&mut self, items: I) {
-        // Preserve bucket Vec capacities across ticks — population and food
-        // count are roughly stable, so reusing allocations beats clearing the
-        // whole HashMap.
-        for bucket in self.buckets.values_mut() {
-            bucket.clear();
-        }
-        for (e, pos, payload) in items {
-            let key = self.key_of(pos);
-            self.buckets.entry(key).or_default().push((e, pos, payload));
-        }
-    }
-
-    /// Sprint 32: 3D bucketing. Pro Sprint 32 (z=0 locked) je dz iterace
-    /// degenerate single-bucket loop, takže overhead minimální. Po Sprintu 33
-    /// (z motion) se naplní celá 3D mřížka.
-    fn for_each_in_radius<F: FnMut(Entity, [f32; 3], P)>(
-        &self,
-        pos: [f32; 3],
-        radius: f32,
-        mut f: F,
-    ) {
-        let r_cells = (radius / self.cell_size).ceil() as i32;
-        let (cx, cy, cz) = self.key_of(pos);
-        for dx in -r_cells..=r_cells {
-            for dy in -r_cells..=r_cells {
-                for dz in -r_cells..=r_cells {
-                    if let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy, cz + dz)) {
-                        for &(e, p, payload) in bucket {
-                            f(e, p, payload);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[derive(Resource)]
-struct CellGrid(SpatialGrid<f32>);
+struct CellGrid(SpatialGrid<Entity, f32>);
 
 impl Default for CellGrid {
     fn default() -> Self {
@@ -164,7 +103,7 @@ impl Default for CellGrid {
 }
 
 #[derive(Resource)]
-struct FoodGrid(SpatialGrid<()>);
+struct FoodGrid(SpatialGrid<Entity, ()>);
 
 impl Default for FoodGrid {
     fn default() -> Self {
