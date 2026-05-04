@@ -9,7 +9,7 @@ use bioscape::{
     ATTACK_THRESHOLD, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
     DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
     HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
-    MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
     PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
     PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
@@ -700,6 +700,8 @@ fn cells_brain_act(
             smell_grad,
             pheromone_grad,
         };
+        // Sprint 41: shell tlumí damage_accum před tím, než ho brain čte.
+        cell.0.apply_shell_absorb(dt);
         let inputs = bioscape::populate_brain_inputs(&mut cell.0, &sensors, vision_r);
         let (hidden, outputs) = cell.0.genome.brain.forward_with_state(&inputs);
         cell.0.last_inputs = inputs;
@@ -734,7 +736,10 @@ fn spawn_food(
     let to_spawn = (target - count).min(FOOD_SPAWN_RATE);
     let mut rng = rand::rng();
     let half = extent.as_array();
-    let broad_r = EAT_RADIUS * BROAD_PHASE_SIZE_BUDGET;
+    // Sprint 41: bump broad-phase budget na MAX_BODY_LENGTH — worst-case max_axis
+    // ellipsoid může extending podél long axis až o tuto velikost. BROAD_PHASE_SIZE_BUDGET
+    // = 3.0 (effective_radius default) by missnul cells s max_axis blízko 4.0.
+    let broad_r = EAT_RADIUS * MAX_BODY_LENGTH;
 
     'spawn: for _ in 0..to_spawn {
         for _ in 0..MAX_SPAWN_ATTEMPTS {
@@ -792,23 +797,25 @@ fn cell_eats_food(
 
     for mut cell in &mut cells {
         let pos = cell.0.position;
-        let eat_r = EAT_RADIUS * cell.0.phenotype.effective_radius();
-        let r2 = eat_r * eat_r;
-        let mut to_eat: Option<(Entity, [f32; 3])> = None;
+        // Sprint 41: broad-phase používá max_axis (worst-case ellipsoid extent),
+        // narrow-phase je ellipsoidní acceptance v `Cell::eat_test`. Closure
+        // pokračuje hledat dokud nenajde food, který projde i narrow check —
+        // jinak by chip cell s long forward axis missnul valid eat target,
+        // pokud broad-phase vrátil first food kdesi v perpendicular směru.
+        let eat_r = EAT_RADIUS * cell.0.phenotype.max_axis();
+        let mut to_eat: Option<(Entity, Food)> = None;
         food_grid.0.for_each_in_radius(pos, eat_r, |food_e, food_pos, _| {
             if to_eat.is_some() || eaten.contains(&food_e) {
                 return;
             }
-            let dx = pos[0] - food_pos[0];
-            let dy = pos[1] - food_pos[1];
-            let dz = pos[2] - food_pos[2];
-            if dx * dx + dy * dy + dz * dz <= r2 {
-                to_eat = Some((food_e, food_pos));
+            let food = Food { position: food_pos };
+            if cell.0.eat_test(&food, EAT_RADIUS) {
+                to_eat = Some((food_e, food));
             }
         });
-        if let Some((food_e, food_pos)) = to_eat {
-            cell.0.energy +=
-                FOOD_VALUE * food_multiplier(world_map.0.sample([food_pos[0], food_pos[1]]));
+        if let Some((food_e, food)) = to_eat {
+            cell.0.energy += FOOD_VALUE
+                * food_multiplier(world_map.0.sample([food.position[0], food.position[1]]));
             eaten.insert(food_e);
             commands.entity(food_e).despawn();
             // Reward-modulated Hebbian update — reinforce the recent decision

@@ -238,6 +238,8 @@ impl World {
             };
 
             let cell = &mut self.cells[i];
+            // Sprint 41: shell tlumí damage_accum před tím, než ho brain čte.
+            cell.apply_shell_absorb(dt);
             let inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
             let (hidden, outputs) = cell.genome.brain.forward_with_state(&inputs);
             cell.last_inputs = inputs;
@@ -412,20 +414,14 @@ impl World {
         self.eaten_scratch.resize(self.foods.len(), false);
         let eaten = &mut self.eaten_scratch;
         for cell in &mut self.cells {
-            let pos = cell.position;
-            let eat_r = EAT_RADIUS * cell.phenotype.effective_radius();
-            let r2 = eat_r * eat_r;
             let mut ate = false;
             for (flag, food) in eaten.iter_mut().zip(self.foods.iter()) {
                 if *flag {
                     continue;
                 }
-                let dx = pos[0] - food.position[0];
-                let dy = pos[1] - food.position[1];
-                let dz = pos[2] - food.position[2];
-                if dx * dx + dy * dy + dz * dz <= r2 {
-                    cell.energy += FOOD_VALUE
-                        * food_multiplier(self.map.sample([food.position[0], food.position[1]]));
+                let value = FOOD_VALUE
+                    * food_multiplier(self.map.sample([food.position[0], food.position[1]]));
+                if cell.try_eat(food, EAT_RADIUS, value) {
                     *flag = true;
                     ate = true;
                     break;
@@ -471,7 +467,10 @@ impl World {
                 }
                 let mut blocked = false;
                 for cell in &self.cells {
-                    let exclusion = EAT_RADIUS * cell.phenotype.effective_radius();
+                    // Sprint 41: max_axis je conservative bound pro ellipsoid
+                    // eat zónu — sféra effective_radius by missnula long axis
+                    // tip a food by se po spawnu hned snědlo.
+                    let exclusion = EAT_RADIUS * cell.phenotype.max_axis();
                     let dx = candidate.position[0] - cell.position[0];
                     let dy = candidate.position[1] - cell.position[1];
                     let dz = candidate.position[2] - cell.position[2];

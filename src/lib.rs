@@ -246,6 +246,20 @@ pub const SPIKE_DOT_THRESHOLD: f32 = 0.7;
 // Sprint 40 cleanup: `SPIKE_RENDER_THRESHOLD` removed — Sprint 36 dropped
 // custom spike shader, takže render-threshold const už není referencovaná.
 
+// Sprint 41: shell jako passive damage absorber. `shell_thickness` gen
+// modifikuje `damage_accum` před zápisem do brain inputu — `apply_shell_absorb`
+// odečte `shell × ABSORB_PER_TICK × dt`, floor 0. Maintenance cost lineární
+// (defensive armor je drahá). Otevírá defensive niku — silně shellovaná
+// buňka neunikne predátorovi, ale unese hazard + occasional spike hits.
+pub const MIN_SHELL_THICKNESS: f32 = 0.0;
+pub const MAX_SHELL_THICKNESS: f32 = 1.5;
+/// Per-second absorb capacity. Single `PREDATION_DRAIN_PER_TICK` = 3.0; shell=1.5
+/// plně absorbuje (3.0 ≤ 1.5 × 2.0), shell=1.0 absorbuje 2/3 hit, shell=0.5 půlí.
+pub const SHELL_ABSORB_PER_TICK: f32 = 2.0;
+/// Maintenance cost ∝ shell. Vyšší než spike (0.3) protože shell pokrývá celý
+/// povrch, ne point structure.
+pub const SHELL_COST_PER_SEC: f32 = 0.4;
+
 pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_speed: 3.0,
     sigma_hue: 5.0,
@@ -255,6 +269,7 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_body_width: 0.05,
     sigma_body_height: 0.05,
     sigma_spike_length: 0.03,
+    sigma_shell: 0.03,
     sigma_brain: 0.2,
 };
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
@@ -415,6 +430,7 @@ pub struct MutationConfig {
     pub sigma_body_width: f32,
     pub sigma_body_height: f32,
     pub sigma_spike_length: f32,
+    pub sigma_shell: f32,
     pub sigma_brain: f32,
 }
 
@@ -429,6 +445,8 @@ pub struct Genome {
     /// Sprint 34: 3-axis ellipsoid — vertikální rozměr.
     pub body_height: f32,
     pub spike_length: f32,
+    /// Sprint 41: shell jako passive damage absorber.
+    pub shell_thickness: f32,
     pub brain: Brain,
 }
 
@@ -447,6 +465,9 @@ impl Genome {
             body_width: body_size,
             body_height: body_size,
             spike_length: rng.random_range(0.0..0.1),
+            // Sprint 41: mírný počáteční mean, žádný extreme spawn — selekce
+            // si shell vytáhne nahoru, pokud má smysl.
+            shell_thickness: rng.random_range(0.0..0.2),
             brain: Brain::random(rng),
         }
     }
@@ -465,6 +486,8 @@ impl Genome {
                 .clamp(MIN_BODY_HEIGHT, MAX_BODY_HEIGHT),
             spike_length: (self.spike_length + gaussian(rng) * cfg.sigma_spike_length)
                 .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH),
+            shell_thickness: (self.shell_thickness + gaussian(rng) * cfg.sigma_shell)
+                .clamp(MIN_SHELL_THICKNESS, MAX_SHELL_THICKNESS),
             brain: self.brain.mutate(rng, cfg.sigma_brain),
         }
     }
@@ -481,6 +504,7 @@ impl Genome {
             body_width: if rng.random::<bool>() { a.body_width } else { b.body_width },
             body_height: if rng.random::<bool>() { a.body_height } else { b.body_height },
             spike_length: if rng.random::<bool>() { a.spike_length } else { b.spike_length },
+            shell_thickness: if rng.random::<bool>() { a.shell_thickness } else { b.shell_thickness },
             brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
     }
@@ -518,6 +542,8 @@ pub struct Phenotype {
     /// Sprint 34: vertikální rozměr ellipsoidu.
     pub body_height: f32,
     pub spike_length: f32,
+    /// Sprint 41: snapshot z genomu, runtime morph zatím neexistuje.
+    pub shell_thickness: f32,
 }
 
 impl Phenotype {
@@ -527,6 +553,7 @@ impl Phenotype {
             body_width: genome.body_width,
             body_height: genome.body_height,
             spike_length: genome.spike_length,
+            shell_thickness: genome.shell_thickness,
         }
     }
 
@@ -535,6 +562,13 @@ impl Phenotype {
     /// — backward compat s pre-Sprint-34 izotropním tělem.
     pub fn effective_radius(&self) -> f32 {
         (self.body_length + self.body_width + self.body_height) / 3.0
+    }
+
+    /// Sprint 41: nejvyšší ze tří os — pro broad-phase bucketing eat zóny,
+    /// kde ellipsoid může extending podél long axis a sféra `effective_radius`
+    /// by ho missnula.
+    pub fn max_axis(&self) -> f32 {
+        self.body_length.max(self.body_width).max(self.body_height)
     }
 
     /// Sprint 34: 3D volume = length × width × height. Když length=width=height
@@ -762,6 +796,9 @@ impl Cell {
         // Sprint 34: maintenance ∝ 3D volume = length×width×height.
         self.energy -= self.phenotype.volume() * physics.body_cost_factor * dt;
         self.energy -= self.phenotype.spike_length * SPIKE_COST_PER_SEC * dt;
+        // Sprint 41: shell maintenance — defensive armor stojí víc než spike,
+        // protože pokrývá celý povrch.
+        self.energy -= self.phenotype.shell_thickness * SHELL_COST_PER_SEC * dt;
         // Sprint 27 attack maintenance: cost ∝ max(0, output[6]).
         let attack_strength = self.last_outputs[6].max(0.0);
         self.energy -= attack_strength * ATTACK_COST_PER_SEC * dt;
@@ -859,16 +896,40 @@ impl Cell {
         PREDATION_GAIN_PER_TICK * self.phenotype.spike_length * SPIKE_PREDATION_BONUS
     }
 
-    pub fn try_eat(&mut self, food: &Food, eat_radius: f32, food_value: f32) -> bool {
-        let dx = self.position[0] - food.position[0];
-        let dy = self.position[1] - food.position[1];
-        let dz = self.position[2] - food.position[2];
-        if dx * dx + dy * dy + dz * dz <= eat_radius * eat_radius {
+    /// Sprint 41: pure ellipsoidní acceptance test bez mutace. Semi-axes ∝
+    /// phenotype × `eat_factor`. Pro L=W=H=s shell sféra radius `s × eat_factor`
+    /// — backward kompat s pre-Sprint-41 isotropic buňkou. Použito v binárkách
+    /// pro broad+narrow phase split (broad uses `max_axis`, narrow tento test).
+    pub fn eat_test(&self, food: &Food, eat_factor: f32) -> bool {
+        let dx = food.position[0] - self.position[0];
+        let dy = food.position[1] - self.position[1];
+        let dz = food.position[2] - self.position[2];
+        let (fwd, right, up) = body_basis(self.heading, self.pitch);
+        let d_par = dx * fwd[0] + dy * fwd[1] + dz * fwd[2];
+        let d_right = dx * right[0] + dy * right[1] + dz * right[2];
+        let d_up = dx * up[0] + dy * up[1] + dz * up[2];
+        let l = (self.phenotype.body_length * eat_factor).max(f32::EPSILON);
+        let w = (self.phenotype.body_width * eat_factor).max(f32::EPSILON);
+        let h = (self.phenotype.body_height * eat_factor).max(f32::EPSILON);
+        (d_par / l).powi(2) + (d_right / w).powi(2) + (d_up / h).powi(2) <= 1.0
+    }
+
+    /// Sprint 41: ellipsoidální acceptance + energy gain při hitu.
+    pub fn try_eat(&mut self, food: &Food, eat_factor: f32, food_value: f32) -> bool {
+        if self.eat_test(food, eat_factor) {
             self.energy += food_value;
             true
         } else {
             false
         }
+    }
+
+    /// Sprint 41: tlumí `damage_accum` shellem před tím, než brain čte damage
+    /// signal. Voláno z hot loop binárek **před** `populate_brain_inputs`
+    /// (která damage čte + resetuje). `shell × ABSORB × dt` units, floor 0.
+    pub fn apply_shell_absorb(&mut self, dt: f32) {
+        let absorb = self.phenotype.shell_thickness * SHELL_ABSORB_PER_TICK * dt;
+        self.damage_accum = (self.damage_accum - absorb).max(0.0);
     }
 }
 
@@ -911,6 +972,21 @@ impl Food {
 pub fn forward_vector(yaw: f32, pitch: f32) -> [f32; 3] {
     let cos_p = pitch.cos();
     [yaw.cos() * cos_p, yaw.sin() * cos_p, pitch.sin()]
+}
+
+/// Sprint 41: orthonormální body frame z (yaw, pitch). `fwd` je `forward_vector`,
+/// `right` je horizontální (rotace forward_xy o +90°, z=0), `up = fwd × right`.
+/// Bez roll. Pro pitch=0 dává up=(0,0,1) a right čistě v xy. Použité pro
+/// projekci food vektoru do body frame v ellipsoidní eat-zóně.
+pub fn body_basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let fwd = forward_vector(yaw, pitch);
+    let right = [-yaw.sin(), yaw.cos(), 0.0];
+    let up = [
+        fwd[1] * right[2] - fwd[2] * right[1],
+        fwd[2] * right[0] - fwd[0] * right[2],
+        fwd[0] * right[1] - fwd[1] * right[0],
+    ];
+    (fwd, right, up)
 }
 
 /// Sprint 40: senzorický kontext brainu. Volá se z hot loop binárek po
@@ -1314,6 +1390,7 @@ mod tests {
             body_width: 1.0,
             body_height: 1.0,
             spike_length: 0.0,
+            shell_thickness: 0.0,
             brain: dummy_brain(),
         }
     }
@@ -1328,6 +1405,7 @@ mod tests {
             sigma_body_width: 0.0,
             sigma_body_height: 0.0,
             sigma_spike_length: 0.0,
+            sigma_shell: 0.0,
             sigma_brain: 0.0,
         }
     }
@@ -1344,6 +1422,7 @@ mod tests {
             body_width: 0.9,
             body_height: 1.0,
             spike_length: 0.4,
+            shell_thickness: 0.0,
             brain: Brain {
                 w1: [[1.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
                 b1: [0.3; BRAIN_HIDDEN],
@@ -1378,6 +1457,7 @@ mod tests {
             sigma_body_width: 10.0,
             sigma_body_height: 10.0,
             sigma_spike_length: 10.0,
+            sigma_shell: 10.0,
             sigma_brain: 10.0,
         };
         for _ in 0..1000 {
@@ -1575,6 +1655,7 @@ mod tests {
             body_width: 0.6,
             body_height: 0.7,
             spike_length: 0.0,
+            shell_thickness: 0.0,
             brain: dummy_brain(),
         };
         let b = Genome {
@@ -1586,6 +1667,7 @@ mod tests {
             body_width: 1.4,
             body_height: 1.3,
             spike_length: 0.8,
+            shell_thickness: 0.5,
             brain: dummy_brain(),
         };
         for _ in 0..100 {
@@ -1726,6 +1808,7 @@ mod tests {
             body_width: 0.8,
             body_height: 1.0,
             spike_length: 0.3,
+            shell_thickness: 0.0,
         };
         let delta = phen.apply_morph([0.0, 0.0, 0.0, 0.0], MORPH_RATE, 0.5);
         assert_eq!(delta, 0.0);
@@ -1742,6 +1825,7 @@ mod tests {
             body_width: MIN_BODY_WIDTH,
             body_height: MAX_BODY_HEIGHT,
             spike_length: MAX_SPIKE_LENGTH,
+            shell_thickness: 0.0,
         };
         // Strong positive signal on length, height & spike (already at max) → no change.
         // Strong negative signal on width (already at min) → no change.
@@ -1760,6 +1844,7 @@ mod tests {
             body_width: 1.0,
             body_height: 1.0,
             spike_length: 0.5,
+            shell_thickness: 0.0,
         };
         // signal × rate × dt = 0.8 × 1.0 × 1.0 = 0.8 podél každé osy.
         // Width clampuje na MIN_BODY_WIDTH (0.3), takže |Δ| pro width je
@@ -1779,6 +1864,7 @@ mod tests {
             body_width: 1.0,
             body_height: 1.0,
             spike_length: 0.0,
+            shell_thickness: 0.0,
         };
         // |signal| < threshold → no change (filters random brain noise).
         let delta = phen.apply_morph(
@@ -1828,6 +1914,7 @@ mod tests {
                 body_width: 1.0,
                 body_height: 1.0,
                 spike_length: 0.0,
+                shell_thickness: 0.0,
             };
             c.velocity = vel;
             c
@@ -1963,5 +2050,165 @@ mod tests {
             cell.energy,
             100.0 - expected_drain
         );
+    }
+
+    #[test]
+    fn body_basis_orthonormal() {
+        let cases = [
+            (0.0, 0.0),
+            (0.5, 0.0),
+            (-1.2, 0.0),
+            (1.7, 0.3),
+            (-2.4, -0.4),
+            (3.1, 0.5),
+            (0.7, -0.2),
+        ];
+        for &(yaw, pitch) in &cases {
+            let (fwd, right, up) = body_basis(yaw, pitch);
+            let mag = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            assert!((mag(fwd) - 1.0).abs() < 1e-5, "fwd not unit at yaw={yaw} pitch={pitch}");
+            assert!((mag(right) - 1.0).abs() < 1e-5, "right not unit");
+            assert!((mag(up) - 1.0).abs() < 1e-5, "up not unit");
+            assert!(dot(fwd, right).abs() < 1e-5, "fwd·right != 0");
+            assert!(dot(fwd, up).abs() < 1e-5, "fwd·up != 0");
+            assert!(dot(right, up).abs() < 1e-5, "right·up != 0");
+        }
+    }
+
+    #[test]
+    fn try_eat_isotropic_unchanged_for_unit_sphere() {
+        // L=W=H=1, eat_factor=8 → ellipsoid degeneruje na sféru radius 8.
+        // Backward-kompat se Sprint 40 sférickou eat-zónou.
+        let mut cell = Cell { energy: 50.0, ..base_cell() };
+        let inside = Food { position: [5.0, 0.0, 0.0] };
+        let outside = Food { position: [10.0, 0.0, 0.0] };
+        let lateral_inside = Food { position: [0.0, 5.0, 0.0] };
+        let vertical_inside = Food { position: [0.0, 0.0, 5.0] };
+        assert!(cell.eat_test(&inside, 8.0));
+        assert!(!cell.eat_test(&outside, 8.0));
+        assert!(cell.eat_test(&lateral_inside, 8.0));
+        assert!(cell.eat_test(&vertical_inside, 8.0));
+    }
+
+    #[test]
+    fn try_eat_forward_chip_reaches_further_than_lateral() {
+        // Chip: L=2, W=0.5, H=0.5, heading=0 → forward semi-osa = 16, lateral = 4.
+        let mut cell = Cell { energy: 50.0, ..base_cell() };
+        cell.phenotype = Phenotype {
+            body_length: 2.0,
+            body_width: 0.5,
+            body_height: 0.5,
+            spike_length: 0.0,
+            shell_thickness: 0.0,
+        };
+        // Forward at +14: inside ellipsoid (14/16 = 0.875).
+        let forward_inside = Food { position: [14.0, 0.0, 0.0] };
+        // Lateral at +3.5: inside (3.5/4 = 0.875).
+        let lateral_inside = Food { position: [0.0, 3.5, 0.0] };
+        // Forward at +17: outside (17/16 > 1).
+        let forward_outside = Food { position: [17.0, 0.0, 0.0] };
+        // Lateral at +5: outside (5/4 > 1).
+        let lateral_outside = Food { position: [0.0, 5.0, 0.0] };
+        assert!(cell.eat_test(&forward_inside, 8.0));
+        assert!(cell.eat_test(&lateral_inside, 8.0));
+        assert!(!cell.eat_test(&forward_outside, 8.0));
+        assert!(!cell.eat_test(&lateral_outside, 8.0));
+    }
+
+    #[test]
+    fn max_axis_returns_largest_dimension() {
+        let phen = Phenotype {
+            body_length: 2.0,
+            body_width: 0.5,
+            body_height: 1.5,
+            spike_length: 0.0,
+            shell_thickness: 0.0,
+        };
+        assert!((phen.max_axis() - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shell_absorbs_predation_drain() {
+        // shell=1.0, ABSORB_PER_TICK=2.0, dt=1 → absorbed 2.0; raw damage 3.0
+        // → damage_accum after = 1.0.
+        let mut cell = base_cell();
+        cell.phenotype.shell_thickness = 1.0;
+        cell.damage_accum = PREDATION_DRAIN_PER_TICK; // = 3.0
+        cell.apply_shell_absorb(1.0);
+        let expected = PREDATION_DRAIN_PER_TICK - 1.0 * SHELL_ABSORB_PER_TICK;
+        assert!(
+            (cell.damage_accum - expected).abs() < 1e-5,
+            "got {}, expected {}",
+            cell.damage_accum,
+            expected
+        );
+    }
+
+    #[test]
+    fn shell_zero_no_effect() {
+        let mut cell = base_cell();
+        cell.phenotype.shell_thickness = 0.0;
+        cell.damage_accum = 2.5;
+        cell.apply_shell_absorb(1.0);
+        assert_eq!(cell.damage_accum, 2.5);
+    }
+
+    #[test]
+    fn shell_does_not_absorb_below_zero() {
+        // Big shell, small damage → clamp to 0, ne na negative.
+        let mut cell = base_cell();
+        cell.phenotype.shell_thickness = MAX_SHELL_THICKNESS;
+        cell.damage_accum = 1.0;
+        cell.apply_shell_absorb(1.0);
+        assert_eq!(cell.damage_accum, 0.0);
+    }
+
+    #[test]
+    fn shell_cost_scales_linearly() {
+        let mut cell = base_cell();
+        cell.phenotype.shell_thickness = 1.0;
+        let physics = PhysicsConfig {
+            drag: 0.0,
+            angular_drag: 0.0,
+            energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.0,
+            vision_cost_per_radius: 0.0,
+            body_cost_factor: 0.0,
+        };
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        let expected_drain = 1.0 * SHELL_COST_PER_SEC;
+        assert!(
+            (cell.energy - (100.0 - expected_drain)).abs() < 1e-4,
+            "got {}, expected {}",
+            cell.energy,
+            100.0 - expected_drain
+        );
+    }
+
+    #[test]
+    fn shell_mutation_clamps_to_range() {
+        let mut rng = rand::rng();
+        let g = dummy_genome();
+        let cfg = MutationConfig {
+            sigma_speed: 0.0,
+            sigma_hue: 0.0,
+            sigma_vision: 0.0,
+            sigma_turn_rate: 0.0,
+            sigma_body_length: 0.0,
+            sigma_body_width: 0.0,
+            sigma_body_height: 0.0,
+            sigma_spike_length: 0.0,
+            sigma_shell: 100.0,
+            sigma_brain: 0.0,
+        };
+        for _ in 0..1000 {
+            let m = g.mutate(&mut rng, &cfg);
+            assert!(
+                (MIN_SHELL_THICKNESS..=MAX_SHELL_THICKNESS).contains(&m.shell_thickness),
+                "shell out of range: {}",
+                m.shell_thickness
+            );
+        }
     }
 }
