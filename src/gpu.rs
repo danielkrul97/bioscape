@@ -488,6 +488,46 @@ impl BrainGpu {
         self.hidden_readback.unmap();
         self.outputs_readback.unmap();
     }
+
+    /// Sprint 51: persistent-mode dispatch — bindujeme `CellsGpu` buffers
+    /// (last_inputs jako vstup, brain_weights jako persistent storage,
+    /// last_hidden + last_outputs jako write-back). **NULL upload weights**
+    /// — to je hlavní win sprintu.
+    pub fn forward_persistent(&self, cells_gpu: &CellsGpu, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let params = Params {
+            num_cells: n as u32,
+            ..Params::default()
+        };
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("brain-bg-persistent"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.last_inputs_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("brain-encoder-persistent"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("brain-pass-persistent"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (n as u32 + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
 }
 
 // ============================================================================
@@ -1333,6 +1373,937 @@ impl FieldGpu {
         drop(data);
         self.grid_readback.unmap();
         result
+    }
+}
+
+// ============================================================================
+// Sprint 51: CellsGpu persistent SoA state — drží brain weights + last_*
+// + xoshiro RNG na GPU mezi ticky. Eliminuje 30 MB/tick brain upload bottleneck
+// ze Sprintu 44.
+// ============================================================================
+
+/// Persistent SoA cell state na GPU. Drží brain forward state (last_inputs,
+/// last_hidden, last_outputs, brain weights) + velocities (pro brownian
+/// mutation) + per-cell xoshiro128++ RNG state. Per Sprint 51 scope:
+/// **NE-drží** position/heading/etc. (ty zůstávají na CPU pro sensor/motor/
+/// step/collision/predate fáze — Sprint 50 standalone shadery jsou ready
+/// pro plnou migraci, kdyby se rozhodlo).
+///
+/// Lifecycle:
+/// 1. `new(ctx, capacity)` alokuje buffers + initializuje xoshiro state.
+/// 2. `upload_brains(brains, init_xoshiro_seed)` na sim init.
+/// 3. Hot loop:
+///    - `upload_inputs(last_inputs)` před brain forward.
+///    - `forward_batch_persistent(brain_gpu)` — channels/persistent.
+///    - `download_hidden_outputs() -> (Vec<hidden>, Vec<outputs>)` po brain.
+///    - `upload_velocities(velocities)` před brownian.
+///    - `brownian_persistent(brownian_gpu, ...)` — mutuje velocities + state.
+///    - `download_velocities() -> Vec<velocities>` po brownian.
+///    - `upload_rewards(rewards)` po eat_food.
+///    - `hebbian_persistent(hebbian_gpu, lr)` — mutuje brain weights in-place.
+/// 4. `upload_brain_at(idx, brain)` po reproduce (nová cell na slot idx).
+/// 5. `download_brains() -> Vec<Brain>` pro checkpoint nebo introspection.
+pub struct CellsGpu {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    capacity: usize,
+    last_inputs_buf: wgpu::Buffer,
+    last_hidden_buf: wgpu::Buffer,
+    last_outputs_buf: wgpu::Buffer,
+    brain_weights_buf: wgpu::Buffer,
+    velocities_buf: wgpu::Buffer,
+    xoshiro_state_buf: wgpu::Buffer,
+    rewards_buf: wgpu::Buffer,
+    last_hidden_rb: wgpu::Buffer,
+    last_outputs_rb: wgpu::Buffer,
+    velocities_rb: wgpu::Buffer,
+    brain_weights_rb: wgpu::Buffer,
+    /// Sprint 51: staging pro `swap_to` — wgpu zakazuje same-buffer copy.
+    swap_brain_temp: wgpu::Buffer,
+    swap_xoshiro_temp: wgpu::Buffer,
+}
+
+impl CellsGpu {
+    pub fn with_context(ctx: &GpuContext, capacity: usize) -> Self {
+        Self::with_device_inner(Arc::clone(&ctx.device), Arc::clone(&ctx.queue), capacity)
+    }
+
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        capacity: usize,
+    ) -> Self {
+        assert!(capacity > 0);
+        let f = std::mem::size_of::<f32>() as u64;
+        let n = capacity as u64;
+        let stor_dst_src = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+        let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+        let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let last_inputs_buf = mk("cells-last-inputs", n * (BRAIN_INPUTS as u64) * f, stor_dst_src);
+        let last_hidden_buf = mk("cells-last-hidden", n * (BRAIN_HIDDEN as u64) * f, stor_dst_src);
+        let last_outputs_buf = mk("cells-last-outputs", n * (BRAIN_OUTPUTS as u64) * f, stor_dst_src);
+        let brain_weights_buf = mk("cells-brain-weights", n * (BRAIN_WEIGHTS_PER_CELL as u64) * f, stor_dst_src);
+        let velocities_buf = mk("cells-velocities", n * 3 * f, stor_dst_src);
+        let xoshiro_state_buf = mk("cells-xoshiro", n * 4 * 4, stor_dst_src);
+        let rewards_buf = mk(
+            "cells-rewards",
+            n * f,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let last_hidden_rb = mk("cells-hidden-rb", n * (BRAIN_HIDDEN as u64) * f, read);
+        let last_outputs_rb = mk("cells-outputs-rb", n * (BRAIN_OUTPUTS as u64) * f, read);
+        let velocities_rb = mk("cells-velocities-rb", n * 3 * f, read);
+        let brain_weights_rb = mk("cells-weights-rb", n * (BRAIN_WEIGHTS_PER_CELL as u64) * f, read);
+        let swap_brain_temp = mk(
+            "cells-swap-brain-temp",
+            (BRAIN_WEIGHTS_PER_CELL as u64) * f,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        );
+        let swap_xoshiro_temp = mk(
+            "cells-swap-xoshiro-temp",
+            16,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        );
+        drop(mk);
+        Self {
+            device,
+            queue,
+            capacity,
+            last_inputs_buf,
+            last_hidden_buf,
+            last_outputs_buf,
+            brain_weights_buf,
+            velocities_buf,
+            xoshiro_state_buf,
+            rewards_buf,
+            last_hidden_rb,
+            last_outputs_rb,
+            velocities_rb,
+            brain_weights_rb,
+            swap_brain_temp,
+            swap_xoshiro_temp,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn last_inputs_buffer(&self) -> &wgpu::Buffer { &self.last_inputs_buf }
+    pub fn last_hidden_buffer(&self) -> &wgpu::Buffer { &self.last_hidden_buf }
+    pub fn last_outputs_buffer(&self) -> &wgpu::Buffer { &self.last_outputs_buf }
+    pub fn brain_weights_buffer(&self) -> &wgpu::Buffer { &self.brain_weights_buf }
+    pub fn velocities_buffer(&self) -> &wgpu::Buffer { &self.velocities_buf }
+    pub fn xoshiro_state_buffer(&self) -> &wgpu::Buffer { &self.xoshiro_state_buf }
+    pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
+
+    /// Uploaduje brain weights pro N cells. Volá se na sim init + po reproduce
+    /// (re-upload všech, nebo per-slot přes `upload_brain_at`).
+    pub fn upload_brains<'a, I>(&self, brains: I)
+    where
+        I: IntoIterator<Item = &'a Brain>,
+    {
+        let mut packed: Vec<f32> = Vec::with_capacity(self.capacity * BRAIN_WEIGHTS_PER_CELL);
+        for brain in brains {
+            for row in brain.w1.iter() { packed.extend_from_slice(row); }
+            packed.extend_from_slice(&brain.b1);
+            for row in brain.w2.iter() { packed.extend_from_slice(row); }
+            packed.extend_from_slice(&brain.b2);
+        }
+        self.queue.write_buffer(&self.brain_weights_buf, 0, bytemuck::cast_slice(&packed));
+    }
+
+    /// Uploaduje brain weights pro jeden slot (idx). Použito po reproduce —
+    /// nová cell se zapíše na konec Vec, její brain na slot idx = old_len.
+    pub fn upload_brain_at(&self, idx: usize, brain: &Brain) {
+        assert!(idx < self.capacity);
+        let mut packed: Vec<f32> = Vec::with_capacity(BRAIN_WEIGHTS_PER_CELL);
+        for row in brain.w1.iter() { packed.extend_from_slice(row); }
+        packed.extend_from_slice(&brain.b1);
+        for row in brain.w2.iter() { packed.extend_from_slice(row); }
+        packed.extend_from_slice(&brain.b2);
+        let offset = (idx * BRAIN_WEIGHTS_PER_CELL * 4) as u64;
+        self.queue.write_buffer(&self.brain_weights_buf, offset, bytemuck::cast_slice(&packed));
+    }
+
+    /// Sync brains z GPU zpátky na CPU. Pomalá operace — kvůli checkpoint
+    /// nebo introspekci. Hot loop ji nevolá.
+    pub fn download_brains(&self, n: usize) -> Vec<Brain> {
+        assert!(n <= self.capacity);
+        if n == 0 { return Vec::new(); }
+        let bytes = (n * BRAIN_WEIGHTS_PER_CELL * 4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-download-brains"),
+        });
+        encoder.copy_buffer_to_buffer(&self.brain_weights_buf, 0, &self.brain_weights_rb, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let s = self.brain_weights_rb.slice(0..bytes);
+        s.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let data = s.get_mapped_range();
+        let f: &[f32] = bytemuck::cast_slice(&data);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = i * BRAIN_WEIGHTS_PER_CELL;
+            let mut b = Brain {
+                w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+                b1: [0.0; BRAIN_HIDDEN],
+                w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+                b2: [0.0; BRAIN_OUTPUTS],
+            };
+            for h in 0..BRAIN_HIDDEN {
+                for in_i in 0..BRAIN_INPUTS {
+                    b.w1[h][in_i] = f[off + h * BRAIN_INPUTS + in_i];
+                }
+            }
+            for h in 0..BRAIN_HIDDEN { b.b1[h] = f[off + 576 + h]; }
+            for o in 0..BRAIN_OUTPUTS {
+                for h in 0..BRAIN_HIDDEN {
+                    b.w2[o][h] = f[off + 592 + o * BRAIN_HIDDEN + h];
+                }
+            }
+            for o in 0..BRAIN_OUTPUTS { b.b2[o] = f[off + 736 + o]; }
+            out.push(b);
+        }
+        drop(data);
+        self.brain_weights_rb.unmap();
+        out
+    }
+
+    pub fn upload_inputs(&self, inputs: &[[f32; BRAIN_INPUTS]]) {
+        let flat: Vec<f32> = inputs.iter().flatten().copied().collect();
+        self.queue.write_buffer(&self.last_inputs_buf, 0, bytemuck::cast_slice(&flat));
+    }
+
+    pub fn upload_velocities(&self, velocities: &[[f32; 3]]) {
+        let flat: Vec<f32> = velocities.iter().flatten().copied().collect();
+        self.queue.write_buffer(&self.velocities_buf, 0, bytemuck::cast_slice(&flat));
+    }
+
+    pub fn upload_rewards(&self, rewards: &[f32]) {
+        self.queue.write_buffer(&self.rewards_buf, 0, bytemuck::cast_slice(rewards));
+    }
+
+    /// Sprint 51: GPU-side copy slot[src] → slot[dst] pro brain_weights +
+    /// xoshiro_state. Použito v die_and_drop_carrion swap_remove pattern —
+    /// keď cell v dst slotu zemřela, src je poslední živá cell, která se
+    /// přesune. NIC se ne-stahuje, NIC se ne-uploaduje — pure GPU memcpy.
+    pub fn swap_to(&self, dst: usize, src: usize) {
+        assert!(dst < self.capacity && src < self.capacity);
+        if dst == src {
+            return;
+        }
+        let brain_bytes = (BRAIN_WEIGHTS_PER_CELL * 4) as u64;
+        let brain_src = (src * BRAIN_WEIGHTS_PER_CELL * 4) as u64;
+        let brain_dst = (dst * BRAIN_WEIGHTS_PER_CELL * 4) as u64;
+        let xosh_bytes = 4u64 * 4;
+        let xosh_src = (src * 4 * 4) as u64;
+        let xosh_dst = (dst * 4 * 4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-swap"),
+        });
+        // wgpu nepovoluje same-buffer copy → routujeme přes staging temps.
+        encoder.copy_buffer_to_buffer(
+            &self.brain_weights_buf,
+            brain_src,
+            &self.swap_brain_temp,
+            0,
+            brain_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.swap_brain_temp,
+            0,
+            &self.brain_weights_buf,
+            brain_dst,
+            brain_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.xoshiro_state_buf,
+            xosh_src,
+            &self.swap_xoshiro_temp,
+            0,
+            xosh_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.swap_xoshiro_temp,
+            0,
+            &self.xoshiro_state_buf,
+            xosh_dst,
+            xosh_bytes,
+        );
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Sprint 51: seed xoshiro state pro konkrétní slot. Použito po reproduce
+    /// (nová cell potřebuje fresh state).
+    pub fn upload_xoshiro_seed_at(&self, slot: usize, seed: u64) {
+        assert!(slot < self.capacity);
+        fn splitmix(z: &mut u64) -> u64 {
+            *z = z.wrapping_add(0x9E3779B97F4A7C15);
+            let mut x = *z;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+            x ^ (x >> 31)
+        }
+        let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let a = splitmix(&mut z);
+        let b = splitmix(&mut z);
+        let mut s0 = a as u32;
+        let s1 = (a >> 32) as u32;
+        let s2 = b as u32;
+        let s3 = (b >> 32) as u32;
+        let mut state = [s0, s1, s2, s3];
+        if state == [0u32; 4] {
+            s0 = 1;
+            state[0] = s0;
+        }
+        let offset = (slot * 4 * 4) as u64;
+        self.queue.write_buffer(&self.xoshiro_state_buf, offset, bytemuck::cast_slice(&state));
+    }
+
+    /// Inicializuj per-cell xoshiro state z deterministic seeds. SplitMix64
+    /// rozšíří 64-bit seed na 4× 32-bit xoshiro state. Protect proti all-zero
+    /// state (xoshiro vyžaduje aspoň jednu non-zero word).
+    pub fn upload_xoshiro_seeds<I>(&self, seeds: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        fn splitmix(z: &mut u64) -> u64 {
+            *z = z.wrapping_add(0x9E3779B97F4A7C15);
+            let mut x = *z;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+            x ^ (x >> 31)
+        }
+        let mut state: Vec<u32> = Vec::with_capacity(self.capacity * 4);
+        for s in seeds {
+            let mut z = s.wrapping_add(0x9E3779B97F4A7C15);
+            let a = splitmix(&mut z);
+            let b = splitmix(&mut z);
+            let mut s0 = a as u32;
+            let s1 = (a >> 32) as u32;
+            let s2 = b as u32;
+            let s3 = (b >> 32) as u32;
+            if s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 {
+                s0 = 1;
+            }
+            state.push(s0);
+            state.push(s1);
+            state.push(s2);
+            state.push(s3);
+        }
+        self.queue.write_buffer(&self.xoshiro_state_buf, 0, bytemuck::cast_slice(&state));
+    }
+
+    /// Stáhne (last_hidden, last_outputs) jako Vec — caller je potřebuje pro
+    /// motor + apply_morph fáze (CPU). Per-tick, kritická pro --gpu-full.
+    pub fn download_hidden_outputs(
+        &self,
+        n: usize,
+    ) -> (Vec<[f32; BRAIN_HIDDEN]>, Vec<[f32; BRAIN_OUTPUTS]>) {
+        if n == 0 { return (Vec::new(), Vec::new()); }
+        assert!(n <= self.capacity);
+        let h_bytes = (n * BRAIN_HIDDEN * 4) as u64;
+        let o_bytes = (n * BRAIN_OUTPUTS * 4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-download-ho"),
+        });
+        encoder.copy_buffer_to_buffer(&self.last_hidden_buf, 0, &self.last_hidden_rb, 0, h_bytes);
+        encoder.copy_buffer_to_buffer(&self.last_outputs_buf, 0, &self.last_outputs_rb, 0, o_bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let h_s = self.last_hidden_rb.slice(0..h_bytes);
+        let o_s = self.last_outputs_rb.slice(0..o_bytes);
+        h_s.map_async(wgpu::MapMode::Read, |_| {});
+        o_s.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let h_data = h_s.get_mapped_range();
+        let o_data = o_s.get_mapped_range();
+        let h_f: &[f32] = bytemuck::cast_slice(&h_data);
+        let o_f: &[f32] = bytemuck::cast_slice(&o_data);
+        let hidden: Vec<[f32; BRAIN_HIDDEN]> = (0..n)
+            .map(|i| {
+                let mut a = [0.0_f32; BRAIN_HIDDEN];
+                a.copy_from_slice(&h_f[i * BRAIN_HIDDEN..(i + 1) * BRAIN_HIDDEN]);
+                a
+            })
+            .collect();
+        let outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
+            .map(|i| {
+                let mut a = [0.0_f32; BRAIN_OUTPUTS];
+                a.copy_from_slice(&o_f[i * BRAIN_OUTPUTS..(i + 1) * BRAIN_OUTPUTS]);
+                a
+            })
+            .collect();
+        drop(h_data);
+        drop(o_data);
+        self.last_hidden_rb.unmap();
+        self.last_outputs_rb.unmap();
+        (hidden, outputs)
+    }
+
+    /// Stáhne brain weights pro jeden slot. Použito v reproduce phase
+    /// (download parent brains z GPU pro crossover/mutate na CPU).
+    pub fn download_brain_at(&self, idx: usize) -> Brain {
+        assert!(idx < self.capacity);
+        let bytes = (BRAIN_WEIGHTS_PER_CELL * 4) as u64;
+        let offset = (idx * BRAIN_WEIGHTS_PER_CELL * 4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-download-brain-slot"),
+        });
+        encoder.copy_buffer_to_buffer(&self.brain_weights_buf, offset, &self.brain_weights_rb, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let s = self.brain_weights_rb.slice(0..bytes);
+        s.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let data = s.get_mapped_range();
+        let f: &[f32] = bytemuck::cast_slice(&data);
+        let mut b = Brain {
+            w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            b1: [0.0; BRAIN_HIDDEN],
+            w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            b2: [0.0; BRAIN_OUTPUTS],
+        };
+        for h in 0..BRAIN_HIDDEN {
+            for in_i in 0..BRAIN_INPUTS {
+                b.w1[h][in_i] = f[h * BRAIN_INPUTS + in_i];
+            }
+        }
+        for h in 0..BRAIN_HIDDEN { b.b1[h] = f[576 + h]; }
+        for o in 0..BRAIN_OUTPUTS {
+            for h in 0..BRAIN_HIDDEN {
+                b.w2[o][h] = f[592 + o * BRAIN_HIDDEN + h];
+            }
+        }
+        for o in 0..BRAIN_OUTPUTS { b.b2[o] = f[736 + o]; }
+        drop(data);
+        self.brain_weights_rb.unmap();
+        b
+    }
+
+    pub fn download_velocities(&self, n: usize) -> Vec<[f32; 3]> {
+        if n == 0 { return Vec::new(); }
+        assert!(n <= self.capacity);
+        let bytes = (n * 3 * 4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-download-vel"),
+        });
+        encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_rb, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let s = self.velocities_rb.slice(0..bytes);
+        s.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let data = s.get_mapped_range();
+        let f: &[f32] = bytemuck::cast_slice(&data);
+        let out: Vec<[f32; 3]> = (0..n).map(|i| [f[i*3], f[i*3+1], f[i*3+2]]).collect();
+        drop(data);
+        self.velocities_rb.unmap();
+        out
+    }
+}
+
+// ============================================================================
+// Sprint 51: GPU brownian (xoshiro128++ per-cell RNG) + Hebbian update
+// ============================================================================
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
+struct BrownianParams {
+    num_cells: u32,
+    has_z: u32,
+    thermal_noise: f32,
+    sqrt_dt: f32,
+}
+
+pub struct BrownianGpu {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    capacity: usize,
+    params_buf: wgpu::Buffer,
+    velocities_buf: wgpu::Buffer,
+    state_buf: wgpu::Buffer,
+    velocities_rb: wgpu::Buffer,
+    state_rb: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl BrownianGpu {
+    pub fn with_context(ctx: &GpuContext, capacity: usize) -> Result<Self, String> {
+        Self::with_device_inner(Arc::clone(&ctx.device), Arc::clone(&ctx.queue), capacity)
+    }
+
+    pub fn new(capacity: usize) -> Result<Self, String> {
+        let ctx = GpuContext::new()?;
+        Self::with_device_inner(ctx.device, ctx.queue, capacity)
+    }
+
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        capacity: usize,
+    ) -> Result<Self, String> {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("brownian"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/brownian.wgsl").into()),
+        });
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..3)
+            .map(|i| {
+                let ty = if i == 0 {
+                    wgpu::BufferBindingType::Uniform
+                } else {
+                    wgpu::BufferBindingType::Storage { read_only: false }
+                };
+                wgpu::BindGroupLayoutEntry {
+                    binding: i,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                }
+            })
+            .collect();
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("brownian-bgl"),
+            entries: &entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("brownian-pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("brownian-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("brownian"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("brownian-params"),
+            contents: bytemuck::bytes_of(&BrownianParams::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let f = std::mem::size_of::<f32>() as u64;
+        let n = capacity as u64;
+        let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let stor_dst_src = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+        let velocities_buf = mk("brownian-vel", n * 3 * f, stor_dst_src);
+        let state_buf = mk("brownian-state", n * 4 * 4, stor_dst_src);
+        let velocities_rb = mk("brownian-vel-rb", n * 3 * f, read);
+        let state_rb = mk("brownian-state-rb", n * 4 * 4, read);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("brownian-bg"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: velocities_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
+            ],
+        });
+        Ok(Self {
+            device, queue, pipeline, bind_group_layout, capacity,
+            params_buf, velocities_buf, state_buf, velocities_rb, state_rb, bind_group,
+        })
+    }
+
+    pub fn compute(
+        &mut self,
+        velocities_in: &[[f32; 3]],
+        state_in: &[[u32; 4]],
+        thermal_noise: f32,
+        dt: f32,
+        has_z: bool,
+    ) -> (Vec<[f32; 3]>, Vec<[u32; 4]>) {
+        let n = velocities_in.len();
+        assert_eq!(state_in.len(), n);
+        assert!(n <= self.capacity);
+        if n == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let vel_flat: Vec<f32> = velocities_in.iter().flatten().copied().collect();
+        let state_flat: Vec<u32> = state_in.iter().flatten().copied().collect();
+        let params = BrownianParams {
+            num_cells: n as u32,
+            has_z: if has_z { 1 } else { 0 },
+            thermal_noise,
+            sqrt_dt: dt.sqrt(),
+        };
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(&self.velocities_buf, 0, bytemuck::cast_slice(&vel_flat));
+        self.queue.write_buffer(&self.state_buf, 0, bytemuck::cast_slice(&state_flat));
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("brownian-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("brownian-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
+        }
+        let v_bytes = (n as u64) * 3 * 4;
+        let s_bytes = (n as u64) * 4 * 4;
+        encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_rb, 0, v_bytes);
+        encoder.copy_buffer_to_buffer(&self.state_buf, 0, &self.state_rb, 0, s_bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let v_s = self.velocities_rb.slice(0..v_bytes);
+        let s_s = self.state_rb.slice(0..s_bytes);
+        v_s.map_async(wgpu::MapMode::Read, |_| {});
+        s_s.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let v_data = v_s.get_mapped_range();
+        let s_data = s_s.get_mapped_range();
+        let v_f: &[f32] = bytemuck::cast_slice(&v_data);
+        let s_u: &[u32] = bytemuck::cast_slice(&s_data);
+        let velocities: Vec<[f32; 3]> = (0..n).map(|i| [v_f[i*3], v_f[i*3+1], v_f[i*3+2]]).collect();
+        let state: Vec<[u32; 4]> = (0..n).map(|i| [s_u[i*4], s_u[i*4+1], s_u[i*4+2], s_u[i*4+3]]).collect();
+        drop(v_data);
+        drop(s_data);
+        self.velocities_rb.unmap();
+        self.state_rb.unmap();
+        (velocities, state)
+    }
+
+    pub fn velocities_buffer(&self) -> &wgpu::Buffer {
+        &self.velocities_buf
+    }
+    pub fn state_buffer(&self) -> &wgpu::Buffer {
+        &self.state_buf
+    }
+
+    /// Sprint 51: persistent-mode dispatch — bindujeme CellsGpu buffery místo
+    /// internal. Žádný upload/download, žádný realloc. Volá se v hot loopu
+    /// po `cells_gpu.upload_velocities(...)`.
+    pub fn compute_persistent(
+        &self,
+        cells_gpu: &CellsGpu,
+        n: usize,
+        thermal_noise: f32,
+        dt: f32,
+        has_z: bool,
+    ) {
+        if n == 0 {
+            return;
+        }
+        let params = BrownianParams {
+            num_cells: n as u32,
+            has_z: if has_z { 1 } else { 0 },
+            thermal_noise,
+            sqrt_dt: dt.sqrt(),
+        };
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("brownian-bg-persistent"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.velocities_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.xoshiro_state_buffer().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("brownian-encoder-persistent"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("brownian-pass-persistent"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
+struct HebbianParams {
+    num_cells: u32,
+    learning_rate: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+pub struct HebbianGpu {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    capacity: usize,
+    params_buf: wgpu::Buffer,
+    inputs_buf: wgpu::Buffer,
+    hidden_buf: wgpu::Buffer,
+    outputs_buf: wgpu::Buffer,
+    rewards_buf: wgpu::Buffer,
+    weights_buf: wgpu::Buffer,
+    weights_rb: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl HebbianGpu {
+    pub fn with_context(ctx: &GpuContext, capacity: usize) -> Result<Self, String> {
+        Self::with_device_inner(Arc::clone(&ctx.device), Arc::clone(&ctx.queue), capacity)
+    }
+
+    pub fn new(capacity: usize) -> Result<Self, String> {
+        let ctx = GpuContext::new()?;
+        Self::with_device_inner(ctx.device, ctx.queue, capacity)
+    }
+
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        capacity: usize,
+    ) -> Result<Self, String> {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hebbian"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/hebbian.wgsl").into()),
+        });
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..6)
+            .map(|i| {
+                let ty = if i == 0 {
+                    wgpu::BufferBindingType::Uniform
+                } else if i == 5 {
+                    wgpu::BufferBindingType::Storage { read_only: false }
+                } else {
+                    wgpu::BufferBindingType::Storage { read_only: true }
+                };
+                wgpu::BindGroupLayoutEntry {
+                    binding: i,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                }
+            })
+            .collect();
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hebbian-bgl"),
+            entries: &entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hebbian-pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("hebbian-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("hebbian"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hebbian-params"),
+            contents: bytemuck::bytes_of(&HebbianParams::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let f = std::mem::size_of::<f32>() as u64;
+        let n = capacity as u64;
+        let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let stor_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let stor_dst_src = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+        let inputs_buf = mk("hebbian-inputs", n * (BRAIN_INPUTS as u64) * f, stor_dst);
+        let hidden_buf = mk("hebbian-hidden", n * (BRAIN_HIDDEN as u64) * f, stor_dst);
+        let outputs_buf = mk("hebbian-outputs", n * (BRAIN_OUTPUTS as u64) * f, stor_dst);
+        let rewards_buf = mk("hebbian-rewards", n * f, stor_dst);
+        let weights_buf = mk("hebbian-weights", n * (BRAIN_WEIGHTS_PER_CELL as u64) * f, stor_dst_src);
+        let weights_rb = mk("hebbian-weights-rb", n * (BRAIN_WEIGHTS_PER_CELL as u64) * f, read);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hebbian-bg"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: inputs_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: hidden_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: outputs_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: rewards_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: weights_buf.as_entire_binding() },
+            ],
+        });
+        Ok(Self {
+            device, queue, pipeline, bind_group_layout, capacity,
+            params_buf, inputs_buf, hidden_buf, outputs_buf, rewards_buf, weights_buf, weights_rb, bind_group,
+        })
+    }
+
+    pub fn compute<'a, I>(
+        &mut self,
+        last_inputs: &[[f32; BRAIN_INPUTS]],
+        last_hidden: &[[f32; BRAIN_HIDDEN]],
+        last_outputs: &[[f32; BRAIN_OUTPUTS]],
+        rewards: &[f32],
+        brains: I,
+        learning_rate: f32,
+    ) -> Vec<Brain>
+    where
+        I: IntoIterator<Item = &'a Brain>,
+    {
+        let n = last_inputs.len();
+        assert_eq!(last_hidden.len(), n);
+        assert_eq!(last_outputs.len(), n);
+        assert_eq!(rewards.len(), n);
+        assert!(n <= self.capacity);
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let inputs_flat: Vec<f32> = last_inputs.iter().flatten().copied().collect();
+        let hidden_flat: Vec<f32> = last_hidden.iter().flatten().copied().collect();
+        let outputs_flat: Vec<f32> = last_outputs.iter().flatten().copied().collect();
+        let mut weights_flat: Vec<f32> = Vec::with_capacity(n * BRAIN_WEIGHTS_PER_CELL);
+        let mut count = 0;
+        for brain in brains.into_iter().take(n) {
+            for row in brain.w1.iter() { weights_flat.extend_from_slice(row); }
+            weights_flat.extend_from_slice(&brain.b1);
+            for row in brain.w2.iter() { weights_flat.extend_from_slice(row); }
+            weights_flat.extend_from_slice(&brain.b2);
+            count += 1;
+        }
+        assert_eq!(count, n, "brains iterator length mismatch");
+
+        let params = HebbianParams {
+            num_cells: n as u32,
+            learning_rate,
+            ..HebbianParams::default()
+        };
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(&self.inputs_buf, 0, bytemuck::cast_slice(&inputs_flat));
+        self.queue.write_buffer(&self.hidden_buf, 0, bytemuck::cast_slice(&hidden_flat));
+        self.queue.write_buffer(&self.outputs_buf, 0, bytemuck::cast_slice(&outputs_flat));
+        self.queue.write_buffer(&self.rewards_buf, 0, bytemuck::cast_slice(rewards));
+        self.queue.write_buffer(&self.weights_buf, 0, bytemuck::cast_slice(&weights_flat));
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("hebbian-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hebbian-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
+        }
+        let bytes = (n as u64) * (BRAIN_WEIGHTS_PER_CELL as u64) * 4;
+        encoder.copy_buffer_to_buffer(&self.weights_buf, 0, &self.weights_rb, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let s = self.weights_rb.slice(0..bytes);
+        s.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let data = s.get_mapped_range();
+        let f: &[f32] = bytemuck::cast_slice(&data);
+        let mut out: Vec<Brain> = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = i * BRAIN_WEIGHTS_PER_CELL;
+            let mut b = Brain {
+                w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+                b1: [0.0; BRAIN_HIDDEN],
+                w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+                b2: [0.0; BRAIN_OUTPUTS],
+            };
+            for h in 0..BRAIN_HIDDEN {
+                for in_i in 0..BRAIN_INPUTS {
+                    b.w1[h][in_i] = f[off + h * BRAIN_INPUTS + in_i];
+                }
+            }
+            for h in 0..BRAIN_HIDDEN {
+                b.b1[h] = f[off + 576 + h];
+            }
+            for o in 0..BRAIN_OUTPUTS {
+                for h in 0..BRAIN_HIDDEN {
+                    b.w2[o][h] = f[off + 592 + o * BRAIN_HIDDEN + h];
+                }
+            }
+            for o in 0..BRAIN_OUTPUTS {
+                b.b2[o] = f[off + 736 + o];
+            }
+            out.push(b);
+        }
+        drop(data);
+        self.weights_rb.unmap();
+        out
+    }
+
+    pub fn weights_buffer(&self) -> &wgpu::Buffer {
+        &self.weights_buf
+    }
+
+    /// Sprint 51: persistent-mode dispatch — bindujeme CellsGpu buffers
+    /// (last_inputs, last_hidden, last_outputs, rewards, brain_weights), což
+    /// znamená že brain_weights ZŮSTÁVAJÍ na GPU mezi ticky a tato funkce je
+    /// mutuje in-place. Volá se po `upload_rewards()`.
+    pub fn compute_persistent(
+        &self,
+        cells_gpu: &CellsGpu,
+        n: usize,
+        learning_rate: f32,
+    ) {
+        if n == 0 {
+            return;
+        }
+        let params = HebbianParams {
+            num_cells: n as u32,
+            learning_rate,
+            ..HebbianParams::default()
+        };
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hebbian-bg-persistent"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.last_inputs_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.rewards_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("hebbian-encoder-persistent"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hebbian-pass-persistent"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 }
 
@@ -3737,6 +4708,149 @@ mod tests {
         close(gpu_stats.sum_z, cpu_sum_z, cpu_sum_z.abs());
         close(gpu_stats.sum_speed_sq, cpu_sum_speed_sq, cpu_sum_speed_sq.abs());
         close(gpu_stats.sum_energy, cpu_sum_energy, cpu_sum_energy.abs());
+    }
+
+    /// Sprint 51: brownian GPU produces non-trivial velocity perturbation +
+    /// xoshiro state mutates (deterministic). Test ne porovnává CPU stejně —
+    /// CPU gaussian (Box-Muller) uses StdRng, GPU uses xoshiro128++ — různé
+    /// PRNG. Ověření je: po N kroků velocity má nenulové statistické
+    /// rozptyly v očekávaném scale (thermal_noise × √dt × √N).
+    #[test]
+    fn brownian_gpu_perturbs_velocity() {
+        let n = 256;
+        let mut gpu = match BrownianGpu::new(n) {
+            Ok(g) => g,
+            Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        };
+        let mut velocities = vec![[0.0_f32; 3]; n];
+        let mut state: Vec<[u32; 4]> = (0..n)
+            .map(|i| {
+                let s = (i as u64) + 0xDEADBEEFu64;
+                [
+                    (s >> 0) as u32 ^ 0x9E3779B9u32,
+                    (s >> 16) as u32 ^ 0xBB67AE85u32,
+                    (s >> 32) as u32 ^ 0x3C6EF372u32,
+                    (s >> 48) as u32 ^ 0xA54FF53Au32,
+                ]
+            })
+            .collect();
+        let thermal_noise = 0.5_f32;
+        let dt = 1.0_f32 / 60.0;
+        let steps = 100;
+        for _ in 0..steps {
+            let (v, s) = gpu.compute(&velocities, &state, thermal_noise, dt, true);
+            velocities = v;
+            state = s;
+        }
+        // Empirical sigma: thermal × sqrt(dt) × sqrt(steps). Test že existuje
+        // nenulová variance (statisticky téměř jistě > 0 pro 256 cells).
+        let mut sum_v_sq = 0.0_f64;
+        for v in velocities.iter() {
+            sum_v_sq += (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) as f64;
+        }
+        let mean_v_sq = sum_v_sq / n as f64;
+        // Theoretical: 3 × thermal² × dt × steps = 3 × 0.25 × (100/60) ≈ 1.25
+        let expected = 3.0 * (thermal_noise * thermal_noise) as f64 * dt as f64 * steps as f64;
+        // Tolerance ±50 % kvůli small N stochastic noise.
+        assert!(
+            mean_v_sq > expected * 0.5 && mean_v_sq < expected * 1.5,
+            "mean_v_sq = {} (expected ~{})",
+            mean_v_sq,
+            expected
+        );
+    }
+
+    /// Sprint 51: brownian determinismus — stejný initial state → stejný
+    /// výsledek napříč běhy. xoshiro128++ je deterministic per state seed.
+    #[test]
+    fn brownian_gpu_deterministic_across_runs() {
+        let n = 64;
+        let mut gpu = match BrownianGpu::new(n) {
+            Ok(g) => g,
+            Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        };
+        let velocities = vec![[0.5_f32, 1.0, -0.3]; n];
+        let state: Vec<[u32; 4]> = (0..n).map(|i| [i as u32 + 1, 2, 3, 4]).collect();
+        let (v1, s1) = gpu.compute(&velocities, &state, 0.3, 1.0 / 60.0, false);
+        let (v2, s2) = gpu.compute(&velocities, &state, 0.3, 1.0 / 60.0, false);
+        for i in 0..n {
+            for k in 0..3 {
+                assert_eq!(v1[i][k].to_bits(), v2[i][k].to_bits(),
+                    "i={i} k={k} not deterministic v1={} v2={}", v1[i][k], v2[i][k]);
+            }
+            for k in 0..4 {
+                assert_eq!(s1[i][k], s2[i][k]);
+            }
+        }
+    }
+
+    /// Sprint 51: Hebbian GPU vs CPU `Brain::hebbian_update` parity. 32 cells,
+    /// random pre/post activations + reward, GPU update vs CPU update.
+    /// Tolerance 1e-4 (per-weight FMA chain).
+    #[test]
+    fn hebbian_gpu_matches_cpu() {
+        let mut rng = StdRng::seed_from_u64(73);
+        let n = 32;
+        let lr: f32 = 0.005;
+        let brains: Vec<Brain> = (0..n).map(|_| Brain::random(&mut rng)).collect();
+        let last_inputs: Vec<[f32; BRAIN_INPUTS]> = (0..n)
+            .map(|_| {
+                let mut a = [0.0_f32; BRAIN_INPUTS];
+                for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
+                a
+            })
+            .collect();
+        let last_hidden: Vec<[f32; BRAIN_HIDDEN]> = (0..n)
+            .map(|_| {
+                let mut a = [0.0_f32; BRAIN_HIDDEN];
+                for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
+                a
+            })
+            .collect();
+        let last_outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
+            .map(|_| {
+                let mut a = [0.0_f32; BRAIN_OUTPUTS];
+                for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
+                a
+            })
+            .collect();
+        let rewards: Vec<f32> = (0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect();
+
+        let mut gpu = match HebbianGpu::new(n) {
+            Ok(g) => g,
+            Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        };
+        let gpu_brains = gpu.compute(
+            &last_inputs, &last_hidden, &last_outputs, &rewards, &brains, lr,
+        );
+
+        // CPU equivalent.
+        let mut cpu_brains = brains.clone();
+        for i in 0..n {
+            cpu_brains[i].hebbian_update(
+                &last_inputs[i], &last_hidden[i], &last_outputs[i], rewards[i], lr,
+            );
+        }
+
+        for i in 0..n {
+            for h in 0..BRAIN_HIDDEN {
+                for in_i in 0..BRAIN_INPUTS {
+                    let d = (cpu_brains[i].w1[h][in_i] - gpu_brains[i].w1[h][in_i]).abs();
+                    assert!(d < 1e-4, "i={i} h={h} in_i={in_i} cpu={} gpu={} d={}",
+                        cpu_brains[i].w1[h][in_i], gpu_brains[i].w1[h][in_i], d);
+                }
+                let d = (cpu_brains[i].b1[h] - gpu_brains[i].b1[h]).abs();
+                assert!(d < 1e-4);
+            }
+            for o in 0..BRAIN_OUTPUTS {
+                for h in 0..BRAIN_HIDDEN {
+                    let d = (cpu_brains[i].w2[o][h] - gpu_brains[i].w2[o][h]).abs();
+                    assert!(d < 1e-4);
+                }
+                let d = (cpu_brains[i].b2[o] - gpu_brains[i].b2[o]).abs();
+                assert!(d < 1e-4);
+            }
+        }
     }
 
     /// Sprint 50: motor GPU vs CPU `Cell::apply_brain_motor` parity. Stejné

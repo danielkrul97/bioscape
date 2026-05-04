@@ -21,7 +21,10 @@ use bioscape::{
     WORLD_UNITS_PER_FOOD,
 };
 #[cfg(feature = "gpu")]
-use bioscape::{gpu::BrainGpu, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS};
+use bioscape::{
+    gpu::{BrainGpu, BrownianGpu, CellsGpu, GpuContext, HebbianGpu},
+    BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS,
+};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -122,6 +125,24 @@ struct World {
     // Sensor gather + populate_brain_inputs + apply_brain_motor zůstává CPU.
     #[cfg(feature = "gpu")]
     gpu: Option<BrainGpu>,
+    // Sprint 51: full-GPU brain pipeline. Když Some, drží brain weights
+    // persistent na GPU mezi ticky (eliminuje 30 MB/tick upload Sprintu 44),
+    // GPU Hebbian replace CPU brain.hebbian_update, GPU Brownian replace
+    // CPU apply_brownian. Sensor/motor/step/collision/predate zůstávají CPU
+    // rayon (Sprint 50 standalone shadery jsou ready, integrace je Sprint 52+).
+    #[cfg(feature = "gpu")]
+    gpu_full: Option<GpuFullState>,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuFullState {
+    cells: CellsGpu,
+    brain: BrainGpu,
+    hebbian: HebbianGpu,
+    brownian: BrownianGpu,
+    /// Persistent buffer reward signal pro Hebbian. CPU plní per-tick podle
+    /// `eat_food` events; GPU Hebbian pass čte při `compute_persistent`.
+    rewards_scratch: Vec<f32>,
 }
 
 impl World {
@@ -178,6 +199,8 @@ impl World {
             bench_timings: PhaseTimings::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
+            #[cfg(feature = "gpu")]
+            gpu_full: None,
         }
     }
 
@@ -252,6 +275,8 @@ impl World {
             bench_timings: PhaseTimings::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
+            #[cfg(feature = "gpu")]
+            gpu_full: None,
         })
     }
 
@@ -298,8 +323,45 @@ impl World {
     }
 
     fn apply_brownian(&mut self, rng: &mut impl Rng, dt: f32) {
+        #[cfg(feature = "gpu")]
+        {
+            if self.gpu_full.is_some() {
+                self.apply_brownian_gpu(dt);
+                return;
+            }
+        }
+        let _ = rng; // touch to satisfy unused warning under gpu cfg path
+        let _ = self.apply_brownian_cpu(rng, dt);
+    }
+
+    fn apply_brownian_cpu(&mut self, rng: &mut impl Rng, dt: f32) {
         for cell in &mut self.cells {
             cell.apply_brownian(rng, dt, WORLD_HALF[2]);
+        }
+    }
+
+    /// Sprint 51: GPU brownian s xoshiro128++ per-cell RNG. Upload velocities,
+    /// dispatch, download. Ne-deterministic vs CPU (different PRNG), ale
+    /// deterministic across GPU runs (xoshiro state seedovaný z cell.lineage_id).
+    #[cfg(feature = "gpu")]
+    fn apply_brownian_gpu(&mut self, dt: f32) {
+        let n = self.cells.len();
+        if n == 0 {
+            return;
+        }
+        let velocities: Vec<[f32; 3]> = self.cells.iter().map(|c| c.velocity).collect();
+        let gpu = self.gpu_full.as_ref().unwrap();
+        gpu.cells.upload_velocities(&velocities);
+        gpu.brownian.compute_persistent(
+            &gpu.cells,
+            n,
+            bioscape::THERMAL_NOISE,
+            dt,
+            WORLD_HALF[2] > 0.0,
+        );
+        let new_vels = gpu.cells.download_velocities(n);
+        for (cell, v) in self.cells.iter_mut().zip(new_vels.iter()) {
+            cell.velocity = *v;
         }
     }
 
@@ -330,16 +392,121 @@ impl World {
         }
     }
 
-    /// Sprint 44: dispatch CPU vs GPU forward pass podle `self.gpu`.
+    /// Sprint 44 + 51: dispatch GPU full / GPU brain / CPU.
     fn run_brain_act(&mut self, dt: f32) {
         #[cfg(feature = "gpu")]
         {
+            if self.gpu_full.is_some() {
+                self.brain_act_gpu_full(dt);
+                return;
+            }
             if self.gpu.is_some() {
                 self.brain_act_gpu(dt);
                 return;
             }
         }
         self.brain_act(dt);
+    }
+
+    /// Sprint 51: --gpu-full brain_act. Sensor gather + populate_brain_inputs
+    /// (CPU rayon, jako Sprint 44 path), pak GPU forward s persistent weights
+    /// (žádný 30 MB upload), download hidden + outputs, CPU motor.
+    #[cfg(feature = "gpu")]
+    fn brain_act_gpu_full(&mut self, dt: f32) {
+        let n = self.cells.len();
+        if n == 0 {
+            return;
+        }
+        self.cell_grid.rebuild(
+            self.cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
+        );
+        self.food_grid.rebuild(
+            self.foods
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.position, ())),
+        );
+        let cell_grid = &self.cell_grid;
+        let food_grid = &self.food_grid;
+        let smell = &self.smell;
+        let pheromone = &self.pheromone;
+
+        // Phase 1: CPU rayon — sensor gather + populate_brain_inputs.
+        let inputs_vec: Vec<[f32; BRAIN_INPUTS]> = self
+            .cells
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i, cell)| {
+                let pos = cell.position;
+                let vision_r = cell.genome.vision_radius;
+                let vr2 = vision_r * vision_r;
+                let mut best_food: Option<[f32; 3]> = None;
+                let mut best_food_d2 = f32::MAX;
+                food_grid.for_each_in_radius(pos, vision_r, |_id, fp, ()| {
+                    let dx = fp[0] - pos[0];
+                    let dy = fp[1] - pos[1];
+                    let dz = fp[2] - pos[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 <= vr2 && d2 < best_food_d2 {
+                        best_food_d2 = d2;
+                        best_food = Some(fp);
+                    }
+                });
+                let mut best_cell: Option<([f32; 3], f32)> = None;
+                let mut best_cell_d2 = f32::MAX;
+                let mut neighbors_in_vision: u32 = 0;
+                cell_grid.for_each_in_radius(pos, vision_r, |id, op, oradius| {
+                    if id == i {
+                        return;
+                    }
+                    let dx = op[0] - pos[0];
+                    let dy = op[1] - pos[1];
+                    let dz = op[2] - pos[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 <= vr2 {
+                        neighbors_in_vision += 1;
+                        if d2 < best_cell_d2 {
+                            best_cell_d2 = d2;
+                            best_cell = Some((op, oradius));
+                        }
+                    }
+                });
+                let pos_xy = [pos[0], pos[1]];
+                let smell_grad = smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
+                let pheromone_grad = pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+                let sensors = bioscape::BrainSensors {
+                    nearest_food: best_food,
+                    nearest_cell: best_cell,
+                    neighbors_in_vision,
+                    smell_grad,
+                    pheromone_grad,
+                };
+                cell.apply_shell_absorb(dt);
+                bioscape::populate_brain_inputs(cell, &sensors, vision_r)
+            })
+            .collect();
+
+        // Phase 2: upload inputs + GPU forward (persistent weights).
+        let gpu = self.gpu_full.as_ref().expect("gpu_full Some");
+        gpu.cells.upload_inputs(&inputs_vec);
+        gpu.brain.forward_persistent(&gpu.cells, n);
+
+        // Phase 3: download hidden + outputs.
+        let (hiddens, outputs) = gpu.cells.download_hidden_outputs(n);
+
+        // Phase 4: writeback + motor (CPU).
+        self.cells
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, cell)| {
+                cell.last_inputs = inputs_vec[i];
+                cell.last_hidden = hiddens[i];
+                cell.last_outputs = outputs[i];
+                cell.apply_brain_motor(&outputs[i], dt);
+            });
     }
 
     #[cfg(feature = "gpu")]
@@ -726,9 +893,8 @@ impl World {
     fn eat_food(&mut self) {
         // Sprint 43: food_grid lookup místo full sweep. Sekvenční, protože
         // despawn `Vec<Food>` je shared mutable + Hebbian update mutuje cell.
-        // Per-cell vidi jen kandidáty z 3³ buckets v `EAT_RADIUS × max_axis` —
-        // při typickém eat reach ~8 a GRID_CELL_SIZE=64 query overestimate je
-        // ~1 bucket → ~10 kandidátů max.
+        // Sprint 51: pokud --gpu-full, sbíráme rewards[N] vec a dispatchneme
+        // GPU Hebbian na konci místo per-cell CPU brain.hebbian_update.
         self.food_grid.rebuild(
             self.foods
                 .iter()
@@ -738,7 +904,18 @@ impl World {
         self.eaten_scratch.clear();
         self.eaten_scratch.resize(self.foods.len(), false);
 
-        for cell in self.cells.iter_mut() {
+        #[cfg(feature = "gpu")]
+        let use_gpu_hebbian = self.gpu_full.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let use_gpu_hebbian = false;
+
+        let mut rewards: Vec<f32> = if use_gpu_hebbian {
+            vec![0.0; self.cells.len()]
+        } else {
+            Vec::new()
+        };
+
+        for (cell_idx, cell) in self.cells.iter_mut().enumerate() {
             let pos = cell.position;
             let search_r = EAT_RADIUS * cell.phenotype.max_axis();
             let mut ate_idx: Option<usize> = None;
@@ -759,16 +936,20 @@ impl World {
                 });
             if let Some(idx) = ate_idx {
                 self.eaten_scratch[idx] = true;
-                let last_inputs = cell.last_inputs;
-                let last_hidden = cell.last_hidden;
-                let last_outputs = cell.last_outputs;
-                cell.genome.brain.hebbian_update(
-                    &last_inputs,
-                    &last_hidden,
-                    &last_outputs,
-                    1.0,
-                    LEARNING_RATE,
-                );
+                if use_gpu_hebbian {
+                    rewards[cell_idx] = 1.0;
+                } else {
+                    let last_inputs = cell.last_inputs;
+                    let last_hidden = cell.last_hidden;
+                    let last_outputs = cell.last_outputs;
+                    cell.genome.brain.hebbian_update(
+                        &last_inputs,
+                        &last_hidden,
+                        &last_outputs,
+                        1.0,
+                        LEARNING_RATE,
+                    );
+                }
             }
         }
         for j in (0..self.eaten_scratch.len()).rev() {
@@ -776,6 +957,18 @@ impl World {
                 self.foods.swap_remove(j);
             }
         }
+
+        // Sprint 51: GPU Hebbian dispatch — mutuje brain weights na GPU
+        // in-place. CPU `cell.genome.brain` se NE-aktualizuje; sync se dělá
+        // až v `reproduce` fázi přes `download_brain_at`.
+        #[cfg(feature = "gpu")]
+        if use_gpu_hebbian {
+            let n = self.cells.len();
+            let gpu = self.gpu_full.as_ref().unwrap();
+            gpu.cells.upload_rewards(&rewards);
+            gpu.hebbian.compute_persistent(&gpu.cells, n, LEARNING_RATE);
+        }
+        let _ = rewards;
     }
 
     fn spawn_food(&mut self, rng: &mut impl Rng) {
@@ -836,9 +1029,24 @@ impl World {
         self.fertile_ticks_gen += fertile.len() as u64;
         let mating_r2 = self.mating_radius * self.mating_radius;
         let matings = bioscape::pair_fertile(&fertile, mating_r2, budget);
+        let child_start = self.cells.len();
         let to_spawn = self.spawn_children_from_matings(&matings, rng);
-        self.births_gen += to_spawn.len() as u64;
+        let n_births = to_spawn.len();
+        self.births_gen += n_births as u64;
         self.cells.extend(to_spawn);
+        // Sprint 51: upload child brains + xoshiro state na GPU.
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_full.as_ref() {
+            for (off, child) in self.cells[child_start..].iter().enumerate() {
+                let slot = child_start + off;
+                gpu.cells.upload_brain_at(slot, &child.genome.brain);
+                gpu.cells.upload_xoshiro_seed_at(
+                    slot,
+                    child.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
+                );
+            }
+        }
+        let _ = n_births;
     }
 
     /// Sprint 40: snapshot fertile cells. Sprint 25 mating gating: cells musí
@@ -858,14 +1066,26 @@ impl World {
     }
 
     /// Sprint 40: split-borrow rodiče po indexu, halve energy, vyrobí dítě.
+    /// Sprint 51: pokud --gpu-full, downloaduje parent brains z GPU před
+    /// crossover (GPU Hebbian je canonical), child brain se uploaduje po
+    /// extend.
     fn spawn_children_from_matings(
         &mut self,
         matings: &[(usize, usize)],
         rng: &mut impl Rng,
     ) -> Vec<Cell> {
+        // Sync parent brains z GPU (sprint 51 GPU Hebbian je canonical).
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_full.as_ref() {
+            for &(a, b) in matings {
+                let brain_a = gpu.cells.download_brain_at(a);
+                let brain_b = gpu.cells.download_brain_at(b);
+                self.cells[a].genome.brain = brain_a;
+                self.cells[b].genome.brain = brain_b;
+            }
+        }
         let mut children = Vec::with_capacity(matings.len());
         for &(a, b) in matings {
-            // Split-borrow: pull `hi`-indexed cell from right slice, `lo` z levé.
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
             let (left, right) = self.cells.split_at_mut(hi);
             let cell_lo = &mut left[lo];
@@ -877,7 +1097,6 @@ impl World {
             };
             cell_a.energy *= 0.5;
             cell_b.energy *= 0.5;
-            // Sprint 42: refractory period po mating.
             cell_a.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
             cell_b.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
             children.push(bioscape::make_mating_child(cell_a, cell_b, rng));
@@ -888,12 +1107,11 @@ impl World {
     fn die_and_drop_carrion(&mut self, rng: &mut impl Rng) {
         let half = WORLD_HALF;
         let mut new_foods: Vec<Food> = Vec::new();
-        let before = self.cells.len();
+
+        // Phase 1: emit carrion food for dead cells (read-only iteration).
         for cell in &self.cells {
             if cell.energy <= 0.0 {
                 for _ in 0..CARRION_FOOD_COUNT {
-                    // Sprint 32: z-osa carrion = z mrtvé buňky (Sprint 32 vždy 0).
-                    // Sprint 33+ s aktivním z motion bude carrion v mid-water.
                     let pos = [
                         (cell.position[0] + rng.random_range(-CELL_RADIUS..CELL_RADIUS))
                             .clamp(-half[0], half[0]),
@@ -905,8 +1123,39 @@ impl World {
                 }
             }
         }
-        self.cells.retain(|c| c.energy > 0.0);
-        self.deaths_gen += (before - self.cells.len()) as u64;
+
+        // Phase 2: remove dead cells. --gpu-full uses swap_remove pattern so
+        // GPU brain_weights + xoshiro_state lze udržet in sync přes O(deaths)
+        // GPU memcpy operations (žádný full re-upload).
+        #[cfg(feature = "gpu")]
+        let gpu_full_active = self.gpu_full.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let gpu_full_active = false;
+
+        if gpu_full_active {
+            let before = self.cells.len();
+            #[cfg(feature = "gpu")]
+            let gpu = self.gpu_full.as_ref().unwrap();
+            let mut i = 0;
+            while i < self.cells.len() {
+                if self.cells[i].energy <= 0.0 {
+                    let last = self.cells.len() - 1;
+                    #[cfg(feature = "gpu")]
+                    if i != last {
+                        gpu.cells.swap_to(i, last);
+                    }
+                    self.cells.swap_remove(i);
+                    // i nezvyšuju — moved cell ze slotu last je teď ve slotu i.
+                } else {
+                    i += 1;
+                }
+            }
+            self.deaths_gen += (before - self.cells.len()) as u64;
+        } else {
+            let before = self.cells.len();
+            self.cells.retain(|c| c.energy > 0.0);
+            self.deaths_gen += (before - self.cells.len()) as u64;
+        }
         self.foods.extend(new_foods);
     }
 }
@@ -1149,7 +1398,10 @@ fn main() {
     let raw_args: Vec<String> = env::args().collect();
     // Sprint 44: `--gpu` flag (filtered před positional parsingem). Bez
     // `--features gpu` se flag tiše ignoruje.
-    let want_gpu = raw_args.iter().any(|a| a == "--gpu");
+    // Sprint 51: `--gpu-full` flag — persistent brain weights + GPU Hebbian +
+    // GPU Brownian. Implies --gpu (brain forward na GPU).
+    let want_gpu_full = raw_args.iter().any(|a| a == "--gpu-full");
+    let want_gpu = want_gpu_full || raw_args.iter().any(|a| a == "--gpu");
     // Sprint 48: `--save=PATH` / `--load=PATH` checkpoint flags. Form
     // `--key=value` aby se PATH ne-leakoval do positional indexingu.
     let save_path: Option<String> = raw_args
@@ -1226,7 +1478,41 @@ fn main() {
     };
 
     #[cfg(feature = "gpu")]
-    if want_gpu {
+    if want_gpu_full {
+        let cap = initial_cells.max(max_population).max(64);
+        let init = || -> Result<GpuFullState, String> {
+            let ctx = GpuContext::new()?;
+            let cells_gpu = CellsGpu::with_context(&ctx, cap);
+            cells_gpu.upload_brains(world.cells.iter().map(|c| &c.genome.brain));
+            cells_gpu.upload_xoshiro_seeds(world.cells.iter().enumerate().map(|(slot, c)| {
+                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
+            }));
+            let brain = BrainGpu::with_context(&ctx, cap)?;
+            let hebbian = HebbianGpu::with_context(&ctx, cap)?;
+            let brownian = BrownianGpu::with_context(&ctx, cap)?;
+            Ok(GpuFullState {
+                cells: cells_gpu,
+                brain,
+                hebbian,
+                brownian,
+                rewards_scratch: Vec::new(),
+            })
+        };
+        match init() {
+            Ok(state) => {
+                eprintln!(
+                    "gpu-full: persistent brain weights + GPU Hebbian + GPU Brownian (capacity {})",
+                    cap
+                );
+                world.gpu_full = Some(state);
+            }
+            Err(e) => {
+                eprintln!("gpu-full: init failed ({e}); fallback to CPU");
+            }
+        }
+    }
+    #[cfg(feature = "gpu")]
+    if want_gpu && !want_gpu_full && world.gpu_full.is_none() {
         match BrainGpu::new(initial_cells.max(64)) {
             Ok(g) => {
                 eprintln!("gpu: BrainGpu initialized (capacity {})", initial_cells.max(64));
@@ -1239,7 +1525,7 @@ fn main() {
     }
     #[cfg(not(feature = "gpu"))]
     if want_gpu {
-        eprintln!("gpu: --gpu requested but binary built without --features gpu");
+        eprintln!("gpu: --gpu / --gpu-full requested but binary built without --features gpu");
     }
 
     let file = std::fs::File::create(&out_path).expect("can't create output file");
