@@ -14,10 +14,11 @@ use bioscape::{
     HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
     MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
     PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
-    PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK,
-    PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY,
-    SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION,
-    WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED,
+    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
+    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
+    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z, SMELL_PER_FOOD,
+    SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z,
+    WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED,
     WORLD_UNITS_PER_FOOD,
 };
 #[cfg(feature = "gpu")]
@@ -36,13 +37,13 @@ use std::time::Instant;
 
 // Headless has no window — fixed extent so seeds reproduce identically across
 // machines. Sim parameters live in `bioscape`.
-// Sprint 35: aktivovaná z-osa (2 = velmi mírný 3D layer, ~vision diameter
-// pokrývá z plně). Větší z způsobuje extinkci pre-evolved random brainů
-// (food density per volume drop + random pitch waste). Sprint 37 ladí z + pitch
-// range, jakmile selekce naučí cells deliberátně používat 3D. WorldMap a
-// SmellField/Pheromone zůstávají 2D (xy projekce); plné volumetric 3D pole
-// je odložené.
-const WORLD_HALF: [f32; 3] = [960.0, 540.0, 2.0];
+// Sprint 53: WORLD_HALF[2] expanded z=2 → z=20. SmellField + WorldMap +
+// Pheromone jsou plně 3D (volumetric grid + 7-point Jacobi diffusion + 3D
+// gradient). Cells získávají vertikální environmental sensing (smell_grad_z,
+// pheromone_grad_z přes inputs[17,19]). z=20 je conservative bump (z=50 v
+// initial smoke způsobil extinkci kolem gen 30 kvůli food sparsity v 25×
+// větším objemu).
+const WORLD_HALF: [f32; 3] = [960.0, 540.0, 20.0];
 
 /// Sprint 48: versioned binary header pro checkpoint files.
 const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
@@ -153,22 +154,25 @@ impl World {
         initial_cells: usize,
         max_population: usize,
     ) -> Self {
-        // Sprint 32: WorldMap a SmellField stále 2D — projekce xy. Sprint 35
-        // promění je na 3D volumetric.
-        let world_half_xy = [WORLD_HALF[0], WORLD_HALF[1]];
-        let map = WorldMap::new(WORLD_MAP_RES, WORLD_MAP_BASE_RES, world_half_xy, map_seed);
+        // Sprint 53: WorldMap a SmellField/Pheromone jsou plně 3D volumetric.
+        // Food richness sampling používá z=0 (canonical surface depth) aby
+        // food clustery zůstaly xy-stratifikované (consistent s pre-Sprint-53
+        // biome semantikou); hazards samplují full 3D pozici.
+        let map = WorldMap::new(
+            [WORLD_MAP_RES, WORLD_MAP_RES, WORLD_MAP_RES_Z],
+            [WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z],
+            WORLD_HALF,
+            map_seed,
+        );
         let cells = (0..initial_cells)
             .map(|i| Cell::random(rng, WORLD_HALF, i as u64, 0))
             .collect();
         let target = food_target(1.0);
-        // Sprint 31 spatial clustering: rejection sampling i pro initial food.
-        // Bez retry budgetu by clustering nikdy nezastavil; MAX_SPAWN_ATTEMPTS
-        // garantuje, že každý slot dostane jídlo, jen distribučně bias.
         let foods = (0..target)
             .map(|_| {
                 for _ in 0..MAX_SPAWN_ATTEMPTS {
                     let candidate = Food::random(rng, WORLD_HALF);
-                    let richness = map.sample([candidate.position[0], candidate.position[1]]);
+                    let richness = map.sample([candidate.position[0], candidate.position[1], 0.0]);
                     if !reject_food_for_richness(rng, richness) {
                         return candidate;
                     }
@@ -181,8 +185,11 @@ impl World {
             foods,
             clock: SimClock::new(TICKS_PER_GENERATION, GENERATIONS_PER_EPOCH),
             density_factor: 1.0,
-            smell: SmellField::new(SMELL_GRID_RES, world_half_xy),
-            pheromone: SmellField::new(PHEROMONE_GRID_RES, world_half_xy),
+            smell: SmellField::new([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z], WORLD_HALF),
+            pheromone: SmellField::new(
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                WORLD_HALF,
+            ),
             map,
             cell_grid: SpatialGrid::new(GRID_CELL_SIZE),
             food_grid: SpatialGrid::new(GRID_CELL_SIZE),
@@ -368,7 +375,7 @@ impl World {
     fn update_smell(&mut self, dt: f32) {
         for food in &self.foods {
             self.smell
-                .add_source([food.position[0], food.position[1]], SMELL_PER_FOOD * dt);
+                .add_source([food.position[0], food.position[1], food.position[2]], SMELL_PER_FOOD * dt);
         }
         self.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
     }
@@ -387,7 +394,7 @@ impl World {
             let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
             let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
             self.pheromone
-                .add_source([cell.position[0], cell.position[1]], rate * dt);
+                .add_source([cell.position[0], cell.position[1], cell.position[2]], rate * dt);
             cell.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
         }
     }
@@ -474,9 +481,9 @@ impl World {
                         }
                     }
                 });
-                let pos_xy = [pos[0], pos[1]];
-                let smell_grad = smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
-                let pheromone_grad = pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+                let pos_xyz = [pos[0], pos[1], pos[2]];
+                let smell_grad = smell.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
+                let pheromone_grad = pheromone.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
                 let sensors = bioscape::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
@@ -577,9 +584,9 @@ impl World {
                     }
                 });
 
-                let pos_xy = [pos[0], pos[1]];
-                let smell_grad = smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
-                let pheromone_grad = pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+                let pos_xyz = [pos[0], pos[1], pos[2]];
+                let smell_grad = smell.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
+                let pheromone_grad = pheromone.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
                 let sensors = bioscape::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
@@ -683,9 +690,9 @@ impl World {
                     }
                 });
 
-                let pos_xy = [pos[0], pos[1]];
-                let smell_grad = smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
-                let pheromone_grad = pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+                let pos_xyz = [pos[0], pos[1], pos[2]];
+                let smell_grad = smell.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
+                let pheromone_grad = pheromone.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
                 let sensors = bioscape::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
@@ -720,7 +727,7 @@ impl World {
 
     fn apply_hazards(&mut self, dt: f32) {
         for cell in &mut self.cells {
-            let noise = self.map.sample([cell.position[0], cell.position[1]]);
+            let noise = self.map.sample([cell.position[0], cell.position[1], cell.position[2]]);
             let drain = hazard_drain(noise) * dt;
             cell.energy -= drain;
             cell.damage_accum += drain;
@@ -927,7 +934,7 @@ impl World {
                     let food = &self.foods[idx];
                     let value = FOOD_VALUE
                         * food_multiplier(
-                            self.map.sample([food.position[0], food.position[1]]),
+                            self.map.sample([food.position[0], food.position[1], 0.0]),
                         )
                         * food.value_factor();
                     if cell.try_eat(food, EAT_RADIUS, value) {
@@ -993,7 +1000,7 @@ impl World {
                 let candidate = Food::random(rng, WORLD_HALF);
                 let richness = self
                     .map
-                    .sample([candidate.position[0], candidate.position[1]]);
+                    .sample([candidate.position[0], candidate.position[1], 0.0]);
                 if reject_food_for_richness(rng, richness) {
                     continue;
                 }
@@ -1169,8 +1176,13 @@ fn hazard_drain(noise: f32) -> f32 {
 }
 
 fn food_target(factor: f32) -> usize {
+    // Sprint 53: scale s 3D objemem aby food density per volume zůstala
+    // konstantní napříč z-expansionem. Pre-Sprint-53 baseline: z=2 → z_extent=4.
+    // Volumetric factor = z_extent / 4. Při z=20: 10× food count vs pre-Sprint-53.
     let area = (2.0 * WORLD_HALF[0]) * (2.0 * WORLD_HALF[1]);
-    ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0)) as usize
+    let z_extent = 2.0 * WORLD_HALF[2];
+    let z_factor = (z_extent / 4.0).max(1.0);
+    ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0) * z_factor) as usize
 }
 
 // Spatial occupancy thresholds for clustering diagnostics. A cell is
@@ -1261,7 +1273,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // napříč generacemi, populace je pod selekčním tlakem (predace/hazard),
         // pokud zůstává ~0, žádná nedobrovolná energy loss neprobíhá.
         dmg_sum += c.last_inputs[14] as f64;
-        noise_sum += world.map.sample([c.position[0], c.position[1]]) as f64;
+        noise_sum += world.map.sample([c.position[0], c.position[1], c.position[2]]) as f64;
         energy_sum += c.energy as f64;
         let nx = (c.position[0] / WORLD_HALF[0]).clamp(-1.0, 1.0);
         let ny = (c.position[1] / WORLD_HALF[1]).clamp(-1.0, 1.0);
@@ -1544,6 +1556,7 @@ fn main() {
         let p = [
             brng.random_range(-WORLD_HALF[0]..WORLD_HALF[0]),
             brng.random_range(-WORLD_HALF[1]..WORLD_HALF[1]),
+            brng.random_range(-WORLD_HALF[2]..WORLD_HALF[2]),
         ];
         bsum += world.map.sample(p) as f64;
     }

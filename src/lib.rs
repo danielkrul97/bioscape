@@ -137,6 +137,10 @@ pub const DAMAGE_NORMALIZATION_GAIN: f32 = 0.5;
 // **a aby byly způsobilé k reprodukci** — `MATING_PHEROMONE_THRESHOLD` gating.
 // Brain detekuje gradient přes `inputs[11..13]`. Cost ∝ emise.
 pub const PHEROMONE_GRID_RES: usize = 64;
+/// Sprint 53: z-axis resolution pro pheromone field. Tenčí z-volume + lower
+/// res = větší cell_size_z (32 vs 64) → matchne thin world aspect a šetří
+/// memory bez ztráty rozlišení v xy.
+pub const PHEROMONE_GRID_RES_Z: usize = 16;
 pub const PHEROMONE_DIFFUSION: f32 = 0.15;
 pub const PHEROMONE_DECAY: f32 = 0.3;
 pub const PHEROMONE_BASELINE_EMIT: f32 = 0.0;
@@ -189,6 +193,8 @@ pub const CYCLE_GEN_PERIOD: u64 = 50;
 pub const CYCLE_AMPLITUDE: f32 = 0.15;
 
 pub const SMELL_GRID_RES: usize = 64;
+/// Sprint 53: smell field z-axis resolution. Same reasoning jako PHEROMONE_GRID_RES_Z.
+pub const SMELL_GRID_RES_Z: usize = 16;
 pub const SMELL_DIFFUSION: f32 = 0.15;
 pub const SMELL_DECAY: f32 = 0.3;
 pub const SMELL_PER_FOOD: f32 = 1.0;
@@ -198,7 +204,12 @@ pub const SMELL_NORMALIZATION_GAIN: f32 = 0.5;
 pub const LEARNING_RATE: f32 = 0.005;
 
 pub const WORLD_MAP_RES: usize = 64;
+/// Sprint 53: WorldMap z-axis resolution.
+pub const WORLD_MAP_RES_Z: usize = 16;
 pub const WORLD_MAP_BASE_RES: usize = 8;
+/// Sprint 53: base z-axis resolution pro WorldMap. Lower base → smoother
+/// vertical noise (less high-frequency variation v thin z-volume).
+pub const WORLD_MAP_BASE_RES_Z: usize = 4;
 pub const WORLD_MAP_SEED: u64 = 1234;
 // Food-value multiplier = FLOOR + AMP × noise(pos), noise ∈ [0,1].
 // → multiplier ∈ [FLOOR, FLOOR+AMP]. Drives spatial selection on richness.
@@ -1151,8 +1162,10 @@ pub struct BrainSensors {
     pub nearest_food: Option<[f32; 3]>,
     pub nearest_cell: Option<([f32; 3], f32)>,
     pub neighbors_in_vision: u32,
-    pub smell_grad: [f32; 2],
-    pub pheromone_grad: [f32; 2],
+    /// Sprint 53: 3D gradient `[d/dx, d/dy, d/dz]`. Pre-Sprint-53 byl 2D s
+    /// inputs[17] (smell_grad_z) zero-padded; teď populuje plnou z-složku.
+    pub smell_grad: [f32; 3],
+    pub pheromone_grad: [f32; 3],
 }
 
 /// Sprint 40: jediný source of truth pro brain inputs layout. Pre-refactor byl
@@ -1189,12 +1202,14 @@ pub fn populate_brain_inputs(
     inputs[5] = speed_norm;
     inputs[7] = (sensors.smell_grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
     inputs[8] = (sensors.smell_grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
+    inputs[17] = (sensors.smell_grad[2] * SMELL_NORMALIZATION_GAIN).tanh();
     let fwd = forward_vector(cell.heading, cell.pitch);
     inputs[9] = fwd[0];
     inputs[10] = fwd[1];
     inputs[18] = fwd[2];
     inputs[11] = (sensors.pheromone_grad[0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
     inputs[12] = (sensors.pheromone_grad[1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[19] = (sensors.pheromone_grad[2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
     inputs[13] = (sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
     inputs[14] = (cell.damage_accum * DAMAGE_NORMALIZATION_GAIN).tanh();
     cell.damage_accum = 0.0;
@@ -1300,20 +1315,23 @@ pub fn make_mating_child(parent_a: &Cell, parent_b: &Cell, rng: &mut impl Rng) -
     }
 }
 
-/// 2D scalar field with explicit-Jacobi diffusion and exponential decay.
-/// Doublet (`grid` + `scratch`) for in-place stepping. Cells tagged at
-/// food positions seed the field; cells read its gradient as a smell input.
+/// Sprint 53: 3D volumetric scalar field s explicit-Jacobi diffusion + decay.
+/// Resolution per-axis (`[res_x, res_y, res_z]`) — typicky `[64, 64, 16]` aby
+/// matchne aspect rátia tenkého z-sliceu (`world_half_z << world_half_xy`).
+/// Grid layout: `idx = z*W*H + y*W + x`. 7-point stencil pro 3D Laplacian.
+/// Stabilní při `diffusion < 1/6` (vs `< 1/4` v 2D — pre-Sprint-53 SmellField
+/// měl 2D stencil). `SMELL_DIFFUSION = 0.15` zůstává pod oběma limity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmellField {
-    pub resolution: usize,
-    pub world_half: [f32; 2],
+    pub resolution: [usize; 3],
+    pub world_half: [f32; 3],
     grid: Vec<f32>,
     scratch: Vec<f32>,
 }
 
 impl SmellField {
-    pub fn new(resolution: usize, world_half: [f32; 2]) -> Self {
-        let n = resolution * resolution;
+    pub fn new(resolution: [usize; 3], world_half: [f32; 3]) -> Self {
+        let n = resolution[0] * resolution[1] * resolution[2];
         Self {
             resolution,
             world_half,
@@ -1322,116 +1340,160 @@ impl SmellField {
         }
     }
 
-    fn cell_size_x(&self) -> f32 {
-        (2.0 * self.world_half[0]) / self.resolution as f32
-    }
-    fn cell_size_y(&self) -> f32 {
-        (2.0 * self.world_half[1]) / self.resolution as f32
+    fn cell_size(&self, axis: usize) -> f32 {
+        (2.0 * self.world_half[axis]) / self.resolution[axis] as f32
     }
 
-    fn idx_of(&self, pos: [f32; 2]) -> Option<usize> {
-        let xi = ((pos[0] + self.world_half[0]) / self.cell_size_x()).floor() as i32;
-        let yi = ((pos[1] + self.world_half[1]) / self.cell_size_y()).floor() as i32;
-        let n = self.resolution as i32;
-        if xi < 0 || xi >= n || yi < 0 || yi >= n {
+    fn idx_of(&self, pos: [f32; 3]) -> Option<usize> {
+        let cs_x = self.cell_size(0);
+        let cs_y = self.cell_size(1);
+        let cs_z = self.cell_size(2);
+        let xi = ((pos[0] + self.world_half[0]) / cs_x).floor() as i32;
+        let yi = ((pos[1] + self.world_half[1]) / cs_y).floor() as i32;
+        let zi = ((pos[2] + self.world_half[2]) / cs_z).floor() as i32;
+        let nx = self.resolution[0] as i32;
+        let ny = self.resolution[1] as i32;
+        let nz = self.resolution[2] as i32;
+        if xi < 0 || xi >= nx || yi < 0 || yi >= ny || zi < 0 || zi >= nz {
             None
         } else {
-            Some((yi as usize) * self.resolution + xi as usize)
+            let nx = self.resolution[0];
+            let ny = self.resolution[1];
+            Some((zi as usize) * nx * ny + (yi as usize) * nx + xi as usize)
         }
     }
 
-    pub fn add_source(&mut self, pos: [f32; 2], amount: f32) {
+    pub fn add_source(&mut self, pos: [f32; 3], amount: f32) {
         if let Some(idx) = self.idx_of(pos) {
             self.grid[idx] += amount;
         }
     }
 
-    /// Single explicit-Jacobi diffusion step + multiplicative decay.
-    /// `diffusion` < 0.25 for stability in 2D. `decay_per_sec` is the
-    /// continuous-time rate; we discretize as `(1 - decay·dt)`.
+    /// 7-point Jacobi stencil + multiplicative decay. Stable pro
+    /// `diffusion < 1/6` (3D Laplacian má koeficient 6).
     pub fn step(&mut self, diffusion: f32, decay_per_sec: f32, dt: f32) {
-        let n = self.resolution;
+        let nx = self.resolution[0];
+        let ny = self.resolution[1];
+        let nz = self.resolution[2];
         let decay = (1.0 - decay_per_sec * dt).max(0.0);
-        for j in 0..n {
-            for i in 0..n {
-                let idx = j * n + i;
-                let center = self.grid[idx];
-                let left = if i > 0 { self.grid[idx - 1] } else { center };
-                let right = if i + 1 < n { self.grid[idx + 1] } else { center };
-                let up = if j > 0 { self.grid[idx - n] } else { center };
-                let down = if j + 1 < n { self.grid[idx + n] } else { center };
-                let new = center + diffusion * (left + right + up + down - 4.0 * center);
-                self.scratch[idx] = new * decay;
+        let plane = nx * ny;
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let idx = k * plane + j * nx + i;
+                    let center = self.grid[idx];
+                    let left = if i > 0 { self.grid[idx - 1] } else { center };
+                    let right = if i + 1 < nx { self.grid[idx + 1] } else { center };
+                    let up = if j > 0 { self.grid[idx - nx] } else { center };
+                    let down = if j + 1 < ny { self.grid[idx + nx] } else { center };
+                    let back = if k > 0 { self.grid[idx - plane] } else { center };
+                    let front = if k + 1 < nz { self.grid[idx + plane] } else { center };
+                    let new = center
+                        + diffusion * (left + right + up + down + back + front - 6.0 * center);
+                    self.scratch[idx] = new * decay;
+                }
             }
         }
         std::mem::swap(&mut self.grid, &mut self.scratch);
     }
 
-    pub fn sample(&self, pos: [f32; 2]) -> f32 {
+    pub fn sample(&self, pos: [f32; 3]) -> f32 {
         self.idx_of(pos).map(|i| self.grid[i]).unwrap_or(0.0)
     }
 
-    /// Central differences at `pos ± epsilon` along each axis. Returns
-    /// `[d/dx, d/dy]`. Out-of-bounds samples count as 0.
-    pub fn gradient_at(&self, pos: [f32; 2], epsilon: f32) -> [f32; 2] {
-        let f_xp = self.sample([pos[0] + epsilon, pos[1]]);
-        let f_xm = self.sample([pos[0] - epsilon, pos[1]]);
-        let f_yp = self.sample([pos[0], pos[1] + epsilon]);
-        let f_ym = self.sample([pos[0], pos[1] - epsilon]);
+    /// 3D central differences at `pos ± epsilon` along each axis. Returns
+    /// `[d/dx, d/dy, d/dz]`. Out-of-bounds samples count as 0.
+    pub fn gradient_at(&self, pos: [f32; 3], epsilon: f32) -> [f32; 3] {
+        let f_xp = self.sample([pos[0] + epsilon, pos[1], pos[2]]);
+        let f_xm = self.sample([pos[0] - epsilon, pos[1], pos[2]]);
+        let f_yp = self.sample([pos[0], pos[1] + epsilon, pos[2]]);
+        let f_ym = self.sample([pos[0], pos[1] - epsilon, pos[2]]);
+        let f_zp = self.sample([pos[0], pos[1], pos[2] + epsilon]);
+        let f_zm = self.sample([pos[0], pos[1], pos[2] - epsilon]);
         let inv = 1.0 / (2.0 * epsilon);
-        [(f_xp - f_xm) * inv, (f_yp - f_ym) * inv]
+        [
+            (f_xp - f_xm) * inv,
+            (f_yp - f_ym) * inv,
+            (f_zp - f_zm) * inv,
+        ]
     }
 }
 
-/// Deterministic 2D scalar field on `[resolution × resolution]` mřížce
-/// pokrývající celý svět. Hodnoty v `[0, 1]` z value-noise:
-/// `base_resolution × base_resolution` random uniform grid, smoothstep
-/// bilinear interp do plné resolution. Generováno jednou při startu, pak
-/// jen čtení — žádný update per tick.
+/// Sprint 53: deterministic 3D volumetric scalar field. `resolution` per axis,
+/// hodnoty v `[0, 1]` z value-noise: `base_resolution³` random uniform grid,
+/// smoothstep trilinear interp do plné resolution. Generováno jednou při
+/// startu, pak jen čtení — žádný update per tick.
 ///
-/// Use case: prostorová modulace mechaniky, která má být nehomogenní —
-/// food_richness, hazard, terrain drag, atd. (Sprint 21 = food_richness.)
+/// Use case: prostorová modulace mechaniky, která má být 3D-nehomogenní —
+/// food_richness (xy projekce stačí pro food spawn floor), hazard (3D field
+/// pro vertikální hazard layers), terrain drag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldMap {
-    pub resolution: usize,
-    pub world_half: [f32; 2],
+    pub resolution: [usize; 3],
+    pub world_half: [f32; 3],
     field: Vec<f32>,
 }
 
 impl WorldMap {
     pub fn new(
-        resolution: usize,
-        base_resolution: usize,
-        world_half: [f32; 2],
+        resolution: [usize; 3],
+        base_resolution: [usize; 3],
+        world_half: [f32; 3],
         seed: u64,
     ) -> Self {
-        assert!(resolution >= 2 && base_resolution >= 2);
+        assert!(
+            resolution.iter().all(|&r| r >= 2) && base_resolution.iter().all(|&r| r >= 2)
+        );
         let mut rng = StdRng::seed_from_u64(seed);
-        let base: Vec<f32> = (0..base_resolution * base_resolution)
-            .map(|_| rng.random())
-            .collect();
+        let base_n = base_resolution[0] * base_resolution[1] * base_resolution[2];
+        let base: Vec<f32> = (0..base_n).map(|_| rng.random()).collect();
 
-        let mut field = vec![0.0_f32; resolution * resolution];
-        let scale = (base_resolution as f32 - 1.0) / resolution as f32;
-        for j in 0..resolution {
-            for i in 0..resolution {
-                let u = (i as f32 + 0.5) * scale;
-                let v = (j as f32 + 0.5) * scale;
-                let x0 = (u.floor() as usize).min(base_resolution - 1);
-                let y0 = (v.floor() as usize).min(base_resolution - 1);
-                let x1 = (x0 + 1).min(base_resolution - 1);
-                let y1 = (y0 + 1).min(base_resolution - 1);
-                let fx = (u - x0 as f32).clamp(0.0, 1.0);
+        let nx = resolution[0];
+        let ny = resolution[1];
+        let nz = resolution[2];
+        let bnx = base_resolution[0];
+        let bny = base_resolution[1];
+        let bnz = base_resolution[2];
+        let scale_x = (bnx as f32 - 1.0) / nx as f32;
+        let scale_y = (bny as f32 - 1.0) / ny as f32;
+        let scale_z = (bnz as f32 - 1.0) / nz as f32;
+
+        let mut field = vec![0.0_f32; nx * ny * nz];
+        for k in 0..nz {
+            let w = (k as f32 + 0.5) * scale_z;
+            let z0 = (w.floor() as usize).min(bnz - 1);
+            let z1 = (z0 + 1).min(bnz - 1);
+            let fz = (w - z0 as f32).clamp(0.0, 1.0);
+            let sz = fz * fz * (3.0 - 2.0 * fz);
+            for j in 0..ny {
+                let v = (j as f32 + 0.5) * scale_y;
+                let y0 = (v.floor() as usize).min(bny - 1);
+                let y1 = (y0 + 1).min(bny - 1);
                 let fy = (v - y0 as f32).clamp(0.0, 1.0);
-                let sx = fx * fx * (3.0 - 2.0 * fx);
                 let sy = fy * fy * (3.0 - 2.0 * fy);
-                let v00 = base[y0 * base_resolution + x0];
-                let v10 = base[y0 * base_resolution + x1];
-                let v01 = base[y1 * base_resolution + x0];
-                let v11 = base[y1 * base_resolution + x1];
-                let v0 = v00 * (1.0 - sx) + v10 * sx;
-                let v1 = v01 * (1.0 - sx) + v11 * sx;
-                field[j * resolution + i] = v0 * (1.0 - sy) + v1 * sy;
+                for i in 0..nx {
+                    let u = (i as f32 + 0.5) * scale_x;
+                    let x0 = (u.floor() as usize).min(bnx - 1);
+                    let x1 = (x0 + 1).min(bnx - 1);
+                    let fx = (u - x0 as f32).clamp(0.0, 1.0);
+                    let sx = fx * fx * (3.0 - 2.0 * fx);
+                    // Trilinear interp s smoothstep blend.
+                    let i000 = base[z0 * bnx * bny + y0 * bnx + x0];
+                    let i100 = base[z0 * bnx * bny + y0 * bnx + x1];
+                    let i010 = base[z0 * bnx * bny + y1 * bnx + x0];
+                    let i110 = base[z0 * bnx * bny + y1 * bnx + x1];
+                    let i001 = base[z1 * bnx * bny + y0 * bnx + x0];
+                    let i101 = base[z1 * bnx * bny + y0 * bnx + x1];
+                    let i011 = base[z1 * bnx * bny + y1 * bnx + x0];
+                    let i111 = base[z1 * bnx * bny + y1 * bnx + x1];
+                    let c00 = i000 * (1.0 - sx) + i100 * sx;
+                    let c10 = i010 * (1.0 - sx) + i110 * sx;
+                    let c01 = i001 * (1.0 - sx) + i101 * sx;
+                    let c11 = i011 * (1.0 - sx) + i111 * sx;
+                    let c0 = c00 * (1.0 - sy) + c10 * sy;
+                    let c1 = c01 * (1.0 - sy) + c11 * sy;
+                    field[k * nx * ny + j * nx + i] = c0 * (1.0 - sz) + c1 * sz;
+                }
             }
         }
 
@@ -1442,14 +1504,20 @@ impl WorldMap {
         }
     }
 
-    pub fn sample(&self, pos: [f32; 2]) -> f32 {
-        let cell_x = (2.0 * self.world_half[0]) / self.resolution as f32;
-        let cell_y = (2.0 * self.world_half[1]) / self.resolution as f32;
-        let xi = ((pos[0] + self.world_half[0]) / cell_x).floor() as i32;
-        let yi = ((pos[1] + self.world_half[1]) / cell_y).floor() as i32;
-        let xi = xi.clamp(0, self.resolution as i32 - 1) as usize;
-        let yi = yi.clamp(0, self.resolution as i32 - 1) as usize;
-        self.field[yi * self.resolution + xi]
+    pub fn sample(&self, pos: [f32; 3]) -> f32 {
+        let nx = self.resolution[0];
+        let ny = self.resolution[1];
+        let nz = self.resolution[2];
+        let cs_x = (2.0 * self.world_half[0]) / nx as f32;
+        let cs_y = (2.0 * self.world_half[1]) / ny as f32;
+        let cs_z = (2.0 * self.world_half[2]) / nz as f32;
+        let xi = ((pos[0] + self.world_half[0]) / cs_x).floor() as i32;
+        let yi = ((pos[1] + self.world_half[1]) / cs_y).floor() as i32;
+        let zi = ((pos[2] + self.world_half[2]) / cs_z).floor() as i32;
+        let xi = xi.clamp(0, nx as i32 - 1) as usize;
+        let yi = yi.clamp(0, ny as i32 - 1) as usize;
+        let zi = zi.clamp(0, nz as i32 - 1) as usize;
+        self.field[zi * nx * ny + yi * nx + xi]
     }
 
     pub fn field(&self) -> &[f32] {
@@ -1953,21 +2021,21 @@ mod tests {
 
     #[test]
     fn world_map_is_deterministic_for_seed() {
-        let a = WorldMap::new(32, 8, [500.0, 500.0], 42);
-        let b = WorldMap::new(32, 8, [500.0, 500.0], 42);
+        let a = WorldMap::new([32, 32, 8], [8, 8, 4], [500.0, 500.0, 50.0], 42);
+        let b = WorldMap::new([32, 32, 8], [8, 8, 4], [500.0, 500.0, 50.0], 42);
         assert_eq!(a.field(), b.field());
     }
 
     #[test]
     fn world_map_seeds_differ() {
-        let a = WorldMap::new(32, 8, [500.0, 500.0], 1);
-        let b = WorldMap::new(32, 8, [500.0, 500.0], 2);
+        let a = WorldMap::new([32, 32, 8], [8, 8, 4], [500.0, 500.0, 50.0], 1);
+        let b = WorldMap::new([32, 32, 8], [8, 8, 4], [500.0, 500.0, 50.0], 2);
         assert_ne!(a.field(), b.field());
     }
 
     #[test]
     fn world_map_values_in_unit_range() {
-        let m = WorldMap::new(32, 8, [500.0, 500.0], 7);
+        let m = WorldMap::new([32, 32, 8], [8, 8, 4], [500.0, 500.0, 50.0], 7);
         for &v in m.field() {
             assert!((0.0..=1.0).contains(&v), "out of range: {}", v);
         }
@@ -1975,12 +2043,14 @@ mod tests {
 
     #[test]
     fn world_map_sample_clamps_to_world_bounds() {
-        let m = WorldMap::new(8, 4, [100.0, 100.0], 0);
-        // Mimo svět musí vracet hodnotu z hraniční buňky, ne panicovat.
-        let inside = m.sample([99.0, 99.0]);
-        let outside_pos = m.sample([1e6, 1e6]);
-        let outside_neg = m.sample([-1e6, -1e6]);
-        assert_eq!(outside_pos, m.field()[m.resolution * m.resolution - 1]);
+        let m = WorldMap::new([8, 8, 4], [4, 4, 2], [100.0, 100.0, 50.0], 0);
+        let inside = m.sample([99.0, 99.0, 0.0]);
+        let outside_pos = m.sample([1e6, 1e6, 1e6]);
+        let outside_neg = m.sample([-1e6, -1e6, -1e6]);
+        let nx = m.resolution[0];
+        let ny = m.resolution[1];
+        let nz = m.resolution[2];
+        assert_eq!(outside_pos, m.field()[(nz - 1) * nx * ny + (ny - 1) * nx + (nx - 1)]);
         assert_eq!(outside_neg, m.field()[0]);
         assert!((0.0..=1.0).contains(&inside));
     }

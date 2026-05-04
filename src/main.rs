@@ -1,9 +1,27 @@
 use bevy::asset::RenderAssetUsages;
-use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::diagnostic::{
+    Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, FrameTimeDiagnosticsPlugin,
+    LogDiagnosticsPlugin, RegisterDiagnostic,
+};
 use bevy::image::Image;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use std::time::Instant;
+
+const DIAG_CELL_COUNT: DiagnosticPath = DiagnosticPath::const_new("sim/cell_count");
+const DIAG_FOOD_COUNT: DiagnosticPath = DiagnosticPath::const_new("sim/food_count");
+const DIAG_BRAIN_ACT: DiagnosticPath = DiagnosticPath::const_new("sim/brain_act_ms");
+const DIAG_BRAIN_GPU_RT: DiagnosticPath = DiagnosticPath::const_new("sim/brain_gpu_rt_ms");
+const DIAG_BROWNIAN: DiagnosticPath = DiagnosticPath::const_new("sim/brownian_ms");
+const DIAG_BROWNIAN_GPU_RT: DiagnosticPath = DiagnosticPath::const_new("sim/brownian_gpu_rt_ms");
+const DIAG_COLLISIONS: DiagnosticPath = DiagnosticPath::const_new("sim/collisions_ms");
+const DIAG_PREDATION: DiagnosticPath = DiagnosticPath::const_new("sim/predation_ms");
+const DIAG_EAT_FOOD: DiagnosticPath = DiagnosticPath::const_new("sim/eat_food_ms");
+const DIAG_SMELL: DiagnosticPath = DiagnosticPath::const_new("sim/smell_field_ms");
+const DIAG_PHEROMONE: DiagnosticPath = DiagnosticPath::const_new("sim/pheromone_field_ms");
+const DIAG_GRID_REBUILD: DiagnosticPath = DiagnosticPath::const_new("sim/grid_rebuild_ms");
+const DIAG_SYNC_TRANSFORMS: DiagnosticPath = DiagnosticPath::const_new("sim/sync_transforms_ms");
 use bioscape::{
     reject_food_for_richness, Cell, Food, Phenotype, SimClock, SmellField, SpatialGrid, WorldMap,
     ATTACK_THRESHOLD, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
@@ -12,11 +30,12 @@ use bioscape::{
     MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH,
     MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
     PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
-    PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
-    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
-    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
-    THERMAL_NOISE, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP,
-    WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD, BRAIN_INPUTS,
+    PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON,
+    PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
+    SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, THERMAL_NOISE, TICKS_PER_GENERATION,
+    WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
+    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD, BRAIN_INPUTS,
 };
 #[cfg(feature = "gpu")]
 use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, GpuContext, HebbianGpu};
@@ -28,8 +47,8 @@ const FOOD_RADIUS: f32 = 2.5;
 const DEATH_FADE_TICKS: u32 = 30;
 const GRID_CELL_SIZE: f32 = 100.0;
 const CAMERA_ZOOM_STEP: f32 = 0.1;
-// Sprint 35: z-osa aktivovaná, mírný 3D layer.
-const SIMULATION_HALF: [f32; 3] = [960.0, 540.0, 2.0];
+// Sprint 53: WORLD_HALF[2] expanded z=2 → z=20. Volumetric environment.
+const SIMULATION_HALF: [f32; 3] = [960.0, 540.0, 20.0];
 // Sprint 36: orbit Camera3d s ORTHOGRAPHIC projection. Distance je fixní;
 // "zoom" modifikuje ortho scale (= world units per pixel), takže větší zoom
 // out neudělá black void kolem scény (na rozdíl od perspective). Cells stále
@@ -259,7 +278,21 @@ fn main() {
                 ..default()
             }),
             FrameTimeDiagnosticsPlugin::default(),
+            LogDiagnosticsPlugin::default(),
         ))
+        .register_diagnostic(Diagnostic::new(DIAG_CELL_COUNT).with_suffix(" cells"))
+        .register_diagnostic(Diagnostic::new(DIAG_FOOD_COUNT).with_suffix(" food"))
+        .register_diagnostic(Diagnostic::new(DIAG_BRAIN_ACT).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_BRAIN_GPU_RT).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_BROWNIAN).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_BROWNIAN_GPU_RT).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_COLLISIONS).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_PREDATION).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_EAT_FOOD).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_SMELL).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_PHEROMONE).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_GRID_REBUILD).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_SYNC_TRANSFORMS).with_suffix(" ms"))
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`
         // (rich zones jsou bílé, poor zelené). Margins jsou bílé.
         .insert_resource(ClearColor(Color::WHITE))
@@ -377,9 +410,13 @@ fn setup(
         )),
     ));
 
-    // Sprint 32: WorldMap + SmellField stále 2D — projekce xy z 3D extentu.
-    let half_xy = [half[0], half[1]];
-    let world_map = WorldMap::new(WORLD_MAP_RES, WORLD_MAP_BASE_RES, half_xy, WORLD_MAP_SEED);
+    // Sprint 53: WorldMap + SmellField/Pheromone plně 3D volumetric.
+    let world_map = WorldMap::new(
+        [WORLD_MAP_RES, WORLD_MAP_RES, WORLD_MAP_RES_Z],
+        [WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z],
+        half,
+        WORLD_MAP_SEED,
+    );
 
     // Sprint 36: WorldMap overlay jako ground plane na z=-half_z-5 (pod cells).
     // Texture je grayscale richness; v 3D pohledu funguje jako "podlaha" světa.
@@ -468,7 +505,7 @@ fn setup(
     for _ in 0..initial_food {
         let mut food = Food::random(&mut rng, half);
         for _ in 0..MAX_SPAWN_ATTEMPTS {
-            let richness = world_map.sample([food.position[0], food.position[1]]);
+            let richness = world_map.sample([food.position[0], food.position[1], 0.0]);
             if !reject_food_for_richness(&mut rng, richness) {
                 break;
             }
@@ -485,10 +522,13 @@ fn setup(
     commands.insert_resource(CellMesh(cell_mesh_handle));
     commands.insert_resource(FoodMesh(food_mesh_handle));
     commands.insert_resource(FoodMaterial(food_material));
-    commands.insert_resource(SmellResource(SmellField::new(SMELL_GRID_RES, half_xy)));
+    commands.insert_resource(SmellResource(SmellField::new(
+        [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+        half,
+    )));
     commands.insert_resource(PheromoneResource(SmellField::new(
-        PHEROMONE_GRID_RES,
-        half_xy,
+        [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+        half,
     )));
     commands.insert_resource(WorldMapResource(world_map));
 }
@@ -525,26 +565,35 @@ fn cell_rotation(yaw: f32, pitch: f32) -> Quat {
 }
 
 fn world_map_image(map: &WorldMap) -> Image {
-    let n = map.resolution;
-    let mut data = Vec::with_capacity(n * n * 4);
-    // Lineární interpolace mezi LOW richness = sytá zelená a HIGH richness = bílá.
-    // Lerp(low, high, v) per kanál; clear color v `main` matchuje LOW.
-    let low = [0.10_f32, 0.42, 0.12]; // chudé oblasti (poor zone)
-    let high = [1.00_f32, 1.00, 1.00]; // bohaté oblasti (rich zone)
-    for &v in map.field() {
-        let t = v.clamp(0.0, 1.0);
-        let r = ((low[0] + t * (high[0] - low[0])) * 255.0).clamp(0.0, 255.0) as u8;
-        let g = ((low[1] + t * (high[1] - low[1])) * 255.0).clamp(0.0, 255.0) as u8;
-        let b = ((low[2] + t * (high[2] - low[2])) * 255.0).clamp(0.0, 255.0) as u8;
-        data.push(r);
-        data.push(g);
-        data.push(b);
-        data.push(255);
+    // Sprint 53: WorldMap je 3D. Ground plane overlay vykreslí xy-slice na
+    // z = floor(nz/2) (canonical surface layer); food spawn taktéž samples
+    // z=0 svět ⇒ middle z-slice.
+    let nx = map.resolution[0];
+    let ny = map.resolution[1];
+    let nz = map.resolution[2];
+    let z_slice = nz / 2;
+    let mut data = Vec::with_capacity(nx * ny * 4);
+    let low = [0.10_f32, 0.42, 0.12];
+    let high = [1.00_f32, 1.00, 1.00];
+    let field = map.field();
+    let plane = nx * ny;
+    for j in 0..ny {
+        for i in 0..nx {
+            let v = field[z_slice * plane + j * nx + i];
+            let t = v.clamp(0.0, 1.0);
+            let r = ((low[0] + t * (high[0] - low[0])) * 255.0).clamp(0.0, 255.0) as u8;
+            let g = ((low[1] + t * (high[1] - low[1])) * 255.0).clamp(0.0, 255.0) as u8;
+            let b = ((low[2] + t * (high[2] - low[2])) * 255.0).clamp(0.0, 255.0) as u8;
+            data.push(r);
+            data.push(g);
+            data.push(b);
+            data.push(255);
+        }
     }
     Image::new(
         Extent3d {
-            width: n as u32,
-            height: n as u32,
+            width: nx as u32,
+            height: ny as u32,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -563,8 +612,11 @@ fn hazard_drain(noise: f32) -> f32 {
 }
 
 fn food_target(extent: &WorldExtent, factor: f32) -> usize {
+    // Sprint 53: scale s 3D objemem (mirror headless logiky).
     let area = (2.0 * extent.half_x) * (2.0 * extent.half_y);
-    ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0)) as usize
+    let z_extent = 2.0 * extent.half_z;
+    let z_factor = (z_extent / 4.0).max(1.0);
+    ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0) * z_factor) as usize
 }
 
 /// Stable u64 → hue mapping for lineage visualization. Knuth-style integer
@@ -621,7 +673,9 @@ fn apply_brownian_motion(
     slot_map: Res<CellSlotMap>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    mut diag: Diagnostics,
 ) {
+    let t_total = Instant::now();
     let dt = time.delta_secs();
     let half_z = extent.as_array()[2];
 
@@ -629,6 +683,7 @@ fn apply_brownian_motion(
     if let Some(gpu) = gpu_state {
         let n = slot_map.len();
         if n == 0 {
+            diag.add_measurement(&DIAG_BROWNIAN, || t_total.elapsed().as_secs_f64() * 1000.0);
             return;
         }
         let mut velocities_by_slot: Vec<[f32; 3]> = vec![[0.0; 3]; n];
@@ -637,15 +692,18 @@ fn apply_brownian_motion(
                 velocities_by_slot[slot] = cell.0.velocity;
             }
         }
+        let t_gpu = Instant::now();
         gpu.cells.upload_velocities(&velocities_by_slot);
         gpu.brownian
             .compute_persistent(&gpu.cells, n, THERMAL_NOISE, dt, half_z > 0.0);
         let new_vels = gpu.cells.download_velocities(n);
+        diag.add_measurement(&DIAG_BROWNIAN_GPU_RT, || t_gpu.elapsed().as_secs_f64() * 1000.0);
         for (entity, mut cell) in &mut cells {
             if let Some(slot) = slot_map.slot_of(entity) {
                 cell.0.velocity = new_vels[slot];
             }
         }
+        diag.add_measurement(&DIAG_BROWNIAN, || t_total.elapsed().as_secs_f64() * 1000.0);
         return;
     }
 
@@ -654,6 +712,7 @@ fn apply_brownian_motion(
     for (_, mut cell) in &mut cells {
         cell.0.apply_brownian(&mut rng, dt, half_z);
     }
+    diag.add_measurement(&DIAG_BROWNIAN, || t_total.elapsed().as_secs_f64() * 1000.0);
 }
 
 /// Sprint 38: gravity drift na food. Aktualizuje Food.position[2] + sync
@@ -685,7 +744,7 @@ fn apply_environmental_hazards(
     for mut cell in &mut cells {
         let noise = world_map
             .0
-            .sample([cell.0.position[0], cell.0.position[1]]);
+            .sample([cell.0.position[0], cell.0.position[1], cell.0.position[2]]);
         let drain = hazard_drain(noise) * dt;
         cell.0.energy -= drain;
         cell.0.damage_accum += drain;
@@ -696,22 +755,32 @@ fn update_smell_field(
     time: Res<Time>,
     foods: Query<&FoodEntity>,
     mut smell: ResMut<SmellResource>,
+    mut diag: Diagnostics,
 ) {
+    let t = Instant::now();
     let dt = time.delta_secs();
+    diag.add_measurement(&DIAG_FOOD_COUNT, || foods.iter().count() as f64);
     for food in &foods {
         smell
             .0
-            .add_source([food.0.position[0], food.0.position[1]], SMELL_PER_FOOD * dt);
+            .add_source([food.0.position[0], food.0.position[1], food.0.position[2]], SMELL_PER_FOOD * dt);
     }
     smell.0.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
+    diag.add_measurement(&DIAG_SMELL, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
-fn update_pheromone_field(time: Res<Time>, mut pheromone: ResMut<PheromoneResource>) {
+fn update_pheromone_field(
+    time: Res<Time>,
+    mut pheromone: ResMut<PheromoneResource>,
+    mut diag: Diagnostics,
+) {
     // Diffuse + decay BEFORE this tick's emissions (in emit_pheromones, which
     // runs after brain_act). Stejně jako headless — brainy detekují gradient
     // ze stavu pole na konci minulého ticku, žádný self-feedback.
+    let t = Instant::now();
     let dt = time.delta_secs();
     pheromone.0.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+    diag.add_measurement(&DIAG_PHEROMONE, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn emit_pheromones(
@@ -726,7 +795,7 @@ fn emit_pheromones(
         let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
         pheromone
             .0
-            .add_source([cell.0.position[0], cell.0.position[1]], rate * dt);
+            .add_source([cell.0.position[0], cell.0.position[1], cell.0.position[2]], rate * dt);
         cell.0.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
     }
 }
@@ -740,8 +809,11 @@ fn cells_brain_act(
     slot_map: Res<CellSlotMap>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    mut diag: Diagnostics,
 ) {
+    let _t_total = Instant::now();
     let dt = time.delta_secs();
+    diag.add_measurement(&DIAG_CELL_COUNT, || cells.iter().count() as f64);
 
     // Sprint 52: helper closure pro per-cell sensor gather + populate_brain_inputs.
     // Reused jak v CPU tak GPU path. Takes &mut Cell + Entity, vrací inputs[36].
@@ -782,9 +854,9 @@ fn cells_brain_act(
                     }
                 }
             });
-        let pos_xy = [pos[0], pos[1]];
-        let smell_grad = smell.0.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
-        let pheromone_grad = pheromone.0.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+        let pos_xyz = [pos[0], pos[1], pos[2]];
+        let smell_grad = smell.0.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
+        let pheromone_grad = pheromone.0.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
         let sensors = bioscape::BrainSensors {
             nearest_food,
             nearest_cell,
@@ -800,6 +872,7 @@ fn cells_brain_act(
     if let Some(gpu) = gpu_state {
         let n = slot_map.len();
         if n == 0 {
+            diag.add_measurement(&DIAG_BRAIN_ACT, || _t_total.elapsed().as_secs_f64() * 1000.0);
             return;
         }
         // Build inputs vec indexed by slot. Iterate alive query, look up slot,
@@ -811,9 +884,11 @@ fn cells_brain_act(
             };
             inputs_by_slot[slot] = gather(entity, &mut cell.0);
         }
+        let t_gpu = Instant::now();
         gpu.cells.upload_inputs(&inputs_by_slot);
         gpu.brain.forward_persistent(&gpu.cells, n);
         let (hiddens, outputs) = gpu.cells.download_hidden_outputs(n);
+        diag.add_measurement(&DIAG_BRAIN_GPU_RT, || t_gpu.elapsed().as_secs_f64() * 1000.0);
         for (entity, mut cell) in &mut cells {
             let Some(slot) = slot_map.slot_of(entity) else {
                 continue;
@@ -823,6 +898,7 @@ fn cells_brain_act(
             cell.0.last_outputs = outputs[slot];
             cell.0.apply_brain_motor(&outputs[slot], dt);
         }
+        diag.add_measurement(&DIAG_BRAIN_ACT, || _t_total.elapsed().as_secs_f64() * 1000.0);
         return;
     }
 
@@ -836,6 +912,7 @@ fn cells_brain_act(
         cell.0.last_outputs = outputs;
         cell.0.apply_brain_motor(&outputs, dt);
     }
+    diag.add_measurement(&DIAG_BRAIN_ACT, || _t_total.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn apply_cell_morph(time: Res<Time>, mut cells: Query<&mut CellEntity, Without<Dying>>) {
@@ -875,7 +952,7 @@ fn spawn_food(
             // Spotřebovává retry budget jako cell-exclusion check níž.
             let richness = world_map
                 .0
-                .sample([candidate.position[0], candidate.position[1]]);
+                .sample([candidate.position[0], candidate.position[1], 0.0]);
             if reject_food_for_richness(&mut rng, richness) {
                 continue;
             }
@@ -921,7 +998,9 @@ fn cell_eats_food(
     slot_map: Res<CellSlotMap>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut commands: Commands,
+    mut diag: Diagnostics,
 ) {
+    let t_total = Instant::now();
     let mut eaten: HashSet<Entity> = HashSet::new();
 
     // Sprint 52: pokud GPU available, sbíráme rewards Vec[N] a dispatchneme
@@ -952,7 +1031,7 @@ fn cell_eats_food(
         });
         if let Some((food_e, food)) = to_eat {
             cell.0.energy += FOOD_VALUE
-                * food_multiplier(world_map.0.sample([food.position[0], food.position[1]]))
+                * food_multiplier(world_map.0.sample([food.position[0], food.position[1], 0.0]))
                 * food.value_factor();
             eaten.insert(food_e);
             commands.entity(food_e).despawn();
@@ -986,9 +1065,14 @@ fn cell_eats_food(
         }
     }
     let _ = rewards;
+    diag.add_measurement(&DIAG_EAT_FOOD, || t_total.elapsed().as_secs_f64() * 1000.0);
 }
 
-fn sync_transforms(mut cells: Query<(&CellEntity, &mut Transform), Without<Dying>>) {
+fn sync_transforms(
+    mut cells: Query<(&CellEntity, &mut Transform), Without<Dying>>,
+    mut diag: Diagnostics,
+) {
+    let t = Instant::now();
     for (cell, mut transform) in &mut cells {
         transform.translation.x = cell.0.position[0];
         transform.translation.y = cell.0.position[1];
@@ -1002,6 +1086,7 @@ fn sync_transforms(mut cells: Query<(&CellEntity, &mut Transform), Without<Dying
             transform.scale = target_scale;
         }
     }
+    diag.add_measurement(&DIAG_SYNC_TRANSFORMS, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>) {
@@ -1443,12 +1528,15 @@ fn cell_dies_on_zero_energy(
 fn rebuild_cell_grid(
     mut grid: ResMut<CellGrid>,
     cells: Query<(Entity, &CellEntity), Without<Dying>>,
+    mut diag: Diagnostics,
 ) {
+    let t = Instant::now();
     grid.0.rebuild(
         cells
             .iter()
             .map(|(e, c)| (e, c.0.position, c.0.phenotype.effective_radius())),
     );
+    diag.add_measurement(&DIAG_GRID_REBUILD, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn rebuild_food_grid(
@@ -1465,7 +1553,9 @@ const BROAD_PHASE_SIZE_BUDGET: f32 = 3.0;
 fn cell_predates_on_neighbor(
     grid: Res<CellGrid>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    mut diag: Diagnostics,
 ) {
+    let t_total = Instant::now();
     let mut energy_changes: HashMap<Entity, f32> = HashMap::new();
     // Sprint 30: nedobrovolný drain do brain damage signálu (input[14]).
     // Voluntární cost (movement, morph, attack) sem nepatří, jen predation.
@@ -1545,12 +1635,15 @@ fn cell_predates_on_neighbor(
             cell.0.damage_accum += delta;
         }
     }
+    diag.add_measurement(&DIAG_PREDATION, || t_total.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn resolve_cell_collisions(
     grid: Res<CellGrid>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    mut diag: Diagnostics,
 ) {
+    let t_total = Instant::now();
     let mut deltas: Vec<(Entity, [f32; 2])> = Vec::new();
 
     for (entity_a, cell_a) in &cells {
@@ -1586,6 +1679,7 @@ fn resolve_cell_collisions(
             cell.0.position[1] += delta[1];
         }
     }
+    diag.add_measurement(&DIAG_COLLISIONS, || t_total.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn tick_death_fade(
