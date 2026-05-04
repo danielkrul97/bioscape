@@ -41,9 +41,12 @@ use bioscape::{
 use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, GpuContext, HebbianGpu};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 // Renderer-only knobs. Sim parameters live in `bioscape` (lib.rs).
-const FOOD_RADIUS: f32 = 2.5;
+// Sprint 53: zmenšeno z 2.5 (Sprint 53 volumetric expansion 10× food count
+// dělalo 2.5 mesh visuálně dominantní).
+const FOOD_RADIUS: f32 = 1.0;
 const DEATH_FADE_TICKS: u32 = 30;
 const GRID_CELL_SIZE: f32 = 100.0;
 const CAMERA_ZOOM_STEP: f32 = 0.1;
@@ -299,6 +302,11 @@ fn main() {
         .init_resource::<LineageMaterials>()
         .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
+        // Cap virtual-time delta na 50 ms — limit catch-up ticků FixedUpdate
+        // (~3 při 60 Hz) po lag spike. Default 250 ms by povolil 15 ticků a
+        // exponenciálně by dohánělo zpoždění (death spiral). Sim po lagu poběží
+        // pomaleji než real time, ale zotaví se.
+        .insert_resource(Time::<Virtual>::from_max_delta(Duration::from_millis(50)))
         .insert_resource(Clock(SimClock::new(
             TICKS_PER_GENERATION,
             GENERATIONS_PER_EPOCH,
@@ -441,9 +449,12 @@ fn setup(
     // (length × width × height) per cell. Spike rendering vynechán (visual
     // loss; predace mechanika beze změny).
     let cell_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS).mesh().ico(2).unwrap());
+    // Sprint 53: jídlo decentnější — menší radius (10× větší food count po
+    // 3D volume scaling jinak vytváří plný display) + ground-matching tint
+    // (low-saturation green) místo skoro-černé proti bílému ClearColoru.
     let food_mesh_handle = meshes.add(Sphere::new(FOOD_RADIUS).mesh().ico(1).unwrap());
     let food_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.05, 0.05, 0.05),
+        base_color: Color::srgb(0.20, 0.30, 0.18),
         ..default()
     });
 
