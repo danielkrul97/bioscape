@@ -15,9 +15,11 @@ use bioscape::{
     PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
     SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
-    TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
-    WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
+    THERMAL_NOISE, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP,
+    WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD, BRAIN_INPUTS,
 };
+#[cfg(feature = "gpu")]
+use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, GpuContext, HebbianGpu};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 
@@ -108,6 +110,66 @@ struct FoodGrid(SpatialGrid<Entity, ()>);
 impl Default for FoodGrid {
     fn default() -> Self {
         Self(SpatialGrid::new(GRID_CELL_SIZE))
+    }
+}
+
+/// Sprint 52: GPU compute state pro renderer. Drží persistent CellsGpu +
+/// BrainGpu/HebbianGpu/BrownianGpu na shared GpuContext. Insert se v `setup`
+/// pokud GpuContext::new uspěje; pokud selže, Resource zůstává `None` a
+/// systems gracefully fallbacknou na CPU.
+#[cfg(feature = "gpu")]
+#[derive(Resource)]
+struct GpuBrainState {
+    cells: CellsGpu,
+    brain: BrainGpu,
+    hebbian: HebbianGpu,
+    brownian: BrownianGpu,
+}
+
+/// Sprint 52: maps Bevy `Entity` ↔ slot index v `CellsGpu` SoA bufferech.
+/// Sloty jsou dense (0..n, žádné holes) přes swap_remove pattern při death.
+#[derive(Resource, Default)]
+struct CellSlotMap {
+    slot_to_entity: Vec<Entity>,
+    entity_to_slot: HashMap<Entity, usize>,
+}
+
+impl CellSlotMap {
+    fn allocate(&mut self, entity: Entity) -> usize {
+        let slot = self.slot_to_entity.len();
+        self.slot_to_entity.push(entity);
+        self.entity_to_slot.insert(entity, slot);
+        slot
+    }
+
+    /// Release slot pro entity. Vrací `Some((freed_slot, moved_entity))`
+    /// pokud entity byla zaregistrovaná. `moved_entity` je Some pokud
+    /// freed_slot byl zaplněn cell ze zadního slotu (swap_remove pattern).
+    fn release(&mut self, entity: Entity) -> Option<(usize, Option<Entity>)> {
+        let slot = self.entity_to_slot.remove(&entity)?;
+        let last = self.slot_to_entity.len() - 1;
+        let moved = if slot != last {
+            let moved_entity = self.slot_to_entity[last];
+            self.slot_to_entity[slot] = moved_entity;
+            self.entity_to_slot.insert(moved_entity, slot);
+            Some(moved_entity)
+        } else {
+            None
+        };
+        self.slot_to_entity.pop();
+        Some((slot, moved))
+    }
+
+    fn slot_of(&self, entity: Entity) -> Option<usize> {
+        self.entity_to_slot.get(&entity).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.slot_to_entity.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.slot_to_entity.capacity()
     }
 }
 
@@ -349,18 +411,59 @@ fn setup(
     });
 
     let mut rng = rand::rng();
+    let mut initial_cells: Vec<Cell> = Vec::with_capacity(INITIAL_CELLS);
+    let mut slot_map = CellSlotMap::default();
     for i in 0..INITIAL_CELLS {
         let cell = Cell::random(&mut rng, half, i as u64, 0);
         let mat = lineage_material(&mut lineage_materials, &mut materials, cell.lineage_id);
-        commands.spawn((
-            CellEntity(cell),
-            Mesh3d(cell_mesh_handle.clone()),
-            MeshMaterial3d(mat),
-            Transform::from_xyz(cell.position[0], cell.position[1], cell.position[2])
-                .with_rotation(cell_rotation(cell.heading, cell.pitch))
-                .with_scale(cell_scale(&cell.phenotype)),
-        ));
+        let entity = commands
+            .spawn((
+                CellEntity(cell),
+                Mesh3d(cell_mesh_handle.clone()),
+                MeshMaterial3d(mat),
+                Transform::from_xyz(cell.position[0], cell.position[1], cell.position[2])
+                    .with_rotation(cell_rotation(cell.heading, cell.pitch))
+                    .with_scale(cell_scale(&cell.phenotype)),
+            ))
+            .id();
+        slot_map.allocate(entity);
+        initial_cells.push(cell);
     }
+
+    // Sprint 52: GPU compute init. Při failu fallback na CPU (Resource None).
+    #[cfg(feature = "gpu")]
+    {
+        // Capacity = MAX_POPULATION + slack pro birth ticks (Dying entities
+        // už slot drží do despawn — ale po Sprint 52 pattern se uvolňují
+        // ihned na cell_dies; slack pokrývá race window).
+        let cap = MAX_POPULATION + 64;
+        let init = || -> Result<GpuBrainState, String> {
+            let ctx = GpuContext::new()?;
+            let cells = CellsGpu::with_context(&ctx, cap);
+            cells.upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
+            cells.upload_xoshiro_seeds(initial_cells.iter().enumerate().map(|(slot, c)| {
+                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
+            }));
+            let brain = BrainGpu::with_context(&ctx, cap)?;
+            let hebbian = HebbianGpu::with_context(&ctx, cap)?;
+            let brownian = BrownianGpu::with_context(&ctx, cap)?;
+            Ok(GpuBrainState { cells, brain, hebbian, brownian })
+        };
+        match init() {
+            Ok(state) => {
+                info!(
+                    "renderer-gpu: persistent brain weights + GPU Hebbian + GPU Brownian (cap {})",
+                    cap
+                );
+                commands.insert_resource(state);
+            }
+            Err(e) => {
+                warn!("renderer-gpu: init failed ({}); falling back to CPU compute", e);
+            }
+        }
+    }
+    commands.insert_resource(slot_map);
+    let _ = initial_cells;
     let initial_food = food_target(&extent, 1.0);
     for _ in 0..initial_food {
         let mut food = Food::random(&mut rng, half);
@@ -510,15 +613,45 @@ fn step_cells(
 }
 
 /// Sprint 42: Brownův pohyb — gaussian perturbation na velocity.
+/// Sprint 52: pokud `GpuBrainState` Resource available, dispatch GPU brownian
+/// (xoshiro128++ per-cell). CPU fallback při absenci GPU.
 fn apply_brownian_motion(
     time: Res<Time>,
     extent: Res<WorldExtent>,
-    mut cells: Query<&mut CellEntity, Without<Dying>>,
+    slot_map: Res<CellSlotMap>,
+    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
+    mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
 ) {
     let dt = time.delta_secs();
     let half_z = extent.as_array()[2];
+
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = gpu_state {
+        let n = slot_map.len();
+        if n == 0 {
+            return;
+        }
+        let mut velocities_by_slot: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+        for (entity, cell) in cells.iter() {
+            if let Some(slot) = slot_map.slot_of(entity) {
+                velocities_by_slot[slot] = cell.0.velocity;
+            }
+        }
+        gpu.cells.upload_velocities(&velocities_by_slot);
+        gpu.brownian
+            .compute_persistent(&gpu.cells, n, THERMAL_NOISE, dt, half_z > 0.0);
+        let new_vels = gpu.cells.download_velocities(n);
+        for (entity, mut cell) in &mut cells {
+            if let Some(slot) = slot_map.slot_of(entity) {
+                cell.0.velocity = new_vels[slot];
+            }
+        }
+        return;
+    }
+
+    let _ = slot_map;
     let mut rng = rand::rng();
-    for mut cell in &mut cells {
+    for (_, mut cell) in &mut cells {
         cell.0.apply_brownian(&mut rng, dt, half_z);
     }
 }
@@ -604,15 +737,18 @@ fn cells_brain_act(
     food_grid: Res<FoodGrid>,
     smell: Res<SmellResource>,
     pheromone: Res<PheromoneResource>,
+    slot_map: Res<CellSlotMap>,
+    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
 ) {
     let dt = time.delta_secs();
 
-    for (entity, mut cell) in &mut cells {
-        let pos = cell.0.position;
-        let vision_r = cell.0.genome.vision_radius;
+    // Sprint 52: helper closure pro per-cell sensor gather + populate_brain_inputs.
+    // Reused jak v CPU tak GPU path. Takes &mut Cell + Entity, vrací inputs[36].
+    let gather = |entity: Entity, cell: &mut Cell| -> [f32; BRAIN_INPUTS] {
+        let pos = cell.position;
+        let vision_r = cell.genome.vision_radius;
         let vr2 = vision_r * vision_r;
-
         let mut nearest_food: Option<[f32; 3]> = None;
         let mut best_food_d2 = f32::MAX;
         food_grid.0.for_each_in_radius(pos, vision_r, |_, fp, _| {
@@ -625,7 +761,6 @@ fn cells_brain_act(
                 nearest_food = Some(fp);
             }
         });
-
         let mut nearest_cell: Option<([f32; 3], f32)> = None;
         let mut best_cell_d2 = f32::MAX;
         let mut neighbors_in_vision: u32 = 0;
@@ -647,9 +782,6 @@ fn cells_brain_act(
                     }
                 }
             });
-
-        // Sprint 40: gradient samples + sensors struct, pak shared
-        // populate_brain_inputs + apply_brain_motor (lib helpers).
         let pos_xy = [pos[0], pos[1]];
         let smell_grad = smell.0.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
         let pheromone_grad = pheromone.0.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
@@ -660,9 +792,44 @@ fn cells_brain_act(
             smell_grad,
             pheromone_grad,
         };
-        // Sprint 41: shell tlumí damage_accum před tím, než ho brain čte.
-        cell.0.apply_shell_absorb(dt);
-        let inputs = bioscape::populate_brain_inputs(&mut cell.0, &sensors, vision_r);
+        cell.apply_shell_absorb(dt);
+        bioscape::populate_brain_inputs(cell, &sensors, vision_r)
+    };
+
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = gpu_state {
+        let n = slot_map.len();
+        if n == 0 {
+            return;
+        }
+        // Build inputs vec indexed by slot. Iterate alive query, look up slot,
+        // place inputs at slot index. Slots jsou dense 0..n.
+        let mut inputs_by_slot: Vec<[f32; BRAIN_INPUTS]> = vec![[0.0; BRAIN_INPUTS]; n];
+        for (entity, mut cell) in &mut cells {
+            let Some(slot) = slot_map.slot_of(entity) else {
+                continue;
+            };
+            inputs_by_slot[slot] = gather(entity, &mut cell.0);
+        }
+        gpu.cells.upload_inputs(&inputs_by_slot);
+        gpu.brain.forward_persistent(&gpu.cells, n);
+        let (hiddens, outputs) = gpu.cells.download_hidden_outputs(n);
+        for (entity, mut cell) in &mut cells {
+            let Some(slot) = slot_map.slot_of(entity) else {
+                continue;
+            };
+            cell.0.last_inputs = inputs_by_slot[slot];
+            cell.0.last_hidden = hiddens[slot];
+            cell.0.last_outputs = outputs[slot];
+            cell.0.apply_brain_motor(&outputs[slot], dt);
+        }
+        return;
+    }
+
+    // CPU fallback (no GPU available or feature disabled).
+    let _ = slot_map;
+    for (entity, mut cell) in &mut cells {
+        let inputs = gather(entity, &mut cell.0);
         let (hidden, outputs) = cell.0.genome.brain.forward_with_state(&inputs);
         cell.0.last_inputs = inputs;
         cell.0.last_hidden = hidden;
@@ -748,20 +915,30 @@ fn spawn_food(
 }
 
 fn cell_eats_food(
-    mut cells: Query<&mut CellEntity, Without<Dying>>,
+    mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     food_grid: Res<FoodGrid>,
     world_map: Res<WorldMapResource>,
+    slot_map: Res<CellSlotMap>,
+    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut commands: Commands,
 ) {
     let mut eaten: HashSet<Entity> = HashSet::new();
 
-    for mut cell in &mut cells {
+    // Sprint 52: pokud GPU available, sbíráme rewards Vec[N] a dispatchneme
+    // GPU Hebbian na konci místo per-cell CPU brain.hebbian_update.
+    #[cfg(feature = "gpu")]
+    let use_gpu_hebbian = gpu_state.is_some();
+    #[cfg(not(feature = "gpu"))]
+    let use_gpu_hebbian = false;
+
+    let mut rewards: Vec<f32> = if use_gpu_hebbian {
+        vec![0.0; slot_map.len()]
+    } else {
+        Vec::new()
+    };
+
+    for (entity, mut cell) in &mut cells {
         let pos = cell.0.position;
-        // Sprint 41: broad-phase používá max_axis (worst-case ellipsoid extent),
-        // narrow-phase je ellipsoidní acceptance v `Cell::eat_test`. Closure
-        // pokračuje hledat dokud nenajde food, který projde i narrow check —
-        // jinak by chip cell s long forward axis missnul valid eat target,
-        // pokud broad-phase vrátil first food kdesi v perpendicular směru.
         let eat_r = EAT_RADIUS * cell.0.phenotype.max_axis();
         let mut to_eat: Option<(Entity, Food)> = None;
         food_grid.0.for_each_in_radius(pos, eat_r, |food_e, food_pos, _| {
@@ -774,26 +951,41 @@ fn cell_eats_food(
             }
         });
         if let Some((food_e, food)) = to_eat {
-            // Sprint 42: starý food má nižší value (decay).
             cell.0.energy += FOOD_VALUE
                 * food_multiplier(world_map.0.sample([food.position[0], food.position[1]]))
                 * food.value_factor();
             eaten.insert(food_e);
             commands.entity(food_e).despawn();
-            // Reward-modulated Hebbian update — reinforce the recent decision
-            // pathway (last forward pass) on positive outcome.
-            let last_inputs = cell.0.last_inputs;
-            let last_hidden = cell.0.last_hidden;
-            let last_outputs = cell.0.last_outputs;
-            cell.0.genome.brain.hebbian_update(
-                &last_inputs,
-                &last_hidden,
-                &last_outputs,
-                1.0,
-                LEARNING_RATE,
-            );
+            if use_gpu_hebbian {
+                if let Some(slot) = slot_map.slot_of(entity) {
+                    if slot < rewards.len() {
+                        rewards[slot] = 1.0;
+                    }
+                }
+            } else {
+                let last_inputs = cell.0.last_inputs;
+                let last_hidden = cell.0.last_hidden;
+                let last_outputs = cell.0.last_outputs;
+                cell.0.genome.brain.hebbian_update(
+                    &last_inputs,
+                    &last_hidden,
+                    &last_outputs,
+                    1.0,
+                    LEARNING_RATE,
+                );
+            }
         }
     }
+
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = gpu_state {
+        let n = slot_map.len();
+        if n > 0 && rewards.iter().any(|&r| r > 0.0) {
+            gpu.cells.upload_rewards(&rewards);
+            gpu.hebbian.compute_persistent(&gpu.cells, n, LEARNING_RATE);
+        }
+    }
+    let _ = rewards;
 }
 
 fn sync_transforms(mut cells: Query<(&CellEntity, &mut Transform), Without<Dying>>) {
@@ -1120,6 +1312,8 @@ fn cell_reproduces_on_threshold(
     cell_mesh: Res<CellMesh>,
     mut lineage_materials: ResMut<LineageMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut slot_map: ResMut<CellSlotMap>,
+    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut commands: Commands,
 ) {
     let current_pop = cells.iter().count();
@@ -1128,7 +1322,6 @@ fn cell_reproduces_on_threshold(
     }
     let budget = MAX_POPULATION - current_pop;
 
-    // Sprint 40: extract collect/pair/spawn fáze. Pairing logika v lib helperu.
     let fertile: Vec<(Entity, [f32; 3])> = cells
         .iter()
         .filter(|(_, c)| {
@@ -1141,6 +1334,22 @@ fn cell_reproduces_on_threshold(
     let mating_r2 = MATING_RADIUS * MATING_RADIUS;
     let matings = bioscape::pair_fertile(&fertile, mating_r2, budget);
 
+    // Sprint 52: před crossover sync parent brains z GPU (post-Hebbian je
+    // canonical). Pokud GPU available; jinak no-op (CPU brain je canonical).
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = gpu_state.as_ref() {
+        for &(a, b) in &matings {
+            if let (Some(slot_a), Some(slot_b)) = (slot_map.slot_of(a), slot_map.slot_of(b)) {
+                let brain_a = gpu.cells.download_brain_at(slot_a);
+                let brain_b = gpu.cells.download_brain_at(slot_b);
+                if let Ok([(_, mut ca), (_, mut cb)]) = cells.get_many_mut([a, b]) {
+                    ca.0.genome.brain = brain_a;
+                    cb.0.genome.brain = brain_b;
+                }
+            }
+        }
+    }
+
     let mut rng = rand::rng();
     let mut to_spawn: Vec<Cell> = Vec::new();
     for (a, b) in matings {
@@ -1149,8 +1358,6 @@ fn cell_reproduces_on_threshold(
         };
         cell_a.0.energy *= 0.5;
         cell_b.0.energy *= 0.5;
-        // Sprint 42: refractory period — oba rodiče nemůžou znovu mating
-        // po MATING_COOLDOWN_TICKS.
         cell_a.0.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
         cell_b.0.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
         to_spawn.push(bioscape::make_mating_child(&cell_a.0, &cell_b.0, &mut rng));
@@ -1159,14 +1366,27 @@ fn cell_reproduces_on_threshold(
     let mesh = cell_mesh.0.clone();
     for cell in to_spawn {
         let mat = lineage_material(&mut lineage_materials, &mut materials, cell.lineage_id);
-        commands.spawn((
-            CellEntity(cell),
-            Mesh3d(mesh.clone()),
-            MeshMaterial3d(mat),
-            Transform::from_xyz(cell.position[0], cell.position[1], cell.position[2])
-                .with_rotation(cell_rotation(cell.heading, cell.pitch))
-                .with_scale(cell_scale(&cell.phenotype)),
-        ));
+        let entity = commands
+            .spawn((
+                CellEntity(cell),
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(mat),
+                Transform::from_xyz(cell.position[0], cell.position[1], cell.position[2])
+                    .with_rotation(cell_rotation(cell.heading, cell.pitch))
+                    .with_scale(cell_scale(&cell.phenotype)),
+            ))
+            .id();
+        let slot = slot_map.allocate(entity);
+        // Sprint 52: upload child brain + xoshiro seed na nový slot.
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = gpu_state.as_ref() {
+            gpu.cells.upload_brain_at(slot, &cell.genome.brain);
+            gpu.cells.upload_xoshiro_seed_at(
+                slot,
+                cell.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
+            );
+        }
+        let _ = slot;
     }
 }
 
@@ -1175,6 +1395,8 @@ fn cell_dies_on_zero_energy(
     extent: Res<WorldExtent>,
     food_mesh: Res<FoodMesh>,
     food_material: Res<FoodMaterial>,
+    mut slot_map: ResMut<CellSlotMap>,
+    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut commands: Commands,
 ) {
     let mut rng = rand::rng();
@@ -1198,6 +1420,21 @@ fn cell_dies_on_zero_energy(
                     MeshMaterial3d(food_material.0.clone()),
                     Transform::from_xyz(pos[0], pos[1], pos[2]),
                 ));
+            }
+            // Sprint 52: release slot ihned na Dying. Entity ještě existuje
+            // pro fade animaci (Without<Dying> ji vyloučí ze sim systems).
+            // GPU swap_to drží sloty dense.
+            if let Some((freed_slot, moved)) = slot_map.release(entity) {
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = gpu_state.as_ref() {
+                    if let Some(_moved_entity) = moved {
+                        // moved cell je ve slot_map.slot_of(moved_entity) = freed_slot
+                        // teď. Source je old_slot = current cell count (po release).
+                        gpu.cells.swap_to(freed_slot, slot_map.len());
+                    }
+                }
+                let _ = freed_slot;
+                let _ = moved;
             }
         }
     }

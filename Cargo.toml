@@ -57,7 +57,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.4", optional = true }
 
 [features]
-default = []
+default = ["gpu"]
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 # Speeds up incremental rebuilds during development.
 # Run with: cargo run --features dev
