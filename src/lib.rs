@@ -44,7 +44,7 @@ pub const MAX_POPULATION: usize = 1000;
 
 pub const CELL_RADIUS: f32 = 5.0;
 pub const EAT_RADIUS: f32 = 8.0;
-pub const MATING_RADIUS: f32 = 100.0;
+pub const MATING_RADIUS: f32 = 200.0;
 
 pub const DRAG_COEFFICIENT: f32 = 0.005;
 pub const ANGULAR_DRAG: f32 = 1.0;
