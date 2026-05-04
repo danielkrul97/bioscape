@@ -123,16 +123,128 @@ plně 3D s 7-point Jacobi diffusion.
     chemistry je více detailní než horizontální. Sprint 54+ může equalizovat
     podle measured selection pressure.
 
-## Sprinty 54–62 — open-ended
+## Sprint 54 — toroidal world (cylinder topology)
 
-- **Sprint 54: GPU field stack 3D migrace.** `field_diffuse_3d.wgsl` 7-point
-  stencil + atomic float CAS. SensorGatherGpu (Sprint 50) read 3D field grid.
-  Re-enable 2 ignored tests.
-- **Sprint 55+:** 3D voxel rendering renderer overlay (Bevy `Mesh3d`
-  voxelmesh nebo iso-surfaces).
-- **Sprint 56+:** progressive z expansion (z=30, z=50) s adaptive selection
-  monitoring.
-- **Sprint 57+:** thermal stratification — temperature field z-gradient
-  ovlivňuje cell metabolism / behavior.
-- **Sprint 58+:** light field (z-attenuation) — photic vs aphotic zones,
-  chemosynthesis vs photosynthesis evolutionary niche.
+- **Cíl:** odstranit edge bias z reflective xy walls. Cells na opačných
+  koncích světa se vidí jako sousedé přes wrap, smell/pheromone gradient
+  pole jsou kontinuální (žádný degenerated Neumann boundary). Z osa zůstává
+  bounded (gravita + food sink + carrion drop vyžadují pevný strop/dno) →
+  cylinder topology, ne plný torus. Pre-Sprint-54 cells akumulovaly u zdí
+  (Sprint 30+ `edge_frac`/`corner_frac` metriky), evoluce našla wall exploit
+  (těsné otáčení), pole degenerovaly u krajů.
+
+  **Plán implementace:**
+
+  *Body 1 — `lib.rs` core helpers:*
+  - `pub fn min_image_delta(a, b, world_half) -> [f32; 3]`: signed delta s
+    minimum-image konvencí na xy (|dx|, |dy| ≤ world_half), dz beze změny.
+  - `pub fn wrap_position_xy(pos, world_half) -> [f32; 3]`: modulo wrap xy
+    do `[-half, half)`, z beze změny.
+  - `Cell::apply_world_bounce` re-fits semantiku: xy modulo wrap (žádný
+    velocity flip, žádný heading recompute), z stále bounce.
+  - `SmellField::idx_of` xy wrap (rem_euclid), z bounded.
+  - `SmellField::step` 7-point Jacobi: xy wrap stencil (i=0 čte i=nx-1, atd.),
+    z stále Neumann zero-flux (ground/ceiling).
+  - `WorldMap::sample` xy wrap (rem_euclid), z clamp.
+  - `BrainSensors.nearest_food` / `nearest_cell` semantika: nyní min-imaged
+    delta `[dx, dy, dz]` (signed), ne absolutní target pozice. populate_brain_inputs
+    odstranil `target − pos` math; používá delta přímo.
+  - `pair_fertile` rozšířen o `world_half: [f32; 3]` parametr; používá
+    `min_image_delta`.
+
+  *Body 2 — `SpatialGrid::for_each_in_radius_toroidal`:*
+  - Nová metoda nad `for_each_in_radius`. Center query + až 8 ghost queries
+    (4 edges + 4 corners) podle blízkosti pos k xy boundary. Z není wrapped.
+  - For pos uvnitř world (ne blízko edge): 1 query, žádný overhead.
+  - For corner cell (do `radius` od obou xy boundary): 9 queries (1 center +
+    4 edges + 4 corners). ~5% cells typicky — overall overhead < 20%.
+
+  *Body 3 — callsite migrace (headless + main):*
+  - **headless** (3 brain_act variants, predate herd+attack, resolve_collisions,
+    eat_food, spawn_food exclusion, pair_fertile call, nn_dist diagnostic):
+    `for_each_in_radius` → `for_each_in_radius_toroidal(WORLD_HALF)`,
+    raw `dx = a − b` → `bioscape::min_image_delta(a, b, WORLD_HALF)`. eat_food
+    a spawn_food používají "ghost food" pattern: před `cell.try_eat()` pos
+    food.position adjustnut o min-image delta aby cell.eat_test ellipsoid
+    acceptance match toroidal frame.
+  - **main** (cells_brain_act gather closure, predate herd+attack,
+    resolve_cell_collisions, cell_eats_food, spawn_food, pair_fertile call):
+    stejný pattern s `SIMULATION_HALF`.
+
+  *Body 4 — GPU step.wgsl wrap:*
+  - Sprint 50 step shader měl `apply_world_bounce` se reflective xy.
+    Sprint 54 nahrazuje xy wrap (modulo) + z bounce, match Cell::step
+    Sprint 54 semantiku. step_gpu_matches_cpu parity test stále prochází.
+  - **GPU spatial broad-phase shadery** (`spatial_hash`, `cell_neighbors`,
+    `collision`, `predate`, `sensor_gather`) zůstávají pre-Sprint-54 (raw
+    bucket clamp + raw distance). Tyto shadery jsou v Sprint 50 standalone +
+    parity tests, nikoliv v `--gpu-full` headless ani renderer GPU default
+    hot path → žádný immediate breakage. Migrace na toroidal bucket modulo +
+    min-image distance je Sprint 55+ work.
+
+  *Body 5 — testy aktualizace:*
+  - `step_bounce_recomputes_heading` → `step_xy_wraps_toroidal`: testuje
+    cell na pos x=99 s vel +60 dt=1 → wrap na x=-41, žádný velocity flip,
+    heading beze změny.
+  - `world_map_sample_clamps_to_world_bounds` → `world_map_sample_xy_wraps_z_clamps`:
+    sample(+half_x) ekvivalentní sample(-half_x), z out-of-range clampuje.
+
+- **Konstanty:** žádné nové.
+
+- **Výstup:**
+  - `lib.rs`: 2 nové pub fn helpers, BrainSensors semantic change (delta vs
+    abs pos), pair_fertile signature + 1 new param, SmellField + WorldMap
+    sample/step toroidal, Cell::apply_world_bounce wrap.
+  - `src/bin/headless.rs`: ~12 callsiteů (3 sensor gather variants + collisions +
+    predate + eat + spawn + nn + pair_fertile) updated.
+  - `src/main.rs`: ~7 Bevy systems updated (gather closure, herd, predate,
+    collision, eat, spawn, pair_fertile call).
+  - `shaders/step.wgsl`: bounce → wrap xy + z bounce. Match CPU semantiku.
+  - **2 lib testy updated** (step wrap, worldmap wrap). **71/71 testů pass +
+    2 ignored** (Sprint 54+ GPU field 3D + GPU spatial wrap follow-up).
+  - **Smoke (seed=0, 60 gen):** pop 200 → 1000 (gen 3 saturated) → 548
+    (gen 60). Lineages 200 → 47. Predation 1921 → 7514 events/gen. **Žádná
+    extinkce.** `corner_frac` stays ≤ 1.6% napříč generacemi (vs reflective
+    borders kde Sprint 30+ `edge_frac` typicky 0.4-0.6 = cells akumulované u
+    krajů). `mean_x` ≈ 0 ± 0.05 (žádný drift).
+  - **Renderer smoke:** Bevy launch OK, GPU init `cap 1064`, no panic.
+
+- **Poznámky:**
+  - **Cylinder vs full torus:** xy wraps, z bounded. Důvody: (1) gravity
+    Sprint 38 modeluje fluid sink — celá fluid column má top/bottom; (2) food
+    sink rate by byl meaningless v wrapped z; (3) carrion drop semantika
+    "drops to floor" potřebuje floor.
+  - **CSV identity break:** trajectory diverguje od pre-Sprint-54 baseline
+    (různý wrap vs bounce, různé sensor delta normalizace). Sprint 41/42/43
+    už CSV identity nezachovaly; consistent.
+  - **Edge bias eliminován:** corner_frac drops, mean_x ≈ 0. Ekologie nyní
+    homogenní napříč prostorem. Selection nemůže favorizovat wall-exploit
+    strategy (nemá kde).
+  - **Smell/pheromone fields kontinuální:** 7-point toroidal stencil =
+    žádný gradient degeneration u xy boundary. Sprint 25+ pheromone signaling
+    funguje v plném prostoru bez border artefaktů.
+  - **GPU production fáze nedotčená:** Sprint 51 `--gpu-full` headless +
+    Sprint 52 renderer GPU default používají BrainGpu/HebbianGpu/BrownianGpu
+    + CPU sensor gather. CPU gather je toroidal (Sprint 54 callsites).
+    GPU spatial broad-phase shadery (Sprint 45/49/50) jsou test-only mimo
+    hot path; jejich migrace na toroidal je Sprint 55+ follow-up.
+  - **Co Sprint 54 NEŘEŠÍ (Sprint 55+):**
+    - GPU spatial_hash bucket modulo (`bucket_id_of` clamp → mod).
+    - GPU cell_neighbors / collision / predate / sensor_gather min-image
+      distance + ghost queries.
+    - GPU FieldGpu 7-point toroidal stencil (Sprint 53 already deferred).
+    - Renderer "ghost cell" rendering — cell na x=−950 visualizována i jako
+      duplicate na x=+970 (smooth wrap visual). Aktuálně cell skipne přes
+      okraj.
+
+## Sprinty 55–62 — open-ended
+
+- **Sprint 55: GPU spatial broad-phase toroidal.** Update spatial_hash /
+  cell_neighbors / collision / predate / sensor_gather WGSL na bucket
+  modulo + min-image distance.
+- **Sprint 56: GPU FieldGpu 3D + toroidal.** field_diffuse_3d.wgsl 7-point
+  stencil with xy wrap.
+- **Sprint 57+:** 3D voxel rendering, ghost cell visual wrap.
+- **Sprint 58+:** progressive z expansion (z=30, z=50).
+- **Sprint 59+:** thermal stratification (temperature field z-gradient).
+- **Sprint 60+:** light field z-attenuation (photic vs aphotic zones).

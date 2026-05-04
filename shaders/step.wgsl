@@ -115,24 +115,21 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let attack_strength = max(attack, 0.0);
     energy = energy - attack_strength * params.attack_cost_per_sec * params.dt;
 
-    // apply_world_bounce
-    var bounced_xy: bool = false;
-    if (abs(pos.x) > params.world_half_x) {
-        vel.x = -vel.x;
-        pos.x = clamp(pos.x, -params.world_half_x, params.world_half_x);
-        bounced_xy = true;
+    // Sprint 54: toroidal xy wrap (cylinder topology), z bounce. Matches
+    // CPU `Cell::apply_world_bounce` Sprint 54 semantiku.
+    let wx = 2.0 * params.world_half_x;
+    let wy = 2.0 * params.world_half_y;
+    if (pos.x >= params.world_half_x || pos.x < -params.world_half_x) {
+        let p = pos.x + params.world_half_x;
+        pos.x = p - floor(p / wx) * wx - params.world_half_x;
     }
-    if (abs(pos.y) > params.world_half_y) {
-        vel.y = -vel.y;
-        pos.y = clamp(pos.y, -params.world_half_y, params.world_half_y);
-        bounced_xy = true;
+    if (pos.y >= params.world_half_y || pos.y < -params.world_half_y) {
+        let p = pos.y + params.world_half_y;
+        pos.y = p - floor(p / wy) * wy - params.world_half_y;
     }
     if (params.world_half_z > 0.0 && abs(pos.z) > params.world_half_z) {
         vel.z = -vel.z;
         pos.z = clamp(pos.z, -params.world_half_z, params.world_half_z);
-    }
-    if (bounced_xy) {
-        heading = atan2(vel.y, vel.x);
     }
 
     positions[i * 3u + 0u] = pos.x;

@@ -45,6 +45,13 @@ use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+#[derive(Resource, Default)]
+struct TickCounter {
+    ticks_this_frame: u32,
+    sim_ms_this_frame: f64,
+    tick_start: Option<Instant>,
+}
+
 // Renderer-only knobs. Sim parameters live in `bioscape` (lib.rs).
 // Sprint 53: zmenšeno z 2.5 (Sprint 53 volumetric expansion 10× food count
 // dělalo 2.5 mesh visuálně dominantní).
@@ -294,17 +301,15 @@ fn main() {
         .register_diagnostic(Diagnostic::new(DIAG_PHEROMONE).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_GRID_REBUILD).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_SYNC_TRANSFORMS).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_TICKS_PER_FRAME).with_suffix(" ticks"))
+        .register_diagnostic(Diagnostic::new(DIAG_RENDER_OVERHEAD).with_suffix(" ms"))
+        .init_resource::<TickCounter>()
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`
         // (rich zones jsou bílé, poor zelené). Margins jsou bílé.
         .insert_resource(ClearColor(Color::WHITE))
         .init_resource::<LineageMaterials>()
         .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
-        // Cap virtual-time delta na 50 ms — limit catch-up ticků FixedUpdate
-        // (~3 při 60 Hz) po lag spike. Default 250 ms by povolil 15 ticků a
-        // exponenciálně by dohánělo zpoždění (death spiral). Sim po lagu poběží
-        // pomaleji než real time, ale zotaví se.
-        .insert_resource(Time::<Virtual>::from_max_delta(Duration::from_millis(50)))
         .insert_resource(Clock(SimClock::new(
             TICKS_PER_GENERATION,
             GENERATIONS_PER_EPOCH,
@@ -314,30 +319,38 @@ fn main() {
         .init_resource::<FoodDensityFactor>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
-        .add_systems(Startup, (setup, setup_stats_overlay, rebuild_cell_grid).chain())
+        .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay, rebuild_cell_grid).chain())
         .add_systems(
             FixedUpdate,
             (
-                advance_clock,
-                update_food_density_cycle,
-                rebuild_food_grid,
-                update_smell_field,
-                update_pheromone_field,
-                cells_brain_act,
-                emit_pheromones,
-                apply_cell_morph,
-                apply_brownian_motion,
-                step_cells,
-                apply_food_gravity,
-                apply_environmental_hazards,
-                rebuild_cell_grid,
-                resolve_cell_collisions,
-                cell_predates_on_neighbor,
-                cell_eats_food,
-                spawn_food,
-                cell_reproduces_on_threshold,
-                cell_dies_on_zero_energy,
-                tick_death_fade,
+                (
+                    tick_start,
+                    advance_clock,
+                    update_food_density_cycle,
+                    rebuild_food_grid,
+                    update_smell_field,
+                    update_pheromone_field,
+                    cells_brain_act,
+                    emit_pheromones,
+                    apply_cell_morph,
+                    apply_brownian_motion,
+                )
+                    .chain(),
+                (
+                    step_cells,
+                    apply_food_gravity,
+                    apply_environmental_hazards,
+                    rebuild_cell_grid,
+                    resolve_cell_collisions,
+                    cell_predates_on_neighbor,
+                    cell_eats_food,
+                    spawn_food,
+                    cell_reproduces_on_threshold,
+                    cell_dies_on_zero_energy,
+                    tick_death_fade,
+                    tick_end,
+                )
+                    .chain(),
             )
                 .chain(),
         )
@@ -354,6 +367,7 @@ fn main() {
                 toggle_stats_overlay,
                 toggle_world_map_overlay,
                 update_stats_overlay,
+                report_frame_diagnostics,
             ),
         )
         .run();
@@ -647,6 +661,52 @@ fn update_food_density_cycle(
     factor.0 = 1.0 + CYCLE_AMPLITUDE * phase.sin();
 }
 
+/// Cap virtual-time delta na 50 ms — limit catch-up FixedUpdate ticků (~4 při
+/// 60 Hz) po lag spike. Default 250 ms (Bevy's `DEFAULT_MAX_DELTA`) by povolil
+/// 15+ ticků a exponenciálně by dohánělo zpoždění (death spiral). Sim po lagu
+/// poběží pomaleji než real time, ale zotaví se.
+///
+/// Musí běžet jako Startup systém přes ResMut, ne přes `insert_resource` v
+/// `App` builderu — `DefaultPlugins.build()` přepíše Time<Virtual> až po
+/// našem `insert_resource`, takže ten by se ztratil.
+fn setup_time_cap(mut virtual_time: ResMut<Time<Virtual>>) {
+    virtual_time.set_max_delta(Duration::from_millis(50));
+    info!(
+        "Time<Virtual>::max_delta capped to {:?}",
+        virtual_time.max_delta()
+    );
+}
+
+fn tick_start(mut counter: ResMut<TickCounter>) {
+    counter.tick_start = Some(Instant::now());
+}
+
+fn tick_end(mut counter: ResMut<TickCounter>) {
+    if let Some(t0) = counter.tick_start.take() {
+        counter.sim_ms_this_frame += t0.elapsed().as_secs_f64() * 1000.0;
+    }
+    counter.ticks_this_frame += 1;
+}
+
+fn report_frame_diagnostics(
+    mut counter: ResMut<TickCounter>,
+    diag_store: Res<DiagnosticsStore>,
+    mut diag: Diagnostics,
+) {
+    let ticks = counter.ticks_this_frame;
+    let sim_ms = counter.sim_ms_this_frame;
+    counter.ticks_this_frame = 0;
+    counter.sim_ms_this_frame = 0.0;
+    diag.add_measurement(&DIAG_TICKS_PER_FRAME, || ticks as f64);
+    let frame_ms = diag_store
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.value())
+        .unwrap_or(0.0);
+    if frame_ms > 0.0 {
+        diag.add_measurement(&DIAG_RENDER_OVERHEAD, || (frame_ms - sim_ms).max(0.0));
+    }
+}
+
 fn advance_clock(
     mut clock: ResMut<Clock>,
     mut generation_ended: MessageWriter<GenerationEnded>,
@@ -832,14 +892,12 @@ fn cells_brain_act(
         let vr2 = vision_r * vision_r;
         let mut nearest_food: Option<[f32; 3]> = None;
         let mut best_food_d2 = f32::MAX;
-        food_grid.0.for_each_in_radius(pos, vision_r, |_, fp, _| {
-            let dx = fp[0] - pos[0];
-            let dy = fp[1] - pos[1];
-            let dz = fp[2] - pos[2];
-            let d2 = dx * dx + dy * dy + dz * dz;
+        food_grid.0.for_each_in_radius_toroidal(pos, vision_r, SIMULATION_HALF, |_, fp, _| {
+            let d = bioscape::min_image_delta(pos, fp, SIMULATION_HALF);
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if d2 <= vr2 && d2 < best_food_d2 {
                 best_food_d2 = d2;
-                nearest_food = Some(fp);
+                nearest_food = Some(d);
             }
         });
         let mut nearest_cell: Option<([f32; 3], f32)> = None;
@@ -847,19 +905,17 @@ fn cells_brain_act(
         let mut neighbors_in_vision: u32 = 0;
         cell_grid
             .0
-            .for_each_in_radius(pos, vision_r, |other, other_pos, other_radius| {
+            .for_each_in_radius_toroidal(pos, vision_r, SIMULATION_HALF, |other, other_pos, other_radius| {
                 if other == entity {
                     return;
                 }
-                let dx = other_pos[0] - pos[0];
-                let dy = other_pos[1] - pos[1];
-                let dz = other_pos[2] - pos[2];
-                let d2 = dx * dx + dy * dy + dz * dz;
+                let d = bioscape::min_image_delta(pos, other_pos, SIMULATION_HALF);
+                let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                 if d2 <= vr2 {
                     neighbors_in_vision += 1;
                     if d2 < best_cell_d2 {
                         best_cell_d2 = d2;
-                        nearest_cell = Some((other_pos, other_radius));
+                        nearest_cell = Some((d, other_radius));
                     }
                 }
             });
@@ -966,20 +1022,21 @@ fn spawn_food(
                 continue;
             }
             let mut blocked = false;
-            cell_grid
-                .0
-                .for_each_in_radius(candidate.position, broad_r, |_, cell_pos, radius| {
+            cell_grid.0.for_each_in_radius_toroidal(
+                candidate.position,
+                broad_r,
+                SIMULATION_HALF,
+                |_, cell_pos, radius| {
                     if blocked {
                         return;
                     }
                     let exclusion = EAT_RADIUS * radius;
-                    let dx = candidate.position[0] - cell_pos[0];
-                    let dy = candidate.position[1] - cell_pos[1];
-                    let dz = candidate.position[2] - cell_pos[2];
-                    if dx * dx + dy * dy + dz * dz < exclusion * exclusion {
+                    let d = bioscape::min_image_delta(candidate.position, cell_pos, SIMULATION_HALF);
+                    if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < exclusion * exclusion {
                         blocked = true;
                     }
-                });
+                },
+            );
             if !blocked {
                 commands.spawn((
                     FoodEntity(candidate),
@@ -1029,13 +1086,18 @@ fn cell_eats_food(
         let pos = cell.0.position;
         let eat_r = EAT_RADIUS * cell.0.phenotype.max_axis();
         let mut to_eat: Option<(Entity, Food)> = None;
-        food_grid.0.for_each_in_radius(pos, eat_r, |food_e, food_pos, _| {
+        food_grid.0.for_each_in_radius_toroidal(pos, eat_r, SIMULATION_HALF, |food_e, food_pos, _| {
             if to_eat.is_some() || eaten.contains(&food_e) {
                 return;
             }
-            let food = Food { position: food_pos, age_ticks: 0 };
-            if cell.0.eat_test(&food, EAT_RADIUS) {
-                to_eat = Some((food_e, food));
+            // Sprint 54: ghost food s min-imaged position pro toroidal eat_test.
+            let md = bioscape::min_image_delta(pos, food_pos, SIMULATION_HALF);
+            let ghost = Food {
+                position: [pos[0] + md[0], pos[1] + md[1], food_pos[2]],
+                age_ticks: 0,
+            };
+            if cell.0.eat_test(&ghost, EAT_RADIUS) {
+                to_eat = Some((food_e, ghost));
             }
         });
         if let Some((food_e, food)) = to_eat {
@@ -1426,7 +1488,7 @@ fn cell_reproduces_on_threshold(
         .map(|(e, c)| (e, c.0.position))
         .collect();
     let mating_r2 = MATING_RADIUS * MATING_RADIUS;
-    let matings = bioscape::pair_fertile(&fertile, mating_r2, budget);
+    let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, SIMULATION_HALF);
 
     // Sprint 52: před crossover sync parent brains z GPU (post-Hebbian je
     // canonical). Pokud GPU available; jinak no-op (CPU brain je canonical).
@@ -1582,13 +1644,12 @@ fn cell_predates_on_neighbor(
         let pos = cell.0.position;
         let mut count: u32 = 0;
         grid.0
-            .for_each_in_radius(pos, HERD_RADIUS, |other, other_pos, _| {
+            .for_each_in_radius_toroidal(pos, HERD_RADIUS, SIMULATION_HALF, |other, other_pos, _| {
                 if other == entity {
                     return;
                 }
-                let dx = other_pos[0] - pos[0];
-                let dy = other_pos[1] - pos[1];
-                if dx * dx + dy * dy < herd_r2 {
+                let d = bioscape::min_image_delta(pos, other_pos, SIMULATION_HALF);
+                if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < herd_r2 {
                     count += 1;
                 }
             });
@@ -1607,7 +1668,7 @@ fn cell_predates_on_neighbor(
         let broad_r = CELL_RADIUS * (radius_a + BROAD_PHASE_SIZE_BUDGET);
 
         grid.0
-            .for_each_in_radius(pos_a, broad_r, |entity_b, pos_b, radius_b| {
+            .for_each_in_radius_toroidal(pos_a, broad_r, SIMULATION_HALF, |entity_b, pos_b, radius_b| {
                 if entity_b == entity_a {
                     return;
                 }
@@ -1616,15 +1677,16 @@ fn cell_predates_on_neighbor(
                 }
                 let pair_r = CELL_RADIUS * (radius_a + radius_b);
                 let pair_r2 = pair_r * pair_r;
-                let dx = pos_a[0] - pos_b[0];
-                let dy = pos_a[1] - pos_b[1];
-                let d2 = dx * dx + dy * dy;
+                // Sprint 54: min-image delta a→b. Spike bonus volá `spike_bonus_against`
+                // s pos_b — pro toroidal upravíme target pos do min-image frame.
+                let d = bioscape::min_image_delta(pos_a, pos_b, SIMULATION_HALF);
+                let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                 if d2 >= pair_r2 {
                     return;
                 }
-                let bonus = cell_a.0.spike_bonus_against(pos_b);
+                let ghost_b = [pos_a[0] + d[0], pos_a[1] + d[1], pos_a[2] + d[2]];
+                let bonus = cell_a.0.spike_bonus_against(ghost_b);
                 let gain_raw = PREDATION_GAIN_PER_TICK + bonus;
-                // Sprint 29 dilution: gain × 1/(1 + K × n_neighbors_prey).
                 let prey_neighbors = *herd_counts.get(&entity_b).unwrap_or(&0);
                 let dilution = 1.0 / (1.0 + DILUTION_K * prey_neighbors as f32);
                 let gain = gain_raw * dilution;
@@ -1661,20 +1723,20 @@ fn resolve_cell_collisions(
         let broad_r = CELL_RADIUS * (radius_a + BROAD_PHASE_SIZE_BUDGET);
         let mut delta = [0.0_f32, 0.0_f32];
         grid.0
-            .for_each_in_radius(pos_a, broad_r, |entity_b, pos_b, radius_b| {
+            .for_each_in_radius_toroidal(pos_a, broad_r, SIMULATION_HALF, |entity_b, pos_b, radius_b| {
                 if entity_b == entity_a {
                     return;
                 }
                 let pair_r = CELL_RADIUS * (radius_a + radius_b);
                 let pair_r2 = pair_r * pair_r;
-                let dx = pos_a[0] - pos_b[0];
-                let dy = pos_a[1] - pos_b[1];
-                let d2 = dx * dx + dy * dy;
+                // Sprint 54: min-image delta b→a (push direction).
+                let d_vec = bioscape::min_image_delta(pos_b, pos_a, SIMULATION_HALF);
+                let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
                 if d2 < pair_r2 && d2 > 0.0 {
                     let d = d2.sqrt();
                     let overlap = pair_r - d;
-                    delta[0] += (dx / d) * overlap * 0.5;
-                    delta[1] += (dy / d) * overlap * 0.5;
+                    delta[0] += (d_vec[0] / d) * overlap * 0.5;
+                    delta[1] += (d_vec[1] / d) * overlap * 0.5;
                 }
             });
         if delta != [0.0, 0.0] {

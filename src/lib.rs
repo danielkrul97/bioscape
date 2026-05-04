@@ -929,30 +929,32 @@ impl Cell {
         self.energy -= attack_strength * ATTACK_COST_PER_SEC * dt;
     }
 
-    /// Sprint 40: world boundary bounce. xy walls flippují velocity + clamp;
-    /// z bounce active jen když half_z > 0. Bounce na xy zdi recomputuje
-    /// heading, pitch zůstává (z-bounce nemá heading effekt).
+    /// Sprint 54: xy modulo wrap (toroidal cylinder topology), z bounce.
+    /// Pre-Sprint-54 byly xy walls reflective → cells akumulovaly u krajů
+    /// (Sprint 30+ edge_frac/corner_frac metriky), evoluce mohla najít wall
+    /// exploit (těsné otáčení před stěnou), smell/pheromone gradients
+    /// degenerovaly u Neumann boundary. Toroidal odstraní edge bias —
+    /// cell na x=−950 sousedí s cell na x=+950. Z osa zůstává bounded
+    /// (gravita + food sink + carrion drop vyžadují pevný strop/dno).
     fn apply_world_bounce(&mut self, world_half: [f32; 3]) {
-        let mut bounced_xy = false;
-        if self.position[0].abs() > world_half[0] {
-            self.velocity[0] = -self.velocity[0];
-            self.position[0] = self.position[0].clamp(-world_half[0], world_half[0]);
-            bounced_xy = true;
+        let wx = 2.0 * world_half[0];
+        let wy = 2.0 * world_half[1];
+        // xy wrap (toroidal): pozice → [-half, half).
+        if self.position[0] >= world_half[0] || self.position[0] < -world_half[0] {
+            // rem_euclid emulace pro f32: pos - floor((pos + half) / w) * w.
+            let p = self.position[0] + world_half[0];
+            self.position[0] = p - (p / wx).floor() * wx - world_half[0];
         }
-        if self.position[1].abs() > world_half[1] {
-            self.velocity[1] = -self.velocity[1];
-            self.position[1] = self.position[1].clamp(-world_half[1], world_half[1]);
-            bounced_xy = true;
+        if self.position[1] >= world_half[1] || self.position[1] < -world_half[1] {
+            let p = self.position[1] + world_half[1];
+            self.position[1] = p - (p / wy).floor() * wy - world_half[1];
         }
-        // Sprint 32: z-bounce no-op pro half_z=0 (žádný drift, position[2]=0).
+        // z stále bounce.
         if world_half[2] > 0.0 && self.position[2].abs() > world_half[2] {
             self.velocity[2] = -self.velocity[2];
             self.position[2] = self.position[2].clamp(-world_half[2], world_half[2]);
         }
-        if bounced_xy {
-            // Recompute yaw z xy velocity. Pitch zůstává.
-            self.heading = self.velocity[1].atan2(self.velocity[0]);
-        }
+        // Heading recompute odstraněn — wrap nezmění směr pohybu.
     }
 
     /// Aplikuje runtime morph z brain outputs na phenotype + naúčtuje
@@ -1159,11 +1161,14 @@ pub fn body_basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
 /// vyplní sjednocený `[f32; BRAIN_INPUTS]` array.
 #[derive(Debug, Clone, Copy)]
 pub struct BrainSensors {
+    /// Sprint 54: min-imaged signed delta (target − cell), ne absolutní target
+    /// pozice. Pro toroidal world je delta správný relativní vektor i přes
+    /// world wrap (cell na x=−950 vidí target na x=+950 jako Δx=20, ne 1900).
+    /// Pre-Sprint-54 byl absolute target_pos; populate_brain_inputs odečetl
+    /// cell.position. Po Sprintu 54 je odečtení už hotové (s wrap).
     pub nearest_food: Option<[f32; 3]>,
     pub nearest_cell: Option<([f32; 3], f32)>,
     pub neighbors_in_vision: u32,
-    /// Sprint 53: 3D gradient `[d/dx, d/dy, d/dz]`. Pre-Sprint-53 byl 2D s
-    /// inputs[17] (smell_grad_z) zero-padded; teď populuje plnou z-složku.
     pub smell_grad: [f32; 3],
     pub pheromone_grad: [f32; 3],
 }
@@ -1187,17 +1192,19 @@ pub fn populate_brain_inputs(
     let energy_norm = (cell.energy / REPRODUCE_THRESHOLD).clamp(0.0, 1.5);
 
     let mut inputs = [0.0_f32; BRAIN_INPUTS];
-    if let Some(target) = sensors.nearest_food {
-        inputs[0] = (target[0] - pos[0]) / vision_r;
-        inputs[1] = (target[1] - pos[1]) / vision_r;
-        inputs[15] = (target[2] - pos[2]) / vision_r;
+    if let Some(delta) = sensors.nearest_food {
+        // Sprint 54: BrainSensors už nese min-imaged delta (toroidal-aware).
+        inputs[0] = delta[0] / vision_r;
+        inputs[1] = delta[1] / vision_r;
+        inputs[15] = delta[2] / vision_r;
     }
-    if let Some((target, other_radius)) = sensors.nearest_cell {
-        inputs[2] = (target[0] - pos[0]) / vision_r;
-        inputs[3] = (target[1] - pos[1]) / vision_r;
+    if let Some((delta, other_radius)) = sensors.nearest_cell {
+        inputs[2] = delta[0] / vision_r;
+        inputs[3] = delta[1] / vision_r;
         inputs[6] = (other_radius - my_radius) / my_radius;
-        inputs[16] = (target[2] - pos[2]) / vision_r;
+        inputs[16] = delta[2] / vision_r;
     }
+    let _ = pos;
     inputs[4] = energy_norm;
     inputs[5] = speed_norm;
     inputs[7] = (sensors.smell_grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
@@ -1235,6 +1242,7 @@ pub fn pair_fertile<I>(
     fertile: &[(I, [f32; 3])],
     mating_r2: f32,
     budget: usize,
+    world_half: [f32; 3],
 ) -> Vec<(I, I)>
 where
     I: Copy + Eq + std::hash::Hash,
@@ -1255,10 +1263,9 @@ where
             if i == j || paired.contains(&b) {
                 continue;
             }
-            let dx = pos_a[0] - pos_b[0];
-            let dy = pos_a[1] - pos_b[1];
-            let dz = pos_a[2] - pos_b[2];
-            let d2 = dx * dx + dy * dy + dz * dz;
+            // Sprint 54: min-image distance pro toroidal world.
+            let d = min_image_delta(pos_a, pos_b, world_half);
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if d2 <= mating_r2 && best.is_none_or(|(_, bd2)| d2 < bd2) {
                 best = Some((b, d2));
             }
@@ -1344,23 +1351,26 @@ impl SmellField {
         (2.0 * self.world_half[axis]) / self.resolution[axis] as f32
     }
 
+    /// Sprint 54: xy wrap (toroidal), z bounded. Mimo z-volume vrací `None`;
+    /// xy je vždy modulo zarovnaný do gridu.
     fn idx_of(&self, pos: [f32; 3]) -> Option<usize> {
         let cs_x = self.cell_size(0);
         let cs_y = self.cell_size(1);
         let cs_z = self.cell_size(2);
-        let xi = ((pos[0] + self.world_half[0]) / cs_x).floor() as i32;
-        let yi = ((pos[1] + self.world_half[1]) / cs_y).floor() as i32;
-        let zi = ((pos[2] + self.world_half[2]) / cs_z).floor() as i32;
         let nx = self.resolution[0] as i32;
         let ny = self.resolution[1] as i32;
         let nz = self.resolution[2] as i32;
-        if xi < 0 || xi >= nx || yi < 0 || yi >= ny || zi < 0 || zi >= nz {
-            None
-        } else {
-            let nx = self.resolution[0];
-            let ny = self.resolution[1];
-            Some((zi as usize) * nx * ny + (yi as usize) * nx + xi as usize)
+        let xi = ((pos[0] + self.world_half[0]) / cs_x).floor() as i32;
+        let yi = ((pos[1] + self.world_half[1]) / cs_y).floor() as i32;
+        let zi = ((pos[2] + self.world_half[2]) / cs_z).floor() as i32;
+        if zi < 0 || zi >= nz {
+            return None;
         }
+        let xi_mod = xi.rem_euclid(nx) as usize;
+        let yi_mod = yi.rem_euclid(ny) as usize;
+        let nx_us = self.resolution[0];
+        let ny_us = self.resolution[1];
+        Some((zi as usize) * nx_us * ny_us + yi_mod * nx_us + xi_mod)
     }
 
     pub fn add_source(&mut self, pos: [f32; 3], amount: f32) {
@@ -1369,8 +1379,10 @@ impl SmellField {
         }
     }
 
-    /// 7-point Jacobi stencil + multiplicative decay. Stable pro
-    /// `diffusion < 1/6` (3D Laplacian má koeficient 6).
+    /// 7-point Jacobi stencil + multiplicative decay. Sprint 54: toroidal v
+    /// xy (left at i=0 čte sloupec i=nx-1, atd.), Neumann zero-flux na z
+    /// (z=0 a z=nz-1 fallback na center — odpovídá ground/ceiling, ne wrap).
+    /// Stable pro `diffusion < 1/6`.
     pub fn step(&mut self, diffusion: f32, decay_per_sec: f32, dt: f32) {
         let nx = self.resolution[0];
         let ny = self.resolution[1];
@@ -1382,10 +1394,16 @@ impl SmellField {
                 for i in 0..nx {
                     let idx = k * plane + j * nx + i;
                     let center = self.grid[idx];
-                    let left = if i > 0 { self.grid[idx - 1] } else { center };
-                    let right = if i + 1 < nx { self.grid[idx + 1] } else { center };
-                    let up = if j > 0 { self.grid[idx - nx] } else { center };
-                    let down = if j + 1 < ny { self.grid[idx + nx] } else { center };
+                    // Toroidal xy: wrap kolem indexů.
+                    let i_left = if i == 0 { nx - 1 } else { i - 1 };
+                    let i_right = if i + 1 == nx { 0 } else { i + 1 };
+                    let j_up = if j == 0 { ny - 1 } else { j - 1 };
+                    let j_down = if j + 1 == ny { 0 } else { j + 1 };
+                    let left = self.grid[k * plane + j * nx + i_left];
+                    let right = self.grid[k * plane + j * nx + i_right];
+                    let up = self.grid[k * plane + j_up * nx + i];
+                    let down = self.grid[k * plane + j_down * nx + i];
+                    // z bounded (Neumann): u krajů fallback na center.
                     let back = if k > 0 { self.grid[idx - plane] } else { center };
                     let front = if k + 1 < nz { self.grid[idx + plane] } else { center };
                     let new = center
@@ -1504,6 +1522,7 @@ impl WorldMap {
         }
     }
 
+    /// Sprint 54: xy wrap (toroidal), z clamp (bounded).
     pub fn sample(&self, pos: [f32; 3]) -> f32 {
         let nx = self.resolution[0];
         let ny = self.resolution[1];
@@ -1514,8 +1533,8 @@ impl WorldMap {
         let xi = ((pos[0] + self.world_half[0]) / cs_x).floor() as i32;
         let yi = ((pos[1] + self.world_half[1]) / cs_y).floor() as i32;
         let zi = ((pos[2] + self.world_half[2]) / cs_z).floor() as i32;
-        let xi = xi.clamp(0, nx as i32 - 1) as usize;
-        let yi = yi.clamp(0, ny as i32 - 1) as usize;
+        let xi = xi.rem_euclid(nx as i32) as usize;
+        let yi = yi.rem_euclid(ny as i32) as usize;
         let zi = zi.clamp(0, nz as i32 - 1) as usize;
         self.field[zi * nx * ny + yi * nx + xi]
     }
@@ -1523,6 +1542,53 @@ impl WorldMap {
     pub fn field(&self) -> &[f32] {
         &self.field
     }
+}
+
+/// Sprint 54: minimum-image displacement na toroidal xy + bounded z.
+/// Vrátí signed delta `b - a` adjustnuté tak, že |dx|, |dy| ≤ `world_half`,
+/// dz beze změny (z-osa není wrapped — gravita + food sink + carrion drop
+/// vyžadují pevný strop/dno).
+///
+/// Pro toroidal world: dva body na opačných koncích světa (např. x=−950 a
+/// x=+950 při half=960) jsou minimum-image-blízké (Δx=20, ne 1900).
+pub fn min_image_delta(a: [f32; 3], b: [f32; 3], world_half: [f32; 3]) -> [f32; 3] {
+    let mut dx = b[0] - a[0];
+    let mut dy = b[1] - a[1];
+    let dz = b[2] - a[2];
+    let wx = 2.0 * world_half[0];
+    let wy = 2.0 * world_half[1];
+    if dx > world_half[0] {
+        dx -= wx;
+    } else if dx < -world_half[0] {
+        dx += wx;
+    }
+    if dy > world_half[1] {
+        dy -= wy;
+    } else if dy < -world_half[1] {
+        dy += wy;
+    }
+    [dx, dy, dz]
+}
+
+/// Sprint 54: wrap pos.xy do `[-half, half)` (toroidal). z se nepojí.
+pub fn wrap_position_xy(pos: [f32; 3], world_half: [f32; 3]) -> [f32; 3] {
+    let wx = 2.0 * world_half[0];
+    let wy = 2.0 * world_half[1];
+    let mut x = pos[0];
+    let mut y = pos[1];
+    while x >= world_half[0] {
+        x -= wx;
+    }
+    while x < -world_half[0] {
+        x += wx;
+    }
+    while y >= world_half[1] {
+        y -= wy;
+    }
+    while y < -world_half[1] {
+        y += wy;
+    }
+    [x, y, pos[2]]
 }
 
 /// Sprint 43: 3D uniform spatial hash. Generic přes `Id` (Bevy `Entity` v
@@ -1588,6 +1654,55 @@ impl<Id: Copy + Eq + Hash, P: Copy> SpatialGrid<Id, P> {
                     }
                 }
             }
+        }
+    }
+
+    /// Sprint 54: toroidal-aware query přes ghost positions. Pokud je `pos`
+    /// blízko xy-boundary (do `radius`), vyšleme dodatečné lookup queries do
+    /// "ghost" pozic na opačné straně světa. Z není wrapped (cylinder topology).
+    /// Stejný `f` callback se může volat na duplicate items pokud je radius
+    /// > world_half — caller musí narrow-phase použít `min_image_delta` aby
+    /// duplicates filtroval.
+    pub fn for_each_in_radius_toroidal<F: FnMut(Id, [f32; 3], P)>(
+        &self,
+        pos: [f32; 3],
+        radius: f32,
+        world_half: [f32; 3],
+        mut f: F,
+    ) {
+        // Center query.
+        self.for_each_in_radius(pos, radius, &mut f);
+        let wx = 2.0 * world_half[0];
+        let wy = 2.0 * world_half[1];
+        let near_left = pos[0] < -world_half[0] + radius;
+        let near_right = pos[0] > world_half[0] - radius;
+        let near_bot = pos[1] < -world_half[1] + radius;
+        let near_top = pos[1] > world_half[1] - radius;
+        // Edges (4 ghost positions).
+        if near_left {
+            self.for_each_in_radius([pos[0] + wx, pos[1], pos[2]], radius, &mut f);
+        }
+        if near_right {
+            self.for_each_in_radius([pos[0] - wx, pos[1], pos[2]], radius, &mut f);
+        }
+        if near_bot {
+            self.for_each_in_radius([pos[0], pos[1] + wy, pos[2]], radius, &mut f);
+        }
+        if near_top {
+            self.for_each_in_radius([pos[0], pos[1] - wy, pos[2]], radius, &mut f);
+        }
+        // Corners (4 ghost positions).
+        if near_left && near_bot {
+            self.for_each_in_radius([pos[0] + wx, pos[1] + wy, pos[2]], radius, &mut f);
+        }
+        if near_left && near_top {
+            self.for_each_in_radius([pos[0] + wx, pos[1] - wy, pos[2]], radius, &mut f);
+        }
+        if near_right && near_bot {
+            self.for_each_in_radius([pos[0] - wx, pos[1] + wy, pos[2]], radius, &mut f);
+        }
+        if near_right && near_top {
+            self.for_each_in_radius([pos[0] - wx, pos[1] - wy, pos[2]], radius, &mut f);
         }
     }
 }
@@ -1819,15 +1934,26 @@ mod tests {
     }
 
     #[test]
-    fn step_bounce_recomputes_heading() {
+    fn step_xy_wraps_toroidal() {
+        // Sprint 54: xy wrap (cylinder topology). Cell s pos x=99, vel +60,
+        // dt=1 → integrate kinematic dá pos x=159 → wrap modulo (world half=100,
+        // wrap shift 200) → x=−41. Heading se nepojí (žádný bounce).
         let mut cell = Cell {
             position: [99.0, 0.0, 0.0],
             velocity: [60.0, 0.0, 0.0],
+            heading: 0.0,
             ..base_cell()
         };
         cell.step(1.0, [100.0, 100.0, 0.0], &no_drag_physics(0.0, 0.0));
-        // velocity flipped to (-60, 0), heading should now be π.
-        assert!((cell.heading - core::f32::consts::PI).abs() < 1e-4);
+        assert!(
+            (cell.position[0] - (-41.0)).abs() < 1e-3,
+            "expected pos.x ≈ -41 after wrap, got {}",
+            cell.position[0]
+        );
+        // Velocity beze změny po wrapu.
+        assert!((cell.velocity[0] - 60.0).abs() < 1e-3);
+        // Heading se po wrap nezmění.
+        assert!((cell.heading - 0.0).abs() < 1e-3);
     }
 
     #[test]
@@ -2042,16 +2168,20 @@ mod tests {
     }
 
     #[test]
-    fn world_map_sample_clamps_to_world_bounds() {
+    fn world_map_sample_xy_wraps_z_clamps() {
+        // Sprint 54: xy modulo wrap, z clamp. Inside sample ∈ [0,1].
+        // Bod přesně na +half_x je přes wrap ekvivalentní -half_x.
         let m = WorldMap::new([8, 8, 4], [4, 4, 2], [100.0, 100.0, 50.0], 0);
         let inside = m.sample([99.0, 99.0, 0.0]);
-        let outside_pos = m.sample([1e6, 1e6, 1e6]);
-        let outside_neg = m.sample([-1e6, -1e6, -1e6]);
-        let nx = m.resolution[0];
-        let ny = m.resolution[1];
-        let nz = m.resolution[2];
-        assert_eq!(outside_pos, m.field()[(nz - 1) * nx * ny + (ny - 1) * nx + (nx - 1)]);
-        assert_eq!(outside_neg, m.field()[0]);
+        // Sample at +half wraps to -half (same grid cell).
+        let at_left = m.sample([-100.0, 0.0, 0.0]);
+        let at_right_wrap = m.sample([100.0, 0.0, 0.0]);
+        assert!((at_left - at_right_wrap).abs() < 1e-6, "xy wrap broken");
+        // Z out-of-range clamps (still valid, no panic).
+        let above = m.sample([0.0, 0.0, 1e6]);
+        let below = m.sample([0.0, 0.0, -1e6]);
+        assert!((0.0..=1.0).contains(&above));
+        assert!((0.0..=1.0).contains(&below));
         assert!((0.0..=1.0).contains(&inside));
     }
 

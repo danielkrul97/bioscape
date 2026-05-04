@@ -439,6 +439,8 @@ impl World {
         let pheromone = &self.pheromone;
 
         // Phase 1: CPU rayon — sensor gather + populate_brain_inputs.
+        // Sprint 54: toroidal sensor gather přes ghost positions + min-image
+        // delta, ukládá min-imaged delta do BrainSensors.nearest_*.
         let inputs_vec: Vec<[f32; BRAIN_INPUTS]> = self
             .cells
             .par_iter_mut()
@@ -449,32 +451,28 @@ impl World {
                 let vr2 = vision_r * vision_r;
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
-                food_grid.for_each_in_radius(pos, vision_r, |_id, fp, ()| {
-                    let dx = fp[0] - pos[0];
-                    let dy = fp[1] - pos[1];
-                    let dz = fp[2] - pos[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, ()| {
+                    let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 <= vr2 && d2 < best_food_d2 {
                         best_food_d2 = d2;
-                        best_food = Some(fp);
+                        best_food = Some(d);
                     }
                 });
                 let mut best_cell: Option<([f32; 3], f32)> = None;
                 let mut best_cell_d2 = f32::MAX;
                 let mut neighbors_in_vision: u32 = 0;
-                cell_grid.for_each_in_radius(pos, vision_r, |id, op, oradius| {
+                cell_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |id, op, oradius| {
                     if id == i {
                         return;
                     }
-                    let dx = op[0] - pos[0];
-                    let dy = op[1] - pos[1];
-                    let dz = op[2] - pos[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                    let d = bioscape::min_image_delta(pos, op, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 <= vr2 {
                         neighbors_in_vision += 1;
                         if d2 < best_cell_d2 {
                             best_cell_d2 = d2;
-                            best_cell = Some((op, oradius));
+                            best_cell = Some((d, oradius));
                         }
                     }
                 });
@@ -550,33 +548,29 @@ impl World {
 
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
-                food_grid.for_each_in_radius(pos, vision_r, |_id, fp, ()| {
-                    let dx = fp[0] - pos[0];
-                    let dy = fp[1] - pos[1];
-                    let dz = fp[2] - pos[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, ()| {
+                    let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 <= vr2 && d2 < best_food_d2 {
                         best_food_d2 = d2;
-                        best_food = Some(fp);
+                        best_food = Some(d);
                     }
                 });
 
                 let mut best_cell: Option<([f32; 3], f32)> = None;
                 let mut best_cell_d2 = f32::MAX;
                 let mut neighbors_in_vision: u32 = 0;
-                cell_grid.for_each_in_radius(pos, vision_r, |id, op, oradius| {
+                cell_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |id, op, oradius| {
                     if id == i {
                         return;
                     }
-                    let dx = op[0] - pos[0];
-                    let dy = op[1] - pos[1];
-                    let dz = op[2] - pos[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                    let d = bioscape::min_image_delta(pos, op, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 <= vr2 {
                         neighbors_in_vision += 1;
                         if d2 < best_cell_d2 {
                             best_cell_d2 = d2;
-                            best_cell = Some((op, oradius));
+                            best_cell = Some((d, oradius));
                         }
                     }
                 });
@@ -656,33 +650,29 @@ impl World {
 
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
-                food_grid.for_each_in_radius(pos, vision_r, |_id, fp, ()| {
-                    let dx = fp[0] - pos[0];
-                    let dy = fp[1] - pos[1];
-                    let dz = fp[2] - pos[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, ()| {
+                    let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 <= vr2 && d2 < best_food_d2 {
                         best_food_d2 = d2;
-                        best_food = Some(fp);
+                        best_food = Some(d);
                     }
                 });
 
                 let mut best_cell: Option<([f32; 3], f32)> = None;
                 let mut best_cell_d2 = f32::MAX;
                 let mut neighbors_in_vision: u32 = 0;
-                cell_grid.for_each_in_radius(pos, vision_r, |id, op, oradius| {
+                cell_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |id, op, oradius| {
                     if id == i {
                         return;
                     }
-                    let dx = op[0] - pos[0];
-                    let dy = op[1] - pos[1];
-                    let dz = op[2] - pos[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                    let d = bioscape::min_image_delta(pos, op, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 <= vr2 {
                         neighbors_in_vision += 1;
                         if d2 < best_cell_d2 {
                             best_cell_d2 = d2;
-                            best_cell = Some((op, oradius));
+                            best_cell = Some((d, oradius));
                         }
                     }
                 });
@@ -758,22 +748,21 @@ impl World {
                 let pos_i = cells[i].position;
                 let radius_i = cells[i].phenotype.effective_radius();
                 let search_r = CELL_RADIUS * (radius_i + cells[i].phenotype.max_axis() * 2.0);
-                cell_grid.for_each_in_radius(pos_i, search_r, |id_j, pos_j, radius_j| {
+                cell_grid.for_each_in_radius_toroidal(pos_i, search_r, WORLD_HALF, |id_j, pos_j, radius_j| {
                     if id_j == i {
                         return;
                     }
                     let pair_r = CELL_RADIUS * (radius_i + radius_j);
                     let pair_r2 = pair_r * pair_r;
-                    let dx = pos_i[0] - pos_j[0];
-                    let dy = pos_i[1] - pos_j[1];
-                    let dz = pos_i[2] - pos_j[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                    // Sprint 54: min-image delta — direction i→j přes wrap.
+                    let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                    let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
                     if d2 < pair_r2 && d2 > 0.0 {
                         let d = d2.sqrt();
                         let overlap = pair_r - d;
-                        delta[0] += (dx / d) * overlap * 0.5;
-                        delta[1] += (dy / d) * overlap * 0.5;
-                        delta[2] += (dz / d) * overlap * 0.5;
+                        delta[0] += (d_vec[0] / d) * overlap * 0.5;
+                        delta[1] += (d_vec[1] / d) * overlap * 0.5;
+                        delta[2] += (d_vec[2] / d) * overlap * 0.5;
                     }
                 });
             });
@@ -811,14 +800,12 @@ impl World {
             .map(|i| {
                 let pos_i = cells[i].position;
                 let mut count = 0u32;
-                cell_grid.for_each_in_radius(pos_i, HERD_RADIUS, |id_j, pos_j, _| {
+                cell_grid.for_each_in_radius_toroidal(pos_i, HERD_RADIUS, WORLD_HALF, |id_j, pos_j, _| {
                     if id_j == i {
                         return;
                     }
-                    let dx = pos_i[0] - pos_j[0];
-                    let dy = pos_i[1] - pos_j[1];
-                    let dz = pos_i[2] - pos_j[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                    let d = bioscape::min_image_delta(pos_i, pos_j, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 < herd_r2 {
                         count += 1;
                     }
@@ -844,7 +831,7 @@ impl World {
             let search_r = CELL_RADIUS * (radius_a + self.cells[i].phenotype.max_axis() * 2.0);
             let mut victims: Vec<(usize, f32, f32, f32, f32)> = Vec::new();
             self.cell_grid
-                .for_each_in_radius(pos_i, search_r, |j, pos_j, radius_b| {
+                .for_each_in_radius_toroidal(pos_i, search_r, WORLD_HALF, |j, pos_j, radius_b| {
                     if j == i {
                         return;
                     }
@@ -853,12 +840,11 @@ impl World {
                     }
                     let pair_r = CELL_RADIUS * (radius_a + radius_b);
                     let pair_r2 = pair_r * pair_r;
-                    let dx = pos_i[0] - pos_j[0];
-                    let dy = pos_i[1] - pos_j[1];
-                    let dz = pos_i[2] - pos_j[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
+                    // Sprint 54: min-image delta i→j (pos_i − pos_j wrapped).
+                    let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                    let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
                     if d2 < pair_r2 {
-                        victims.push((j, dx, dy, dz, d2));
+                        victims.push((j, d_vec[0], d_vec[1], d_vec[2], d2));
                     }
                 });
             for (j, dx, dy, dz, d2) in victims {
@@ -924,7 +910,7 @@ impl World {
             let search_r = EAT_RADIUS * cell.phenotype.max_axis();
             let mut ate_idx: Option<usize> = None;
             self.food_grid
-                .for_each_in_radius(pos, search_r, |idx, _fp, ()| {
+                .for_each_in_radius_toroidal(pos, search_r, WORLD_HALF, |idx, _fp, ()| {
                     if ate_idx.is_some() || self.eaten_scratch[idx] {
                         return;
                     }
@@ -934,7 +920,14 @@ impl World {
                             self.map.sample([food.position[0], food.position[1], 0.0]),
                         )
                         * food.value_factor();
-                    if cell.try_eat(food, EAT_RADIUS, value) {
+                    // Sprint 54: ghost food s min-imaged position aby try_eat
+                    // ellipsoid acceptance match cell frame přes toroidal wrap.
+                    let md = bioscape::min_image_delta(pos, food.position, WORLD_HALF);
+                    let ghost = Food {
+                        position: [pos[0] + md[0], pos[1] + md[1], food.position[2]],
+                        age_ticks: food.age_ticks,
+                    };
+                    if cell.try_eat(&ghost, EAT_RADIUS, value) {
                         ate_idx = Some(idx);
                     }
                 });
@@ -1002,19 +995,21 @@ impl World {
                     continue;
                 }
                 let mut blocked = false;
-                self.cell_grid
-                    .for_each_in_radius(candidate.position, max_search_r, |id, cell_pos, _r| {
+                self.cell_grid.for_each_in_radius_toroidal(
+                    candidate.position,
+                    max_search_r,
+                    WORLD_HALF,
+                    |id, cell_pos, _r| {
                         if blocked {
                             return;
                         }
                         let exclusion = EAT_RADIUS * self.cells[id].phenotype.max_axis();
-                        let dx = candidate.position[0] - cell_pos[0];
-                        let dy = candidate.position[1] - cell_pos[1];
-                        let dz = candidate.position[2] - cell_pos[2];
-                        if dx * dx + dy * dy + dz * dz < exclusion * exclusion {
+                        let d = bioscape::min_image_delta(candidate.position, cell_pos, WORLD_HALF);
+                        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < exclusion * exclusion {
                             blocked = true;
                         }
-                    });
+                    },
+                );
                 if !blocked {
                     self.foods.push(candidate);
                     continue 'spawn;
@@ -1032,7 +1027,7 @@ impl World {
         let fertile = self.collect_fertile();
         self.fertile_ticks_gen += fertile.len() as u64;
         let mating_r2 = self.mating_radius * self.mating_radius;
-        let matings = bioscape::pair_fertile(&fertile, mating_r2, budget);
+        let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
         let child_start = self.cells.len();
         let to_spawn = self.spawn_children_from_matings(&matings, rng);
         let n_births = to_spawn.len();
@@ -1340,13 +1335,12 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
             let mut min_d2 = f32::MAX;
             let mut search_r = GRID_CELL_SIZE;
             while min_d2 == f32::MAX && search_r <= world_diag {
-                grid.for_each_in_radius(pi, search_r, |j, pj, _| {
+                grid.for_each_in_radius_toroidal(pi, search_r, WORLD_HALF, |j, pj, _| {
                     if i == j {
                         return;
                     }
-                    let dx = pi[0] - pj[0];
-                    let dy = pi[1] - pj[1];
-                    let d2 = dx * dx + dy * dy;
+                    let d = bioscape::min_image_delta(pi, pj, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1];
                     if d2 < min_d2 {
                         min_d2 = d2;
                     }
