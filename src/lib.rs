@@ -24,7 +24,10 @@ pub const INITIAL_ENERGY: f32 = 100.0;
 // = previous tick `last_hidden` activations (Elman RNN). Genom drží sjednocený
 // `w1` matrix 28×8, mutace + Hebbian pracují bez rozlišení sensory vs recurrent.
 pub const BRAIN_INPUTS_SENSORY: usize = 20;
-pub const BRAIN_HIDDEN: usize = 8;
+// Sprint 39 patch: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs
+// → 8 hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
+// w1 z 28×8=224 na 36×16=576 weights (2.6×), brain hot-loop ~2× pomalejší.
+pub const BRAIN_HIDDEN: usize = 16;
 /// Sprint 28: kolik dimenzí předchozího hidden state se feeduje zpátky jako
 /// input. = `BRAIN_HIDDEN` znamená 1:1 mapping (každý neuron má vlastní paměť
 /// slot). Menší než HIDDEN by exponoval jen subset hidden state; větší by
