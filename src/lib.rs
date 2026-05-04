@@ -9,6 +9,9 @@ use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::hash::Hash;
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 const HUE_RANGE: f32 = 360.0;
 const MIN_SPEED: f32 = 1.0;
 const MIN_VISION: f32 = 1.0;

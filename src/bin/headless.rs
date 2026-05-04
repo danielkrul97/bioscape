@@ -20,6 +20,8 @@ use bioscape::{
     WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED,
     WORLD_UNITS_PER_FOOD,
 };
+#[cfg(feature = "gpu")]
+use bioscape::{gpu::BrainGpu, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -85,6 +87,10 @@ struct World {
     // může nastavit výš (potřeba pro bench při N > 1000).
     max_population: usize,
     bench_timings: PhaseTimings,
+    // Sprint 44: pokud `Some`, brain_act offloaduje forward pass na GPU.
+    // Sensor gather + populate_brain_inputs + apply_brain_motor zůstává CPU.
+    #[cfg(feature = "gpu")]
+    gpu: Option<BrainGpu>,
 }
 
 impl World {
@@ -139,6 +145,8 @@ impl World {
             mating_radius,
             max_population,
             bench_timings: PhaseTimings::default(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
         }
     }
 
@@ -161,7 +169,7 @@ impl World {
 
         timed!(update_smell, self.update_smell(dt));
         timed!(update_pheromone, self.update_pheromone(dt));
-        timed!(brain_act, self.brain_act(dt));
+        timed!(brain_act, self.run_brain_act(dt));
         timed!(emit_pheromones, self.emit_pheromones(dt));
         timed!(apply_morph, self.apply_morph(dt));
         timed!(apply_brownian, self.apply_brownian(rng, dt));
@@ -215,6 +223,129 @@ impl World {
                 .add_source([cell.position[0], cell.position[1]], rate * dt);
             cell.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
         }
+    }
+
+    /// Sprint 44: dispatch CPU vs GPU forward pass podle `self.gpu`.
+    fn run_brain_act(&mut self, dt: f32) {
+        #[cfg(feature = "gpu")]
+        {
+            if self.gpu.is_some() {
+                self.brain_act_gpu(dt);
+                return;
+            }
+        }
+        self.brain_act(dt);
+    }
+
+    #[cfg(feature = "gpu")]
+    fn brain_act_gpu(&mut self, dt: f32) {
+        let n = self.cells.len();
+        if n == 0 {
+            return;
+        }
+        self.cell_grid.rebuild(
+            self.cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
+        );
+        self.food_grid.rebuild(
+            self.foods
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.position, ())),
+        );
+
+        let cell_grid = &self.cell_grid;
+        let food_grid = &self.food_grid;
+        let smell = &self.smell;
+        let pheromone = &self.pheromone;
+
+        // Phase 1: par_iter_mut nad cells — sensor gather, populate inputs,
+        // apply_shell_absorb. Vrací inputs[N] pro GPU dispatch.
+        let inputs_vec: Vec<[f32; BRAIN_INPUTS]> = self
+            .cells
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i, cell)| {
+                let pos = cell.position;
+                let vision_r = cell.genome.vision_radius;
+                let vr2 = vision_r * vision_r;
+
+                let mut best_food: Option<[f32; 3]> = None;
+                let mut best_food_d2 = f32::MAX;
+                food_grid.for_each_in_radius(pos, vision_r, |_id, fp, ()| {
+                    let dx = fp[0] - pos[0];
+                    let dy = fp[1] - pos[1];
+                    let dz = fp[2] - pos[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 <= vr2 && d2 < best_food_d2 {
+                        best_food_d2 = d2;
+                        best_food = Some(fp);
+                    }
+                });
+
+                let mut best_cell: Option<([f32; 3], f32)> = None;
+                let mut best_cell_d2 = f32::MAX;
+                let mut neighbors_in_vision: u32 = 0;
+                cell_grid.for_each_in_radius(pos, vision_r, |id, op, oradius| {
+                    if id == i {
+                        return;
+                    }
+                    let dx = op[0] - pos[0];
+                    let dy = op[1] - pos[1];
+                    let dz = op[2] - pos[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 <= vr2 {
+                        neighbors_in_vision += 1;
+                        if d2 < best_cell_d2 {
+                            best_cell_d2 = d2;
+                            best_cell = Some((op, oradius));
+                        }
+                    }
+                });
+
+                let pos_xy = [pos[0], pos[1]];
+                let smell_grad = smell.gradient_at(pos_xy, SMELL_SAMPLE_EPSILON);
+                let pheromone_grad = pheromone.gradient_at(pos_xy, PHEROMONE_SAMPLE_EPSILON);
+                let sensors = bioscape::BrainSensors {
+                    nearest_food: best_food,
+                    nearest_cell: best_cell,
+                    neighbors_in_vision,
+                    smell_grad,
+                    pheromone_grad,
+                };
+                cell.apply_shell_absorb(dt);
+                bioscape::populate_brain_inputs(cell, &sensors, vision_r)
+            })
+            .collect();
+
+        // Phase 2: GPU forward batch.
+        let mut hiddens = vec![[0.0_f32; BRAIN_HIDDEN]; n];
+        let mut outputs = vec![[0.0_f32; BRAIN_OUTPUTS]; n];
+        {
+            let gpu = self
+                .gpu
+                .as_mut()
+                .expect("brain_act_gpu called without gpu");
+            gpu.forward_batch(
+                &inputs_vec,
+                self.cells.iter().map(|c| &c.genome.brain),
+                &mut hiddens,
+                &mut outputs,
+            );
+        }
+
+        // Phase 3: par_iter_mut writes back + apply_brain_motor.
+        self.cells
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, cell)| {
+                cell.last_inputs = inputs_vec[i];
+                cell.last_hidden = hiddens[i];
+                cell.last_outputs = outputs[i];
+                cell.apply_brain_motor(&outputs[i], dt);
+            });
     }
 
     fn brain_act(&mut self, dt: f32) {
@@ -910,7 +1041,15 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+    // Sprint 44: `--gpu` flag (filtered před positional parsingem). Bez
+    // `--features gpu` se flag tiše ignoruje.
+    let want_gpu = raw_args.iter().any(|a| a == "--gpu");
+    let args: Vec<String> = raw_args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
     let seed: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let max_gens: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(500);
     let out_path = args
@@ -952,6 +1091,23 @@ fn main() {
 
     let mut rng = StdRng::seed_from_u64(seed);
     let mut world = World::new(&mut rng, map_seed, mating_radius, initial_cells, max_population);
+
+    #[cfg(feature = "gpu")]
+    if want_gpu {
+        match BrainGpu::new(initial_cells.max(64)) {
+            Ok(g) => {
+                eprintln!("gpu: BrainGpu initialized (capacity {})", initial_cells.max(64));
+                world.gpu = Some(g);
+            }
+            Err(e) => {
+                eprintln!("gpu: init failed ({e}); falling back to CPU");
+            }
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    if want_gpu {
+        eprintln!("gpu: --gpu requested but binary built without --features gpu");
+    }
 
     let file = std::fs::File::create(&out_path).expect("can't create output file");
     let mut log = BufWriter::new(file);
