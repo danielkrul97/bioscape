@@ -321,6 +321,8 @@ impl World {
     }
 
     fn apply_morph(&mut self, dt: f32) {
+        // Sprint 57: zkoušel jsem rayon par_iter_mut, ale ~2 us sekvenčně vs
+        // ~26 us paralelně — rayon spawn overhead převáží práci. Sekvenční win.
         for cell in &mut self.cells {
             cell.apply_morph(dt);
         }
@@ -699,6 +701,8 @@ impl World {
     }
 
     fn step(&mut self, dt: f32) {
+        // Sprint 57: stejně jako apply_morph, ~16 us sekvenčně vs ~30 us
+        // paralelně — work per cell je příliš malý pro rayon. Sekvenční win.
         for cell in &mut self.cells {
             cell.step(dt, WORLD_HALF, &PHYSICS_CONFIG);
         }
@@ -713,8 +717,12 @@ impl World {
     }
 
     fn apply_hazards(&mut self, dt: f32) {
+        // Sprint 57: ~14 us sekvenčně vs ~27 us paralelně — work per cell je
+        // jen map.sample + 2× scalar update, rayon overhead převáží.
         for cell in &mut self.cells {
-            let noise = self.map.sample([cell.position[0], cell.position[1], cell.position[2]]);
+            let noise = self
+                .map
+                .sample([cell.position[0], cell.position[1], cell.position[2]]);
             let drain = hazard_drain(noise) * dt;
             cell.energy -= drain;
             cell.damage_accum += drain;
@@ -814,59 +822,68 @@ impl World {
             })
             .collect();
 
-        let mut events: u64 = 0;
-        for i in 0..n {
-            // Sprint 27: attack je opt-in přes brain. Bez aktivního signálu jsou
-            // kontakty s menšími cells jen kolize (řešené v resolve_collisions).
-            let attack_signal = self.cells[i].last_outputs[6].max(0.0);
-            if attack_signal <= ATTACK_THRESHOLD {
-                continue;
-            }
-            let pos_i = self.cells[i].position;
-            let radius_a = self.cells[i].phenotype.effective_radius();
-            let spike = self.cells[i].phenotype.spike_length;
-            let heading = self.cells[i].heading;
-            // Search radius pro pair_r2 = CELL_RADIUS × (r_a + r_b). Bound na
-            // r_b ≤ MAX_BODY axis-y → konzervativně CELL_RADIUS × (r_a + max_axis).
-            let search_r = CELL_RADIUS * (radius_a + self.cells[i].phenotype.max_axis() * 2.0);
-            let mut victims: Vec<(usize, f32, f32, f32, f32)> = Vec::new();
-            self.cell_grid
-                .for_each_in_radius_toroidal(pos_i, search_r, WORLD_HALF, |j, pos_j, radius_b| {
-                    if j == i {
-                        return;
-                    }
-                    if radius_a < SIZE_RATIO_THRESHOLD * radius_b {
-                        return;
-                    }
-                    let pair_r = CELL_RADIUS * (radius_a + radius_b);
-                    let pair_r2 = pair_r * pair_r;
-                    // Sprint 54: min-image delta i→j (pos_i − pos_j wrapped).
-                    let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
-                    let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
-                    if d2 < pair_r2 {
-                        victims.push((j, d_vec[0], d_vec[1], d_vec[2], d2));
-                    }
-                });
-            for (j, dx, dy, dz, d2) in victims {
-                let mut gain = PREDATION_GAIN_PER_TICK;
-                if spike > 0.0 && d2 > 0.0 {
-                    let inv_d = 1.0 / d2.sqrt();
-                    let to_j_x = -dx * inv_d;
-                    let to_j_y = -dy * inv_d;
-                    let _ = dz;
-                    let cos_angle = heading.cos() * to_j_x + heading.sin() * to_j_y;
-                    if cos_angle >= bioscape::SPIKE_DOT_THRESHOLD {
-                        gain +=
-                            PREDATION_GAIN_PER_TICK * spike * bioscape::SPIKE_PREDATION_BONUS;
-                    }
+        // Sprint 57: paralelní attack candidate gathering. Pass 2a sbírá
+        // (i, j, gain) eventy bez sdílených writes; Pass 2b aggreguje sekvenčně
+        // do energy/damage scratch (řeší race na victim j shared mezi attackery).
+        let attack_events: Vec<(usize, usize, f32)> = (0..n)
+            .into_par_iter()
+            .flat_map_iter(|i| {
+                let attack_signal = cells[i].last_outputs[6].max(0.0);
+                if attack_signal <= ATTACK_THRESHOLD {
+                    return Vec::new();
                 }
-                let dilution = 1.0 / (1.0 + DILUTION_K * herd_counts[j] as f32);
-                gain *= dilution;
-                self.energy_deltas_scratch[i] += gain;
-                self.energy_deltas_scratch[j] -= PREDATION_DRAIN_PER_TICK;
-                self.damage_deltas_scratch[j] += PREDATION_DRAIN_PER_TICK;
-                events += 1;
-            }
+                let pos_i = cells[i].position;
+                let radius_a = cells[i].phenotype.effective_radius();
+                let spike = cells[i].phenotype.spike_length;
+                let heading = cells[i].heading;
+                let search_r =
+                    CELL_RADIUS * (radius_a + cells[i].phenotype.max_axis() * 2.0);
+                let mut local: Vec<(usize, usize, f32)> = Vec::new();
+                cell_grid.for_each_in_radius_toroidal(
+                    pos_i,
+                    search_r,
+                    WORLD_HALF,
+                    |j, pos_j, radius_b| {
+                        if j == i {
+                            return;
+                        }
+                        if radius_a < SIZE_RATIO_THRESHOLD * radius_b {
+                            return;
+                        }
+                        let pair_r = CELL_RADIUS * (radius_a + radius_b);
+                        let pair_r2 = pair_r * pair_r;
+                        let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                        let d2 = d_vec[0] * d_vec[0]
+                            + d_vec[1] * d_vec[1]
+                            + d_vec[2] * d_vec[2];
+                        if d2 < pair_r2 {
+                            let mut gain = PREDATION_GAIN_PER_TICK;
+                            if spike > 0.0 && d2 > 0.0 {
+                                let inv_d = 1.0 / d2.sqrt();
+                                let to_j_x = -d_vec[0] * inv_d;
+                                let to_j_y = -d_vec[1] * inv_d;
+                                let cos_angle = heading.cos() * to_j_x + heading.sin() * to_j_y;
+                                if cos_angle >= bioscape::SPIKE_DOT_THRESHOLD {
+                                    gain += PREDATION_GAIN_PER_TICK
+                                        * spike
+                                        * bioscape::SPIKE_PREDATION_BONUS;
+                                }
+                            }
+                            let dilution = 1.0 / (1.0 + DILUTION_K * herd_counts[j] as f32);
+                            gain *= dilution;
+                            local.push((i, j, gain));
+                        }
+                    },
+                );
+                local
+            })
+            .collect();
+
+        let events: u64 = attack_events.len() as u64;
+        for (i, j, gain) in attack_events {
+            self.energy_deltas_scratch[i] += gain;
+            self.energy_deltas_scratch[j] -= PREDATION_DRAIN_PER_TICK;
+            self.damage_deltas_scratch[j] += PREDATION_DRAIN_PER_TICK;
         }
         self.predation_events_gen += events;
         for ((cell, energy_delta), dmg_delta) in self
@@ -881,10 +898,11 @@ impl World {
     }
 
     fn eat_food(&mut self) {
-        // Sprint 43: food_grid lookup místo full sweep. Sekvenční, protože
-        // despawn `Vec<Food>` je shared mutable + Hebbian update mutuje cell.
-        // Sprint 51: pokud --gpu-full, sbíráme rewards[N] vec a dispatchneme
-        // GPU Hebbian na konci místo per-cell CPU brain.hebbian_update.
+        // Sprint 43: food_grid lookup místo full sweep.
+        // Sprint 57: 3-pass paralelizace. Pass 1 paralelně vybere candidate
+        // food per cell (read-only test), Pass 2 sekvenčně resolvne race
+        // (first-cell-wins per food + Hebbian na CPU), Pass 3 swap_remove.
+        // GPU Hebbian zůstává na konci jako pre-Sprint-57.
         self.food_grid.rebuild(
             self.foods
                 .iter()
@@ -905,50 +923,86 @@ impl World {
             Vec::new()
         };
 
-        for (cell_idx, cell) in self.cells.iter_mut().enumerate() {
-            let pos = cell.position;
-            let search_r = EAT_RADIUS * cell.phenotype.max_axis();
-            let mut ate_idx: Option<usize> = None;
-            self.food_grid
-                .for_each_in_radius_toroidal(pos, search_r, WORLD_HALF, |idx, _fp, ()| {
-                    if ate_idx.is_some() || self.eaten_scratch[idx] {
-                        return;
-                    }
-                    let food = &self.foods[idx];
-                    let value = FOOD_VALUE
-                        * food_multiplier(
-                            self.map.sample([food.position[0], food.position[1], 0.0]),
-                        )
-                        * food.value_factor();
-                    // Sprint 54: ghost food s min-imaged position aby try_eat
-                    // ellipsoid acceptance match cell frame přes toroidal wrap.
-                    let md = bioscape::min_image_delta(pos, food.position, WORLD_HALF);
-                    let ghost = Food {
-                        position: [pos[0] + md[0], pos[1] + md[1], food.position[2]],
-                        age_ticks: food.age_ticks,
-                    };
-                    if cell.try_eat(&ghost, EAT_RADIUS, value) {
-                        ate_idx = Some(idx);
-                    }
-                });
-            if let Some(idx) = ate_idx {
-                self.eaten_scratch[idx] = true;
+        // Pass 1 (parallel): per-cell candidate selection. Žádná mutace.
+        // First match v grid traversal wins (zachovává pre-Sprint-57 sémantiku).
+        let cells = &self.cells;
+        let foods = &self.foods;
+        let map = &self.map;
+        let food_grid = &self.food_grid;
+        let candidates: Vec<Option<(usize, f32)>> = cells
+            .par_iter()
+            .map(|cell| {
+                let pos = cell.position;
+                let search_r = EAT_RADIUS * cell.phenotype.max_axis();
+                let mut ate: Option<(usize, f32)> = None;
+                food_grid.for_each_in_radius_toroidal(
+                    pos,
+                    search_r,
+                    WORLD_HALF,
+                    |idx, _fp, ()| {
+                        if ate.is_some() {
+                            return;
+                        }
+                        let food = &foods[idx];
+                        let md = bioscape::min_image_delta(pos, food.position, WORLD_HALF);
+                        let ghost = Food {
+                            position: [pos[0] + md[0], pos[1] + md[1], food.position[2]],
+                            age_ticks: food.age_ticks,
+                        };
+                        if cell.eat_test(&ghost, EAT_RADIUS) {
+                            let value = FOOD_VALUE
+                                * food_multiplier(
+                                    map.sample([food.position[0], food.position[1], 0.0]),
+                                )
+                                * food.value_factor();
+                            ate = Some((idx, value));
+                        }
+                    },
+                );
+                ate
+            })
+            .collect();
+
+        // Pass 2 (sequential): resolve. Per cell_idx v insertion order — first
+        // cell to claim a food wins. Matches pre-Sprint-57 ordering (sekvenční
+        // outer loop with eaten_scratch shortcut).
+        let mut ate_cell_indices: Vec<usize> = Vec::new();
+        for (cell_idx, opt) in candidates.iter().enumerate() {
+            if let Some((food_idx, value)) = opt {
+                if self.eaten_scratch[*food_idx] {
+                    continue;
+                }
+                self.eaten_scratch[*food_idx] = true;
+                let cell = &mut self.cells[cell_idx];
+                cell.energy += *value;
                 if use_gpu_hebbian {
                     rewards[cell_idx] = 1.0;
                 } else {
-                    let last_inputs = cell.last_inputs;
-                    let last_hidden = cell.last_hidden;
-                    let last_outputs = cell.last_outputs;
-                    cell.genome.brain.hebbian_update(
-                        &last_inputs,
-                        &last_hidden,
-                        &last_outputs,
-                        1.0,
-                        LEARNING_RATE,
-                    );
+                    ate_cell_indices.push(cell_idx);
                 }
             }
         }
+
+        // Pass 2b: CPU Hebbian update sekvenčně. Hebbian je ~700 ops × max
+        // ~10-30 cells/tick (kteří snědli), takže paralelizace by stejně byla
+        // overhead-bound — sekvenční je rychlejší než thread spawn cost.
+        if !use_gpu_hebbian {
+            for &cell_idx in &ate_cell_indices {
+                let cell = &mut self.cells[cell_idx];
+                let last_inputs = cell.last_inputs;
+                let last_hidden = cell.last_hidden;
+                let last_outputs = cell.last_outputs;
+                cell.genome.brain.hebbian_update(
+                    &last_inputs,
+                    &last_hidden,
+                    &last_outputs,
+                    1.0,
+                    LEARNING_RATE,
+                );
+            }
+        }
+
+        // Pass 3: swap_remove eaten foods.
         for j in (0..self.eaten_scratch.len()).rev() {
             if self.eaten_scratch[j] {
                 self.foods.swap_remove(j);

@@ -6,8 +6,9 @@
 use core::f32::consts::TAU;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::hash::Hash;
 
 #[cfg(feature = "gpu")]
@@ -1383,35 +1384,45 @@ impl SmellField {
     /// xy (left at i=0 čte sloupec i=nx-1, atd.), Neumann zero-flux na z
     /// (z=0 a z=nz-1 fallback na center — odpovídá ground/ceiling, ne wrap).
     /// Stable pro `diffusion < 1/6`.
+    ///
+    /// Sprint 57: paralelizováno přes z-roviny — každá rovina čte své okolí
+    /// (xy stencil + back/front z grid) a zapisuje pouze do své části scratch,
+    /// takže žádný write conflict. Pro 12-core CPU + 16 rovin je load balanced.
     pub fn step(&mut self, diffusion: f32, decay_per_sec: f32, dt: f32) {
         let nx = self.resolution[0];
         let ny = self.resolution[1];
         let nz = self.resolution[2];
         let decay = (1.0 - decay_per_sec * dt).max(0.0);
         let plane = nx * ny;
-        for k in 0..nz {
-            for j in 0..ny {
-                for i in 0..nx {
-                    let idx = k * plane + j * nx + i;
-                    let center = self.grid[idx];
-                    // Toroidal xy: wrap kolem indexů.
-                    let i_left = if i == 0 { nx - 1 } else { i - 1 };
-                    let i_right = if i + 1 == nx { 0 } else { i + 1 };
-                    let j_up = if j == 0 { ny - 1 } else { j - 1 };
-                    let j_down = if j + 1 == ny { 0 } else { j + 1 };
-                    let left = self.grid[k * plane + j * nx + i_left];
-                    let right = self.grid[k * plane + j * nx + i_right];
-                    let up = self.grid[k * plane + j_up * nx + i];
-                    let down = self.grid[k * plane + j_down * nx + i];
-                    // z bounded (Neumann): u krajů fallback na center.
-                    let back = if k > 0 { self.grid[idx - plane] } else { center };
-                    let front = if k + 1 < nz { self.grid[idx + plane] } else { center };
-                    let new = center
-                        + diffusion * (left + right + up + down + back + front - 6.0 * center);
-                    self.scratch[idx] = new * decay;
+        let grid = &self.grid;
+        self.scratch
+            .par_chunks_mut(plane)
+            .enumerate()
+            .for_each(|(k, scratch_plane)| {
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let idx_in_plane = j * nx + i;
+                        let idx = k * plane + idx_in_plane;
+                        let center = grid[idx];
+                        // Toroidal xy: wrap kolem indexů.
+                        let i_left = if i == 0 { nx - 1 } else { i - 1 };
+                        let i_right = if i + 1 == nx { 0 } else { i + 1 };
+                        let j_up = if j == 0 { ny - 1 } else { j - 1 };
+                        let j_down = if j + 1 == ny { 0 } else { j + 1 };
+                        let left = grid[k * plane + j * nx + i_left];
+                        let right = grid[k * plane + j * nx + i_right];
+                        let up = grid[k * plane + j_up * nx + i];
+                        let down = grid[k * plane + j_down * nx + i];
+                        // z bounded (Neumann): u krajů fallback na center.
+                        let back = if k > 0 { grid[idx - plane] } else { center };
+                        let front = if k + 1 < nz { grid[idx + plane] } else { center };
+                        let new = center
+                            + diffusion
+                                * (left + right + up + down + back + front - 6.0 * center);
+                        scratch_plane[idx_in_plane] = new * decay;
+                    }
                 }
-            }
-        }
+            });
         std::mem::swap(&mut self.grid, &mut self.scratch);
     }
 
@@ -1606,14 +1617,14 @@ pub fn wrap_position_xy(pos: [f32; 3], world_half: [f32; 3]) -> [f32; 3] {
 /// nejsou bit-identical s O(N²) baseline kvůli jinému pořadí akumulace.
 pub struct SpatialGrid<Id: Copy + Eq + Hash, P: Copy> {
     cell_size: f32,
-    buckets: HashMap<(i32, i32, i32), Vec<(Id, [f32; 3], P)>>,
+    buckets: FxHashMap<(i32, i32, i32), Vec<(Id, [f32; 3], P)>>,
 }
 
 impl<Id: Copy + Eq + Hash, P: Copy> SpatialGrid<Id, P> {
     pub fn new(cell_size: f32) -> Self {
         Self {
             cell_size,
-            buckets: HashMap::new(),
+            buckets: FxHashMap::default(),
         }
     }
 

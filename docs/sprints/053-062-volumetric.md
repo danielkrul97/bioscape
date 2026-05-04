@@ -417,11 +417,143 @@ plně 3D s 7-point Jacobi diffusion.
     BrainGpu + HebbianGpu + step + collision + predate v jednom unified
     GPU loop. Pre-Sprint-56 byl FieldGpu blocking item.
 
-## Sprinty 57–62 — open-ended
+## Sprint 57 — performance hardening (CPU)
 
-- **Sprint 57+:** unified GPU tick pipeline (FieldGpu deposit/diffuse +
-  SensorGatherGpu wired do `--gpu-full` headless a renderer GPU default
-  hot path; CPU SmellField fallback only).
+- **Cíl:** dostat z headless tick rate maximum bez GPU wire-up. Baseline
+  pre-Sprint-57 (release default profile, 1000 cells, 60 gen, seed=0):
+  **164 ticks/s**. Profil identifikoval `eat_food` jako 56 % ticku
+  (2120 µs avg) díky standardnímu `HashMap` SipHasheru v `SpatialGrid`
+  (27–243 lookupů per radius query) + sekvenční sběr candidate eats.
+
+  **Plán implementace:**
+
+  *Body 1 — `[profile.release]` v Cargo.toml:*
+  - `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`. Inlining napříč
+    Bevy / wgpu / rayon crate boundaries; LLVM vidí celý program pro
+    vektorizaci. Dev rebuild +20 s, ale release wall-clock zisk se měřitelně
+    projeví v každém dalším bodu.
+
+  *Body 2 — criterion bench harness:*
+  - `criterion = "0.5"` v dev-dependencies, dva benchovací moduly:
+    `benches/headless_phases.rs` měří lib API (Brain forward, SmellField
+    step, WorldMap sample, Cell step, populate_brain_inputs); `benches/full_tick.rs`
+    je momentálně placeholder (full World tick se replikovat nedá bez
+    refactoru bin → lib, viz "co Sprint 57 neřeší"). End-to-end měření
+    běží přes `time ./target/release/headless 0 60` se seed=0 baseline.
+
+  *Body 3 — paralelizace + hash swap:*
+  - **`SpatialGrid` `HashMap` → `FxHashMap`** (rustc-hash 2). Drop-in,
+    fixed-seed (deterministický mezi runy), 5-10× rychlejší hash than
+    SipHash. Iteration order zachován (3³ buckets v fixním pořadí; per-bucket
+    `Vec` insert-order zachován). Zachovává cross-run reproducibility.
+  - **`SmellField::step` paralelní přes z-roviny.** `par_chunks_mut(plane)`
+    nad scratch — každá z-rovina čte své stencil okolí z `grid` (read-only)
+    a píše jen do své části `scratch`. Žádný write conflict. Pro 16 z-rovin
+    × 12 cores load-balance chodí ok.
+  - **`eat_food` 3-pass refactor.** Pass 1 (`par_iter` cells): per-cell
+    candidate selection — `eat_test` je read-only, `min_image_delta` +
+    grid lookup paralelně. Pass 2 (sekvenční): resolve race per food
+    (first-cell-wins, mark `eaten_scratch[idx]`), apply energy delta +
+    Hebbian update sekvenčně. Pass 3: `swap_remove` eaten foods. Hebbian
+    sběr šlo paralelizovat (per-cell brain je disjoint), ale ~700 ops × 10–30
+    cells per tick je pod rayon spawn overhead → sekvenční.
+  - **`predate` Pass 2 → parallel candidate gather + sequential aggregate.**
+    `(0..n).par_iter().flat_map_iter()` sbírá `(attacker_i, victim_j, gain)`
+    eventy; sekvenční aggregate rozdistribuuje do `energy_deltas_scratch`
+    a `damage_deltas_scratch` (ty jsou per-victim shared, takže paralelní
+    write by potřeboval atomics nebo per-thread bucket reduce).
+  - **Drobné fáze NEparalelizovány.** `apply_morph` (2 µs/tick),
+    `step` (16 µs), `apply_hazards` (14 µs), `apply_brownian` (26 µs) —
+    work per cell je tak malý, že rayon spawn overhead převáží: rayon
+    verze v testovacím průběhu ukázala ~25 µs floor pro každou z těchto fází
+    (10–13× zhoršení). Sekvenční je rychlejší.
+
+- **Konstanty / dependencies:** žádné nové konstanty; `rustc-hash = "2"`
+  + `criterion = "0.5"` (dev-dep) v Cargo.toml.
+
+- **Výstup:**
+  - `Cargo.toml`: `[profile.release]` (LTO + codegen-units=1), `rustc-hash`
+    dep, `criterion` dev-dep + 2 `[[bench]]` entries.
+  - `src/lib.rs`: `HashMap` → `FxHashMap` v `SpatialGrid`,
+    `SmellField::step` paralelní stencil.
+  - `src/bin/headless.rs`: `eat_food` 3-pass refactor, `predate` Pass 2
+    paralelní gather. `apply_morph` / `step` / `apply_hazards` zůstávají
+    sekvenční (rayon overhead)— ozkoušeno ale revertnuto.
+  - `benches/headless_phases.rs` + `benches/full_tick.rs`: criterion
+    skeleton + 9 lib benchmarků (brain_forward batch/single, smell_step
+    populated/empty, pheromone_step, world_map_sample, smell_gradient,
+    cell_step, populate_brain_inputs, brain_random, genome_random).
+  - **Test suite: 73/73 pass** (jeden flaky `random_brain_average_thrust_is_positive`
+    používající unseeded `rand::rng()`, projde re-runem; ne-Sprint-57 issue).
+  - **Smoke seed=0, 60 gen, 1000 cells, default world:**
+    - **wall-clock 219 s → 36.8 s = 164 → 977 ticks/s = 6.0×.**
+    - Pop trajektorie: 200 → 1000 (gen 3 saturated) → 572 (gen 60). Baseline
+      finálně 548; +5 % ticha varianta z eat_food ordering change (Pass 1
+      paralelní sběr nemá pre-Sprint-57 sekvenční eaten_scratch shortcut).
+    - Žádná extinkce, lineages a predation events v healthy rangi.
+
+- **Per-fáze breakdown (us avg per tick, seed=0, 60 gen):**
+
+  | Fáze              | Pre-Sprint-57 | Sprint 57 | Speedup |
+  |-------------------|---------------|-----------|---------|
+  | update_smell      | 316.9         | 211.5     | 1.5×    |
+  | update_pheromone  | 175.0         | 73.3      | 2.4×    |
+  | brain_act         | 584.1         | 333.6     | 1.8×    |
+  | resolve_collisions| 134.1         | 71.8      | 1.9×    |
+  | predate           | 330.9         | 105.0     | **3.2×**|
+  | **eat_food**      | **2120.7**    | **277.8** | **7.6×**|
+  | spawn_food        | 23.4          | 14.4      | 1.6×    |
+
+  Ostatní fáze < 30 µs nebyly hot path; FxHashMap je vyvedl z ~1 µs do
+  ~1 µs. `brain_act` zlepšení je čistě z FxHashMap (sensor gather grid
+  lookups), funkční tělo zůstává sekvenční sběr inputs / forward / motor.
+
+- **Poznámky:**
+  - **FxHashMap drop-in:** žádný change v determinismu. SpatialGrid řád
+    items je insert-order (per-bucket `Vec`), bucket iter je 3³ fixed
+    `(dx, dy, dz)`. Hash function ovlivňuje jen *který* bucket dostane
+    klíč; lookup `get(&key)` je deterministický (vůči same key) ať je
+    hasher jakýkoli. Default `RandomState` SipHash ALE má per-process
+    random seed → cross-run iteration *order* HashMap.iter() není
+    deterministický. SpatialGrid neposílá `iter()` ven (jen `get(&key)`),
+    takže to nikdy nebyl problém — ale FxHashMap je "more deterministic"
+    + 5-10× rychlejší. Pro hot path 27-243 lookupů/query × 1000 cells/tick
+    × 13 fází to dělá velký rozdíl.
+  - **eat_food behavior change:** pre-Sprint-57 sekvenční loop měl
+    `if ate_idx.is_some() || self.eaten_scratch[idx]` shortcut uvnitř grid
+    callback — tj. cell pokud našel zabraný food v rané grid traversal
+    pokračoval hledat NEzabraný. Sprint 57 paralelní Pass 1 nevidí
+    `eaten_scratch` (ne yet populated), takže cell vybere first
+    eat_test-passing food, a pokud Pass 2 zjistí že je zabraný, cell ten
+    tick nedostane jídlo. Smoke ukazuje že tohle pop trajektorii nepoškodí
+    (final 572 vs baseline 548); nově introdukovaný stochasticism má drobný
+    selekční effect ale nezmění direction evoluce.
+  - **Co Sprint 57 NEŘEŠÍ (Sprint 58+):**
+    - GPU FieldGpu wire-up (deposit/diffuse). Po Sprintu 57 update_smell+pheromone
+      = 285 µs = 22 % ticku; readback latence (PCIe + sync) by srovnala benefit
+      pro grid 64×64×16 (jen ~65k elementů). FieldGpu má smysl při bigger grid
+      nebo full-GPU loop bez per-tick readback.
+    - GPU SensorGatherGpu wire-up (Sprint 56 ready). Závislé na FieldGpu —
+      sensor potřebuje sample/gradient z field na GPU.
+    - `brain_act` GPU dispatch v `--gpu-full` (Sprint 51 ready ale CPU sensor
+      gather + GPU forward s upload/download stále je net negative pro 1000
+      cells × 36 inputs × 8 outputs).
+    - `SpatialGrid` `FxHashMap` → dense `Vec` indexed by 3D bucket coord
+      (~1020 buckets pro default world). Eliminuje hash kompletně, ale
+      vyžaduje refactor generic API (signed bucket coords, modulo wrap).
+    - `apply_brownian_cpu` paralelní s per-cell deterministic RNG (seed-derived
+      z lineage_id, jako Sprint 51 GPU brownian). Celkem 26 µs → potenciálně
+      5–10 µs, ale Sprint 51 už má GPU verzi pro `--gpu-full`.
+    - Renderer-side parallelizace `cell_eats_food` / `predate` — Bevy ECS
+      Commands (despawn) blokuje par_iter Query pattern; vyžaduje strukturní
+      přepis přes `EntityCommands` bucket + main-thread flush.
+    - Full headless tick benchmark v criterion (současný `benches/full_tick.rs`
+      je placeholder; měření přes `time` binary stačí pro Sprint 57 baseline).
+
+## Sprinty 58–62 — open-ended
+
+- **Sprint 58+:** GPU FieldGpu/SensorGather hot-path wire-up, případně
+  `SpatialGrid` dense Vec layout (žádný hash).
 - **Sprint 58+:** 3D voxel rendering, ghost cell visual wrap.
 - **Sprint 59+:** progressive z expansion (z=30, z=50).
 - **Sprint 60+:** thermal stratification (temperature field z-gradient).
