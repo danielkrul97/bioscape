@@ -550,11 +550,103 @@ plně 3D s 7-point Jacobi diffusion.
     - Full headless tick benchmark v criterion (současný `benches/full_tick.rs`
       je placeholder; měření přes `time` binary stačí pro Sprint 57 baseline).
 
-## Sprinty 58–62 — open-ended
+## Sprint 58 — performance hardening (renderer)
 
-- **Sprint 58+:** GPU FieldGpu/SensorGather hot-path wire-up, případně
+- **Cíl:** replikovat Sprint 57 paralelizační wins do renderer hot path
+  (`src/main.rs`). Sprint 57 paralelně pracoval s headless `Vec<Cell>`;
+  renderer používá Bevy ECS Query, takže pattern je jiný — snapshot
+  primitivních dat z Query → rayon par compute → sekvenční apply přes
+  `Query::get_mut` (ECS write je single-threaded).
+
+  **Plán implementace:**
+
+  *Body 1 — `HashMap` / `HashSet` → `FxHashMap` / `FxHashSet`:*
+  - `LineageMaterials`, `CellSlotMap.entity_to_slot`, predate scratch tables
+    (energy_changes, damage_changes, herd_counts), eat_food eaten set,
+    stats_overlay lineages set → drop-in. Stejně jako Sprint 57: SipHash
+    je v hot path drahý (Bevy `Entity` je 64-bit, hash overhead je per-key).
+
+  *Body 2 — `cell_predates_on_neighbor`:*
+  - Pre-compute `herd_counts` přes `snapshot.par_iter()` → `Vec<u32>`
+    indexed by snapshot order. Pak `FxHashMap<Entity, u32>` pro lookup
+    v sekvenčním attack loopu (zachován kvůli ECS write).
+  - Attack event pass zůstává sekvenční (jako headless Pass 2 pre-Sprint-57)
+    — refactor na par flat_map vyžaduje extra snapshot pose dat (heading,
+    pitch, spike_length) a `slot_map` lookup pro per-victim herd_count;
+    pro Sprint 58 stačí FxHashMap drop-in + par herd_counts.
+
+  *Body 3 — `resolve_cell_collisions`:*
+  - Pass 1 (par): snapshot `Vec<(Entity, pos, radius)>` → par compute
+    `Vec<(Entity, [f32; 2])>` non-zero deltas přes `par_iter().filter_map()`.
+  - Pass 2 (seq): apply přes `cells.get_mut(entity)`.
+
+  *Body 4 — `cell_eats_food`:*
+  - 3-pass refactor (mirror Sprint 57 headless `eat_food`).
+  - Pass 1 (par): snapshot s `(Entity, pos, max_axis, body_dims, heading, pitch)`
+    pro `eat_test_pose` (nový lib helper). `Vec<Option<(Entity_food, value)>>`
+    candidates collect.
+  - Pass 2 (seq): resolve race (first-cell-wins per food entity), apply
+    energy + Hebbian.
+  - Pass 3 (seq, main thread): `commands.entity(food_e).despawn()` flush —
+    Bevy `Commands` je single-threaded resource, nelze v `par_iter`.
+
+  *Body 5 — lib helper `eat_test_pose`:*
+  - Pure ellipsoid acceptance test bez `&Cell` (Bevy Query nemá `Send + Sync`
+    refs do Cell ve `par_iter`). Parametrizováno: `cell_pos`, `heading`,
+    `pitch`, `body_dims = [length, width, height]`, `food_pos`, `eat_factor`.
+  - `Cell::eat_test` re-implementováno jako tenký delegát na `eat_test_pose`
+    — zachovává původní API + sjednocuje math do jednoho místa.
+
+  *Body 6 — `step_cells` / `apply_environmental_hazards` / `apply_cell_morph`:*
+  - Stejně jako Sprint 57 lekce: rayon spawn overhead převáží malou per-cell
+    práci (1-15 µs sekvenčně vs ~25 µs paralelně). Sekvenční zachováno.
+
+- **Konstanty / dependencies:** žádné nové. `rayon` + `rustc-hash` už v
+  Sprint 57. Nový lib helper `eat_test_pose` neviditelný pro callsites
+  mimo refactor.
+
+- **Výstup:**
+  - `src/main.rs`: imports `rayon::prelude::*` + `rustc_hash::{FxHashMap,
+    FxHashSet}`. Hot path 3 systémy paralelizovány (predate herd counts,
+    collisions, eats_food). Drobnosti zachovány sekvenční. HashMap/Set drop-in
+    všude (4 callsites + 2 struct fields).
+  - `src/lib.rs`: `eat_test_pose` pub fn helper. `Cell::eat_test`
+    delegát.
+  - **Test suite: 73/73 pass** (existující eat_test testy validují delegate
+    refactor).
+  - **Renderer launch:** Bevy app starts bez panic, sim tick + render OK.
+    Wgpu init `cap 1064`, žádné GPU validation errory.
+
+- **Poznámky:**
+  - **ECS write je single-threaded:** `Query::par_iter_mut` v Bevy 0.18
+    funguje jen pro for_each-style closures bez collecting. Pro `cells.get_mut(entity)`
+    apply pattern (po par compute) je sekvenční — pattern: snapshot →
+    par compute → seq apply. Pomáhá když per-iter práce je drahá (grid
+    lookup, eat_test, ellipsoid math); pro malé fáze (step, hazards, morph)
+    je rayon overhead větší než paralelní zisk (Sprint 57 lekce).
+  - **Snapshot allocation cost:** Vec<(Entity, [f32; 3], f32)> ~= 32 bytes ×
+    1000 cells = 32 KB clone per tick. Při 60 FPS = 2 MB/s memcpy — negligible
+    vs 6 GB/s DDR4 bandwidth.
+  - **Commands flush dependency:** `cell_eats_food` despawn je v Pass 3
+    sekvenčně. `cell_dies_on_zero_energy` + `cell_reproduces_on_threshold`
+    používají Commands podobně, ale per-entity work je tak malý (energy
+    threshold check, jednorázový spawn), že rayon overhead by převážil —
+    sekvenční zachováno.
+  - **Co Sprint 58 NEŘEŠÍ (Sprint 59+):**
+    - `cells_brain_act` CPU sensor gather paralelizace (snapshot + par_iter).
+      GPU forward path už pokrývá brain forward; sensor gather je ~30 % brain_act
+      time. Refactor vyžaduje extract pose snapshot per cell.
+    - GPU FieldGpu / SensorGather hot-path wire-up (Sprint 56 ready).
+    - GPU brain_act CPU fallback path paralelizace (Bevy par_iter_mut + extract
+      Vec<Cell> snapshot + scatter back).
+    - `SpatialGrid` `FxHashMap` → dense `Vec` (Sprint 57 deferred).
+    - 3D voxel rendering, ghost cell visual wrap.
+
+## Sprinty 59–62 — open-ended
+
+- **Sprint 59+:** GPU FieldGpu/SensorGather hot-path wire-up, případně
   `SpatialGrid` dense Vec layout (žádný hash).
-- **Sprint 58+:** 3D voxel rendering, ghost cell visual wrap.
-- **Sprint 59+:** progressive z expansion (z=30, z=50).
-- **Sprint 60+:** thermal stratification (temperature field z-gradient).
-- **Sprint 61+:** light field z-attenuation (photic vs aphotic zones).
+- **Sprint 59+:** 3D voxel rendering, ghost cell visual wrap.
+- **Sprint 60+:** progressive z expansion (z=30, z=50).
+- **Sprint 61+:** thermal stratification (temperature field z-gradient).
+- **Sprint 62+:** light field z-attenuation (photic vs aphotic zones).

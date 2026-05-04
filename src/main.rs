@@ -42,7 +42,8 @@ use bioscape::{
 #[cfg(feature = "gpu")]
 use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, GpuContext, HebbianGpu};
 use rand::Rng;
-use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Duration;
 
 #[derive(Resource, Default)]
@@ -162,7 +163,7 @@ struct GpuBrainState {
 #[derive(Resource, Default)]
 struct CellSlotMap {
     slot_to_entity: Vec<Entity>,
-    entity_to_slot: HashMap<Entity, usize>,
+    entity_to_slot: FxHashMap<Entity, usize>,
 }
 
 impl CellSlotMap {
@@ -213,7 +214,7 @@ struct FoodMaterial(Handle<StandardMaterial>);
 /// `Assets<StandardMaterial>`. Bevy automaticky deduplikuje stejné materialy
 /// na renderer instances draw call.
 #[derive(Resource, Default)]
-struct LineageMaterials(HashMap<u64, Handle<StandardMaterial>>);
+struct LineageMaterials(FxHashMap<u64, Handle<StandardMaterial>>);
 
 /// Sprint 36 orbit camera state. Camera obíhá kolem `target` ve sférických
 /// souřadnicích (yaw + pitch). Distance camera→target je fixní
@@ -1067,7 +1068,6 @@ fn cell_eats_food(
     mut diag: Diagnostics,
 ) {
     let t_total = Instant::now();
-    let mut eaten: HashSet<Entity> = HashSet::new();
 
     // Sprint 52: pokud GPU available, sbíráme rewards Vec[N] a dispatchneme
     // GPU Hebbian na konci místo per-cell CPU brain.hebbian_update.
@@ -1082,49 +1082,97 @@ fn cell_eats_food(
         Vec::new()
     };
 
-    for (entity, mut cell) in &mut cells {
-        let pos = cell.0.position;
-        let eat_r = EAT_RADIUS * cell.0.phenotype.max_axis();
-        let mut to_eat: Option<(Entity, Food)> = None;
-        food_grid.0.for_each_in_radius_toroidal(pos, eat_r, SIMULATION_HALF, |food_e, food_pos, _| {
-            if to_eat.is_some() || eaten.contains(&food_e) {
-                return;
-            }
-            // Sprint 54: ghost food s min-imaged position pro toroidal eat_test.
-            let md = bioscape::min_image_delta(pos, food_pos, SIMULATION_HALF);
-            let ghost = Food {
-                position: [pos[0] + md[0], pos[1] + md[1], food_pos[2]],
-                age_ticks: 0,
-            };
-            if cell.0.eat_test(&ghost, EAT_RADIUS) {
-                to_eat = Some((food_e, ghost));
-            }
-        });
-        if let Some((food_e, food)) = to_eat {
-            cell.0.energy += FOOD_VALUE
-                * food_multiplier(world_map.0.sample([food.position[0], food.position[1], 0.0]))
-                * food.value_factor();
-            eaten.insert(food_e);
-            commands.entity(food_e).despawn();
-            if use_gpu_hebbian {
-                if let Some(slot) = slot_map.slot_of(entity) {
-                    if slot < rewards.len() {
-                        rewards[slot] = 1.0;
+    // Sprint 58: 3-pass refactor (mirror Sprint 57 headless eat_food).
+    // Pass 1 (par): per-cell candidate selection. Snapshot s pose data pro
+    // toroidal-aware eat_test_pose (lib helper bez `&Cell`).
+    let snapshot: Vec<(Entity, [f32; 3], f32, [f32; 3], f32, f32)> = cells
+        .iter()
+        .map(|(e, c)| {
+            (
+                e,
+                c.0.position,
+                c.0.phenotype.max_axis(),
+                [
+                    c.0.phenotype.body_length,
+                    c.0.phenotype.body_width,
+                    c.0.phenotype.body_height,
+                ],
+                c.0.heading,
+                c.0.pitch,
+            )
+        })
+        .collect();
+    let food_grid_ref = &food_grid.0;
+    let candidates: Vec<Option<(Entity, f32)>> = snapshot
+        .par_iter()
+        .map(|(_entity, pos, max_axis, dims, heading, pitch)| {
+            let eat_r = EAT_RADIUS * *max_axis;
+            let mut ate: Option<(Entity, f32)> = None;
+            food_grid_ref.for_each_in_radius_toroidal(
+                *pos,
+                eat_r,
+                SIMULATION_HALF,
+                |food_e, food_pos, _| {
+                    if ate.is_some() {
+                        return;
                     }
+                    // Sprint 54: ghost food s min-imaged position pro toroidal eat_test.
+                    let md = bioscape::min_image_delta(*pos, food_pos, SIMULATION_HALF);
+                    let ghost_pos = [pos[0] + md[0], pos[1] + md[1], food_pos[2]];
+                    if bioscape::eat_test_pose(*pos, *heading, *pitch, *dims, ghost_pos, EAT_RADIUS) {
+                        let value = FOOD_VALUE
+                            * food_multiplier(
+                                world_map.0.sample([food_pos[0], food_pos[1], 0.0]),
+                            )
+                            * Food {
+                                position: food_pos,
+                                age_ticks: 0,
+                            }
+                            .value_factor();
+                        ate = Some((food_e, value));
+                    }
+                },
+            );
+            ate
+        })
+        .collect();
+
+    // Pass 2 (sequential): resolve race + apply energy + Hebbian. First-cell-wins
+    // per food entity (matches pre-Sprint-58 ordering).
+    let mut eaten: FxHashSet<Entity> = FxHashSet::default();
+    for ((entity, _, _, _, _, _), opt) in snapshot.iter().zip(candidates.iter()) {
+        if let Some((food_e, value)) = opt {
+            if eaten.contains(food_e) {
+                continue;
+            }
+            eaten.insert(*food_e);
+            if let Ok((_, mut cell)) = cells.get_mut(*entity) {
+                cell.0.energy += *value;
+                if use_gpu_hebbian {
+                    if let Some(slot) = slot_map.slot_of(*entity) {
+                        if slot < rewards.len() {
+                            rewards[slot] = 1.0;
+                        }
+                    }
+                } else {
+                    let last_inputs = cell.0.last_inputs;
+                    let last_hidden = cell.0.last_hidden;
+                    let last_outputs = cell.0.last_outputs;
+                    cell.0.genome.brain.hebbian_update(
+                        &last_inputs,
+                        &last_hidden,
+                        &last_outputs,
+                        1.0,
+                        LEARNING_RATE,
+                    );
                 }
-            } else {
-                let last_inputs = cell.0.last_inputs;
-                let last_hidden = cell.0.last_hidden;
-                let last_outputs = cell.0.last_outputs;
-                cell.0.genome.brain.hebbian_update(
-                    &last_inputs,
-                    &last_hidden,
-                    &last_outputs,
-                    1.0,
-                    LEARNING_RATE,
-                );
             }
         }
+    }
+
+    // Pass 3: main-thread Commands flush (despawn nelze v par_iter).
+    for food_e in &eaten {
+        commands.entity(*food_e).despawn();
     }
 
     #[cfg(feature = "gpu")]
@@ -1376,7 +1424,7 @@ fn update_stats_overlay(
     let mut spk_sum = 0.0_f64;
     let mut spk_max = 0.0_f64;
     let mut e_sum = 0.0_f64;
-    let mut lineages: HashSet<u64> = HashSet::new();
+    let mut lineages: FxHashSet<u64> = FxHashSet::default();
     let mut oldest_age: u64 = 0;
     let current_gen = clock.0.generation;
     for c in &cells {
@@ -1627,34 +1675,50 @@ fn cell_predates_on_neighbor(
     mut diag: Diagnostics,
 ) {
     let t_total = Instant::now();
-    let mut energy_changes: HashMap<Entity, f32> = HashMap::new();
+    // Sprint 58: HashMap → FxHashMap (5-10× rychlejší hash than SipHash).
+    // Predate je hot path s 3 entity-keyed mapami × n insertů × n lookupů.
+    let mut energy_changes: FxHashMap<Entity, f32> = FxHashMap::default();
     // Sprint 30: nedobrovolný drain do brain damage signálu (input[14]).
     // Voluntární cost (movement, morph, attack) sem nepatří, jen predation.
-    let mut damage_changes: HashMap<Entity, f32> = HashMap::new();
+    let mut damage_changes: FxHashMap<Entity, f32> = FxHashMap::default();
 
     // Sprint 29 selfish-herd: pre-compute herd count per cell (počet sousedů
     // ve `HERD_RADIUS`). V predaci níže se gain násobí 1/(1 + K × herd_count_prey)
-    // — kořist obklopena hejnem dává predátorovi menší odměnu. `for_each_in_radius`
-    // je broad-phase (vrací bucket-grid kandidáty), narrow-phase distance check
-    // musí být explicitně, jinak se počítají i cells mimo HERD_RADIUS a dilution
-    // je silnější než v headless harness.
+    // — kořist obklopena hejnem dává predátorovi menší odměnu.
+    // Sprint 58: snapshot + rayon par compute. Snapshot drží jen entity+pos,
+    // herd query je read-only přes grid Res. Indexed Vec<u32> result.
     let herd_r2 = HERD_RADIUS * HERD_RADIUS;
-    let mut herd_counts: HashMap<Entity, u32> = HashMap::new();
-    for (entity, cell) in &cells {
-        let pos = cell.0.position;
-        let mut count: u32 = 0;
-        grid.0
-            .for_each_in_radius_toroidal(pos, HERD_RADIUS, SIMULATION_HALF, |other, other_pos, _| {
-                if other == entity {
-                    return;
-                }
-                let d = bioscape::min_image_delta(pos, other_pos, SIMULATION_HALF);
-                if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < herd_r2 {
-                    count += 1;
-                }
-            });
-        herd_counts.insert(entity, count);
-    }
+    let snapshot: Vec<(Entity, [f32; 3])> = cells
+        .iter()
+        .map(|(e, c)| (e, c.0.position))
+        .collect();
+    let grid_ref = &grid.0;
+    let herd_counts_vec: Vec<u32> = snapshot
+        .par_iter()
+        .map(|(entity, pos)| {
+            let mut count: u32 = 0;
+            grid_ref.for_each_in_radius_toroidal(
+                *pos,
+                HERD_RADIUS,
+                SIMULATION_HALF,
+                |other, other_pos, _| {
+                    if other == *entity {
+                        return;
+                    }
+                    let d = bioscape::min_image_delta(*pos, other_pos, SIMULATION_HALF);
+                    if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < herd_r2 {
+                        count += 1;
+                    }
+                },
+            );
+            count
+        })
+        .collect();
+    let herd_counts: FxHashMap<Entity, u32> = snapshot
+        .iter()
+        .zip(herd_counts_vec.iter())
+        .map(|((e, _), c)| (*e, *c))
+        .collect();
 
     for (entity_a, cell_a) in &cells {
         // Sprint 27: attack je opt-in přes brain output[6]. Bez aktivního
@@ -1715,34 +1779,47 @@ fn resolve_cell_collisions(
     mut diag: Diagnostics,
 ) {
     let t_total = Instant::now();
-    let mut deltas: Vec<(Entity, [f32; 2])> = Vec::new();
-
-    for (entity_a, cell_a) in &cells {
-        let pos_a = cell_a.0.position;
-        let radius_a = cell_a.0.phenotype.effective_radius();
-        let broad_r = CELL_RADIUS * (radius_a + BROAD_PHASE_SIZE_BUDGET);
-        let mut delta = [0.0_f32, 0.0_f32];
-        grid.0
-            .for_each_in_radius_toroidal(pos_a, broad_r, SIMULATION_HALF, |entity_b, pos_b, radius_b| {
-                if entity_b == entity_a {
-                    return;
-                }
-                let pair_r = CELL_RADIUS * (radius_a + radius_b);
-                let pair_r2 = pair_r * pair_r;
-                // Sprint 54: min-image delta b→a (push direction).
-                let d_vec = bioscape::min_image_delta(pos_b, pos_a, SIMULATION_HALF);
-                let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
-                if d2 < pair_r2 && d2 > 0.0 {
-                    let d = d2.sqrt();
-                    let overlap = pair_r - d;
-                    delta[0] += (d_vec[0] / d) * overlap * 0.5;
-                    delta[1] += (d_vec[1] / d) * overlap * 0.5;
-                }
-            });
-        if delta != [0.0, 0.0] {
-            deltas.push((entity_a, delta));
-        }
-    }
+    // Sprint 58: snapshot + rayon par compute deltas. Pass 1 sběr (entity, pos,
+    // radius) → par filter_map vrací jen non-zero deltas. Pass 2 sekvenčně
+    // applikuje přes Query::get_mut (ECS write requires single-threaded access).
+    let snapshot: Vec<(Entity, [f32; 3], f32)> = cells
+        .iter()
+        .map(|(e, c)| (e, c.0.position, c.0.phenotype.effective_radius()))
+        .collect();
+    let grid_ref = &grid.0;
+    let deltas: Vec<(Entity, [f32; 2])> = snapshot
+        .par_iter()
+        .filter_map(|(entity_a, pos_a, radius_a)| {
+            let broad_r = CELL_RADIUS * (*radius_a + BROAD_PHASE_SIZE_BUDGET);
+            let mut delta = [0.0_f32, 0.0_f32];
+            grid_ref.for_each_in_radius_toroidal(
+                *pos_a,
+                broad_r,
+                SIMULATION_HALF,
+                |entity_b, pos_b, radius_b| {
+                    if entity_b == *entity_a {
+                        return;
+                    }
+                    let pair_r = CELL_RADIUS * (*radius_a + radius_b);
+                    let pair_r2 = pair_r * pair_r;
+                    // Sprint 54: min-image delta b→a (push direction).
+                    let d_vec = bioscape::min_image_delta(pos_b, *pos_a, SIMULATION_HALF);
+                    let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
+                    if d2 < pair_r2 && d2 > 0.0 {
+                        let d = d2.sqrt();
+                        let overlap = pair_r - d;
+                        delta[0] += (d_vec[0] / d) * overlap * 0.5;
+                        delta[1] += (d_vec[1] / d) * overlap * 0.5;
+                    }
+                },
+            );
+            if delta != [0.0, 0.0] {
+                Some((*entity_a, delta))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     for (entity, delta) in deltas {
         if let Ok((_, mut cell)) = cells.get_mut(entity) {

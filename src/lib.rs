@@ -1035,17 +1035,18 @@ impl Cell {
     /// — backward kompat s pre-Sprint-41 isotropic buňkou. Použito v binárkách
     /// pro broad+narrow phase split (broad uses `max_axis`, narrow tento test).
     pub fn eat_test(&self, food: &Food, eat_factor: f32) -> bool {
-        let dx = food.position[0] - self.position[0];
-        let dy = food.position[1] - self.position[1];
-        let dz = food.position[2] - self.position[2];
-        let (fwd, right, up) = body_basis(self.heading, self.pitch);
-        let d_par = dx * fwd[0] + dy * fwd[1] + dz * fwd[2];
-        let d_right = dx * right[0] + dy * right[1] + dz * right[2];
-        let d_up = dx * up[0] + dy * up[1] + dz * up[2];
-        let l = (self.phenotype.body_length * eat_factor).max(f32::EPSILON);
-        let w = (self.phenotype.body_width * eat_factor).max(f32::EPSILON);
-        let h = (self.phenotype.body_height * eat_factor).max(f32::EPSILON);
-        (d_par / l).powi(2) + (d_right / w).powi(2) + (d_up / h).powi(2) <= 1.0
+        eat_test_pose(
+            self.position,
+            self.heading,
+            self.pitch,
+            [
+                self.phenotype.body_length,
+                self.phenotype.body_width,
+                self.phenotype.body_height,
+            ],
+            food.position,
+            eat_factor,
+        )
     }
 
     /// Sprint 41: ellipsoidální acceptance + energy gain při hitu.
@@ -1153,6 +1154,31 @@ pub fn body_basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
         fwd[0] * right[1] - fwd[1] * right[0],
     ];
     (fwd, right, up)
+}
+
+/// Sprint 58: pure ellipsoid-acceptance test bez `&Cell` reference. Stejná
+/// matematika jako `Cell::eat_test` ale parametrizovaná — umožňuje volat z
+/// rayon par_iter snapshotu kde nedrží `&Cell` (Bevy Query lifetime).
+/// `body_dims = [length, width, height]`.
+pub fn eat_test_pose(
+    cell_pos: [f32; 3],
+    heading: f32,
+    pitch: f32,
+    body_dims: [f32; 3],
+    food_pos: [f32; 3],
+    eat_factor: f32,
+) -> bool {
+    let dx = food_pos[0] - cell_pos[0];
+    let dy = food_pos[1] - cell_pos[1];
+    let dz = food_pos[2] - cell_pos[2];
+    let (fwd, right, up) = body_basis(heading, pitch);
+    let d_par = dx * fwd[0] + dy * fwd[1] + dz * fwd[2];
+    let d_right = dx * right[0] + dy * right[1] + dz * right[2];
+    let d_up = dx * up[0] + dy * up[1] + dz * up[2];
+    let l = (body_dims[0] * eat_factor).max(f32::EPSILON);
+    let w = (body_dims[1] * eat_factor).max(f32::EPSILON);
+    let h = (body_dims[2] * eat_factor).max(f32::EPSILON);
+    (d_par / l).powi(2) + (d_right / w).powi(2) + (d_up / h).powi(2) <= 1.0
 }
 
 /// Sprint 40: senzorický kontext brainu. Volá se z hot loop binárek po
