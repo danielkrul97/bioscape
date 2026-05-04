@@ -1,11 +1,8 @@
-mod cell_material;
-
-use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
-use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
-use bevy::mesh::MeshTag;
-use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::image::Image;
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bioscape::{
     reject_food_for_richness,
@@ -17,7 +14,7 @@ use bioscape::{
     GENERATIONS_PER_EPOCH, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS,
     INITIAL_CELLS,
     LEARNING_RATE, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
-    MAX_SPIKE_LENGTH, MUTATION_CONFIG, PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD,
+    MUTATION_CONFIG, PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD,
     PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES,
     PHEROMONE_NORMALIZATION_GAIN, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK,
     PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY,
@@ -25,7 +22,6 @@ use bioscape::{
     TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
     WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
-use cell_material::{pack_cell_tag, CellMaterial, CellMaterialPlugin};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 
@@ -36,14 +32,12 @@ const GRID_CELL_SIZE: f32 = 100.0;
 const CAMERA_ZOOM_STEP: f32 = 0.1;
 const CAMERA_ZOOM_MIN: f32 = 0.1;
 const CAMERA_ZOOM_MAX: f32 = 10.0;
-// Fixní simulační svět (matches headless WORLD_HALF). Window je jen viewport —
-// WorldMap, cell bounds a vše sim mechanika pracují v těchto rozměrech, nezávisle
-// na velikosti okna. Bez tohoto by overlay neodpovídal pozicím buněk po
-// maximalizaci a seed by dával různé mapy na různých monitorech.
-// Sprint 35: aktivovaná z-osa (2 = velmi mírný 3D layer). Sprint 37 ladí.
+// Sprint 35: z-osa aktivovaná, mírný 3D layer.
 const SIMULATION_HALF: [f32; 3] = [960.0, 540.0, 2.0];
-const WORLD_MAP_OVERLAY_ALPHA: f32 = 0.3;
-const WORLD_MAP_OVERLAY_Z: f32 = -10.0;
+// Sprint 36: aerial Camera3d view. Camera nahoru po +Z na výšce sufficient,
+// aby celá xy plochá scéna se vešla do FoV při fov=π/3 (=60°).
+// half_y / tan(fov/2) = 540 / tan(30°) ≈ 935. S marginem volíme 1500.
+const CAMERA_HEIGHT_INITIAL: f32 = 1500.0;
 
 #[derive(Component)]
 struct CellEntity(Cell);
@@ -72,12 +66,6 @@ struct WorldExtent {
 impl WorldExtent {
     fn as_array(self) -> [f32; 3] {
         [self.half_x, self.half_y, self.half_z]
-    }
-
-    /// Sprint 32: 2D projekce pro WorldMap / SmellField API, které jsou stále
-    /// 2D. Sprint 35 odstraní (fields přejdou na 3D).
-    fn as_array_xy(self) -> [f32; 2] {
-        [self.half_x, self.half_y]
     }
 }
 
@@ -179,10 +167,13 @@ struct CellMesh(Handle<Mesh>);
 struct FoodMesh(Handle<Mesh>);
 
 #[derive(Resource)]
-struct FoodMaterial(Handle<ColorMaterial>);
+struct FoodMaterial(Handle<StandardMaterial>);
 
-#[derive(Resource)]
-struct CellMaterialHandle(Handle<CellMaterial>);
+/// Sprint 36: per-lineage material cache. Lineage hue → handle do
+/// `Assets<StandardMaterial>`. Bevy automaticky deduplikuje stejné materialy
+/// na renderer instances draw call.
+#[derive(Resource, Default)]
+struct LineageMaterials(HashMap<u64, Handle<StandardMaterial>>);
 
 #[derive(Resource)]
 struct SmellResource(SmellField);
@@ -217,9 +208,9 @@ fn main() {
                 ..default()
             }),
             FrameTimeDiagnosticsPlugin::default(),
-            CellMaterialPlugin,
         ))
         .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.08)))
+        .init_resource::<LineageMaterials>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
         .insert_resource(Clock(SimClock::new(
             TICKS_PER_GENERATION,
@@ -274,9 +265,9 @@ fn main() {
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut color_materials: ResMut<Assets<ColorMaterial>>,
-    mut cell_materials: ResMut<Assets<CellMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut lineage_materials: ResMut<LineageMaterials>,
     mut window: Single<&mut Window>,
 ) {
     window.set_maximized(true);
@@ -288,49 +279,85 @@ fn setup(
     };
     commands.insert_resource(extent);
 
-    commands.spawn(Camera2d);
+    // Sprint 36: Camera3d nahoru po +Z, looking at origin. Bevy 0.18 Camera3d
+    // má default perspective projection — explicitní Projection by konfliktoval
+    // s render graph wiringem. Sim z-osa = vertical; up vektor pro look_at
+    // volíme +Y aby horizontální xy plocha byla "stage".
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 0.0, CAMERA_HEIGHT_INITIAL).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+
+    // Ambient + DirectionalLight pro 3D scénu. Bevy 0.18 typické hodnoty:
+    // ambient ~1000-2000, directional ~10000+ pro outdoor scénu.
+    commands.spawn(AmbientLight {
+        color: Color::WHITE,
+        brightness: 1500.0,
+        ..default()
+    });
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 12000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(
+            EulerRot::XYZ,
+            -std::f32::consts::FRAC_PI_4,
+            std::f32::consts::FRAC_PI_6,
+            0.0,
+        )),
+    ));
 
     // Sprint 32: WorldMap + SmellField stále 2D — projekce xy z 3D extentu.
     let half_xy = [half[0], half[1]];
     let world_map = WorldMap::new(WORLD_MAP_RES, WORLD_MAP_BASE_RES, half_xy, WORLD_MAP_SEED);
-    let overlay_image = images.add(world_map_image(&world_map));
+
+    // Sprint 36: WorldMap overlay jako ground plane na z=-half_z-5 (pod cells).
+    // Texture je grayscale richness; v 3D pohledu funguje jako "podlaha" světa.
+    let overlay_image_handle = images.add(world_map_image(&world_map));
+    let overlay_material = materials.add(StandardMaterial {
+        base_color_texture: Some(overlay_image_handle),
+        unlit: true,
+        ..default()
+    });
+    let overlay_mesh =
+        meshes.add(Plane3d::default().mesh().size(2.0 * half[0], 2.0 * half[1]));
     commands.spawn((
-        Sprite {
-            image: overlay_image,
-            custom_size: Some(Vec2::new(2.0 * half[0], 2.0 * half[1])),
-            color: Color::srgba(1.0, 1.0, 1.0, WORLD_MAP_OVERLAY_ALPHA),
-            ..default()
-        },
-        Transform::from_xyz(0.0, 0.0, WORLD_MAP_OVERLAY_Z),
+        Mesh3d(overlay_mesh),
+        MeshMaterial3d(overlay_material),
+        Transform::from_xyz(0.0, 0.0, -half[2] - 5.0)
+            // Plane3d defaultně leží v xz; rotujem do xy aby normála ukazovala +z.
+            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
         WorldMapOverlay,
     ));
 
-    let cell_mesh = meshes.add(cell_mesh(CELL_RADIUS));
-    let food_mesh = meshes.add(Circle::new(FOOD_RADIUS));
-    let food_material = color_materials.add(Color::srgb(0.95, 0.95, 0.85));
-    let cell_material = cell_materials.add(CellMaterial::default());
+    // Sprint 36: cell mesh = unit-radius sphere, scale aplikuje ellipsoid
+    // (length × width × height) per cell. Spike rendering vynechán (visual
+    // loss; predace mechanika beze změny).
+    let cell_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS).mesh().ico(2).unwrap());
+    let food_mesh_handle = meshes.add(Sphere::new(FOOD_RADIUS).mesh().ico(1).unwrap());
+    let food_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.95, 0.95, 0.85),
+        emissive: LinearRgba::new(0.4, 0.4, 0.3, 1.0),
+        ..default()
+    });
 
     let mut rng = rand::rng();
     for i in 0..INITIAL_CELLS {
         let cell = Cell::random(&mut rng, half, i as u64, 0);
+        let mat = lineage_material(&mut lineage_materials, &mut materials, cell.lineage_id);
         commands.spawn((
             CellEntity(cell),
-            Mesh2d(cell_mesh.clone()),
-            MeshMaterial2d(cell_material.clone()),
-            MeshTag(pack_cell_tag(
-                lineage_hue(cell.lineage_id),
-                1.0,
-                spike_norm(&cell.phenotype),
-            )),
-            Transform::from_xyz(cell.position[0], cell.position[1], 0.0)
-                .with_rotation(Quat::from_rotation_z(cell.heading))
+            Mesh3d(cell_mesh_handle.clone()),
+            MeshMaterial3d(mat),
+            Transform::from_xyz(cell.position[0], cell.position[1], cell.position[2])
+                .with_rotation(cell_rotation(cell.heading, cell.pitch))
                 .with_scale(cell_scale(&cell.phenotype)),
         ));
     }
     let initial_food = food_target(&extent, 1.0);
     for _ in 0..initial_food {
-        // Sprint 31: rejection sampling i pro initial food. Retry budget
-        // garantuje, že žádný slot nezůstane prázdný.
         let mut food = Food::random(&mut rng, half);
         for _ in 0..MAX_SPAWN_ATTEMPTS {
             let richness = world_map.sample([food.position[0], food.position[1]]);
@@ -341,22 +368,52 @@ fn setup(
         }
         commands.spawn((
             FoodEntity(food),
-            Mesh2d(food_mesh.clone()),
-            MeshMaterial2d(food_material.clone()),
-            Transform::from_xyz(food.position[0], food.position[1], -1.0),
+            Mesh3d(food_mesh_handle.clone()),
+            MeshMaterial3d(food_material.clone()),
+            Transform::from_xyz(food.position[0], food.position[1], food.position[2]),
         ));
     }
 
-    commands.insert_resource(CellMesh(cell_mesh));
-    commands.insert_resource(FoodMesh(food_mesh));
+    commands.insert_resource(CellMesh(cell_mesh_handle));
+    commands.insert_resource(FoodMesh(food_mesh_handle));
     commands.insert_resource(FoodMaterial(food_material));
-    commands.insert_resource(CellMaterialHandle(cell_material));
     commands.insert_resource(SmellResource(SmellField::new(SMELL_GRID_RES, half_xy)));
     commands.insert_resource(PheromoneResource(SmellField::new(
         PHEROMONE_GRID_RES,
         half_xy,
     )));
     commands.insert_resource(WorldMapResource(world_map));
+}
+
+/// Sprint 36: vrátí (případně vytvoří) StandardMaterial handle pro daný
+/// lineage_id. Hue mapuje deterministicky přes `lineage_hue`. Cache zaručuje,
+/// že cells se stejným lineage sdílejí jeden material — Bevy je instance
+/// podle materialu pro draw call binning, takže shared material = 1 batch.
+fn lineage_material(
+    cache: &mut LineageMaterials,
+    materials: &mut Assets<StandardMaterial>,
+    lineage_id: u64,
+) -> Handle<StandardMaterial> {
+    if let Some(h) = cache.0.get(&lineage_id) {
+        return h.clone();
+    }
+    let hue = lineage_hue(lineage_id);
+    let color = Color::hsl(hue, 0.75, 0.55);
+    let handle = materials.add(StandardMaterial {
+        base_color: color,
+        perceptual_roughness: 0.6,
+        ..default()
+    });
+    cache.0.insert(lineage_id, handle.clone());
+    handle
+}
+
+/// Sprint 36: Quat z yaw + pitch pro orientaci ellipsoidu. Body's local +X
+/// musí mířit ve forward direction = (cos(y)cos(p), sin(y)cos(p), sin(p)).
+/// Quat::from_rotation_z(yaw) * Quat::from_rotation_y(pitch) splňuje
+/// (1,0,0) → forward (viz `bioscape::forward_vector`).
+fn cell_rotation(yaw: f32, pitch: f32) -> Quat {
+    Quat::from_rotation_z(yaw) * Quat::from_rotation_y(-pitch)
 }
 
 fn world_map_image(map: &WorldMap) -> Image {
@@ -414,51 +471,6 @@ fn update_food_density_cycle(
     }
     let phase = (clock.0.generation as f32 / CYCLE_GEN_PERIOD as f32) * std::f32::consts::TAU;
     factor.0 = 1.0 + CYCLE_AMPLITUDE * phase.sin();
-}
-
-fn cell_mesh(radius: f32) -> Mesh {
-    use bevy::asset::RenderAssetUsages;
-    use bevy::mesh::{Indices, PrimitiveTopology};
-
-    // Unit-radius circle, vertex 1 at (+r, 0). Vertex 1 je shader-extension
-    // anchor pro spike (cell_material.wgsl): při spike_length > 0 shader
-    // protáhne tenhle vertex po +x heading o `spike_norm × MAX_SPIKE_WORLD_PX`.
-    // Tělo zůstává kruhové, spike se rýsuje až přes morfogenetický gen.
-    let segments = 24;
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(segments + 1);
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(segments + 1);
-    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(segments + 1);
-
-    positions.push([0.0, 0.0, 0.0]);
-    normals.push([0.0, 0.0, 1.0]);
-    uvs.push([0.5, 0.5]);
-
-    for i in 0..segments {
-        let t = (i as f32 / segments as f32) * std::f32::consts::TAU;
-        let x = radius * t.cos();
-        let y = radius * t.sin();
-        positions.push([x, y, 0.0]);
-        normals.push([0.0, 0.0, 1.0]);
-        uvs.push([x / (2.0 * radius) + 0.5, y / (2.0 * radius) + 0.5]);
-    }
-
-    let mut indices: Vec<u32> = Vec::with_capacity(segments * 3);
-    for i in 0..segments {
-        let next = (i + 1) % segments;
-        indices.push(0);
-        indices.push((i + 1) as u32);
-        indices.push((next + 1) as u32);
-    }
-
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
 }
 
 fn advance_clock(
@@ -725,9 +737,13 @@ fn spawn_food(
             if !blocked {
                 commands.spawn((
                     FoodEntity(candidate),
-                    Mesh2d(food_mesh.0.clone()),
-                    MeshMaterial2d(food_material.0.clone()),
-                    Transform::from_xyz(candidate.position[0], candidate.position[1], -1.0),
+                    Mesh3d(food_mesh.0.clone()),
+                    MeshMaterial3d(food_material.0.clone()),
+                    Transform::from_xyz(
+                        candidate.position[0],
+                        candidate.position[1],
+                        candidate.position[2],
+                    ),
                 ));
                 continue 'spawn;
             }
@@ -783,26 +799,18 @@ fn cell_eats_food(
     }
 }
 
-fn sync_transforms(
-    mut cells: Query<(&CellEntity, &mut Transform, &mut MeshTag), Without<Dying>>,
-) {
-    for (cell, mut transform, mut tag) in &mut cells {
+fn sync_transforms(mut cells: Query<(&CellEntity, &mut Transform), Without<Dying>>) {
+    for (cell, mut transform) in &mut cells {
         transform.translation.x = cell.0.position[0];
         transform.translation.y = cell.0.position[1];
-        transform.rotation = Quat::from_rotation_z(cell.0.heading);
+        transform.translation.z = cell.0.position[2];
+        transform.rotation = cell_rotation(cell.0.heading, cell.0.pitch);
         let target_scale = cell_scale(&cell.0.phenotype);
         if (transform.scale.x - target_scale.x).abs() > 1e-3
             || (transform.scale.y - target_scale.y).abs() > 1e-3
+            || (transform.scale.z - target_scale.z).abs() > 1e-3
         {
             transform.scale = target_scale;
-        }
-        let new_tag = pack_cell_tag(
-            lineage_hue(cell.0.lineage_id),
-            1.0,
-            spike_norm(&cell.0.phenotype),
-        );
-        if tag.0 != new_tag {
-            tag.0 = new_tag;
         }
     }
 }
@@ -839,41 +847,43 @@ fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>)
     }
 }
 
+/// Sprint 36: Camera3d pan v xy-plochy přes WASD/arrow klávesy. Mouse motion
+/// resp. middle-drag se v 3D pohledu typicky hodí na orbit (rotace), takže
+/// pan necháme klávesnicovou.
 fn camera_pan(
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut motion: MessageReader<MouseMotion>,
-    camera: Single<(&mut Transform, &Projection), With<Camera2d>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    camera: Single<&mut Transform, With<Camera3d>>,
 ) {
-    if !buttons.pressed(MouseButton::Middle) {
-        // Drop accumulated motion when not actively dragging — jinak by
-        // se delta nasčítaly a po stisku middle by kamera skočila.
-        motion.clear();
-        return;
-    }
     let mut delta = Vec2::ZERO;
-    for ev in motion.read() {
-        delta += ev.delta;
+    if keys.pressed(KeyCode::ArrowLeft) || keys.pressed(KeyCode::KeyA) {
+        delta.x -= 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowRight) || keys.pressed(KeyCode::KeyD) {
+        delta.x += 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowDown) || keys.pressed(KeyCode::KeyS) {
+        delta.y -= 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowUp) || keys.pressed(KeyCode::KeyW) {
+        delta.y += 1.0;
     }
     if delta == Vec2::ZERO {
         return;
     }
-    let (mut transform, projection) = camera.into_inner();
-    let scale = if let Projection::Orthographic(o) = projection {
-        o.scale
-    } else {
-        1.0
-    };
-    // Map-style drag ("cursor pulls world"): cursor right → camera left,
-    // takže content visually follows cursor. Cursor Y v screen-space jde
-    // dolů, world Y nahoru — flip pro Y.
-    transform.translation.x -= delta.x * scale;
-    transform.translation.y += delta.y * scale;
+    let mut transform = camera.into_inner();
+    // Pan rychlost ∝ camera Z výšce (víc zoomout = rychlejší pan).
+    let speed = transform.translation.z.abs() * 0.5;
+    transform.translation.x += delta.x * speed * time.delta_secs();
+    transform.translation.y += delta.y * speed * time.delta_secs();
 }
 
+/// Sprint 36: zoom přes mouse wheel — adjustuje camera Z distance. Bližší
+/// kamera = větší cells na obrazovce. Clamp brání tomu aby kamera prošla
+/// scénou nebo se ztratila daleko.
 fn camera_zoom(
     mut wheel: MessageReader<MouseWheel>,
-    window: Single<&Window>,
-    camera: Single<(&mut Transform, &mut Projection), With<Camera2d>>,
+    camera: Single<&mut Transform, With<Camera3d>>,
 ) {
     let mut scroll = 0.0_f32;
     for ev in wheel.read() {
@@ -885,32 +895,11 @@ fn camera_zoom(
     if scroll == 0.0 {
         return;
     }
-    let (mut transform, mut projection) = camera.into_inner();
-    let Projection::Orthographic(ortho) = &mut *projection else {
-        return;
-    };
-
-    let old_scale = ortho.scale;
-    let new_scale = (old_scale * (-scroll * CAMERA_ZOOM_STEP).exp())
-        .clamp(CAMERA_ZOOM_MIN, CAMERA_ZOOM_MAX);
-    if new_scale == old_scale {
-        return;
-    }
-    ortho.scale = new_scale;
-
-    // Cursor-anchored zoom: shift camera so the world point under the cursor
-    // stays put. World under cursor = C + offset · scale, where offset is the
-    // cursor's distance from viewport center (Y flipped). To keep it fixed
-    // when scale goes s → s', move camera by offset · s · (1 - s'/s).
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    let viewport = Vec2::new(window.resolution.width(), window.resolution.height());
-    let offset = (cursor - viewport * 0.5) * Vec2::new(1.0, -1.0);
-    let factor = new_scale / old_scale;
-    let delta = offset * old_scale * (1.0 - factor);
-    transform.translation.x += delta.x;
-    transform.translation.y += delta.y;
+    let mut transform = camera.into_inner();
+    let factor = (-scroll * CAMERA_ZOOM_STEP).exp();
+    let new_z = (transform.translation.z * factor)
+        .clamp(CAMERA_HEIGHT_INITIAL * CAMERA_ZOOM_MIN, CAMERA_HEIGHT_INITIAL * CAMERA_ZOOM_MAX);
+    transform.translation.z = new_z;
 }
 
 fn log_clock_events(
@@ -1072,7 +1061,8 @@ fn update_stats_overlay(
 fn cell_reproduces_on_threshold(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     cell_mesh: Res<CellMesh>,
-    cell_material: Res<CellMaterialHandle>,
+    mut lineage_materials: ResMut<LineageMaterials>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut commands: Commands,
 ) {
     let current_pop = cells.iter().count();
@@ -1174,19 +1164,14 @@ fn cell_reproduces_on_threshold(
     }
 
     let mesh = cell_mesh.0.clone();
-    let material = cell_material.0.clone();
     for cell in to_spawn {
+        let mat = lineage_material(&mut lineage_materials, &mut materials, cell.lineage_id);
         commands.spawn((
             CellEntity(cell),
-            Mesh2d(mesh.clone()),
-            MeshMaterial2d(material.clone()),
-            MeshTag(pack_cell_tag(
-                lineage_hue(cell.lineage_id),
-                1.0,
-                spike_norm(&cell.phenotype),
-            )),
-            Transform::from_xyz(cell.position[0], cell.position[1], 0.0)
-                .with_rotation(Quat::from_rotation_z(cell.heading))
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(mat),
+            Transform::from_xyz(cell.position[0], cell.position[1], cell.position[2])
+                .with_rotation(cell_rotation(cell.heading, cell.pitch))
                 .with_scale(cell_scale(&cell.phenotype)),
         ));
     }
@@ -1216,9 +1201,9 @@ fn cell_dies_on_zero_energy(
                 ];
                 commands.spawn((
                     FoodEntity(Food { position: pos }),
-                    Mesh2d(food_mesh.0.clone()),
-                    MeshMaterial2d(food_material.0.clone()),
-                    Transform::from_xyz(pos[0], pos[1], pos[2] - 1.0),
+                    Mesh3d(food_mesh.0.clone()),
+                    MeshMaterial3d(food_material.0.clone()),
+                    Transform::from_xyz(pos[0], pos[1], pos[2]),
                 ));
             }
         }
@@ -1379,32 +1364,33 @@ fn tick_death_fade(
         &mut Dying,
         &CellEntity,
         &mut Transform,
-        &mut MeshTag,
     )>,
     mut commands: Commands,
 ) {
-    for (entity, mut d, cell, mut transform, mut tag) in &mut dying {
+    for (entity, mut d, cell, mut transform) in &mut dying {
         if d.ticks_left == 0 {
             commands.entity(entity).despawn();
             continue;
         }
         d.ticks_left -= 1;
         let progress = d.ticks_left as f32 / DEATH_FADE_TICKS as f32;
+        // Sprint 36: fade jen přes scale shrinkout. Alpha fade by chtělo
+        // Material handle adjustment per cell (StandardMaterial alpha_mode +
+        // base_color.alpha). Sprint 38+ může to vyřešit; teď postačí scaling.
         transform.scale = cell_scale(&cell.0.phenotype) * progress;
-        tag.0 = pack_cell_tag(
-            lineage_hue(cell.0.lineage_id),
-            progress,
-            spike_norm(&cell.0.phenotype),
-        );
     }
 }
 
+/// Sprint 36: 3-axis ellipsoid scale (length × width × height). Bevy non-uniform
+/// scale aplikuje na unit-radius sphere, vytváří ellipsoid s poloosami
+/// (L, W, H) podél x, y, z. Po `cell_rotation(yaw, pitch)` je local +X
+/// alignovaný s forward vektorem buňky.
 fn cell_scale(phenotype: &Phenotype) -> Vec3 {
-    Vec3::new(phenotype.body_length, phenotype.body_width, 1.0)
-}
-
-fn spike_norm(phenotype: &Phenotype) -> f32 {
-    (phenotype.spike_length / MAX_SPIKE_LENGTH).clamp(0.0, 1.0)
+    Vec3::new(
+        phenotype.body_length,
+        phenotype.body_width,
+        phenotype.body_height,
+    )
 }
 
 

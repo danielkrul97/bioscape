@@ -34,8 +34,11 @@ bevy = { version = "0.18", default-features = false, features = [
     "x11",
     "wayland",
     "sysinfo_plugin",
-    # 2D rendering stack (sprites, core pipeline, gizmos, post-process)
+    # 2D + 3D rendering stack (sprites, PBR, core pipeline, gizmos, post-process)
     "2d_bevy_render",
+    "3d_bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
     # UI overlays (Node + Text); bevy_text comes in transitively via 2d_bevy_render
     "bevy_ui",
     "bevy_ui_render",

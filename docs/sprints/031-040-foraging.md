@@ -145,23 +145,38 @@ Decade tématicky bipolární. **Sprint 31** rozšiřuje 2D ekosystém přes spa
   - **Co Sprint 35 NEMĚNÍ**: WorldMap (stále 2D), SmellField (stále 2D), pheromone (stále 2D). Brain inputs[17] (smell_dz), [19] (ph_dz) zůstávají 0 — gradient v z neexistuje, dokud pole nejsou volumetric. Cells navigují z přes vision (food_dz, cell_dz already populated since Sprint 33) + memory (Sprint 28 recurrent).
   - **Pitch range conservativeness**: ±π/12 = 15°. Při full thrust to znamená max 26 % thrust v z, 96 % v xy. Bezpečné pro random brainy. Selekce může chtít víc; Sprint 37 ladí.
 
-## Sprint 36 — 3d-renderer (DEFERRED)
+## Sprint 36 — 3d-renderer
 
-- **Cíl:** převést Bevy renderer z 2D pipeline na 3D — `Camera2d → Camera3d`, `Mesh2d → Mesh3d`, custom `Material2d` shader (`cell_material.wgsl`) port na `Material3d`, sphere/ellipsoid mesh místo teardrop, lighting (DirectionalLight + AmbientLight), kameraový orbit/fly control, WorldMap overlay jako bottom plane texture. Spike rendering ve 3D = elongation podél 3D forward axisu.
+- **Cíl:** převést Bevy renderer z 2D pipeline na 3D — `Camera2d → Camera3d`, `Mesh2d → Mesh3d`, drop custom `Material2d` shader, použít `StandardMaterial` s lineage hue (cached per-lineage), Sphere mesh + non-uniform scale pro ellipsoid, AmbientLight + DirectionalLight pro shading, WorldMap jako ground plane texture, klávesnicový pan + scroll zoom v 3D.
 
-- **Status: DEFERRED.** Implementační scope ~500+ LOC + WGSL port = sprint-sized session sám o sobě. Při kompletní 2D→3D session bylo prioritou simulační logika (Sprinty 32–35). Renderer port následuje:
+  **Plán:**
+  - **Drop custom shader**: `mod cell_material` smazán, `cell_material.rs` + `assets/shaders/cell_material.wgsl` removed. Custom Material2d port na Material3d (PBR pipeline) by vyžadoval značný WGSL rewrite — pro Sprint 36 minimální scope použijeme `StandardMaterial`.
+  - **LineageMaterials cache**: `HashMap<lineage_id, Handle<StandardMaterial>>` resource. Každý lineage má vlastní material s `Color::hsl(lineage_hue, 0.75, 0.55)` — Bevy automaticky deduplikuje cells stejné linie do jednoho draw call.
+  - **Camera3d**: nahoru po +Z na výšce 1500 (sufficient pro full 1920×1080 scene fit při fov=π/3), looking at origin, up=+Y. Top-down pohled, Bevy konvence Y-up zachovaná. Sim z-osa = Bevy z-osa (vertical).
+  - **Cell mesh**: `Sphere::new(CELL_RADIUS).mesh().ico(2)` — icosphere subdivision 2 = 162 vertices (smooth ale levné). Non-uniform `cell_scale = Vec3::new(length, width, height)` aplikuje ellipsoid. Po `cell_rotation(yaw, pitch)` je local +X (forward) alignovaný s buněčným heading vektorem.
+  - **Food mesh**: `Sphere::new(FOOD_RADIUS).mesh().ico(1)`.
+  - **Lighting**: `AmbientLight` (brightness 600) drží minimum osvětlení, `DirectionalLight` (illuminance 4000) z mírně bočního úhlu pro jemný shading.
+  - **WorldMap overlay**: `Plane3d` s texture z grayscale richness field, na z=-half_z-5 (pod cells). Rotation `Quat::from_rotation_x(π/2)` převrací Plane3d (defaultně xz) na xy plane s normálou +z.
+  - **Camera controls**: pan přes WASD/arrows (rychlost ∝ camera Z), zoom přes mouse wheel (camera Z exponential clamp).
+  - **Spike rendering**: drop. Predace mechanika nezměněna (spike stále existuje v Phenotype), jen není visible. Sprint 38+ může vrátit přes child cone entity.
+  - **Death fade**: jen scale shrinkout (no alpha — vyžadovalo by per-cell material handle adjust). Sprint 38+ revisit.
 
-  **Plán pro budoucí session:**
-  - `cell_material.rs`: `Material2d` → `Material` (Bevy 0.18 Material3d). Shader binding bude potřebovat `bevy_pbr::mesh_functions` namísto `bevy_sprite::mesh2d_functions`. Vertex output struct potřebuje 3D `clip_position`.
-  - `cell_material.wgsl`: vertex stage rewrite — `mesh_functions::get_world_from_local`, `mesh_position_local_to_world`, `mesh_position_world_to_clip`. Spike extension v world space podél 3D heading.
-  - `main.rs::setup`: `commands.spawn(Camera3d)` na elevated angle s perspective projection. `DirectionalLight` + `AmbientLight` resource. Window setup beze změny.
-  - Cell mesh: `Sphere::new(CELL_RADIUS).mesh()` místo teardrop. Spike rendering přes shader vertex extension (jako 2D, ale v 3D world frame).
-  - Food mesh: `Sphere::new(FOOD_RADIUS).mesh()`.
-  - `cell_scale`: `Vec3::new(length, height, width)` (Bevy 3D má Y up, takže length × width × height mapping pojde přehodit). Anisotropic ellipsoid.
-  - WorldMap overlay: bottom plane (`Plane3d::new`) s texture z grayscale field. Z stratification: z=lowest_layer.
-  - Camera control: orbit přes mouse drag, scroll = zoom. Implementace je ~50 LOC s `bevy_panorbit_camera` crate (nebo manuální).
+- **Konstanty:** `CAMERA_HEIGHT_INITIAL = 1500.0`, FoV = π/3 (60°). Bevy feature `3d_bevy_render` přidána do Cargo.toml pro PBR + Camera3d podporu.
 
-- **Mezistav po Sprintech 32–35**: simulace produkuje 3D dynamiku (cells s position[2] ≠ 0, pitch motion, height morfologie), renderer pořád 2D — cells vidíme v xy projekci, z dimenze viz není. Headless + CSV jsou zdroj pravdy pro 3D measurement; renderer slouží 2D viz.
+- **Výstup:**
+  - `Cargo.toml`: nová Bevy feature `3d_bevy_render` (vedle existujícího `2d_bevy_render`, oba sdílejí pipeline).
+  - `src/main.rs`: ~150 řádků změn — drop CellMaterial, dropped pack_cell_tag/MeshTag, dropped spike_norm/cell_mesh fns, `LineageMaterials` resource, Camera3d setup, lighting, Plane3d overlay, Sphere mesh, lineage_material helper, cell_rotation helper. Pan/zoom přepsány z Camera2d → Camera3d.
+  - `src/cell_material.rs` + `assets/shaders/cell_material.wgsl`: deleted.
+  - **Build clean**: `cargo build --release` 0 errors, 0 warnings (po cleanup).
+  - **Lib testy**: 36/36 unchanged (lib není dotčen).
+
+- **Poznámky:**
+  - **Kompromis: drop custom shader**: WGSL port na PBR pipeline by vyžadoval ~100 řádků nového shader codu + Material3d trait impl + struct overhaul. StandardMaterial dává 90 % vizuálního efektu (lineage hue přes per-material) za zlomek práce. Spike viz a death-fade alpha jsou jediná regrese.
+  - **Bevy Y-up vs sim z-up konvence**: Bevy 3D používá Y-up by default. Sprint 36 to ignoruje a používá z-up — kamera spawn s `looking_at(Vec3::ZERO, Vec3::Y)` říká "up vector je Y", což je orthogonální k cell motion v xy, takže to zachovává pohled top-down. Cells s sim z>0 jsou blíž ke kameře. DirectionalLight `Quat::from_euler(-π/4, π/6, 0)` je kalibrované pro tuto orientaci.
+  - **Camera zoom přes Z, ne FoV**: alternativní strategie zoom přes FoV (perspective scaling). Camera Z je intuitivnější (cursor-anchored zoom by chtělo screen-to-world raycast pro 3D, příliš komplexní pro Sprint 36).
+  - **Pan = klávesy, ne mouse drag**: v 3D pohledu je middle-mouse drag typicky orbit (rotation kolem cíle). Klávesnicový pan je jednodušší a oddělený od future orbit feature.
+  - **Sphere icosphere subdivision 2 = 162 vertex počet**: kompromis hladkost vs. memory. ico(0) = 12 vert (kostkovité), ico(1) = 42 vert (rough), ico(2) = 162 (good), ico(3) = 642 (overkill pro CELL_RADIUS=5).
+  - **Co Sprint 36 NEMĚNÍ**: simulační logika (lib.rs + brain_act + step + predate v main.rs), CSV výstupy, headless. Jen visual representation cells. Sim je 3D, viz je teď 3D.
 
 ## Sprint 37 — measurement (DEFERRED)
 
