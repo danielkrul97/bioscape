@@ -337,14 +337,19 @@ fn setup(
     commands.insert_resource(extent);
 
     // Sprint 36: Camera3d s orthographic projection — "scale" zoom feel bez
-    // perspective void okolo scény když user zoomne pryč. `IsDefaultUiCamera`
-    // marker říká bevy_ui_render ať použije tuto kameru pro UI.
+    // perspective void okolo scény. `IsDefaultUiCamera` marker říká
+    // bevy_ui_render ať použije tuto kameru pro UI.
+    // Near/far explicitně dimenzované na CAMERA_OFFSET_DISTANCE — default_3d()
+    // má far ~1000, ale camera je 3000 od target, takže by scéna padla za far
+    // plane a vše by bylo culled.
     let initial_orbit = OrbitCamera::default();
     commands.spawn((
         Camera3d::default(),
         IsDefaultUiCamera,
         Projection::Orthographic(OrthographicProjection {
             scale: initial_orbit.scale,
+            near: 0.1,
+            far: CAMERA_OFFSET_DISTANCE * 3.0,
             ..OrthographicProjection::default_3d()
         }),
         initial_orbit.transform(),
