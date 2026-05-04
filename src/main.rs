@@ -937,17 +937,19 @@ fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>)
     }
 }
 
-/// Sprint 36: middle-mouse drag rotuje kamerou kolem `target` (orbit).
-/// Horizontální delta → yaw, vertical delta → pitch (clamped). Sensitivity
-/// `ORBIT_SENSITIVITY` ladí — full screen drag ≈ π rad.
+/// Sprint 36: mouse drag rotuje kamerou kolem `target` (orbit) NEBO pannuje
+/// `target` — left = orbit, middle = pan. Horizontální delta orbit → yaw,
+/// vertical → pitch. Pan v "cursor pulls world" módu (drag right ⇒ target left).
 fn camera_orbit_input(
     buttons: Res<ButtonInput<MouseButton>>,
     mut motion: MessageReader<MouseMotion>,
     mut orbit: ResMut<OrbitCamera>,
 ) {
-    if !buttons.pressed(MouseButton::Middle) {
+    let orbit_active = buttons.pressed(MouseButton::Left);
+    let pan_active = buttons.pressed(MouseButton::Middle);
+    if !orbit_active && !pan_active {
         // Drop accumulated motion when not actively dragging — jinak by
-        // se delta nasčítaly a po stisku middle by kamera skočila.
+        // se delta nasčítaly a po stisku tlačítka by kamera skočila.
         motion.clear();
         return;
     }
@@ -958,9 +960,26 @@ fn camera_orbit_input(
     if delta == Vec2::ZERO {
         return;
     }
-    orbit.yaw = (orbit.yaw + delta.x * ORBIT_SENSITIVITY).rem_euclid(std::f32::consts::TAU);
-    orbit.pitch =
-        (orbit.pitch + delta.y * ORBIT_SENSITIVITY).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
+    if orbit_active {
+        orbit.yaw = (orbit.yaw + delta.x * ORBIT_SENSITIVITY).rem_euclid(std::f32::consts::TAU);
+        orbit.pitch =
+            (orbit.pitch + delta.y * ORBIT_SENSITIVITY).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
+    } else if pan_active {
+        // Pan target proti směru drag (cursor pulls world). Pan rovina v xy
+        // podle yaw — right vector + forward vector v xy projekci.
+        // Vertical screen drag (y) ≡ "do scény" → forward; Y screen jde dolů,
+        // takže invertovat (y- = forward+).
+        let cos_y = orbit.yaw.cos();
+        let sin_y = orbit.yaw.sin();
+        let forward_xy = Vec2::new(sin_y, cos_y);
+        let right_xy = Vec2::new(cos_y, -sin_y);
+        // Pan rychlost ∝ scale (víc zoomout = rychlejší pan, drag-distance
+        // odpovídá viditelnému světu).
+        let speed = orbit.scale;
+        let world_xy = -right_xy * delta.x * speed + forward_xy * delta.y * speed;
+        orbit.target.x += world_xy.x;
+        orbit.target.y += world_xy.y;
+    }
 }
 
 /// Sprint 36: mouse wheel zoom — adjustuje orthographic scale. Scroll up =
