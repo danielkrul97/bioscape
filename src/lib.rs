@@ -74,7 +74,10 @@ pub const TICKS_PER_GENERATION: u64 = 600;
 pub const GENERATIONS_PER_EPOCH: u64 = 100;
 
 pub const INITIAL_CELLS: usize = 200;
-pub const MAX_POPULATION: usize = 1000;
+/// Sprint 64: 1000 → 2500 (proportional s z=20 → z=50 expansion). Cells
+/// density per volume zachovaná: pre-Sprint-64 1.2e-5 cells/unit³, post:
+/// stejně. CPU paralelní cesta drží > 60 FPS (Sprint 63 5k = 870 ticks/s).
+pub const MAX_POPULATION: usize = 2500;
 
 pub const CELL_RADIUS: f32 = 5.0;
 pub const EAT_RADIUS: f32 = 8.0;

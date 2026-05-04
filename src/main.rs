@@ -61,7 +61,9 @@ const DEATH_FADE_TICKS: u32 = 30;
 const GRID_CELL_SIZE: f32 = 100.0;
 const CAMERA_ZOOM_STEP: f32 = 0.1;
 // Sprint 53: WORLD_HALF[2] expanded z=2 → z=20. Volumetric environment.
-const SIMULATION_HALF: [f32; 3] = [960.0, 540.0, 20.0];
+// Sprint 64: z=20 → z=50. Plus MAX_POPULATION 1000 → 2500 (proportional
+// volumetric scaling — viz lib.rs comment).
+const SIMULATION_HALF: [f32; 3] = [960.0, 540.0, 50.0];
 // Sprint 36: orbit Camera3d s ORTHOGRAPHIC projection. Distance je fixní;
 // "zoom" modifikuje ortho scale (= world units per pixel), takže větší zoom
 // out neudělá black void kolem scény (na rozdíl od perspective). Cells stále

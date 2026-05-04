@@ -47,10 +47,15 @@ use std::time::Instant;
 // Sprint 53: WORLD_HALF[2] expanded z=2 → z=20. SmellField + WorldMap +
 // Pheromone jsou plně 3D (volumetric grid + 7-point Jacobi diffusion + 3D
 // gradient). Cells získávají vertikální environmental sensing (smell_grad_z,
-// pheromone_grad_z přes inputs[17,19]). z=20 je conservative bump (z=50 v
-// initial smoke způsobil extinkci kolem gen 30 kvůli food sparsity v 25×
-// větším objemu).
-const WORLD_HALF: [f32; 3] = [960.0, 540.0, 20.0];
+// pheromone_grad_z přes inputs[17,19]).
+//
+// Sprint 64: z=20 → z=50 expansion. Pre-Sprint-53 initial smoke s z=50
+// extinktoval gen 30 kvůli food sparsity (food count škáloval lineárně,
+// ale ne s volume), Sprint 53 přidal volumetric food scaling (`z_factor =
+// z_extent / 4`). Při z=50: z_factor=25 → ~20000 food vs ~8000 pro z=20.
+// Plus Sprint 64 MAX_POPULATION 1000 → 2500 zachovává cell density per
+// volume (cells/unit³ = 1.2e-5, same jako pre-bump).
+const WORLD_HALF: [f32; 3] = [960.0, 540.0, 50.0];
 
 /// Sprint 48: versioned binary header pro checkpoint files.
 const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
