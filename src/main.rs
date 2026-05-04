@@ -9,7 +9,8 @@ use bioscape::{
     ATTACK_THRESHOLD, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
     DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
     HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
-    MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH,
+    MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
     PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
     PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
@@ -285,6 +286,7 @@ fn main() {
                 cells_brain_act,
                 emit_pheromones,
                 apply_cell_morph,
+                apply_brownian_motion,
                 step_cells,
                 apply_food_gravity,
                 apply_environmental_hazards,
@@ -568,18 +570,37 @@ fn step_cells(
     }
 }
 
+/// Sprint 42: Brownův pohyb — gaussian perturbation na velocity.
+fn apply_brownian_motion(
+    time: Res<Time>,
+    extent: Res<WorldExtent>,
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+) {
+    let dt = time.delta_secs();
+    let half_z = extent.as_array()[2];
+    let mut rng = rand::rng();
+    for mut cell in &mut cells {
+        cell.0.apply_brownian(&mut rng, dt, half_z);
+    }
+}
+
 /// Sprint 38: gravity drift na food. Aktualizuje Food.position[2] + sync
 /// Transform.translation.z aby viditelně klesalo k dnu.
 fn apply_food_gravity(
     time: Res<Time>,
     extent: Res<WorldExtent>,
-    mut foods: Query<(&mut FoodEntity, &mut Transform)>,
+    mut foods: Query<(Entity, &mut FoodEntity, &mut Transform)>,
+    mut commands: Commands,
 ) {
     let dt = time.delta_secs();
     let half_z = extent.as_array()[2];
-    for (mut food, mut transform) in &mut foods {
+    for (entity, mut food, mut transform) in &mut foods {
         food.0.apply_gravity(dt, half_z);
         transform.translation.z = food.0.position[2];
+        // Sprint 42: increment age + despawn expired (value_factor ≤ 0).
+        if !food.0.age_step() {
+            commands.entity(entity).despawn();
+        }
     }
 }
 
@@ -808,14 +829,16 @@ fn cell_eats_food(
             if to_eat.is_some() || eaten.contains(&food_e) {
                 return;
             }
-            let food = Food { position: food_pos };
+            let food = Food { position: food_pos, age_ticks: 0 };
             if cell.0.eat_test(&food, EAT_RADIUS) {
                 to_eat = Some((food_e, food));
             }
         });
         if let Some((food_e, food)) = to_eat {
+            // Sprint 42: starý food má nižší value (decay).
             cell.0.energy += FOOD_VALUE
-                * food_multiplier(world_map.0.sample([food.position[0], food.position[1]]));
+                * food_multiplier(world_map.0.sample([food.position[0], food.position[1]]))
+                * food.value_factor();
             eaten.insert(food_e);
             commands.entity(food_e).despawn();
             // Reward-modulated Hebbian update — reinforce the recent decision
@@ -1172,6 +1195,7 @@ fn cell_reproduces_on_threshold(
         .filter(|(_, c)| {
             c.0.energy >= REPRODUCE_THRESHOLD
                 && c.0.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
+                && c.0.reproduce_cooldown_ticks == 0
         })
         .map(|(e, c)| (e, c.0.position))
         .collect();
@@ -1186,6 +1210,10 @@ fn cell_reproduces_on_threshold(
         };
         cell_a.0.energy *= 0.5;
         cell_b.0.energy *= 0.5;
+        // Sprint 42: refractory period — oba rodiče nemůžou znovu mating
+        // po MATING_COOLDOWN_TICKS.
+        cell_a.0.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
+        cell_b.0.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
         to_spawn.push(bioscape::make_mating_child(&cell_a.0, &cell_b.0, &mut rng));
     }
 
@@ -1226,7 +1254,7 @@ fn cell_dies_on_zero_energy(
                     cell.0.position[2].clamp(-half[2], half[2]),
                 ];
                 commands.spawn((
-                    FoodEntity(Food { position: pos }),
+                    FoodEntity(Food { position: pos, age_ticks: 0 }),
                     Mesh3d(food_mesh.0.clone()),
                     MeshMaterial3d(food_material.0.clone()),
                     Transform::from_xyz(pos[0], pos[1], pos[2]),

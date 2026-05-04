@@ -260,6 +260,22 @@ pub const SHELL_ABSORB_PER_TICK: f32 = 2.0;
 /// povrch, ne point structure.
 pub const SHELL_COST_PER_SEC: f32 = 0.4;
 
+// Sprint 42 life-history: 5 biofyzikálních realismů. Smoke-tuned po A/B isolation.
+/// Aging body cost ramp. Při age_sec=100 factor=1.1 (10 % extra). Conservative.
+pub const AGE_DECAY_PER_SEC: f32 = 0.001;
+/// Brownian thermal noise — robustness signál bez navigation disruption.
+/// Per-tick stddev ≈ 0.04 (oproti max_speed ~90, šum < 0.05 %).
+pub const THERMAL_NOISE: f32 = 0.3;
+/// Refractory period po mating. Mírný — 10 ticks (1/6 sec) nepoznatelný v
+/// normálním energy-cycle, ale chrání proti instant remating spam.
+pub const MATING_COOLDOWN_TICKS: u32 = 10;
+/// Food decay rate — universal aging (carrion + map-spawn). Smoke-tuned z 0.05
+/// (extinkce gen 23 — food saturoval na low-pop, vzájemně decay) na 0.0005
+/// (gentle aging, food prakticky vždy fresh, decay viditelný jen u dlouho-
+/// nesnězeného carrion). Carrion-specific decay je cleaner ale Sprint 42
+/// scope-cut na universal gentle.
+pub const CARRION_DECAY_PER_SEC: f32 = 0.0005;
+
 pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_speed: 3.0,
     sigma_hue: 5.0,
@@ -647,6 +663,11 @@ pub struct Cell {
     /// (damage signal), pak resetuje na 0. Voluntární cost se NEZAPISUJE
     /// — cell sama drives ty náklady přes outputs, není to externí útok.
     pub damage_accum: f32,
+    /// Sprint 42: ticks od spawnu / mating-childu. Drives aging body cost ramp.
+    pub age: u64,
+    /// Sprint 42: refractory period po mating, decremented per tick. Mating
+    /// gating čte `== 0`.
+    pub reproduce_cooldown_ticks: u32,
     pub phenotype: Phenotype,
     pub genome: Genome,
 }
@@ -706,6 +727,8 @@ impl Cell {
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
             damage_accum: 0.0,
+            age: 0,
+            reproduce_cooldown_ticks: 0,
             phenotype,
             genome,
         }
@@ -721,6 +744,12 @@ impl Cell {
     /// frame: forward motion „cítí" width (frontální), sideways motion cítí
     /// length. Pro length=width=s drag přesně reprodukuje původní isotropní.
     pub fn step(&mut self, dt: f32, world_half: [f32; 3], physics: &PhysicsConfig) {
+        // Sprint 42: aging + cooldown decrement na začátku ticku, aby
+        // apply_energy_costs viděl current age v ramp formuli.
+        self.age = self.age.saturating_add(1);
+        if self.reproduce_cooldown_ticks > 0 {
+            self.reproduce_cooldown_ticks -= 1;
+        }
         self.integrate_kinematics(dt, world_half);
         self.apply_anisotropic_drag(dt, physics);
         self.apply_angular_drag(dt, physics);
@@ -794,7 +823,10 @@ impl Cell {
         self.energy -= eff_r * eff_r * av * av * physics.angular_energy_cost * dt;
         self.energy -= self.genome.vision_radius * physics.vision_cost_per_radius * dt;
         // Sprint 34: maintenance ∝ 3D volume = length×width×height.
-        self.energy -= self.phenotype.volume() * physics.body_cost_factor * dt;
+        // Sprint 42: aging ramp — starší cells platí postupně víc per volume unit.
+        let age_sec = self.age as f32 / FIXED_TIMESTEP_HZ;
+        let aging_factor = 1.0 + AGE_DECAY_PER_SEC * age_sec;
+        self.energy -= self.phenotype.volume() * physics.body_cost_factor * aging_factor * dt;
         self.energy -= self.phenotype.spike_length * SPIKE_COST_PER_SEC * dt;
         // Sprint 41: shell maintenance — defensive armor stojí víc než spike,
         // protože pokrývá celý povrch.
@@ -853,17 +885,23 @@ impl Cell {
     /// byla pre-refactor duplikovaná v `cells_brain_act` (main) a `brain_act`
     /// (headless). Bere `outputs[0] = turn`, `[1] = thrust`, `[7] = pitch`.
     pub fn apply_brain_motor(&mut self, outputs: &[f32; BRAIN_OUTPUTS], dt: f32) {
-        let body_proxy = self.phenotype.effective_radius().max(0.01);
+        // Sprint 42: F=ma — denominator je `mass = effective_radius` (smoke-tuned
+        // fallback z `volume()`). Plný volume() byl příliš agresivní inerce penalty
+        // pro untrained brainy v Sprint 42 smoke (extinct gen 40). `effective_radius`
+        // (= aritmetický průměr 3 os) zachovává inerce-by-size škálování bez
+        // kvadratického cost shocku. Cells s objemnějším tělem stále inertia, ale
+        // menší magnitude.
+        let mass = self.phenotype.effective_radius().max(0.01);
         let turn_rate = self.genome.turn_rate;
         let max_speed = self.genome.max_speed;
         let turn_signal = outputs[0];
         let thrust_norm = (outputs[1] + 1.0) * 0.5;
         let pitch_signal = outputs[7];
-        let ang_acc = turn_signal * turn_rate / body_proxy;
+        let ang_acc = turn_signal * turn_rate / mass;
         self.angular_velocity += ang_acc * dt;
-        let pitch_acc = pitch_signal * turn_rate / body_proxy;
+        let pitch_acc = pitch_signal * turn_rate / mass;
         self.pitch_velocity += pitch_acc * dt;
-        let a_max = DRAG_COEFFICIENT * max_speed * max_speed / body_proxy;
+        let a_max = DRAG_COEFFICIENT * max_speed * max_speed / mass;
         let a = thrust_norm * a_max;
         let fwd = forward_vector(self.heading, self.pitch);
         self.velocity[0] += a * fwd[0] * dt;
@@ -931,11 +969,27 @@ impl Cell {
         let absorb = self.phenotype.shell_thickness * SHELL_ABSORB_PER_TICK * dt;
         self.damage_accum = (self.damage_accum - absorb).max(0.0);
     }
+
+    /// Sprint 42: Brownův pohyb — gaussian noise na velocity. `√dt` scaling je
+    /// correct stochastic integration (Wiener process), ne lineární dt. z-osa
+    /// se rušený jen když je z-volume aktivní (`world_half_z > 0`).
+    pub fn apply_brownian(&mut self, rng: &mut impl Rng, dt: f32, world_half_z: f32) {
+        let scale = THERMAL_NOISE * dt.sqrt();
+        self.velocity[0] += gaussian(rng) * scale;
+        self.velocity[1] += gaussian(rng) * scale;
+        if world_half_z > 0.0 {
+            self.velocity[2] += gaussian(rng) * scale;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Food {
     pub position: [f32; 3],
+    /// Sprint 42: ticks od spawnu. Drives decay of `value_factor`. Init 0
+    /// pro fresh food i carrion (univerzální decay, žádný carrion-specific
+    /// staleness offset).
+    pub age_ticks: u32,
 }
 
 impl Food {
@@ -953,6 +1007,7 @@ impl Food {
                 rng.random_range(-world_half[1]..world_half[1]),
                 z,
             ],
+            age_ticks: 0,
         }
     }
 
@@ -963,6 +1018,21 @@ impl Food {
             return;
         }
         self.position[2] = (self.position[2] - FOOD_SINK_RATE * dt).max(-world_half_z);
+    }
+
+    /// Sprint 42: lineární decay value factor podle stáří. Pro age=0 vrací 1.0,
+    /// klesá lineárně k nule, pak clampnuto na 0.
+    pub fn value_factor(&self) -> f32 {
+        let age_sec = self.age_ticks as f32 / FIXED_TIMESTEP_HZ;
+        (1.0 - CARRION_DECAY_PER_SEC * age_sec).max(0.0)
+    }
+
+    /// Sprint 42: age tick increment. Vrací `false` pokud food expiroval
+    /// (value_factor ≤ 0) — caller despawne. Volá se po `apply_gravity`
+    /// v hot loopu binárek.
+    pub fn age_step(&mut self) -> bool {
+        self.age_ticks = self.age_ticks.saturating_add(1);
+        self.value_factor() > 0.0
     }
 }
 
@@ -1139,6 +1209,10 @@ pub fn make_mating_child(parent_a: &Cell, parent_b: &Cell, rng: &mut impl Rng) -
         last_hidden: [0.0; BRAIN_HIDDEN],
         last_outputs: [0.0; BRAIN_OUTPUTS],
         damage_accum: 0.0,
+        age: 0,
+        // Sprint 42: child startuje s plnou cooldown — rodičovská cooldown
+        // se nastaví v binárkách po `make_mating_child`, nezasáhne childa.
+        reproduce_cooldown_ticks: 0,
         phenotype: child_phenotype,
         genome: child_genome,
     }
@@ -1500,6 +1574,8 @@ mod tests {
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
             damage_accum: 0.0,
+            age: 0,
+            reproduce_cooldown_ticks: 0,
             phenotype,
             genome,
         }
@@ -1627,7 +1703,7 @@ mod tests {
             energy: 50.0,
             ..base_cell()
         };
-        let food = Food { position: [5.0, 0.0, 0.0] };
+        let food = Food { position: [5.0, 0.0, 0.0], age_ticks: 0 };
         assert!(cell.try_eat(&food, 8.0, 20.0));
         assert_eq!(cell.energy, 70.0);
     }
@@ -1638,7 +1714,7 @@ mod tests {
             energy: 50.0,
             ..base_cell()
         };
-        let food = Food { position: [20.0, 0.0, 0.0] };
+        let food = Food { position: [20.0, 0.0, 0.0], age_ticks: 0 };
         assert!(!cell.try_eat(&food, 8.0, 20.0));
         assert_eq!(cell.energy, 50.0);
     }
@@ -2081,10 +2157,10 @@ mod tests {
         // L=W=H=1, eat_factor=8 → ellipsoid degeneruje na sféru radius 8.
         // Backward-kompat se Sprint 40 sférickou eat-zónou.
         let mut cell = Cell { energy: 50.0, ..base_cell() };
-        let inside = Food { position: [5.0, 0.0, 0.0] };
-        let outside = Food { position: [10.0, 0.0, 0.0] };
-        let lateral_inside = Food { position: [0.0, 5.0, 0.0] };
-        let vertical_inside = Food { position: [0.0, 0.0, 5.0] };
+        let inside = Food { position: [5.0, 0.0, 0.0], age_ticks: 0 };
+        let outside = Food { position: [10.0, 0.0, 0.0], age_ticks: 0 };
+        let lateral_inside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0 };
+        let vertical_inside = Food { position: [0.0, 0.0, 5.0], age_ticks: 0 };
         assert!(cell.eat_test(&inside, 8.0));
         assert!(!cell.eat_test(&outside, 8.0));
         assert!(cell.eat_test(&lateral_inside, 8.0));
@@ -2103,13 +2179,13 @@ mod tests {
             shell_thickness: 0.0,
         };
         // Forward at +14: inside ellipsoid (14/16 = 0.875).
-        let forward_inside = Food { position: [14.0, 0.0, 0.0] };
+        let forward_inside = Food { position: [14.0, 0.0, 0.0], age_ticks: 0 };
         // Lateral at +3.5: inside (3.5/4 = 0.875).
-        let lateral_inside = Food { position: [0.0, 3.5, 0.0] };
+        let lateral_inside = Food { position: [0.0, 3.5, 0.0], age_ticks: 0 };
         // Forward at +17: outside (17/16 > 1).
-        let forward_outside = Food { position: [17.0, 0.0, 0.0] };
+        let forward_outside = Food { position: [17.0, 0.0, 0.0], age_ticks: 0 };
         // Lateral at +5: outside (5/4 > 1).
-        let lateral_outside = Food { position: [0.0, 5.0, 0.0] };
+        let lateral_outside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0 };
         assert!(cell.eat_test(&forward_inside, 8.0));
         assert!(cell.eat_test(&lateral_inside, 8.0));
         assert!(!cell.eat_test(&forward_outside, 8.0));
@@ -2210,5 +2286,157 @@ mod tests {
                 m.shell_thickness
             );
         }
+    }
+
+    #[test]
+    fn step_aging_increases_body_cost() {
+        let physics = PhysicsConfig {
+            drag: 0.0,
+            angular_drag: 0.0,
+            energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.0,
+            vision_cost_per_radius: 0.0,
+            body_cost_factor: 1.0,
+        };
+        // Cell at age 0 → factor 1.0, drain = volume = 1.
+        let mut young = base_cell();
+        young.age = 0;
+        let young_energy_before = young.energy;
+        young.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        let young_drain = young_energy_before - young.energy;
+
+        // Cell at age 600 (= 10s) → factor 1 + 0.005×10 = 1.05.
+        let mut old = base_cell();
+        old.age = 600;
+        let old_energy_before = old.energy;
+        old.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        let old_drain = old_energy_before - old.energy;
+
+        assert!(
+            old_drain > young_drain,
+            "old cell should drain more: young={} old={}",
+            young_drain,
+            old_drain
+        );
+    }
+
+    #[test]
+    fn step_increments_age() {
+        let mut cell = base_cell();
+        assert_eq!(cell.age, 0);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.0, 0.0));
+        assert_eq!(cell.age, 1);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.0, 0.0));
+        assert_eq!(cell.age, 2);
+    }
+
+    #[test]
+    fn cooldown_decrements_per_step() {
+        let mut cell = base_cell();
+        cell.reproduce_cooldown_ticks = 5;
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.0, 0.0));
+        assert_eq!(cell.reproduce_cooldown_ticks, 4);
+    }
+
+    #[test]
+    fn cooldown_does_not_underflow() {
+        let mut cell = base_cell();
+        cell.reproduce_cooldown_ticks = 0;
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.0, 0.0));
+        assert_eq!(cell.reproduce_cooldown_ticks, 0);
+    }
+
+    #[test]
+    fn motor_scales_inversely_with_mass() {
+        // Unit cell eff_r=1 vs tubby cell eff_r=2 (L=W=H=2): tubby pomalejší 2×.
+        // Mass scaling používá effective_radius (smoke-tuned fallback z volume).
+        let mut unit = base_cell();
+        let mut tubby = base_cell();
+        tubby.phenotype.body_length = 2.0;
+        tubby.phenotype.body_width = 2.0;
+        tubby.phenotype.body_height = 2.0;
+        let outputs = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        unit.apply_brain_motor(&outputs, 1.0);
+        tubby.apply_brain_motor(&outputs, 1.0);
+        let unit_v = unit.velocity[0].abs();
+        let tubby_v = tubby.velocity[0].abs();
+        assert!(
+            unit_v > tubby_v,
+            "unit cell should accelerate faster: unit={} tubby={}",
+            unit_v,
+            tubby_v
+        );
+        let ratio = unit_v / tubby_v.max(1e-6);
+        assert!(
+            (ratio - 2.0).abs() < 0.2,
+            "expected ratio ~2 (eff_r), got {}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn brownian_perturbs_zero_velocity() {
+        let mut rng = rand::rng();
+        let mut cell = base_cell();
+        // 100 brownian steps; statisticky téměř jistě některá komponenta != 0.
+        for _ in 0..100 {
+            cell.apply_brownian(&mut rng, 1.0 / FIXED_TIMESTEP_HZ, 0.0);
+        }
+        // 2D případ (world_half_z = 0) — z se nesmí měnit.
+        assert_eq!(cell.velocity[2], 0.0);
+        let v_xy_sq =
+            cell.velocity[0] * cell.velocity[0] + cell.velocity[1] * cell.velocity[1];
+        assert!(v_xy_sq > 0.0, "expected nonzero velocity from brownian");
+    }
+
+    #[test]
+    fn brownian_z_only_in_3d_world() {
+        let mut rng = rand::rng();
+        let mut cell = base_cell();
+        // 3D mode: world_half_z > 0 → z se má hýbat.
+        for _ in 0..100 {
+            cell.apply_brownian(&mut rng, 1.0 / FIXED_TIMESTEP_HZ, 2.0);
+        }
+        assert!(cell.velocity[2] != 0.0, "expected nonzero z velocity in 3D");
+    }
+
+    #[test]
+    fn food_value_decays_with_age() {
+        let mut food = Food { position: [0.0, 0.0, 0.0], age_ticks: 0 };
+        assert!((food.value_factor() - 1.0).abs() < 1e-6);
+        // 1 sec = 60 ticks → factor = 1 - CARRION_DECAY_PER_SEC.
+        food.age_ticks = 60;
+        let expected = 1.0 - CARRION_DECAY_PER_SEC;
+        assert!(
+            (food.value_factor() - expected).abs() < 1e-4,
+            "got {}, expected {}",
+            food.value_factor(),
+            expected
+        );
+    }
+
+    #[test]
+    fn food_expires_when_zero_value() {
+        let mut fresh = Food { position: [0.0, 0.0, 0.0], age_ticks: 0 };
+        assert!(fresh.age_step());
+        // Past lifetime: age_step bump → value_factor = 0 → returns false.
+        // F32 precision: použijeme age daleko za bod expirace, abychom se vyhli
+        // ULP edge case (60.0/0.0005 jako u32 rounds k 119999, ne 120000).
+        let mut expired = Food {
+            position: [0.0, 0.0, 0.0],
+            age_ticks: ((FIXED_TIMESTEP_HZ / CARRION_DECAY_PER_SEC) as u32) + 100,
+        };
+        assert!(!expired.age_step());
+    }
+
+    #[test]
+    fn child_starts_with_zero_age_and_cooldown() {
+        let mut rng = rand::rng();
+        let g = dummy_genome();
+        let cell_a = Cell::from_genome(&mut rng, g, [100.0, 100.0, 0.0], 0, 0);
+        let cell_b = Cell::from_genome(&mut rng, g, [100.0, 100.0, 0.0], 0, 0);
+        let child = make_mating_child(&cell_a, &cell_b, &mut rng);
+        assert_eq!(child.age, 0);
+        assert_eq!(child.reproduce_cooldown_ticks, 0);
     }
 }

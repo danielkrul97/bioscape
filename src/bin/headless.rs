@@ -11,7 +11,8 @@ use bioscape::{
     BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K,
     EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH, HAZARD_AMP,
     HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
-    MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_POPULATION,
+    MAX_SPAWN_ATTEMPTS,
     PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
     PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
@@ -125,6 +126,7 @@ impl World {
         self.brain_act(dt);
         self.emit_pheromones(dt);
         self.apply_morph(dt);
+        self.apply_brownian(rng, dt);
         self.step(dt);
         self.apply_food_gravity(dt);
         self.apply_hazards(dt);
@@ -141,6 +143,12 @@ impl World {
     fn apply_morph(&mut self, dt: f32) {
         for cell in &mut self.cells {
             cell.apply_morph(dt);
+        }
+    }
+
+    fn apply_brownian(&mut self, rng: &mut impl Rng, dt: f32) {
+        for cell in &mut self.cells {
+            cell.apply_brownian(rng, dt, WORLD_HALF[2]);
         }
     }
 
@@ -259,6 +267,8 @@ impl World {
         for food in &mut self.foods {
             food.apply_gravity(dt, WORLD_HALF[2]);
         }
+        // Sprint 42: aging + despawn expired food (value_factor ≤ 0).
+        self.foods.retain_mut(|f| f.age_step());
     }
 
     fn apply_hazards(&mut self, dt: f32) {
@@ -420,7 +430,8 @@ impl World {
                     continue;
                 }
                 let value = FOOD_VALUE
-                    * food_multiplier(self.map.sample([food.position[0], food.position[1]]));
+                    * food_multiplier(self.map.sample([food.position[0], food.position[1]]))
+                    * food.value_factor();
                 if cell.try_eat(food, EAT_RADIUS, value) {
                     *flag = true;
                     ate = true;
@@ -512,6 +523,7 @@ impl World {
             .filter(|(_, c)| {
                 c.energy >= REPRODUCE_THRESHOLD
                     && c.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
+                    && c.reproduce_cooldown_ticks == 0
             })
             .map(|(i, c)| (i, c.position))
             .collect()
@@ -537,6 +549,9 @@ impl World {
             };
             cell_a.energy *= 0.5;
             cell_b.energy *= 0.5;
+            // Sprint 42: refractory period po mating.
+            cell_a.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
+            cell_b.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
             children.push(bioscape::make_mating_child(cell_a, cell_b, rng));
         }
         children
@@ -558,7 +573,7 @@ impl World {
                             .clamp(-half[1], half[1]),
                         cell.position[2].clamp(-half[2], half[2]),
                     ];
-                    new_foods.push(Food { position: pos });
+                    new_foods.push(Food { position: pos, age_ticks: 0 });
                 }
             }
         }
