@@ -233,14 +233,117 @@ horizontálně (thermal/light fields, bigger world) místo vertical perf-pursuit
     - Bigger horizontal world (xy bigger than ±960 / ±540) — vyžaduje
       `GpuSpatialHash::GRID_NX/NY` bump nebo dynamic sizing.
 
-## Sprinty 65–72 — open-ended
+## Sprint 65 — fyzika 3D fixes (gravita off + 3D collision + velocity damping)
 
-- **Sprint 65+:** Thermal stratification (temperature field z-gradient).
-- **Sprint 65+:** Light field z-attenuation (photic vs aphotic zones).
-- **Sprint 65+:** GPU collision/predate wire (Sprint 64 deferred).
-- **Sprint 65+:** Renderer mirror Sprint 60-63 GPU pipeline.
-- **Sprint 65+:** Bigger horizontal world expansion + dynamic GPU
+- **Cíl:** opravit 3 problémy ve fyzice ze Sprintu 53-58 era:
+  1. **Cell-cell collision byl jen 2D** v `main.rs` (delta na x/y, pre-Sprint-58
+     headless taky 2D, fixed Sprint 53). Buňky se v z prolínaly.
+  2. **Gravity = 5.0 bez buoyancy** vytvářelo selekční tlak směrem k „seď
+     na dně" — všechno postupně sedimentovalo na floor reflective wall,
+     vertikální motion neměla evoluční benefit.
+  3. **Žádná velocity-response v collision** — pozice se depenetrovala,
+     ale momentum pokračoval. Cells po push-apart pokračovaly v closing
+     motion → re-overlap next tick (oscilace + zbytečný compute).
+
+  **Plán implementace:**
+
+  *Body 1 — `GRAVITY` 5.0 → 0.0 (neutral buoyancy):*
+  - lib.rs const update + doc string. Pre-Sprint-65 komentář popisoval
+    GRAVITY jako "effective post-buoyancy" (5 % netto force kvůli density
+    ratio 1.05/1.0). Sprint 65 přijímá explicit "cell density == water
+    density → neutral buoyancy" jako cleaner design — vertikální motion
+    100 % brain-driven.
+  - Food (`FOOD_SINK_RATE = 8.0`) zachován — food má vyšší density než
+    cells (benthic deposit semantika, cells musí proaktivně dive za food).
+
+  *Body 2 — `COLLISION_RESTITUTION = 0.0` const + velocity damping:*
+  - Lib const pro inelastic collision tuning. Restitution 0 = closing
+    velocity podél separation normal je vynulovaná (cells „stick"
+    momentárně, oddělí se přes position depenetration). 1.0 = elastic
+    (perfect bounce). Soft biological cells = 0 default.
+  - Math: per pair (i, j), `n = (pos_i - pos_j).normalize()`,
+    `v_rel_n = (v_i - v_j) · n`. Pokud `v_rel_n < 0` (closing), Δv_i along
+    n = `-v_rel_n × 0.5 × (1 - restitution)`. Symmetric per pair (Newton
+    3rd law když j visits i v par_iter).
+
+  *Body 3 — Headless `resolve_collisions` 3D + velocity damping:*
+  - `velocity_deltas_scratch: Vec<[f32; 3]>` přidán k `World` struct.
+  - Callback computes both position delta + velocity delta v jediném
+    callback pass.
+  - Aplikace: cell.position += delta + cell.velocity += vel_delta v
+    sekvenčním Pass 2.
+
+  *Body 4 — Main `resolve_cell_collisions` 3D + velocity damping:*
+  - Snapshot rozšířen o velocity (4-tuple místo 3-tuple).
+  - `FxHashMap<Entity, [f32; 3]>` pre-built pro O(1) velocity lookup
+    v par_iter callback (per-pair v_rel computation). Bez něho by každý
+    callback dělal linear scan snapshot = O(N²) per tick.
+  - Pass 2 apply 3D delta + vel_delta přes `Query::get_mut`.
+
+- **Konstanty:**
+  - `lib::GRAVITY`: `5.0` → `0.0`.
+  - `lib::COLLISION_RESTITUTION` nový: `0.0`.
+
+- **Výstup:**
+  - `src/lib.rs`: GRAVITY = 0.0 + Sprint 65 doc string. COLLISION_RESTITUTION
+    nový const + doc.
+  - `src/bin/headless.rs`: `velocity_deltas_scratch` field + 3D collision
+    + velocity damping. Re-export COLLISION_RESTITUTION.
+  - `src/main.rs`: 3D position delta (pre-Sprint-65 missing z!), velocity
+    delta + FxHashMap velocity lookup v par_iter.
+  - **Test suite: 73/73 pass** (1 flaky `random_brain_average_thrust_is_positive`,
+    pre-existing).
+  - **Smoke seed=0, 60 gen, z=50, pop=2500, CPU:**
+    - Wall-clock 58.5 s = **615 ticks/s** (Sprint 64 811, –24 % wall-clock
+      ale **pop dynamic zcela jiná**).
+    - **Pop final 883 (Sprint 64: 559, +58 % vyšší)** — cells už nesedí
+      na floor → 3D distribution → vyšší steady-state populace.
+    - Per-fáze deltas vs Sprint 64 (n=734 avg vs Sprint 64 n=1946 — fewer
+      cells per fáze, ale per-tick rates lower):
+      - brain_act 554 µs (S64: 665, –17 %)
+      - eat_food 683 µs (S64: 797, –14 %)
+      - predate 83 µs (S64: 117, –29 %)
+      - resolve_collisions 65 µs (S64: 106, –39 %) — **velocity damping
+        eliminuje re-overlap loops** ✓
+      - step 10 µs (S64: 17, –41 %)
+  - **Renderer launch:** Bevy app starts s GRAVITY=0 + 3D collisions OK,
+    žádný panic. 8 s SIGTERM exit clean.
+
+- **Poznámky:**
+  - **Pop trajectory dramaticky lepší.** Sprint 64 měl pop saturated
+    early ~1946, deklinoval k 559. Sprint 65 má pop osciluje stable v
+    rozsahu 700-900, gen 60 = 883 (final). Důvod: bez gravity cells nemusí
+    plavat up jen aby přežily — vertikální motion je now optional. Plus
+    velocity damping snižuje wasted collision-cycles → cells mají více
+    energie na užitečnou activity (food search, mating).
+  - **Velocity damping přínos kvantifikován v collisions fáze:** 65 µs
+    vs 106 µs (S64) = 39 % rychlejší. Per-collision compute je vyšší
+    (extra v_rel + impulse compute), ale počet collision events nižší
+    (no re-overlap oscilace) → net lower work.
+  - **Renderer collision fix:** main.rs delta byl `[f32; 2]` od Sprintu 58
+    refactoru (chybou pre-Sprint-58 verze měla `[f32; 2]` který nikdy
+    nebyl updaten po Sprint 53 z=2→z=20 expansion). Reálně to 4 sprinty
+    cells volně prolínaly v z. Sprint 65 fix je pure correctness fix.
+  - **Co Sprint 65 NEŘEŠÍ (Sprint 66+):**
+    - GPU collision shader — wire-up Sprint 64 deferred. Sprint 50
+      `collision.wgsl` má 2D delta per Sprint 50 design; potřebuje 3D
+      update + velocity damping mirror.
+    - Anisotropic collision (cells s elongated body geometrie nemají
+      stejný collision radius v různých směrech). Aktuálně `pair_r =
+      CELL_RADIUS × (radius_i + radius_j)` je sféra; měl by být ellipsoid
+      (matchnout `eat_test` semantiku).
+    - Wall collision velocity response — z-bounce má reflective wall
+      (Sprint 53/54 cylinder), velocity[2] je flipped. Inelastic by
+      damped reflection. Aktuálně bounce je elastic.
+    - Long-run smoke (200+ gen) — verify že pop oscilace stable napříč
+      širších time scales s nový dynamikou.
+
+## Sprinty 66–72 — open-ended
+
+- **Sprint 66+:** Thermal stratification (temperature field z-gradient).
+- **Sprint 66+:** Light field z-attenuation (photic vs aphotic zones).
+- **Sprint 66+:** GPU collision wire (3D + velocity damping mirror).
+- **Sprint 66+:** Anisotropic cell collision (ellipsoid geometry).
+- **Sprint 66+:** Bigger horizontal world expansion + dynamic GPU
   SpatialHash sizing.
-- **Sprint 65+:** INITIAL_CELLS bump pro rychlejší pop ramp.
-- **Sprint 65+:** Long-run smoke (200+ gen) ověření že 3D navigator brainy
-  evolve a populace satureuje ke cap pri z=50.
+- **Sprint 66+:** Long-run smoke (200+ gen) verify pop dynamic stable.

@@ -94,12 +94,24 @@ pub const FOOD_VALUE: f32 = 20.0;
 pub const FOOD_SPAWN_RATE: usize = 5;
 pub const WORLD_UNITS_PER_FOOD: f32 = 2600.0;
 
-/// Sprint 38: gravitační zrychlení (sim units / sec²) působící na vše s mass.
-/// Hodnota je effective gravity po vztlaku — reálná buňka v vodě má cca 5 %
-/// netto force kvůli density ratio 1.05/1.0. Ve volném prostoru by 9.81 m/s²
-/// dávalo nereálně rychlý sink; tady malé G + drag dá realistic sedimentation
-/// (cells s pitch=0 a žádným thrustem klesnou postupně k dnu).
-pub const GRAVITY: f32 = 5.0;
+/// Sprint 38: gravitační zrychlení (sim units / sec²) působící na cells.
+/// Sprint 65: 5.0 → 0.0 (neutral buoyancy approximation). Pre-Sprint-65
+/// vytvářelo selekční tlak směrem k „seď na dně" — cells postupně
+/// sedimentovaly, akumulovaly se na floor reflective wall, vertikální
+/// motion neměla evoluční benefit (úsilí plavat up = stejně sedneš dolů).
+/// Po Sprintu 65 cell density == water density → vertikální motion je
+/// 100 % brain-driven. Food sink (`FOOD_SINK_RATE`) zachován — food má
+/// vyšší density než cells (benthic deposit semantika), cells musí
+/// proaktivně dive za food.
+pub const GRAVITY: f32 = 0.0;
+/// Sprint 65: collision velocity damping. Restitution 0 = perfectly
+/// inelastic — closing velocity podél separation normal je vynulovaná
+/// (cells "stick" momentárně, pak se separují přes position depenetration).
+/// 1.0 = elastic (perfect bounce). Soft biological cells = 0.0 default.
+/// Pre-Sprint-65 cells měly delta_pos depenetration ale velocity neaffected
+/// → po push-apart pokračovaly v closing motion → re-overlapped next tick
+/// (oscilace + zbytečný compute).
+pub const COLLISION_RESTITUTION: f32 = 0.0;
 /// Sprint 38: terminal sink rate pro food (food nemá velocity field, pohybuje
 /// se konstantní rychlostí dolů). Pomalejší než cells (které mohou plavat),
 /// takže food drift k dnu = postupný „benthic deposit". 8 units/sec ~ 4 sec

@@ -1864,19 +1864,29 @@ fn resolve_cell_collisions(
     mut diag: Diagnostics,
 ) {
     let t_total = Instant::now();
-    // Sprint 58: snapshot + rayon par compute deltas. Pass 1 sběr (entity, pos,
-    // radius) → par filter_map vrací jen non-zero deltas. Pass 2 sekvenčně
-    // applikuje přes Query::get_mut (ECS write requires single-threaded access).
-    let snapshot: Vec<(Entity, [f32; 3], f32)> = cells
+    // Sprint 58: snapshot + rayon par compute deltas.
+    // Sprint 65: 3D position delta (pre-Sprint-65 byl jen xy — overhlédnutí
+    // ze Sprintu 53 volumetric expansion; cells se v z volně prolínaly).
+    // Plus inelastic velocity damping (closing component podél separation
+    // normal je halved per pair → eliminuje re-overlap oscilace).
+    let snapshot: Vec<(Entity, [f32; 3], [f32; 3], f32)> = cells
         .iter()
-        .map(|(e, c)| (e, c.0.position, c.0.phenotype.effective_radius()))
+        .map(|(e, c)| (e, c.0.position, c.0.velocity, c.0.phenotype.effective_radius()))
+        .collect();
+    // Sprint 65: O(1) velocity lookup pro per-pair v_rel computation. Bez
+    // tohoto FxHashMap by každý collision callback dělal linear scan snapshot
+    // (N×k×N = O(N²) per tick).
+    let velocity_map: FxHashMap<Entity, [f32; 3]> = snapshot
+        .iter()
+        .map(|(e, _, v, _)| (*e, *v))
         .collect();
     let grid_ref = &grid.0;
-    let deltas: Vec<(Entity, [f32; 2])> = snapshot
+    let deltas: Vec<(Entity, [f32; 3], [f32; 3])> = snapshot
         .par_iter()
-        .filter_map(|(entity_a, pos_a, radius_a)| {
+        .filter_map(|(entity_a, pos_a, vel_a, radius_a)| {
             let broad_r = CELL_RADIUS * (*radius_a + BROAD_PHASE_SIZE_BUDGET);
-            let mut delta = [0.0_f32, 0.0_f32];
+            let mut delta = [0.0_f32, 0.0_f32, 0.0_f32];
+            let mut vel_delta = [0.0_f32, 0.0_f32, 0.0_f32];
             grid_ref.for_each_in_radius_toroidal(
                 *pos_a,
                 broad_r,
@@ -1887,29 +1897,56 @@ fn resolve_cell_collisions(
                     }
                     let pair_r = CELL_RADIUS * (*radius_a + radius_b);
                     let pair_r2 = pair_r * pair_r;
-                    // Sprint 54: min-image delta b→a (push direction).
+                    // d_vec = pos_a - pos_b (b → a direction). Push a along +d_vec.
                     let d_vec = bioscape::min_image_delta(pos_b, *pos_a, SIMULATION_HALF);
                     let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
                     if d2 < pair_r2 && d2 > 0.0 {
                         let d = d2.sqrt();
                         let overlap = pair_r - d;
-                        delta[0] += (d_vec[0] / d) * overlap * 0.5;
-                        delta[1] += (d_vec[1] / d) * overlap * 0.5;
+                        let nx = d_vec[0] / d;
+                        let ny = d_vec[1] / d;
+                        let nz = d_vec[2] / d;
+                        delta[0] += nx * overlap * 0.5;
+                        delta[1] += ny * overlap * 0.5;
+                        delta[2] += nz * overlap * 0.5;
+                        // Sprint 65: velocity damping (inelastic). FxHashMap
+                        // O(1) lookup b's velocity (snapshot pre-built).
+                        let vel_b = velocity_map
+                            .get(&entity_b)
+                            .copied()
+                            .unwrap_or([0.0, 0.0, 0.0]);
+                        let v_rel = [
+                            vel_a[0] - vel_b[0],
+                            vel_a[1] - vel_b[1],
+                            vel_a[2] - vel_b[2],
+                        ];
+                        let v_rel_n = v_rel[0] * nx + v_rel[1] * ny + v_rel[2] * nz;
+                        if v_rel_n < 0.0 {
+                            let damp =
+                                -v_rel_n * 0.5 * (1.0 - bioscape::COLLISION_RESTITUTION);
+                            vel_delta[0] += damp * nx;
+                            vel_delta[1] += damp * ny;
+                            vel_delta[2] += damp * nz;
+                        }
                     }
                 },
             );
-            if delta != [0.0, 0.0] {
-                Some((*entity_a, delta))
+            if delta != [0.0; 3] || vel_delta != [0.0; 3] {
+                Some((*entity_a, delta, vel_delta))
             } else {
                 None
             }
         })
         .collect();
 
-    for (entity, delta) in deltas {
+    for (entity, delta, vel_delta) in deltas {
         if let Ok((_, mut cell)) = cells.get_mut(entity) {
             cell.0.position[0] += delta[0];
             cell.0.position[1] += delta[1];
+            cell.0.position[2] += delta[2];
+            cell.0.velocity[0] += vel_delta[0];
+            cell.0.velocity[1] += vel_delta[1];
+            cell.0.velocity[2] += vel_delta[2];
         }
     }
     diag.add_measurement(&DIAG_COLLISIONS, || t_total.elapsed().as_secs_f64() * 1000.0);

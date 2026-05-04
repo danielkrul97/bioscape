@@ -8,8 +8,9 @@
 
 use bioscape::{
     reject_food_for_richness, Cell, Food, SimClock, SmellField, SpatialGrid, WorldMap,
-    ATTACK_THRESHOLD, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE,
-    CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE,
+    ATTACK_THRESHOLD, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS, COLLISION_RESTITUTION,
+    CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
+    FOOD_VALUE,
     GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
     HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
     MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
@@ -122,6 +123,10 @@ struct World {
     food_grid: SpatialGrid<usize, ()>,
     // Persistent scratch — reused per tick to avoid hot-loop allocations.
     deltas_scratch: Vec<[f32; 3]>,
+    /// Sprint 65: collision velocity damping (inelastic) — per pair, closing
+    /// velocity podél separation normal je halved. Cell i sees pair (i, j),
+    /// computes own delta; symmetric (Newton 3rd law) když j visits i.
+    velocity_deltas_scratch: Vec<[f32; 3]>,
     energy_deltas_scratch: Vec<f32>,
     damage_deltas_scratch: Vec<f32>,
     eaten_scratch: Vec<bool>,
@@ -226,6 +231,7 @@ impl World {
             cell_grid: SpatialGrid::new(GRID_CELL_SIZE),
             food_grid: SpatialGrid::new(GRID_CELL_SIZE),
             deltas_scratch: Vec::new(),
+            velocity_deltas_scratch: Vec::new(),
             energy_deltas_scratch: Vec::new(),
             damage_deltas_scratch: Vec::new(),
             eaten_scratch: Vec::new(),
@@ -302,6 +308,7 @@ impl World {
             cell_grid: SpatialGrid::new(GRID_CELL_SIZE),
             food_grid: SpatialGrid::new(GRID_CELL_SIZE),
             deltas_scratch: Vec::new(),
+            velocity_deltas_scratch: Vec::new(),
             energy_deltas_scratch: Vec::new(),
             damage_deltas_scratch: Vec::new(),
             eaten_scratch: Vec::new(),
@@ -973,6 +980,11 @@ impl World {
         // Sprint 43: grid + rayon. Δ pro každé i je write-only do vlastního
         // slotu. Max search radius = CELL_RADIUS × (radius_i + max_neighbor_r);
         // vyhledáme přes effective_radius_i + GRID_CELL_SIZE konzervativně.
+        // Sprint 65: rozšířeno o velocity damping (inelastic, restitution=0).
+        // Closing velocity podél separation normal je vynulovaná — eliminuje
+        // re-overlap oscilace. delta[2] aktivní (pre-Sprint-65 byl 3D math
+        // ale apply pouze x/y v rendereru; headless měl 3D apply už od Sprint 53,
+        // tady jen sjednocujeme + přidáváme velocity).
         let n = self.cells.len();
         self.cell_grid.rebuild(
             self.cells
@@ -982,6 +994,8 @@ impl World {
         );
         self.deltas_scratch.clear();
         self.deltas_scratch.resize(n, [0.0, 0.0, 0.0]);
+        self.velocity_deltas_scratch.clear();
+        self.velocity_deltas_scratch.resize(n, [0.0, 0.0, 0.0]);
 
         let cell_grid = &self.cell_grid;
         let cells = &self.cells;
@@ -991,9 +1005,11 @@ impl World {
         // bumpneme na CELL_RADIUS × max_axis × 2.
         self.deltas_scratch
             .par_iter_mut()
+            .zip(self.velocity_deltas_scratch.par_iter_mut())
             .enumerate()
-            .for_each(|(i, delta)| {
+            .for_each(|(i, (delta, vel_delta))| {
                 let pos_i = cells[i].position;
+                let vel_i = cells[i].velocity;
                 let radius_i = cells[i].phenotype.effective_radius();
                 let search_r = CELL_RADIUS * (radius_i + cells[i].phenotype.max_axis() * 2.0);
                 cell_grid.for_each_in_radius_toroidal(pos_i, search_r, WORLD_HALF, |id_j, pos_j, radius_j| {
@@ -1002,23 +1018,53 @@ impl World {
                     }
                     let pair_r = CELL_RADIUS * (radius_i + radius_j);
                     let pair_r2 = pair_r * pair_r;
-                    // Sprint 54: min-image delta — direction i→j přes wrap.
+                    // d_vec = pos_i - pos_j (j → i direction). Push i along +d_vec.
                     let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
                     let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
                     if d2 < pair_r2 && d2 > 0.0 {
                         let d = d2.sqrt();
                         let overlap = pair_r - d;
-                        delta[0] += (d_vec[0] / d) * overlap * 0.5;
-                        delta[1] += (d_vec[1] / d) * overlap * 0.5;
-                        delta[2] += (d_vec[2] / d) * overlap * 0.5;
+                        let nx = d_vec[0] / d;
+                        let ny = d_vec[1] / d;
+                        let nz = d_vec[2] / d;
+                        // Position depenetration (mass-symmetric, halved).
+                        delta[0] += nx * overlap * 0.5;
+                        delta[1] += ny * overlap * 0.5;
+                        delta[2] += nz * overlap * 0.5;
+                        // Sprint 65: velocity damping. v_rel_n = (v_i - v_j) · n.
+                        // Closing pair má v_rel_n < 0 (distance derivative).
+                        // Pro restitution=0 → Δv_i along n = -v_rel_n × 0.5 ×
+                        // (1 - restitution) = -v_rel_n × 0.5. Pro pair je
+                        // Newton 3rd law symmetric (j visits i later v par_iter).
+                        let vel_j = cells[id_j].velocity;
+                        let v_rel = [
+                            vel_i[0] - vel_j[0],
+                            vel_i[1] - vel_j[1],
+                            vel_i[2] - vel_j[2],
+                        ];
+                        let v_rel_n = v_rel[0] * nx + v_rel[1] * ny + v_rel[2] * nz;
+                        if v_rel_n < 0.0 {
+                            let damp = -v_rel_n * 0.5 * (1.0 - COLLISION_RESTITUTION);
+                            vel_delta[0] += damp * nx;
+                            vel_delta[1] += damp * ny;
+                            vel_delta[2] += damp * nz;
+                        }
                     }
                 });
             });
 
-        for (cell, delta) in self.cells.iter_mut().zip(self.deltas_scratch.iter()) {
+        for ((cell, delta), vel_delta) in self
+            .cells
+            .iter_mut()
+            .zip(self.deltas_scratch.iter())
+            .zip(self.velocity_deltas_scratch.iter())
+        {
             cell.position[0] += delta[0];
             cell.position[1] += delta[1];
             cell.position[2] += delta[2];
+            cell.velocity[0] += vel_delta[0];
+            cell.velocity[1] += vel_delta[1];
+            cell.velocity[2] += vel_delta[2];
         }
     }
 
