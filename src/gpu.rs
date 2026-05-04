@@ -1507,6 +1507,16 @@ pub struct CellsGpu {
     velocities_buf: wgpu::Buffer,
     xoshiro_state_buf: wgpu::Buffer,
     rewards_buf: wgpu::Buffer,
+    /// Sprint 61: cell metadata pro GPU populate_brain_inputs shader.
+    /// energy / heading / pitch / damage_accum mutable per tick (CPU upload),
+    /// max_speed / eff_radius zpravidla constant po reproduce/morph (CPU upload
+    /// per tick je ale levný — ~4 KB × 6 = 24 KB při N=1000).
+    energy_buf: wgpu::Buffer,
+    heading_buf: wgpu::Buffer,
+    pitch_buf: wgpu::Buffer,
+    damage_accum_buf: wgpu::Buffer,
+    max_speed_buf: wgpu::Buffer,
+    eff_radius_buf: wgpu::Buffer,
     last_hidden_rb: wgpu::Buffer,
     last_outputs_rb: wgpu::Buffer,
     velocities_rb: wgpu::Buffer,
@@ -1552,6 +1562,13 @@ impl CellsGpu {
             n * f,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
+        // Sprint 61: cell metadata pro populate_inputs shader.
+        let energy_buf = mk("cells-energy", n * f, stor_dst_src);
+        let heading_buf = mk("cells-heading", n * f, stor_dst_src);
+        let pitch_buf = mk("cells-pitch", n * f, stor_dst_src);
+        let damage_accum_buf = mk("cells-damage", n * f, stor_dst_src);
+        let max_speed_buf = mk("cells-max-speed", n * f, stor_dst_src);
+        let eff_radius_buf = mk("cells-eff-radius", n * f, stor_dst_src);
         let last_hidden_rb = mk("cells-hidden-rb", n * (BRAIN_HIDDEN as u64) * f, read);
         let last_outputs_rb = mk("cells-outputs-rb", n * (BRAIN_OUTPUTS as u64) * f, read);
         let velocities_rb = mk("cells-velocities-rb", n * 3 * f, read);
@@ -1578,6 +1595,12 @@ impl CellsGpu {
             velocities_buf,
             xoshiro_state_buf,
             rewards_buf,
+            energy_buf,
+            heading_buf,
+            pitch_buf,
+            damage_accum_buf,
+            max_speed_buf,
+            eff_radius_buf,
             last_hidden_rb,
             last_outputs_rb,
             velocities_rb,
@@ -1598,6 +1621,37 @@ impl CellsGpu {
     pub fn velocities_buffer(&self) -> &wgpu::Buffer { &self.velocities_buf }
     pub fn xoshiro_state_buffer(&self) -> &wgpu::Buffer { &self.xoshiro_state_buf }
     pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
+    /// Sprint 61: cell metadata buffery pro populate_inputs shader binding.
+    pub fn energy_buffer(&self) -> &wgpu::Buffer { &self.energy_buf }
+    pub fn heading_buffer(&self) -> &wgpu::Buffer { &self.heading_buf }
+    pub fn pitch_buffer(&self) -> &wgpu::Buffer { &self.pitch_buf }
+    pub fn damage_accum_buffer(&self) -> &wgpu::Buffer { &self.damage_accum_buf }
+    pub fn max_speed_buffer(&self) -> &wgpu::Buffer { &self.max_speed_buf }
+    pub fn eff_radius_buffer(&self) -> &wgpu::Buffer { &self.eff_radius_buf }
+
+    /// Sprint 61: bulk upload metadata pro populate_inputs shader. Sloučeno
+    /// do jediného call pro jasnost — všechna pole jsou per-cell f32.
+    pub fn upload_metadata(
+        &self,
+        energies: &[f32],
+        headings: &[f32],
+        pitches: &[f32],
+        damage_accums: &[f32],
+        max_speeds: &[f32],
+        eff_radii: &[f32],
+    ) {
+        debug_assert_eq!(energies.len(), headings.len());
+        debug_assert_eq!(energies.len(), pitches.len());
+        debug_assert_eq!(energies.len(), damage_accums.len());
+        debug_assert_eq!(energies.len(), max_speeds.len());
+        debug_assert_eq!(energies.len(), eff_radii.len());
+        self.queue.write_buffer(&self.energy_buf, 0, bytemuck::cast_slice(energies));
+        self.queue.write_buffer(&self.heading_buf, 0, bytemuck::cast_slice(headings));
+        self.queue.write_buffer(&self.pitch_buf, 0, bytemuck::cast_slice(pitches));
+        self.queue.write_buffer(&self.damage_accum_buf, 0, bytemuck::cast_slice(damage_accums));
+        self.queue.write_buffer(&self.max_speed_buf, 0, bytemuck::cast_slice(max_speeds));
+        self.queue.write_buffer(&self.eff_radius_buf, 0, bytemuck::cast_slice(eff_radii));
+    }
 
     /// Uploaduje brain weights pro N cells. Volá se na sim init + po reproduce
     /// (re-upload všech, nebo per-slot přes `upload_brain_at`).
@@ -3746,6 +3800,97 @@ impl SensorGatherGpu {
         })
     }
 
+    /// Sprint 61: accessory pro chained shadery (populate_inputs).
+    pub fn output_buffer(&self) -> &wgpu::Buffer {
+        &self.output_buf
+    }
+    pub fn vision_radii_buffer(&self) -> &wgpu::Buffer {
+        &self.vision_radii_buf
+    }
+
+    /// Sprint 61: variant of `compute()` bez Vec<SensorRow> readback. Submit
+    /// only — sensor output zůstává v `output_buf` storage buffer pro chained
+    /// `PopulateInputsGpu` shader. Eliminuje 60 KB readback × 1 round-trip/tick.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_no_readback(
+        &mut self,
+        positions: &[[f32; 3]],
+        eff_radii: &[f32],
+        vision_radii: &[f32],
+        food_positions: &[[f32; 3]],
+        cell_hash: &SpatialHashGpu,
+        food_hash: &SpatialHashGpu,
+        smell: &FieldGpu,
+        pheromone: &FieldGpu,
+        params: SensorParamsGpu,
+    ) {
+        let n = positions.len();
+        let nf = food_positions.len();
+        assert!(n <= self.capacity_cells, "sensor cell capacity overflow");
+        assert!(nf <= self.capacity_foods, "sensor food capacity overflow");
+        if n == 0 {
+            return;
+        }
+        let mut params = params;
+        params.num_cells = n as u32;
+        params.num_foods = nf as u32;
+
+        self.pos_packed.clear();
+        self.pos_packed.reserve(n * 3);
+        for p in positions {
+            self.pos_packed.extend_from_slice(p);
+        }
+        self.food_packed.clear();
+        self.food_packed.reserve((nf.max(1)) * 3);
+        for p in food_positions {
+            self.food_packed.extend_from_slice(p);
+        }
+        if self.food_packed.is_empty() {
+            self.food_packed.extend_from_slice(&[0.0, 0.0, 0.0]);
+        }
+
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(&self.positions_buf, 0, bytemuck::cast_slice(&self.pos_packed));
+        self.queue.write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
+        self.queue.write_buffer(&self.vision_radii_buf, 0, bytemuck::cast_slice(vision_radii));
+        self.queue.write_buffer(&self.food_positions_buf, 0, bytemuck::cast_slice(&self.food_packed));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sensor-bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.positions_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.eff_radii_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.vision_radii_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.food_positions_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cell_hash.offsets_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: cell_hash.sorted_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: food_hash.offsets_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: food_hash.sorted_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: smell.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sensor-dispatch-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sensor-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
+        }
+        // Sprint 61: NO copy_buffer_to_buffer to readback — output_buf
+        // zůstává jako storage pro PopulateInputsGpu chained access.
+        self.queue.submit(Some(encoder.finish()));
+    }
+
     /// Spustí celý sensor gather pipeline. `cell_hash` musí být rebuildnut z
     /// `positions`, `food_hash` z `food_positions`. `smell` + `pheromone`
     /// FieldGpu musí mít stepnuté za current tick.
@@ -3867,6 +4012,162 @@ impl SensorGatherGpu {
         drop(data);
         self.output_rb.unmap();
         out
+    }
+}
+
+// ============================================================================
+// Sprint 61: PopulateInputsGpu — fuze sensor → brain forward
+// ============================================================================
+
+/// Sprint 61: shader params pro `populate_inputs.wgsl`. Konstanty mirroruje
+/// lib::populate_brain_inputs (BRAIN_INPUTS layout, normalizace gainy,
+/// REPRODUCE_THRESHOLD, DENSITY_NORM_COUNT).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
+pub struct PopulateInputsParams {
+    pub num_cells: u32,
+    pub brain_inputs: u32,
+    pub brain_inputs_sensory: u32,
+    pub brain_hidden: u32,
+    pub brain_recurrent: u32,
+    pub smell_norm_gain: f32,
+    pub phero_norm_gain: f32,
+    pub damage_norm_gain: f32,
+    pub density_norm: f32,
+    pub reproduce_threshold: f32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+pub struct PopulateInputsGpu {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    params_buf: wgpu::Buffer,
+}
+
+impl PopulateInputsGpu {
+    pub fn with_context(ctx: &GpuContext) -> Result<Self, String> {
+        Self::with_device_inner(Arc::clone(&ctx.device), Arc::clone(&ctx.queue))
+    }
+
+    pub fn new() -> Result<Self, String> {
+        let ctx = GpuContext::new()?;
+        Self::with_device_inner(ctx.device, ctx.queue)
+    }
+
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+    ) -> Result<Self, String> {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("populate_inputs"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/populate_inputs.wgsl").into(),
+            ),
+        });
+        // 12 bindings: 0 uniform, 1-10 storage read, 11 storage read_write,
+        // plus binding 6 (damage_accums) je read_write, binding 11 (last_inputs) read_write.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..12u32)
+            .map(|i| {
+                let ty = if i == 0 {
+                    wgpu::BufferBindingType::Uniform
+                } else if i == 6 || i == 11 {
+                    wgpu::BufferBindingType::Storage { read_only: false }
+                } else {
+                    wgpu::BufferBindingType::Storage { read_only: true }
+                };
+                wgpu::BindGroupLayoutEntry {
+                    binding: i,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }
+            })
+            .collect();
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("populate-inputs-bgl"),
+            entries: &entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("populate-inputs-pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("populate-inputs-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("populate_inputs"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("populate-inputs-params"),
+            contents: bytemuck::bytes_of(&PopulateInputsParams::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            bind_group_layout,
+            params_buf,
+        })
+    }
+
+    /// Sprint 61: dispatch populate_inputs shader. Caller pass:
+    /// - `cells`: CellsGpu (drží energy/heading/pitch/damage/max_speed/eff_radius/last_hidden/last_inputs/velocities buffery).
+    /// - `sensor`: SensorGatherGpu (output_buf + vision_radii_buf přes accessory).
+    /// Output = `cells.last_inputs_buf` populated; brain forward toto čte direct.
+    pub fn dispatch(
+        &mut self,
+        cells: &CellsGpu,
+        sensor: &SensorGatherGpu,
+        params: PopulateInputsParams,
+    ) {
+        if params.num_cells == 0 {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("populate-inputs-bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: sensor.output_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cells.velocities_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells.energy_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cells.heading_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cells.pitch_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: cells.damage_accum_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: cells.max_speed_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: cells.eff_radius_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: sensor.vision_radii_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: cells.last_hidden_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: cells.last_inputs_buffer().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("populate-inputs-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("populate-inputs-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (params.num_cells + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 }
 

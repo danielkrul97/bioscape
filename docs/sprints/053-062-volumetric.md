@@ -896,9 +896,119 @@ plně 3D s 7-point Jacobi diffusion.
     - GPU step / collision / predate / eat shadery (Sprint 50 standalone)
       wire-up. Plný GPU tick loop bez CPU side-effects.
 
-## Sprinty 61–62 — open-ended
+## Sprint 61 — fuze sensor → brain forward (eliminate sensor readback)
 
-- **Sprint 61+:** Renderer GPU sensor pipeline (mirror Sprint 60 do main.rs).
-- **Sprint 61+:** GPU full tick loop (no per-tick readback).
+- **Cíl:** odstranit 1 ze 3 GPU round-trips v `--gpu-full` brain_act (sensor
+  output 60 KB readback). Klíč: GPU shader `populate_inputs.wgsl` čte
+  `sensor.output_buf` storage direct + cell metadata (energy, velocity,
+  heading, pitch, damage_accum, max_speed, eff_radius, last_hidden) → píše
+  `cells.last_inputs_buf` který brain forward už čte. Žádný `device.poll(Wait)`
+  ze sensor stage.
+
+  **Plán implementace:**
+
+  *Body 1 — `CellsGpu` rozšíření o cell metadata buffery:*
+  - Add 6 buffers (každý `n × f32 = 4 KB`): `energy_buf`, `heading_buf`,
+    `pitch_buf`, `damage_accum_buf`, `max_speed_buf`, `eff_radius_buf`.
+    Velocities buf už existuje (Sprint 51 brownian).
+  - Pub accessory pro shader binding. Bulk `upload_metadata(...)` helper.
+
+  *Body 2 — `populate_inputs.wgsl` shader:*
+  - 12 bindings: params (uniform) + 11 storage. Read-only: sensor_output,
+    velocities, energies, headings, pitches, max_speeds, eff_radii,
+    vision_radii, last_hidden. Read-write: damage_accums (reset side-effect),
+    last_inputs (write target). Workgroup 64.
+  - Mirroruje lib `populate_brain_inputs` 1:1 — sensor stride 15 → BrainSensors
+    field mapping; energy/speed/forward_vector/recurrent normalizace; damage
+    consume + reset.
+  - Konstanty (gainy, REPRODUCE_THRESHOLD, BRAIN_INPUTS layout) přes uniform
+    `PopulateInputsParams`.
+
+  *Body 3 — `PopulateInputsGpu` Rust wrapper:*
+  - Pipeline + bind group layout. `dispatch(&CellsGpu, &SensorGatherGpu, params)`
+    metoda. Sdílí GpuContext s ostatními (Sprint 47 pattern).
+
+  *Body 4 — `SensorGatherGpu::dispatch_no_readback`:*
+  - Variant of `compute()` bez `Vec<SensorRow>` readback. Submit only —
+    `output_buf` zůstává storage pro chained populate shader.
+  - Pub `output_buffer()` + `vision_radii_buffer()` accessory pro binding.
+
+  *Body 5 — `brain_act_gpu_full` 8-fáze refactor:*
+  - 1: CPU `apply_shell_absorb` pre-pass + snapshot positions/eff_radii/
+       vision_radii/food_positions + cell metadata (energies, headings, pitches,
+       damage_accums, max_speeds, velocities).
+  - 2: `cells.upload_metadata(...)` + `cells.upload_velocities(...)`.
+  - 3: `cell_hash.dispatch + food_hash.dispatch` (no readback).
+  - 4: `sensor.dispatch_no_readback(...)` (no readback).
+  - 5: `populate.dispatch(&cells, &sensor, params)` (no readback).
+  - 6: `brain.forward_persistent(&cells, n)` (no readback — brain reads
+       last_inputs_buf direct).
+  - 7: `cells.download_hidden_outputs(n)` ← **round-trip #2** (Sprint 62
+       target: motor na GPU eliminuje).
+  - 8: CPU motor + writeback last_hidden/last_outputs/damage_accum=0.
+
+- **Konstanty:** žádné nové. Lib re-export `BRAIN_INPUTS_SENSORY`,
+  `BRAIN_RECURRENT`, `DAMAGE_NORMALIZATION_GAIN`, `DENSITY_NORM_COUNT`,
+  `PHEROMONE_NORMALIZATION_GAIN`, `SMELL_NORMALIZATION_GAIN`,
+  `REPRODUCE_THRESHOLD` (všechny pre-existing pub const).
+
+- **Výstup:**
+  - `src/gpu.rs`: `CellsGpu` přidává 6 metadata buffery + accessors +
+    `upload_metadata`. `SensorGatherGpu` přidává `output_buffer()` /
+    `vision_radii_buffer()` accessory + `dispatch_no_readback()`.
+    `PopulateInputsGpu` + `PopulateInputsParams` nový.
+  - `shaders/populate_inputs.wgsl` nový — 11-binding shader.
+  - `src/bin/headless.rs`: `GpuFullState` přidává `populate: PopulateInputsGpu`.
+    `brain_act_gpu_full` 8-fáze refactor.
+  - **Test suite: 73/73 pass**.
+  - **Smoke seed=0, 60 gen, 1000 cells, default world s `--gpu-full`:**
+    - **Wall-clock 136 s = 265 ticks/s** (Sprint 60 222 = **+19 %**, ale
+      Sprint 59 345, Sprint 58 CPU 977 = stále **3.7× slower** než CPU).
+    - Per-fáze us avg: update_smell 41 (Sprint 60 47), update_pheromone 16
+      (Sprint 60 20), **brain_act 3341 (Sprint 60 4103, –762 µs ✓)**,
+      apply_brownian 142 (Sprint 60 199), reproduce 217 (Sprint 60 299).
+    - Pop final 548 (Sprint 60 525, CPU 572) — populate shader správně
+      mirroruje CPU populate, drift v CAS noise rangi.
+
+- **Poznámky:**
+  - **Sprint 61 win nad Sprint 60 ale ne nad Sprint 59.** Sprint 60 přidal
+    GPU sensor pipeline (3 dispatch + 1 readback). Sprint 61 odstranil
+    sensor readback (1 RT eliminován). Net: Sprint 60→61 -19% wall-clock.
+    Ale Sprint 59 (CPU sensor + GPU field) je stále rychlejší — Sprint 61
+    má víc dispatch overhead (5 GPU passes brain_act fáze).
+  - **Round-trip status po Sprint 61:**
+    - #1 sensor: ELIMINATED (Sprint 61) ✓
+    - #2 hidden+outputs (96 KB): zůstává — Sprint 62 motor na GPU eliminuje.
+    - #3 velocities (12 KB): zůstává — Sprint 51 GPU brownian path.
+    - + reproduce sparse upload_brain_at: rare event, ne hot path.
+    Sprint 62 motor + Sprint 63+ step/collision/predate by snížilo na 0
+    round-trips/tick (jen na konci epochy CSV log readback).
+  - **Damage_accum dual-state:** populate_inputs shader resetuje
+    `damage_accums[i] = 0` GPU-side. CPU mirror: `cell.damage_accum = 0.0`
+    v Phase 8 motor pass (před výpisem v dalším tick uploadu metadata).
+    Apply_hazards + predate píší CPU damage_accum, který je v dalším
+    brain_act ticku uploadnut → consistent.
+  - **Per-tick metadata upload:** 6 buffers × 1000 cells × 4 B = 24 KB
+    upload/tick. `queue.write_buffer` je async submit (no Wait). Plus
+    velocities 12 KB. Total ~36 KB/tick metadata = 2.2 MB/s při 60 Hz —
+    pod PCIe limity.
+  - **Co Sprint 61 NEŘEŠÍ (Sprint 62+):**
+    - Motor on GPU shader (`shaders/motor.wgsl` Sprint 50 standalone
+      ready). Eliminuje round-trip #2 (96 KB hidden+outputs readback).
+      Brain forward → motor jako single fused pipeline.
+    - GPU step/brownian/eat/predate/collision (Sprint 50 standalone shadery)
+      wire — full GPU loop. Eliminuje round-trip #3 + ostatní CPU phase
+      readbacks.
+    - Renderer GPU populate_inputs (mirror Sprint 61 do main.rs Bevy ECS).
+    - Bigger-workload benchmark: Sprint 61 měřeno jen 1000 cells. GPU
+      stack profitabilita roste s N — 5k+ cells je expected break-even
+      vs CPU baseline.
+
+## Sprinty 62 — open-ended
+
+- **Sprint 62+:** Motor on GPU (`motor.wgsl` wire) → eliminate round-trip
+  #2. Plus full GPU step/eat/predate/collision Sprint 63+.
+- **Sprint 62+:** Renderer GPU populate_inputs.
+- **Sprint 62+:** Bigger workload benchmark (5k–10k cells, larger grid).
 - **Sprint 62+:** 3D voxel rendering, ghost cell visual wrap.
 - **Sprint 62+:** progressive z expansion (z=30, z=50).
