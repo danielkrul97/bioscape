@@ -29,6 +29,32 @@ struct PredateParams {
     spike_bonus: f32,
     dilution_k: f32,
     _pad0: u32,
+    /// Sprint 55: toroidal bounds.
+    world_half_x: f32,
+    world_half_y: f32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+fn min_image_xy(d: f32, half: f32) -> f32 {
+    let w = 2.0 * half;
+    if (d > half) { return d - w; }
+    if (d < -half) { return d + w; }
+    return d;
+}
+
+fn bucket_id_wrapped(pos: vec3<f32>) -> u32 {
+    let wx = 2.0 * params.world_half_x;
+    let wy = 2.0 * params.world_half_y;
+    let pos_wx = pos.x - floor((pos.x + params.world_half_x) / wx) * wx;
+    let pos_wy = pos.y - floor((pos.y + params.world_half_y) / wy) * wy;
+    let bx = i32(floor(pos_wx / params.cell_size)) + HALF_NX;
+    let by = i32(floor(pos_wy / params.cell_size)) + HALF_NY;
+    let bz = i32(floor(pos.z / params.cell_size)) + HALF_NZ;
+    let bx_c = clamp(bx, 0, GRID_NX - 1);
+    let by_c = clamp(by, 0, GRID_NY - 1);
+    let bz_c = clamp(bz, 0, GRID_NZ - 1);
+    return u32(bx_c + by_c * GRID_NX + bz_c * GRID_NX * GRID_NY);
 }
 
 @group(0) @binding(0) var<uniform> params: PredateParams;
@@ -56,17 +82,18 @@ fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let herd_r = sqrt(params.herd_radius_sq);
     let r_cells = i32(ceil(herd_r / params.cell_size));
-    let bx_base = i32(floor(pos_i.x / params.cell_size)) + HALF_NX;
-    let by_base = i32(floor(pos_i.y / params.cell_size)) + HALF_NY;
-    let bz_base = i32(floor(pos_i.z / params.cell_size)) + HALF_NZ;
+    let cs = params.cell_size;
     var count: u32 = 0u;
+    // Sprint 55: ghost positions + bucket_id_wrapped + min-image distance.
     for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
             for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-                let bx = clamp(bx_base + dx, 0, GRID_NX - 1);
-                let by = clamp(by_base + dy, 0, GRID_NY - 1);
-                let bz = clamp(bz_base + dz, 0, GRID_NZ - 1);
-                let b = u32(bx + by * GRID_NX + bz * GRID_NX * GRID_NY);
+                let nbr_pos = vec3<f32>(
+                    pos_i.x + f32(dx) * cs,
+                    pos_i.y + f32(dy) * cs,
+                    pos_i.z + f32(dz) * cs,
+                );
+                let b = bucket_id_wrapped(nbr_pos);
                 let start = hash_offsets[b];
                 let end = hash_offsets[b + 1u];
                 for (var k = start; k < end; k = k + 1u) {
@@ -79,7 +106,11 @@ fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
                         positions[j * 3u + 1u],
                         positions[j * 3u + 2u],
                     );
-                    let d = pos_i - pj;
+                    let d = vec3<f32>(
+                        min_image_xy(pos_i.x - pj.x, params.world_half_x),
+                        min_image_xy(pos_i.y - pj.y, params.world_half_y),
+                        pos_i.z - pj.z,
+                    );
                     if (dot(d, d) < params.herd_radius_sq) {
                         count = count + 1u;
                     }
@@ -113,20 +144,20 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (size ratio threshold předtím), tedy max pair_r = 2 × CELL_RADIUS × r_i.
     let max_pair_r = 2.0 * params.cell_radius_const * r_i;
     let r_cells = i32(ceil(max_pair_r / params.cell_size));
-
-    let bx_base = i32(floor(pos_i.x / params.cell_size)) + HALF_NX;
-    let by_base = i32(floor(pos_i.y / params.cell_size)) + HALF_NY;
-    let bz_base = i32(floor(pos_i.z / params.cell_size)) + HALF_NZ;
+    let cs = params.cell_size;
 
     var self_gain: f32 = 0.0;
 
+    // Sprint 55: ghost positions + bucket_id_wrapped + min-image distance.
     for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
             for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-                let bx = clamp(bx_base + dx, 0, GRID_NX - 1);
-                let by = clamp(by_base + dy, 0, GRID_NY - 1);
-                let bz = clamp(bz_base + dz, 0, GRID_NZ - 1);
-                let b = u32(bx + by * GRID_NX + bz * GRID_NX * GRID_NY);
+                let nbr_pos = vec3<f32>(
+                    pos_i.x + f32(dx) * cs,
+                    pos_i.y + f32(dy) * cs,
+                    pos_i.z + f32(dz) * cs,
+                );
+                let b = bucket_id_wrapped(nbr_pos);
                 let start = hash_offsets[b];
                 let end = hash_offsets[b + 1u];
                 for (var k = start; k < end; k = k + 1u) {
@@ -145,7 +176,11 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                         positions[j * 3u + 1u],
                         positions[j * 3u + 2u],
                     );
-                    let d = pos_i - pj;
+                    let d = vec3<f32>(
+                        min_image_xy(pos_i.x - pj.x, params.world_half_x),
+                        min_image_xy(pos_i.y - pj.y, params.world_half_y),
+                        pos_i.z - pj.z,
+                    );
                     let d2 = dot(d, d);
                     if (d2 < pair_r2) {
                         var gain = params.predation_gain;

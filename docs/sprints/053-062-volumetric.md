@@ -237,11 +237,93 @@ plně 3D s 7-point Jacobi diffusion.
       duplicate na x=+970 (smooth wrap visual). Aktuálně cell skipne přes
       okraj.
 
-## Sprinty 55–62 — open-ended
+## Sprint 55 — GPU broad-phase toroidal
 
-- **Sprint 55: GPU spatial broad-phase toroidal.** Update spatial_hash /
-  cell_neighbors / collision / predate / sensor_gather WGSL na bucket
-  modulo + min-image distance.
+- **Cíl:** dokončit toroidal semantiku v GPU broad-phase shaderech ze
+  Sprintu 45/49/50 — Sprint 54 toroidal CPU implementaci dotáhne i na GPU
+  side. 4 shadery updated (spatial_hash, cell_neighbors, collision, predate);
+  sensor_gather zůstává `#[ignore]` až do Sprint 56 (FieldGpu 3D migrace).
+
+  **Plán implementace:**
+
+  *Body 1 — `spatial_hash.wgsl` bucket wrap:*
+  - `bucket_id_of(pos)`: pre-Sprint-55 clamp xy bucket coords k grid bounds.
+    Sprint 55 wraps pos.xy do `[-half, half)` modulo, pak spočítá bucket.
+    Cells na opačných koncích světa získávají adjacent bucket ID. Z stále
+    bounded.
+  - Params struct rozšířen o `world_half_x`, `world_half_y`. Rust `HashParams`
+    + `SpatialHashGpu.world_half_xy` field, propagated přes `with_context` /
+    `new` constructory.
+
+  *Body 2 — `cell_neighbors.wgsl` toroidal query:*
+  - Přidán helper `min_image_xy(d, half)` — toroidal-aware signed delta.
+    Bucket iter změněn z manual `bx_base + dx` clamp na ghost positions
+    (`pos_i + offset * cell_size`) přes `bucket_id_of` který wraps. Narrow-
+    phase `dx, dy` přes `min_image_xy`, dz beze změny.
+  - `NeighborsParams` + `NeighborsGpu.world_half_xy` field, constructor
+    propagated.
+
+  *Body 3 — `collision.wgsl` + `predate.wgsl` toroidal:*
+  - Stejný pattern jako cell_neighbors: lokální `min_image_xy` +
+    `bucket_id_wrapped` helpers, ghost position iteration. Narrow-phase
+    distance přes min-image.
+  - `CollisionParams` + `PredateParamsGpu` rozšířeny o `world_half_x/y`
+    + 2 padding fields (zarovnání 16-byte uniform alignment).
+  - `CollisionGpu.world_half_xy` field. `PredateGpu` čte z params (caller
+    naplní per compute() call).
+
+  *Body 4 — testy:*
+  - `cargo test --features gpu` callsiteů updated: `with_context(..., [1000.0, 1000.0])`
+    nebo `world_half_x: 1000.0, world_half_y: 1000.0` v params struct.
+    Cluster fixtury (positions ±500) zůstávají uvnitř [−1000, 1000] tak že
+    min-image collapses na raw delta — parity tests s CPU brute force
+    procházejí.
+  - **71/71 tests pass + 2 ignored**.
+
+- **Konstanty:** žádné nové; world_half přidán do 4 GPU params struktur.
+
+- **Výstup:**
+  - 4 WGSL shadery updated (spatial_hash, cell_neighbors, collision, predate).
+  - 4 Rust Params struct extended + 3 Gpu structs (Hash/Neighbors/Collision)
+    získali `world_half_xy` field; PredateGpu čte z compute() params.
+  - `with_context` / `new` constructor signatury rozšířeny o `world_half_xy:
+    [f32; 2]` (Hash, Neighbors, Collision).
+  - **71/71 testů pass + 2 ignored** (sensor_gather + field_gpu_diffusion
+    deferred Sprint 56).
+  - **Smoke headless seed=0:** beze změny od Sprintu 54 (--gpu-full
+    nepoužívá GPU broad-phase v hot loopu — používá CPU sensor gather +
+    GPU brain forward). GPU broad-phase shadery zatím test-only.
+  - **Renderer launch OK** (žádný panic).
+
+- **Poznámky:**
+  - **Ghost position iteration vs explicit modulo:** šel jsem cestou
+    "neighbor_pos = pos_i + dx*cell_size" + bucket_id_of wraps internally.
+    Alternativa: explicit modulo na bucket coords (`(bx_base+dx) mod
+    world_bx_count`). Ghost approach je jednodušší (nepotřebuje
+    `world_bucket_count_x` uniform) a bucket_id_of už wraps pos.xy. Nevýhoda:
+    při r_cells × 2 ≥ world_bucket_count by se objevily duplicates (cells
+    counted 2× v některých scénářích). Pro typický vision_radius (50) +
+    cell_size=64 je r_cells=1 → 3³=27 bucket queries < world_bx_count=30,
+    žádné dups. Pro broader predator search (r_cells=2 → 5×5=25 < 30),
+    také OK. Edge case r_cells ≥ world_bx_count/2 dokumentován.
+  - **GPU broad-phase není v hot path:** Sprint 51 `--gpu-full` headless +
+    Sprint 52 renderer GPU default používají BrainGpu/HebbianGpu/BrownianGpu
+    + CPU sensor gather. Sprint 50 GPU shadery (sensor/motor/step/collision/
+    predate) jsou tested-in-isolation, ne wired. Sprint 55 jejich toroidal
+    konzistence znamená readiness pro Sprint 57+ full GPU tick pipeline.
+  - **CPU brute force v parity testech:** zůstávají raw delta (no min_image).
+    Test fixtury jsou cluster (±500 nebo ±300 v ±1000 world) → raw delta ==
+    min_image (žádný cell přes wrap). Tests pass se aktuální brute force.
+    Pokud budoucí test stresuje wrap (cells na opačných koncích), CPU brute
+    force bude muset taky použít min_image_delta.
+  - **Sensor_gather odložené:** Sprint 53 ignored kvůli FieldGpu 2D vs
+    SmellField 3D mismatch. Sprint 55 by mohl bucket part toroidal fixnout,
+    ale field sample part stále nematch. Sprint 56 (FieldGpu 3D) re-enable.
+
+## Sprinty 56–62 — open-ended
+
+- **Sprint 56: GPU FieldGpu 3D + toroidal.** field_diffuse_3d.wgsl 7-point
+  stencil with xy wrap. Re-enable 2 ignored tests.
 - **Sprint 56: GPU FieldGpu 3D + toroidal.** field_diffuse_3d.wgsl 7-point
   stencil with xy wrap.
 - **Sprint 57+:** 3D voxel rendering, ghost cell visual wrap.

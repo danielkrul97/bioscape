@@ -31,8 +31,9 @@ const HALF_NZ: i32 = 2;
 struct Params {
     num_cells: u32,
     cell_size: f32,
-    _pad0: u32,
-    _pad1: u32,
+    /// Sprint 55: world bounds pro toroidal bucket wrap + min-image distance.
+    world_half_x: f32,
+    world_half_y: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -43,9 +44,23 @@ struct Params {
 @group(0) @binding(5) var<storage, read> hash_sorted: array<u32>;      // N
 @group(0) @binding(6) var<storage, read_write> output: array<f32>;     // N*5
 
+// Sprint 55: minimum-image displacement na xy axes. Returns dx tak, že
+// |dx| ≤ world_half. Pre-Sprint-55 byl raw subtraction.
+fn min_image_xy(d: f32, half: f32) -> f32 {
+    let w = 2.0 * half;
+    if (d > half) { return d - w; }
+    if (d < -half) { return d + w; }
+    return d;
+}
+
 fn bucket_id_of(pos: vec3<f32>) -> u32 {
-    let bx = i32(floor(pos.x / params.cell_size)) + HALF_NX;
-    let by = i32(floor(pos.y / params.cell_size)) + HALF_NY;
+    // Sprint 55: wrap xy do [-half, half) než spočítáme bucket.
+    let wx = 2.0 * params.world_half_x;
+    let wy = 2.0 * params.world_half_y;
+    let pos_wx = pos.x - floor((pos.x + params.world_half_x) / wx) * wx;
+    let pos_wy = pos.y - floor((pos.y + params.world_half_y) / wy) * wy;
+    let bx = i32(floor(pos_wx / params.cell_size)) + HALF_NX;
+    let by = i32(floor(pos_wy / params.cell_size)) + HALF_NY;
     let bz = i32(floor(pos.z / params.cell_size)) + HALF_NZ;
     let bx_c = clamp(bx, 0, GRID_NX - 1);
     let by_c = clamp(by, 0, GRID_NY - 1);
@@ -67,10 +82,6 @@ fn neighbors(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vr = vision_radii[i];
     let vr2 = vr * vr;
 
-    let bx_base = i32(floor(pos_i.x / params.cell_size)) + HALF_NX;
-    let by_base = i32(floor(pos_i.y / params.cell_size)) + HALF_NY;
-    let bz_base = i32(floor(pos_i.z / params.cell_size)) + HALF_NZ;
-
     var best_d2 = vr2 + 1.0;
     var best_dx: f32 = 0.0;
     var best_dy: f32 = 0.0;
@@ -78,17 +89,20 @@ fn neighbors(@builtin(global_invocation_id) gid: vec3<u32>) {
     var best_radius: f32 = -1.0;
     var count: u32 = 0u;
 
-    // r_cells = ceil(vision_radius / cell_size). Při cell_size=64 a vr_max=80
-    // dostaneme r_cells=2 → 5³ = 125 buckets. CPU SpatialGrid používá stejný
-    // pattern (ceil division). Bez dynamiky bychom missnuli neighbors na okraji.
+    // Sprint 55: iterate 3³ buckets s ghost positions (pos_i + offset). bucket_id_of
+    // wraps pos automaticky → toroidal lookup. Narrow-phase používá min_image_xy
+    // pro delta (dx, dy přes wrap → |dx|, |dy| ≤ world_half).
     let r_cells = i32(ceil(vr / params.cell_size));
+    let cs = params.cell_size;
     for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
             for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-                let bx = clamp(bx_base + dx, 0, GRID_NX - 1);
-                let by = clamp(by_base + dy, 0, GRID_NY - 1);
-                let bz = clamp(bz_base + dz, 0, GRID_NZ - 1);
-                let b = u32(bx + by * GRID_NX + bz * GRID_NX * GRID_NY);
+                let nbr_pos = vec3<f32>(
+                    pos_i.x + f32(dx) * cs,
+                    pos_i.y + f32(dy) * cs,
+                    pos_i.z + f32(dz) * cs,
+                );
+                let b = bucket_id_of(nbr_pos);
                 let start = hash_offsets[b];
                 let end = hash_offsets[b + 1u];
                 for (var k = start; k < end; k = k + 1u) {
@@ -101,8 +115,9 @@ fn neighbors(@builtin(global_invocation_id) gid: vec3<u32>) {
                         positions[j * 3u + 1u],
                         positions[j * 3u + 2u],
                     );
-                    let dxf = pos_j.x - pos_i.x;
-                    let dyf = pos_j.y - pos_i.y;
+                    // Sprint 55: min-image delta — toroidal-aware distance.
+                    let dxf = min_image_xy(pos_j.x - pos_i.x, params.world_half_x);
+                    let dyf = min_image_xy(pos_j.y - pos_i.y, params.world_half_y);
                     let dzf = pos_j.z - pos_i.z;
                     let d2 = dxf * dxf + dyf * dyf + dzf * dzf;
                     if (d2 <= vr2) {

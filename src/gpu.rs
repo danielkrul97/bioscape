@@ -548,8 +548,9 @@ pub const GPU_HASH_NUM_BUCKETS: usize =
 struct HashParams {
     num_cells: u32,
     cell_size: f32,
-    _pad0: u32,
-    _pad1: u32,
+    /// Sprint 55: xy world bounds pro toroidal bucket wrap.
+    world_half_x: f32,
+    world_half_y: f32,
 }
 
 pub struct SpatialHashGpu {
@@ -561,6 +562,8 @@ pub struct SpatialHashGpu {
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
     cell_size: f32,
+    /// Sprint 55: xy world bounds pro toroidal bucket wrap.
+    world_half_xy: [f32; 2],
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
     counts_buf: wgpu::Buffer,
@@ -573,22 +576,24 @@ pub struct SpatialHashGpu {
 }
 
 impl SpatialHashGpu {
-    pub fn new(capacity: usize, cell_size: f32) -> Result<Self, String> {
+    pub fn new(capacity: usize, cell_size: f32, world_half_xy: [f32; 2]) -> Result<Self, String> {
         assert!(capacity > 0);
         let ctx = GpuContext::new()?;
-        Self::with_device_inner(ctx.device, ctx.queue, capacity, cell_size)
+        Self::with_device_inner(ctx.device, ctx.queue, capacity, cell_size, world_half_xy)
     }
 
     pub fn with_context(
         ctx: &GpuContext,
         capacity: usize,
         cell_size: f32,
+        world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         Self::with_device_inner(
             Arc::clone(&ctx.device),
             Arc::clone(&ctx.queue),
             capacity,
             cell_size,
+            world_half_xy,
         )
     }
 
@@ -597,6 +602,7 @@ impl SpatialHashGpu {
         queue: Arc<wgpu::Queue>,
         capacity: usize,
         cell_size: f32,
+        world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("spatial_hash"),
@@ -709,6 +715,7 @@ impl SpatialHashGpu {
             bind_group_layout,
             capacity,
             cell_size,
+            world_half_xy,
             params_buf,
             positions_buf,
             counts_buf,
@@ -871,7 +878,8 @@ impl SpatialHashGpu {
         let params = HashParams {
             num_cells: n as u32,
             cell_size: self.cell_size,
-            ..HashParams::default()
+            world_half_x: self.world_half_xy[0],
+            world_half_y: self.world_half_xy[1],
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -2964,6 +2972,11 @@ struct CollisionParams {
     cell_size: f32,
     cell_radius_const: f32,
     _pad0: u32,
+    /// Sprint 55: toroidal world bounds.
+    world_half_x: f32,
+    world_half_y: f32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 pub struct CollisionGpu {
@@ -2974,6 +2987,8 @@ pub struct CollisionGpu {
     capacity: usize,
     cell_size: f32,
     cell_radius_const: f32,
+    /// Sprint 55: toroidal bounds.
+    world_half_xy: [f32; 2],
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
     eff_radii_buf: wgpu::Buffer,
@@ -2989,6 +3004,7 @@ impl CollisionGpu {
         capacity: usize,
         cell_size: f32,
         cell_radius_const: f32,
+        world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         Self::with_device_inner(
             Arc::clone(&ctx.device),
@@ -2996,6 +3012,7 @@ impl CollisionGpu {
             capacity,
             cell_size,
             cell_radius_const,
+            world_half_xy,
         )
     }
 
@@ -3003,9 +3020,10 @@ impl CollisionGpu {
         capacity: usize,
         cell_size: f32,
         cell_radius_const: f32,
+        world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         let ctx = GpuContext::new()?;
-        Self::with_device_inner(ctx.device, ctx.queue, capacity, cell_size, cell_radius_const)
+        Self::with_device_inner(ctx.device, ctx.queue, capacity, cell_size, cell_radius_const, world_half_xy)
     }
 
     fn with_device_inner(
@@ -3014,6 +3032,7 @@ impl CollisionGpu {
         capacity: usize,
         cell_size: f32,
         cell_radius_const: f32,
+        world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         assert!(capacity > 0);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3090,6 +3109,7 @@ impl CollisionGpu {
             capacity,
             cell_size,
             cell_radius_const,
+            world_half_xy,
             params_buf,
             positions_buf,
             eff_radii_buf,
@@ -3122,6 +3142,10 @@ impl CollisionGpu {
             cell_size: self.cell_size,
             cell_radius_const: self.cell_radius_const,
             _pad0: 0,
+            world_half_x: self.world_half_xy[0],
+            world_half_y: self.world_half_xy[1],
+            _pad1: 0,
+            _pad2: 0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -3198,6 +3222,11 @@ pub struct PredateParamsGpu {
     pub spike_bonus: f32,
     pub dilution_k: f32,
     pub _pad0: u32,
+    /// Sprint 55: toroidal world bounds.
+    pub world_half_x: f32,
+    pub world_half_y: f32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -3765,8 +3794,9 @@ impl SensorGatherGpu {
 struct NeighborsParams {
     num_cells: u32,
     cell_size: f32,
-    _pad0: u32,
-    _pad1: u32,
+    /// Sprint 55: toroidal bounds.
+    world_half_x: f32,
+    world_half_y: f32,
 }
 
 /// Per-cell broad-phase result. `nearest_cell` = None pokud žádný neighbor
@@ -3784,6 +3814,8 @@ pub struct NeighborsGpu {
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
     cell_size: f32,
+    /// Sprint 55: toroidal bounds.
+    world_half_xy: [f32; 2],
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
     radii_buf: wgpu::Buffer,
@@ -3798,18 +3830,20 @@ impl NeighborsGpu {
         ctx: &GpuContext,
         capacity: usize,
         cell_size: f32,
+        world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         Self::with_device_inner(
             Arc::clone(&ctx.device),
             Arc::clone(&ctx.queue),
             capacity,
             cell_size,
+            world_half_xy,
         )
     }
 
-    pub fn new(capacity: usize, cell_size: f32) -> Result<Self, String> {
+    pub fn new(capacity: usize, cell_size: f32, world_half_xy: [f32; 2]) -> Result<Self, String> {
         let ctx = GpuContext::new()?;
-        Self::with_device_inner(ctx.device, ctx.queue, capacity, cell_size)
+        Self::with_device_inner(ctx.device, ctx.queue, capacity, cell_size, world_half_xy)
     }
 
     fn with_device_inner(
@@ -3817,6 +3851,7 @@ impl NeighborsGpu {
         queue: Arc<wgpu::Queue>,
         capacity: usize,
         cell_size: f32,
+        world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         assert!(capacity > 0);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3936,6 +3971,7 @@ impl NeighborsGpu {
             bind_group_layout,
             capacity,
             cell_size,
+            world_half_xy,
             params_buf,
             positions_buf,
             radii_buf,
@@ -4027,7 +4063,8 @@ impl NeighborsGpu {
         let params = NeighborsParams {
             num_cells: n as u32,
             cell_size: self.cell_size,
-            ..NeighborsParams::default()
+            world_half_x: self.world_half_xy[0],
+            world_half_y: self.world_half_xy[1],
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -4552,7 +4589,7 @@ mod tests {
             })
             .collect();
 
-        let mut gpu = match SpatialHashGpu::new(n, cell_size) {
+        let mut gpu = match SpatialHashGpu::new(n, cell_size, [1000.0, 1000.0]) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("skip: no GPU adapter ({e})");
@@ -4907,7 +4944,7 @@ mod tests {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
         };
-        let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size).expect("hash");
+        let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
         let _ = hash.rebuild(&positions);
         let mut pred = PredateGpu::with_context(&ctx, n).expect("predate init");
         let params = PredateParamsGpu {
@@ -4921,6 +4958,8 @@ mod tests {
             spike_dot_threshold: SPIKE_DOT_THRESHOLD,
             spike_bonus: SPIKE_PREDATION_BONUS,
             dilution_k: DILUTION_K,
+            world_half_x: 1000.0,
+            world_half_y: 1000.0,
             ..PredateParamsGpu::default()
         };
         let res = pred.compute(
@@ -5023,9 +5062,9 @@ mod tests {
             Ok(c) => c,
             Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
         };
-        let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size).expect("hash");
+        let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
         let _ = hash.rebuild(&positions);
-        let mut col = CollisionGpu::with_context(&ctx, n, cell_size, CELL_RADIUS)
+        let mut col = CollisionGpu::with_context(&ctx, n, cell_size, CELL_RADIUS, [1000.0, 1000.0])
             .expect("collision init");
         let gpu_deltas = col.compute(&positions, &eff_radii, &max_axes, &hash);
 
@@ -5201,9 +5240,9 @@ mod tests {
                 return;
             }
         };
-        let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size).expect("hash init");
+        let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash init");
         let _ = hash.rebuild(&positions);
-        let mut nb = NeighborsGpu::with_context(&ctx, n, cell_size).expect("nb init");
+        let mut nb = NeighborsGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("nb init");
         let gpu_results = nb.compute(&positions, &radii, &vision_radii, &hash);
 
         for i in 0..n {
@@ -5334,7 +5373,7 @@ mod tests {
 
         let mut brain_gpu = BrainGpu::with_context(&ctx, n).expect("BrainGpu init");
         let mut hash_gpu =
-            SpatialHashGpu::with_context(&ctx, n, 64.0).expect("SpatialHashGpu init");
+            SpatialHashGpu::with_context(&ctx, n, 64.0, [1000.0, 1000.0]).expect("SpatialHashGpu init");
         let mut field_gpu =
             FieldGpu::with_context(&ctx, 16, [320.0, 320.0], 32).expect("FieldGpu init");
         let mut stats_gpu = StatsGpu::with_context(&ctx, n).expect("StatsGpu init");

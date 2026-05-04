@@ -25,8 +25,9 @@ const NUM_BUCKETS: u32 = 8192u; // = GRID_NX * GRID_NY * GRID_NZ
 struct Params {
     num_cells: u32,
     cell_size: f32,
-    _pad0: u32,
-    _pad1: u32,
+    // Sprint 55: world_half xy pro toroidal wrap. z bounded (cylinder topology).
+    world_half_x: f32,
+    world_half_y: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -36,8 +37,14 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> sorted_cells: array<u32>;
 
 fn bucket_id_of(pos: vec3<f32>) -> u32 {
-    let bx = i32(floor(pos.x / params.cell_size)) + HALF_NX;
-    let by = i32(floor(pos.y / params.cell_size)) + HALF_NY;
+    // Sprint 55: wrap xy do [-half, half) než spočítáme bucket — toroidal
+    // cylinder topology. z stále bounded (clamp).
+    let wx = 2.0 * params.world_half_x;
+    let wy = 2.0 * params.world_half_y;
+    let pos_wx = pos.x - floor((pos.x + params.world_half_x) / wx) * wx;
+    let pos_wy = pos.y - floor((pos.y + params.world_half_y) / wy) * wy;
+    let bx = i32(floor(pos_wx / params.cell_size)) + HALF_NX;
+    let by = i32(floor(pos_wy / params.cell_size)) + HALF_NY;
     let bz = i32(floor(pos.z / params.cell_size)) + HALF_NZ;
     let bx_c = clamp(bx, 0, GRID_NX - 1);
     let by_c = clamp(by, 0, GRID_NY - 1);
