@@ -13,9 +13,14 @@ const MIN_VISION: f32 = 1.0;
 const MIN_TURN_RATE: f32 = 0.1;
 const MIN_BODY_SIZE: f32 = 0.3;
 pub const INITIAL_ENERGY: f32 = 100.0;
-pub const BRAIN_INPUTS: usize = 11;
+// Brain inputs: 0=food_dx, 1=food_dy, 2=cell_dx, 3=cell_dy, 4=energy,
+// 5=speed, 6=rel_size, 7=smell_grad_x, 8=smell_grad_y, 9=heading_x,
+// 10=heading_y, 11=pheromone_grad_x, 12=pheromone_grad_y.
+pub const BRAIN_INPUTS: usize = 13;
 pub const BRAIN_HIDDEN: usize = 8;
-pub const BRAIN_OUTPUTS: usize = 2;
+// Brain outputs: 0=turn, 1=thrust, 2=pheromone modulation (positive = emit
+// more above baseline, costs energy).
+pub const BRAIN_OUTPUTS: usize = 3;
 /// Inicializační bias na thrust output bin v `Brain::random`. Bez něj má ~½
 /// random brainů thrust output blízko nuly (cell se sotva hýbe), což vytvářelo
 /// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce
@@ -56,6 +61,19 @@ pub const WORLD_UNITS_PER_FOOD: f32 = 2600.0;
 pub const HAZARD_DRAIN_PER_SEC: f32 = 0.5;
 pub const HAZARD_FLOOR: f32 = 0.0;
 pub const HAZARD_AMP: f32 = 1.0;
+
+// Pheromone signaling layer. 2D scalar field jako SmellField, ale zdroje jsou
+// cells (ne food). Každá živá cell přidává `BASELINE` zdarma + brain output[2]
+// modulátor (jen kladný, stojí energii). Brain detekuje gradient přes
+// `inputs[11..13]`. Diffusion + decay stejné jako smell.
+pub const PHEROMONE_GRID_RES: usize = 64;
+pub const PHEROMONE_DIFFUSION: f32 = 0.15;
+pub const PHEROMONE_DECAY: f32 = 0.3;
+pub const PHEROMONE_BASELINE_EMIT: f32 = 0.5;
+pub const PHEROMONE_BRAIN_MOD: f32 = 1.0;
+pub const PHEROMONE_COST_PER_RATE: f32 = 1.0;
+pub const PHEROMONE_SAMPLE_EPSILON: f32 = 10.0;
+pub const PHEROMONE_NORMALIZATION_GAIN: f32 = 0.5;
 pub const MAX_SPAWN_ATTEMPTS: usize = 5;
 pub const CARRION_FOOD_COUNT: usize = 2;
 
@@ -1055,11 +1073,14 @@ mod tests {
     fn brain_forward_zero_weights_outputs_tanh_of_output_biases() {
         // Zero weights kill signal flow at both layers — output equals tanh(b2),
         // independent of b1 (the hidden activations get zeroed by w2).
+        let mut b2 = [0.0_f32; BRAIN_OUTPUTS];
+        b2[0] = 0.5;
+        b2[1] = -0.5;
         let brain = Brain {
             w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
             b1: [0.7; BRAIN_HIDDEN],
             w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
-            b2: [0.5, -0.5],
+            b2,
         };
         let outputs = brain.forward(&[0.0; BRAIN_INPUTS]);
         assert!((outputs[0] - 0.5_f32.tanh()).abs() < 1e-6);

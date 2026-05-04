@@ -12,11 +12,13 @@ use bioscape::{
     CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DRAG_COEFFICIENT,
     EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
     HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, INITIAL_CELLS, LEARNING_RATE, MATING_RADIUS,
-    MAX_POPULATION, MAX_SPAWN_ATTEMPTS, MUTATION_CONFIG, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK,
-    PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION,
-    SMELL_GRID_RES, SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
-    TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
-    WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
+    MAX_POPULATION, MAX_SPAWN_ATTEMPTS, MUTATION_CONFIG, PHEROMONE_BASELINE_EMIT,
+    PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
+    PHEROMONE_GRID_RES, PHEROMONE_NORMALIZATION_GAIN, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
+    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
+    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD,
+    SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP,
+    WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 use cell_material::{pack_cell_tag, CellMaterial, CellMaterialPlugin};
 use rand::Rng;
@@ -167,6 +169,9 @@ struct CellMaterialHandle(Handle<CellMaterial>);
 struct SmellResource(SmellField);
 
 #[derive(Resource)]
+struct PheromoneResource(SmellField);
+
+#[derive(Resource)]
 struct WorldMapResource(WorldMap);
 
 #[derive(Component)]
@@ -214,7 +219,9 @@ fn main() {
                 update_food_density_cycle,
                 rebuild_food_grid,
                 update_smell_field,
+                update_pheromone_field,
                 cells_brain_act,
+                emit_pheromones,
                 step_cells,
                 apply_environmental_hazards,
                 rebuild_cell_grid,
@@ -308,6 +315,7 @@ fn setup(
     commands.insert_resource(FoodMaterial(food_material));
     commands.insert_resource(CellMaterialHandle(cell_material));
     commands.insert_resource(SmellResource(SmellField::new(SMELL_GRID_RES, half)));
+    commands.insert_resource(PheromoneResource(SmellField::new(PHEROMONE_GRID_RES, half)));
     commands.insert_resource(WorldMapResource(world_map));
 }
 
@@ -461,11 +469,35 @@ fn update_smell_field(
     smell.0.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
 }
 
+fn update_pheromone_field(time: Res<Time>, mut pheromone: ResMut<PheromoneResource>) {
+    // Diffuse + decay BEFORE this tick's emissions (in emit_pheromones, which
+    // runs after brain_act). Stejně jako headless — brainy detekují gradient
+    // ze stavu pole na konci minulého ticku, žádný self-feedback.
+    let dt = time.delta_secs();
+    pheromone.0.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+}
+
+fn emit_pheromones(
+    time: Res<Time>,
+    mut pheromone: ResMut<PheromoneResource>,
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+) {
+    let dt = time.delta_secs();
+    for mut cell in &mut cells {
+        let mod_strength = cell.0.last_outputs[2].max(0.0);
+        let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+        let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+        pheromone.0.add_source(cell.0.position, rate * dt);
+        cell.0.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+    }
+}
+
 fn cells_brain_act(
     time: Res<Time>,
     cell_grid: Res<CellGrid>,
     food_grid: Res<FoodGrid>,
     smell: Res<SmellResource>,
+    pheromone: Res<PheromoneResource>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
 ) {
     let dt = time.delta_secs();
@@ -527,6 +559,9 @@ fn cells_brain_act(
         inputs[8] = (grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
         inputs[9] = cell.0.heading.cos();
         inputs[10] = cell.0.heading.sin();
+        let pgrad = pheromone.0.gradient_at(pos, PHEROMONE_SAMPLE_EPSILON);
+        inputs[11] = (pgrad[0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+        inputs[12] = (pgrad[1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
 
         let (hidden, outputs) = cell.0.genome.brain.forward_with_state(&inputs);
         cell.0.last_inputs = inputs;

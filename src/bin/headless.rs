@@ -11,11 +11,13 @@ use bioscape::{
     CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DRAG_COEFFICIENT,
     EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
     HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, INITIAL_CELLS, LEARNING_RATE, MATING_RADIUS,
-    MAX_POPULATION, MAX_SPAWN_ATTEMPTS, MUTATION_CONFIG, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK,
-    PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION,
-    SMELL_GRID_RES, SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
-    TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
-    WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
+    MAX_POPULATION, MAX_SPAWN_ATTEMPTS, MUTATION_CONFIG, PHEROMONE_BASELINE_EMIT,
+    PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
+    PHEROMONE_GRID_RES, PHEROMONE_NORMALIZATION_GAIN, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
+    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
+    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD,
+    SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP,
+    WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -33,6 +35,7 @@ struct World {
     clock: SimClock,
     density_factor: f32,
     smell: SmellField,
+    pheromone: SmellField,
     map: WorldMap,
     // Persistent scratch — sized like cells/foods, reused per tick to avoid
     // hot-loop allocations.
@@ -58,6 +61,7 @@ impl World {
             clock: SimClock::new(TICKS_PER_GENERATION, GENERATIONS_PER_EPOCH),
             density_factor: 1.0,
             smell: SmellField::new(SMELL_GRID_RES, WORLD_HALF),
+            pheromone: SmellField::new(PHEROMONE_GRID_RES, WORLD_HALF),
             map,
             positions_scratch: Vec::new(),
             body_sizes_scratch: Vec::new(),
@@ -78,7 +82,9 @@ impl World {
         }
 
         self.update_smell(dt);
+        self.update_pheromone(dt);
         self.brain_act(dt);
+        self.emit_pheromones(dt);
         self.step(dt);
         self.apply_hazards(dt);
         self.resolve_collisions();
@@ -96,6 +102,24 @@ impl World {
             self.smell.add_source(food.position, SMELL_PER_FOOD * dt);
         }
         self.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
+    }
+
+    fn update_pheromone(&mut self, dt: f32) {
+        // Diffuse + decay BEFORE this tick's emissions are added (in
+        // emit_pheromones, called after brain_act). Cells thus read the
+        // gradient ze stavu pole na předchozí tick — prevents instant
+        // self-feedback (cell vidí svůj vlastní právě emitovaný puff).
+        self.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+    }
+
+    fn emit_pheromones(&mut self, dt: f32) {
+        for cell in &mut self.cells {
+            let mod_strength = cell.last_outputs[2].max(0.0);
+            let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+            let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+            self.pheromone.add_source(cell.position, rate * dt);
+            cell.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+        }
     }
 
     fn brain_act(&mut self, dt: f32) {
@@ -169,6 +193,9 @@ impl World {
             inputs[8] = (grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
             inputs[9] = cell.heading.cos();
             inputs[10] = cell.heading.sin();
+            let pgrad = self.pheromone.gradient_at(pos, PHEROMONE_SAMPLE_EPSILON);
+            inputs[11] = (pgrad[0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+            inputs[12] = (pgrad[1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
 
             let (hidden, outputs) = cell.genome.brain.forward_with_state(&inputs);
             cell.last_inputs = inputs;
@@ -479,7 +506,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     if n == 0 {
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,{},{:.3},0,0",
+            "{},0,0,0,0,0,0,0,{},{:.3},0,0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor
@@ -491,6 +518,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let mut vis_sumsq = 0.0_f64;
     let mut size_sum = 0.0_f64;
     let mut size_sumsq = 0.0_f64;
+    let mut ph_emit_sum = 0.0_f64;
     let mut lineages: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut oldest_age: u64 = 0;
     let current_gen = world.clock.generation;
@@ -504,6 +532,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         vis_sumsq += v * v;
         size_sum += bs;
         size_sumsq += bs * bs;
+        ph_emit_sum += c.last_outputs[2].max(0.0) as f64;
         lineages.insert(c.lineage_id);
         let age = current_gen.saturating_sub(c.lineage_birth_gen);
         if age > oldest_age {
@@ -517,9 +546,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let spd_d = ((spd_sumsq / nf) - spd_m * spd_m).max(0.0).sqrt();
     let vis_d = ((vis_sumsq / nf) - vis_m * vis_m).max(0.0).sqrt();
     let size_d = ((size_sumsq / nf) - size_m * size_m).max(0.0).sqrt();
+    let ph_emit_m = ph_emit_sum / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.4},{},{:.3},{},{}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.4},{},{:.3},{},{},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -532,6 +562,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         world.density_factor,
         lineages.len(),
         oldest_age,
+        ph_emit_m,
     )
 }
 
@@ -551,7 +582,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,size_avg,size_dev,food,density,lineages,oldest"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,size_avg,size_dev,food,density,lineages,oldest,ph_emit"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();

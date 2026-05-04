@@ -91,11 +91,41 @@ Decade focused on **prostorové struktuře a niche differentiation**. Sprint 20 
   - **Tunování drain:** 0.5/sec sweet spot. 2.0 = extinkce, 0.1 nejspíš zanedbatelné. Mohlo by být jeptelnější jako fraction of food gain, ale konstantní funguje.
   - **Rich-dangerous interpretace** je intuitivní: bohaté biomy reálného světa (džungle) jsou taky nebezpečnější (predátoři, soutěž). Cells musí být efektivní aby z toho profitovali.
 
-## Sprint 24+ — TBD
+## Sprint 24 — pheromone-signaling
+
+- **Cíl:** zavést pheromone field jako mechanismus pro emergent komunikaci. Cells emitují skalární signál (`baseline` zdarma + brain-controlled `mod` s energy cost), detekují gradient. Otázka: vznikne adaptivní emisi/detekce, nebo selekce eliminuje signaling?
+
+  **Plán:**
+  - `BRAIN_INPUTS: 11 → 13` (pheromone gradient x/y), `BRAIN_OUTPUTS: 2 → 3` (emisi modulátor).
+  - Reuse `SmellField` jako `pheromone` — stejný Jacobi diff + decay.
+  - `emit_pheromones`: per cell `rate = BASELINE + BRAIN_MOD × max(0, output[2])`. Cost = `COST × BRAIN_MOD × max(0, output[2]) × dt`.
+  - Tick order: `update_pheromone (decay)` → `brain_act (read gradient)` → `emit_pheromones (write field)`. Brain detekuje stav z konce minulého ticku — žádný self-feedback.
+  - CSV: nová metrika `ph_emit` = mean `last_outputs[2].max(0)` napříč populací.
+
+- **Konstanty:** `PHEROMONE_BASELINE_EMIT = 0.5`, `PHEROMONE_BRAIN_MOD = 1.0`, `PHEROMONE_COST_PER_RATE = 1.0`. Diffusion + decay stejné jako smell.
+
+- **Výstup:**
+  - Mechanismus implementován v lib.rs + obě binárky. 22/22 testů.
+  - **Pozorovaná dynamika (seed 0, 200 gen):**
+    - gen 30: `ph_emit = 0.319` (peak, cells aktivně emitují), populace 1000, lineages 22
+    - gen 100: `ph_emit = 0.000` (selekce eliminovala emisi), populace 260, lineages 4
+    - gen 200: `ph_emit = 0.000`, populace 235, lineages 1, size_avg 5.0 (giant regime)
+- **Poznámky:**
+  - **Komunikace nevznikla.** Selekce eliminovala active emission do gen 100. Free-rider problem: emitter platí cost, pole obohacuje všechny okolo. Bez specifické pressure (kin selection, signaling theory podmínky) emisi nevyplácí.
+  - **Vedlejší efekt: baseline emission = "social sensor" pro predátory.** Každá živá cell přidává `BASELINE` do pole zdarma. Predátoři detekují gradient → najdou kořist → giant regime (size 5) dominuje.
+  - **Sprint 23 diverzita zničena.** 20+ linií → 1. Predátorský exploit baseline pheromone překonal hazard niching. Po 200 gen jen monokultura giants.
+  - **Biologicky správné chování** (komunikace je v reálu rare, vznikla evolučně jen za specifických podmínek), ale **ne to, co jsme chtěli**. Pro adaptivní signaling potřeba: kin recognition, mating signals, alarm calls s benefit pro vysílatele, nebo jiný explicit payoff.
+  - **Možné fixy v Sprintu 25+:**
+    - `BASELINE_EMIT = 0` → cells musí aktivně emitovat aby vznikl signál. Eliminuje predator exploit, ale field může být prázdné.
+    - **Typed pheromones** (multi-channel) s explicitní rolí: alarm = decreases predator approach, mate call = increases reproduction radius.
+    - **Cost na DETECTION** ne emission. Detekovat info stojí, vysílat zdarma — opačná dynamika.
+
+## Sprint 25+ — TBD
 
 Možné směry:
 - **Spatial speciation analytics** — CSV stats per region (svět rozdělen na N×N kvadrantů, lineage count + dominant genome per region). Přímo testovatelná hypotéza spatial niching.
 - **Reprodukční izolace** přes `genome_distance(a, b) < threshold` (NEAT-style speciation) — pojistka pro persistenci diverzity.
+- **Pheromone v2: typed signals** — multi-channel s explicit payoff (alarm, mate call), zkusit dosáhnout adaptivní komunikace.
 - **Mobilní hrozby** — wandering predator entities, navigační AI challenge (brain musí zpracovat hrozbu jako další gradient).
 - **Multi-food types** — různé typy jídla s různými energetickými profily, food-side niching.
 - **Terrain drag** (třetí WorldMap vrstva) — pohyblivost varíuje s pozicí.
