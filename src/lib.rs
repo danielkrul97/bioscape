@@ -4,7 +4,8 @@
 //! from a windowed renderer (`main.rs`) or a headless batch run later.
 
 use core::f32::consts::TAU;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 const HUE_RANGE: f32 = 360.0;
 const MIN_SPEED: f32 = 1.0;
@@ -15,6 +16,76 @@ pub const INITIAL_ENERGY: f32 = 100.0;
 pub const BRAIN_INPUTS: usize = 9;
 pub const BRAIN_HIDDEN: usize = 8;
 pub const BRAIN_OUTPUTS: usize = 2;
+
+// Shared sim parameters consumed by both the Bevy renderer (`src/main.rs`)
+// and the headless harness (`src/bin/headless.rs`). Single source of truth —
+// tune here. Renderer-only and headless-only knobs stay in their binaries.
+
+pub const FIXED_TIMESTEP_HZ: f32 = 60.0;
+pub const TICKS_PER_GENERATION: u64 = 600;
+pub const GENERATIONS_PER_EPOCH: u64 = 100;
+
+pub const INITIAL_CELLS: usize = 200;
+pub const MAX_POPULATION: usize = 1000;
+
+pub const CELL_RADIUS: f32 = 5.0;
+pub const EAT_RADIUS: f32 = 8.0;
+pub const MATING_RADIUS: f32 = 100.0;
+
+pub const DRAG_COEFFICIENT: f32 = 0.005;
+pub const ANGULAR_DRAG: f32 = 1.0;
+pub const ENERGY_COST_PER_V_SQ: f32 = 0.0008;
+pub const ANGULAR_ENERGY_COST: f32 = 0.05;
+pub const VISION_COST_PER_RADIUS: f32 = 0.02;
+pub const BODY_COST_FACTOR: f32 = 0.8;
+
+pub const FOOD_VALUE: f32 = 20.0;
+pub const FOOD_SPAWN_RATE: usize = 5;
+pub const WORLD_UNITS_PER_FOOD: f32 = 2600.0;
+pub const MAX_SPAWN_ATTEMPTS: usize = 5;
+pub const CARRION_FOOD_COUNT: usize = 2;
+
+pub const REPRODUCE_THRESHOLD: f32 = 150.0;
+pub const SIZE_RATIO_THRESHOLD: f32 = 1.3;
+pub const PREDATION_DRAIN_PER_TICK: f32 = 3.0;
+pub const PREDATION_GAIN_PER_TICK: f32 = 1.5;
+
+pub const CYCLE_GEN_PERIOD: u64 = 50;
+pub const CYCLE_AMPLITUDE: f32 = 0.15;
+
+pub const SMELL_GRID_RES: usize = 64;
+pub const SMELL_DIFFUSION: f32 = 0.15;
+pub const SMELL_DECAY: f32 = 0.3;
+pub const SMELL_PER_FOOD: f32 = 1.0;
+pub const SMELL_SAMPLE_EPSILON: f32 = 10.0;
+pub const SMELL_NORMALIZATION_GAIN: f32 = 0.5;
+
+pub const LEARNING_RATE: f32 = 0.005;
+
+pub const WORLD_MAP_RES: usize = 64;
+pub const WORLD_MAP_BASE_RES: usize = 8;
+pub const WORLD_MAP_SEED: u64 = 1234;
+// Food-value multiplier = FLOOR + AMP × noise(pos), noise ∈ [0,1].
+// → multiplier ∈ [FLOOR, FLOOR+AMP]. Drives spatial selection on richness.
+pub const WORLD_MAP_FOOD_FLOOR: f32 = 0.85;
+pub const WORLD_MAP_FOOD_AMP: f32 = 0.3;
+
+pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
+    sigma_speed: 3.0,
+    sigma_hue: 5.0,
+    sigma_vision: 3.0,
+    sigma_turn_rate: 0.3,
+    sigma_body_size: 0.05,
+    sigma_brain: 0.2,
+};
+pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
+    drag: DRAG_COEFFICIENT,
+    angular_drag: ANGULAR_DRAG,
+    energy_cost_per_v_sq: ENERGY_COST_PER_V_SQ,
+    angular_energy_cost: ANGULAR_ENERGY_COST,
+    vision_cost_per_radius: VISION_COST_PER_RADIUS,
+    body_cost_factor: BODY_COST_FACTOR,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Brain {
@@ -46,6 +117,15 @@ impl Brain {
     }
 
     pub fn forward(&self, inputs: &[f32; BRAIN_INPUTS]) -> [f32; BRAIN_OUTPUTS] {
+        self.forward_with_state(inputs).1
+    }
+
+    /// Same forward pass as `forward`, but also returns hidden activations
+    /// (needed for Hebbian updates).
+    pub fn forward_with_state(
+        &self,
+        inputs: &[f32; BRAIN_INPUTS],
+    ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
         let mut hidden = [0.0_f32; BRAIN_HIDDEN];
         for ((h, row), &bias) in hidden.iter_mut().zip(self.w1.iter()).zip(self.b1.iter()) {
             let mut sum = bias;
@@ -62,7 +142,38 @@ impl Brain {
             }
             *o = sum.tanh();
         }
-        out
+        (hidden, out)
+    }
+
+    /// Reward-modulated Hebbian update. `Δw = lr · reward · pre · post`.
+    /// Pre-/post-synaptic activations come from a stored prior forward
+    /// pass — this is "myopic" credit assignment (1-tick window). Reward
+    /// fires on biologically meaningful events (eating, predation kills).
+    pub fn hebbian_update(
+        &mut self,
+        last_inputs: &[f32; BRAIN_INPUTS],
+        last_hidden: &[f32; BRAIN_HIDDEN],
+        last_outputs: &[f32; BRAIN_OUTPUTS],
+        reward: f32,
+        learning_rate: f32,
+    ) {
+        let lr = learning_rate * reward;
+        for (out_h, &h) in self.w1.iter_mut().zip(last_hidden.iter()) {
+            for (w, &x) in out_h.iter_mut().zip(last_inputs.iter()) {
+                *w += lr * h * x;
+            }
+        }
+        for (b, &h) in self.b1.iter_mut().zip(last_hidden.iter()) {
+            *b += lr * h;
+        }
+        for (out_o, &o) in self.w2.iter_mut().zip(last_outputs.iter()) {
+            for (w, &h) in out_o.iter_mut().zip(last_hidden.iter()) {
+                *w += lr * o * h;
+            }
+        }
+        for (b, &o) in self.b2.iter_mut().zip(last_outputs.iter()) {
+            *b += lr * o;
+        }
     }
 
     pub fn mutate(&self, rng: &mut impl Rng, sigma: f32) -> Self {
@@ -78,6 +189,27 @@ impl Brain {
                 *w += gaussian(rng) * sigma;
             }
             *bias += gaussian(rng) * sigma;
+        }
+        out
+    }
+
+    /// Per-row uniform crossover. Each hidden neuron's `w1` row + `b1`
+    /// scalar comes from one parent (50/50); same for output neurons. Per-row
+    /// rather than per-weight preserves coordinated patterns within a single
+    /// neuron's receptive field.
+    pub fn crossover(a: &Brain, b: &Brain, rng: &mut impl Rng) -> Brain {
+        let mut out = *a;
+        for i in 0..BRAIN_HIDDEN {
+            if rng.random::<bool>() {
+                out.w1[i] = b.w1[i];
+                out.b1[i] = b.b1[i];
+            }
+        }
+        for i in 0..BRAIN_OUTPUTS {
+            if rng.random::<bool>() {
+                out.w2[i] = b.w2[i];
+                out.b2[i] = b.b2[i];
+            }
         }
         out
     }
@@ -125,6 +257,19 @@ impl Genome {
             brain: self.brain.mutate(rng, cfg.sigma_brain),
         }
     }
+
+    /// Per-gene uniform crossover. Each scalar gene picks 50/50 from one
+    /// parent; brain uses its own per-row crossover.
+    pub fn crossover(a: &Genome, b: &Genome, rng: &mut impl Rng) -> Genome {
+        Genome {
+            max_speed: if rng.random::<bool>() { a.max_speed } else { b.max_speed },
+            color_hue: if rng.random::<bool>() { a.color_hue } else { b.color_hue },
+            vision_radius: if rng.random::<bool>() { a.vision_radius } else { b.vision_radius },
+            turn_rate: if rng.random::<bool>() { a.turn_rate } else { b.turn_rate },
+            body_size: if rng.random::<bool>() { a.body_size } else { b.body_size },
+            brain: Brain::crossover(&a.brain, &b.brain, rng),
+        }
+    }
 }
 
 fn gaussian(rng: &mut impl Rng) -> f32 {
@@ -138,6 +283,11 @@ pub struct PhysicsConfig {
     pub drag: f32,
     pub angular_drag: f32,
     pub energy_cost_per_v_sq: f32,
+    /// Multiplier on `body_size² × ω² × dt` for rotational kinetic drain.
+    /// Decoupled from linear cost so spinning-in-place is properly punished
+    /// (otherwise random brains settle into a "spin and starve" local minimum
+    /// because rotation is essentially free).
+    pub angular_energy_cost: f32,
     pub vision_cost_per_radius: f32,
     pub body_cost_factor: f32,
 }
@@ -151,16 +301,37 @@ pub struct Cell {
     // Persists even when velocity hits zero — atan2(0, 0) would otherwise
     // collapse to 0 and bias evolution toward east-facing motion.
     pub heading: f32,
+    // Lineage tracking — inherited from parent at reproduction (no mutation).
+    // birth_gen records the generation when the lineage was created (initial
+    // population: 0; new lineages from speciation events would bump it).
+    pub lineage_id: u64,
+    pub lineage_birth_gen: u64,
+    // Recent activations from the last brain forward pass — Hebbian updates
+    // read these to credit-assign on reward events (myopic, 1-tick window).
+    pub last_inputs: [f32; BRAIN_INPUTS],
+    pub last_hidden: [f32; BRAIN_HIDDEN],
+    pub last_outputs: [f32; BRAIN_OUTPUTS],
     pub genome: Genome,
 }
 
 impl Cell {
-    pub fn random(rng: &mut impl Rng, world_half: [f32; 2]) -> Self {
+    pub fn random(
+        rng: &mut impl Rng,
+        world_half: [f32; 2],
+        lineage_id: u64,
+        lineage_birth_gen: u64,
+    ) -> Self {
         let genome = Genome::random(rng);
-        Self::from_genome(rng, genome, world_half)
+        Self::from_genome(rng, genome, world_half, lineage_id, lineage_birth_gen)
     }
 
-    pub fn from_genome(rng: &mut impl Rng, genome: Genome, world_half: [f32; 2]) -> Self {
+    pub fn from_genome(
+        rng: &mut impl Rng,
+        genome: Genome,
+        world_half: [f32; 2],
+        lineage_id: u64,
+        lineage_birth_gen: u64,
+    ) -> Self {
         let direction = rng.random_range(0.0..TAU);
         Self {
             position: [
@@ -171,6 +342,11 @@ impl Cell {
             angular_velocity: 0.0,
             energy: INITIAL_ENERGY,
             heading: direction,
+            lineage_id,
+            lineage_birth_gen,
+            last_inputs: [0.0; BRAIN_INPUTS],
+            last_hidden: [0.0; BRAIN_HIDDEN],
+            last_outputs: [0.0; BRAIN_OUTPUTS],
             genome,
         }
     }
@@ -203,7 +379,7 @@ impl Cell {
         self.energy -= v_mag * v_mag * physics.energy_cost_per_v_sq * dt;
         let bs = self.genome.body_size;
         let av = self.angular_velocity;
-        self.energy -= bs * bs * av * av * physics.energy_cost_per_v_sq * dt;
+        self.energy -= bs * bs * av * av * physics.angular_energy_cost * dt;
         self.energy -= self.genome.vision_radius * physics.vision_cost_per_radius * dt;
         self.energy -= bs * bs * physics.body_cost_factor * dt;
 
@@ -332,6 +508,80 @@ impl SmellField {
         let f_ym = self.sample([pos[0], pos[1] - epsilon]);
         let inv = 1.0 / (2.0 * epsilon);
         [(f_xp - f_xm) * inv, (f_yp - f_ym) * inv]
+    }
+}
+
+/// Deterministic 2D scalar field on `[resolution × resolution]` mřížce
+/// pokrývající celý svět. Hodnoty v `[0, 1]` z value-noise:
+/// `base_resolution × base_resolution` random uniform grid, smoothstep
+/// bilinear interp do plné resolution. Generováno jednou při startu, pak
+/// jen čtení — žádný update per tick.
+///
+/// Use case: prostorová modulace mechaniky, která má být nehomogenní —
+/// food_richness, hazard, terrain drag, atd. (Sprint 21 = food_richness.)
+#[derive(Debug, Clone)]
+pub struct WorldMap {
+    pub resolution: usize,
+    pub world_half: [f32; 2],
+    field: Vec<f32>,
+}
+
+impl WorldMap {
+    pub fn new(
+        resolution: usize,
+        base_resolution: usize,
+        world_half: [f32; 2],
+        seed: u64,
+    ) -> Self {
+        assert!(resolution >= 2 && base_resolution >= 2);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let base: Vec<f32> = (0..base_resolution * base_resolution)
+            .map(|_| rng.random())
+            .collect();
+
+        let mut field = vec![0.0_f32; resolution * resolution];
+        let scale = (base_resolution as f32 - 1.0) / resolution as f32;
+        for j in 0..resolution {
+            for i in 0..resolution {
+                let u = (i as f32 + 0.5) * scale;
+                let v = (j as f32 + 0.5) * scale;
+                let x0 = (u.floor() as usize).min(base_resolution - 1);
+                let y0 = (v.floor() as usize).min(base_resolution - 1);
+                let x1 = (x0 + 1).min(base_resolution - 1);
+                let y1 = (y0 + 1).min(base_resolution - 1);
+                let fx = (u - x0 as f32).clamp(0.0, 1.0);
+                let fy = (v - y0 as f32).clamp(0.0, 1.0);
+                let sx = fx * fx * (3.0 - 2.0 * fx);
+                let sy = fy * fy * (3.0 - 2.0 * fy);
+                let v00 = base[y0 * base_resolution + x0];
+                let v10 = base[y0 * base_resolution + x1];
+                let v01 = base[y1 * base_resolution + x0];
+                let v11 = base[y1 * base_resolution + x1];
+                let v0 = v00 * (1.0 - sx) + v10 * sx;
+                let v1 = v01 * (1.0 - sx) + v11 * sx;
+                field[j * resolution + i] = v0 * (1.0 - sy) + v1 * sy;
+            }
+        }
+
+        Self {
+            resolution,
+            world_half,
+            field,
+        }
+    }
+
+    pub fn sample(&self, pos: [f32; 2]) -> f32 {
+        let cell_x = (2.0 * self.world_half[0]) / self.resolution as f32;
+        let cell_y = (2.0 * self.world_half[1]) / self.resolution as f32;
+        let xi = ((pos[0] + self.world_half[0]) / cell_x).floor() as i32;
+        let yi = ((pos[1] + self.world_half[1]) / cell_y).floor() as i32;
+        let xi = xi.clamp(0, self.resolution as i32 - 1) as usize;
+        let yi = yi.clamp(0, self.resolution as i32 - 1) as usize;
+        self.field[yi * self.resolution + xi]
+    }
+
+    pub fn field(&self) -> &[f32] {
+        &self.field
     }
 }
 
@@ -491,20 +741,33 @@ mod tests {
             drag: 0.0,
             angular_drag: 0.0,
             energy_cost_per_v_sq: cost_per_v_sq,
+            angular_energy_cost: 0.0,
             vision_cost_per_radius: vision_cost,
             body_cost_factor: 0.0,
+        }
+    }
+
+    fn base_cell() -> Cell {
+        Cell {
+            position: [0.0, 0.0],
+            velocity: [0.0, 0.0],
+            angular_velocity: 0.0,
+            energy: 100.0,
+            heading: 0.0,
+            lineage_id: 0,
+            lineage_birth_gen: 0,
+            last_inputs: [0.0; BRAIN_INPUTS],
+            last_hidden: [0.0; BRAIN_HIDDEN],
+            last_outputs: [0.0; BRAIN_OUTPUTS],
+            genome: dummy_genome(),
         }
     }
 
     #[test]
     fn step_drains_energy_from_motion_and_vision() {
         let mut cell = Cell {
-            position: [0.0, 0.0],
             velocity: [60.0, 0.0],
-            angular_velocity: 0.0,
-            energy: 100.0,
-            heading: 0.0,
-            genome: dummy_genome(),
+            ..base_cell()
         };
         cell.step(1.0, [1000.0, 1000.0], &no_drag_physics(0.001, 0.05));
         // motion (v² model): 60² × 0.001 × 1.0 = 3.6 energy
@@ -520,10 +783,7 @@ mod tests {
         let mut cell = Cell {
             position: [99.0, 0.0],
             velocity: [60.0, 0.0],
-            angular_velocity: 0.0,
-            energy: 100.0,
-            heading: 0.0,
-            genome: dummy_genome(),
+            ..base_cell()
         };
         cell.step(1.0, [100.0, 100.0], &no_drag_physics(0.0, 0.0));
         // velocity flipped to (-60, 0), heading should now be π.
@@ -533,12 +793,8 @@ mod tests {
     #[test]
     fn step_preserves_heading_when_velocity_zero() {
         let mut cell = Cell {
-            position: [0.0, 0.0],
-            velocity: [0.0, 0.0],
-            angular_velocity: 0.0,
-            energy: 100.0,
             heading: 1.5,
-            genome: dummy_genome(),
+            ..base_cell()
         };
         cell.step(1.0, [100.0, 100.0], &no_drag_physics(0.0, 0.0));
         // No movement, no bounce, no angular velocity, heading must persist.
@@ -548,17 +804,14 @@ mod tests {
     #[test]
     fn step_applies_quadratic_drag() {
         let mut cell = Cell {
-            position: [0.0, 0.0],
             velocity: [10.0, 0.0],
-            angular_velocity: 0.0,
-            energy: 100.0,
-            heading: 0.0,
-            genome: dummy_genome(),
+            ..base_cell()
         };
         let physics = PhysicsConfig {
             drag: 0.01,
             angular_drag: 0.0,
             energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
@@ -571,39 +824,53 @@ mod tests {
     #[test]
     fn step_drains_energy_from_rotation() {
         let mut cell = Cell {
-            position: [0.0, 0.0],
-            velocity: [0.0, 0.0],
             angular_velocity: 2.0,
-            energy: 100.0,
-            heading: 0.0,
-            genome: dummy_genome(),
+            ..base_cell()
         };
         let physics = PhysicsConfig {
             drag: 0.0,
             angular_drag: 0.0,
-            energy_cost_per_v_sq: 0.001,
+            energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.05,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
         cell.step(1.0, [1000.0, 1000.0], &physics);
-        // body_size²(=1) × ω²(=4) × cost(=0.001) × dt(=1) = 0.004 drained
-        assert!((cell.energy - 99.996).abs() < 1e-4, "got {}", cell.energy);
+        // body_size²(=1) × ω²(=4) × angular_cost(=0.05) × dt(=1) = 0.2 drained
+        assert!((cell.energy - 99.8).abs() < 1e-4, "got {}", cell.energy);
+    }
+
+    #[test]
+    fn step_rotation_cost_independent_of_linear_cost() {
+        // Regression: spinning-in-place was a degenerate local minimum because
+        // rotational drain piggy-backed on energy_cost_per_v_sq. Now decoupled.
+        let mut cell = Cell {
+            angular_velocity: 3.0,
+            ..base_cell()
+        };
+        let physics = PhysicsConfig {
+            drag: 0.0,
+            angular_drag: 0.0,
+            energy_cost_per_v_sq: 99.0,
+            angular_energy_cost: 0.0,
+            vision_cost_per_radius: 0.0,
+            body_cost_factor: 0.0,
+        };
+        cell.step(1.0, [1000.0, 1000.0], &physics);
+        assert!((cell.energy - 100.0).abs() < 1e-4, "got {}", cell.energy);
     }
 
     #[test]
     fn step_applies_angular_drag() {
         let mut cell = Cell {
-            position: [0.0, 0.0],
-            velocity: [0.0, 0.0],
             angular_velocity: 1.0,
-            energy: 100.0,
-            heading: 0.0,
-            genome: dummy_genome(),
+            ..base_cell()
         };
         let physics = PhysicsConfig {
             drag: 0.0,
             angular_drag: 0.5,
             energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
@@ -615,12 +882,8 @@ mod tests {
     #[test]
     fn try_eat_within_radius_returns_true_and_adds_energy() {
         let mut cell = Cell {
-            position: [0.0, 0.0],
-            velocity: [0.0, 0.0],
-            angular_velocity: 0.0,
             energy: 50.0,
-            heading: 0.0,
-            genome: dummy_genome(),
+            ..base_cell()
         };
         let food = Food { position: [5.0, 0.0] };
         assert!(cell.try_eat(&food, 8.0, 20.0));
@@ -630,16 +893,115 @@ mod tests {
     #[test]
     fn try_eat_outside_radius_returns_false_and_keeps_energy() {
         let mut cell = Cell {
-            position: [0.0, 0.0],
-            velocity: [0.0, 0.0],
-            angular_velocity: 0.0,
             energy: 50.0,
-            heading: 0.0,
-            genome: dummy_genome(),
+            ..base_cell()
         };
         let food = Food { position: [20.0, 0.0] };
         assert!(!cell.try_eat(&food, 8.0, 20.0));
         assert_eq!(cell.energy, 50.0);
+    }
+
+    #[test]
+    fn crossover_picks_genes_from_either_parent() {
+        let mut rng = rand::rng();
+        let a = Genome {
+            max_speed: 30.0,
+            color_hue: 10.0,
+            vision_radius: 20.0,
+            turn_rate: 1.0,
+            body_size: 0.5,
+            brain: dummy_brain(),
+        };
+        let b = Genome {
+            max_speed: 90.0,
+            color_hue: 200.0,
+            vision_radius: 80.0,
+            turn_rate: 5.0,
+            body_size: 1.5,
+            brain: dummy_brain(),
+        };
+        // Run many crossovers, each gene must be one of the two parent values.
+        for _ in 0..100 {
+            let c = Genome::crossover(&a, &b, &mut rng);
+            assert!(c.max_speed == 30.0 || c.max_speed == 90.0);
+            assert!(c.color_hue == 10.0 || c.color_hue == 200.0);
+            assert!(c.vision_radius == 20.0 || c.vision_radius == 80.0);
+            assert!(c.turn_rate == 1.0 || c.turn_rate == 5.0);
+            assert!(c.body_size == 0.5 || c.body_size == 1.5);
+        }
+    }
+
+    #[test]
+    fn hebbian_update_with_zero_reward_is_noop() {
+        let mut brain = dummy_brain();
+        brain.b1[0] = 0.5;
+        brain.b2[0] = 0.7;
+        let snapshot_b1 = brain.b1;
+        let snapshot_b2 = brain.b2;
+        brain.hebbian_update(
+            &[1.0; BRAIN_INPUTS],
+            &[1.0; BRAIN_HIDDEN],
+            &[1.0; BRAIN_OUTPUTS],
+            0.0,
+            0.1,
+        );
+        assert_eq!(brain.b1, snapshot_b1);
+        assert_eq!(brain.b2, snapshot_b2);
+    }
+
+    #[test]
+    fn hebbian_update_reinforces_when_reward_positive() {
+        let mut brain = dummy_brain();
+        // hidden = [1.0; 8], output = [1.0; 2], reward = 1.0, lr = 0.1
+        // Δb1[i] = 0.1 × 1.0 × hidden[i] = 0.1
+        // Δb2[i] = 0.1 × 1.0 × output[i] = 0.1
+        brain.hebbian_update(
+            &[0.0; BRAIN_INPUTS],
+            &[1.0; BRAIN_HIDDEN],
+            &[1.0; BRAIN_OUTPUTS],
+            1.0,
+            0.1,
+        );
+        for &b in &brain.b1 {
+            assert!((b - 0.1).abs() < 1e-5, "b1 got {}", b);
+        }
+        for &b in &brain.b2 {
+            assert!((b - 0.1).abs() < 1e-5, "b2 got {}", b);
+        }
+    }
+
+    #[test]
+    fn world_map_is_deterministic_for_seed() {
+        let a = WorldMap::new(32, 8, [500.0, 500.0], 42);
+        let b = WorldMap::new(32, 8, [500.0, 500.0], 42);
+        assert_eq!(a.field(), b.field());
+    }
+
+    #[test]
+    fn world_map_seeds_differ() {
+        let a = WorldMap::new(32, 8, [500.0, 500.0], 1);
+        let b = WorldMap::new(32, 8, [500.0, 500.0], 2);
+        assert_ne!(a.field(), b.field());
+    }
+
+    #[test]
+    fn world_map_values_in_unit_range() {
+        let m = WorldMap::new(32, 8, [500.0, 500.0], 7);
+        for &v in m.field() {
+            assert!((0.0..=1.0).contains(&v), "out of range: {}", v);
+        }
+    }
+
+    #[test]
+    fn world_map_sample_clamps_to_world_bounds() {
+        let m = WorldMap::new(8, 4, [100.0, 100.0], 0);
+        // Mimo svět musí vracet hodnotu z hraniční buňky, ne panicovat.
+        let inside = m.sample([99.0, 99.0]);
+        let outside_pos = m.sample([1e6, 1e6]);
+        let outside_neg = m.sample([-1e6, -1e6]);
+        assert_eq!(outside_pos, m.field()[m.resolution * m.resolution - 1]);
+        assert_eq!(outside_neg, m.field()[0]);
+        assert!((0.0..=1.0).contains(&inside));
     }
 
     #[test]

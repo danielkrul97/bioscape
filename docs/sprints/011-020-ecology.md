@@ -268,6 +268,120 @@ Druhá desítka: vizuální differentiation buněk → predace + carrion ekologi
   **Patche po Sprintu 17:**
   - **Rotational kinetic energy cost:** `Cell::step` přidá drain `body_size² × ω² × cost_per_v_sq × dt`. Před tímto patchem bylo otáčení free — brain mohl spinovat bez metabolic penalty. Teď je rotace symetrická k translaci (oboje platí kinetic energy proxy). Velké buňky platí 4× víc za stejnou ω — umocněný physics-based agility tradeoff. Test `step_drains_energy_from_rotation` přidán (13/13 testů celkem).
   - **Food anti-overlap spawn:** `spawn_food` (main.rs i headless) rejektuje pozice uvnitř `EAT_RADIUS × body_size` jakékoliv živé buňky. Max `MAX_SPAWN_ATTEMPTS = 5` pokusů per slot; pokud všech 5 narazí, slot se přeskočí. Před tímto patchem se food náhodně materializoval i přímo na buňce → free energy delivery se silným bias k velkým buňkám (větší eat_radius = větší šance být obslužen). Patch odstraňuje bias. V hustých populacích food count může být lehce pod target (saturace), ale to je realistické (v real ecosystem se food těžko hledá místo). Constant `MAX_SPAWN_ATTEMPTS` přidán v main.rs i headless.
+
+## Sprint 18 — lineage-and-learning
+
+- **Cíl:** dvě nezávislé vrstvy najednou — **(A) lineage tracking** dává okno do populační dynamiky (kdo dominuje, jak rychle selekce konverguje), **(B) reward-modulated Hebbian** přidá **lifetime učení** nad genetickou evolucí (dvě časové škály — pomalá evoluce mezi gens, rychlé učení v rámci života).
+
+  **A) Lineage tracking:**
+  - `Cell` rozšířen o `lineage_id: u64` a `lineage_birth_gen: u64`. Inherit od rodiče (no mutation).
+  - V `setup`: 200 unikátních `lineage_id` (= `i as u64`), `birth_gen = 0`.
+  - V `cell_reproduces_on_threshold` / headless `reproduce`: child kopíruje parent's `lineage_id` a `lineage_birth_gen` beze změny.
+  - **Vizualizace:** `pack_cell_tag` použije `hash(lineage_id) % 360` jako hue místo `color_hue` genu. Vidět "jezera" stejných barev jak lineages dominují.
+  - **Stats:** `lineages` (distinct lineage_ids alive), `oldest` (max age = `current_gen − lineage_birth_gen` přes všechny živé buňky).
+  - **color_hue gene** zůstává v Genome ale visual unused — drift pokračuje, ale neviditelně. Future cleanup může gen odebrat (breaking change pro brain weights).
+
+  **B) Reward-modulated Hebbian:**
+  - `Cell` rozšířen o `last_inputs: [f32; BRAIN_INPUTS]`, `last_hidden: [f32; BRAIN_HIDDEN]`, `last_outputs: [f32; BRAIN_OUTPUTS]` — recent activation memory pro 1-tick credit assignment.
+  - `Brain::forward_with_state(inputs) -> ([hidden], [outputs])` — vrací i hidden activations (vedle existing `forward`).
+  - V `cells_brain_act`: po forward pass se store last_inputs/hidden/outputs do `Cell`.
+  - V `cell_eats_food`: na eat event trigger `Brain::hebbian_update` s reward = +1.0:
+    ```
+    Δw1[i][j] = LR × reward × last_inputs[j] × last_hidden[i]
+    Δw2[i][j] = LR × reward × last_hidden[j] × last_outputs[i]
+    Δb1[i]   = LR × reward × last_hidden[i]
+    Δb2[i]   = LR × reward × last_outputs[i]
+    ```
+  - **Lamarckian inheritance:** child kopíruje parent's CURRENT (po-učení) brain včetně mutace. Learned skills se předávají mezi gens. Zjednodušení proti reálné biologii (kde se neurální skills nepředávají Darwinovsky), ale **fits existing reproduce mechanic** a otevírá rychlou evoluci behaviors (selection má víc material k zachycení).
+
+- **Konstanty:** `LEARNING_RATE = 0.01` (jednotný pro všechny weights/biases).
+- **Výstup:**
+  - `src/lib.rs`: `Cell` rozšířen o `lineage_id`, `lineage_birth_gen`, `last_inputs`, `last_hidden`, `last_outputs`. `Cell::random` / `from_genome` mají dva nové parametry (lineage info). `Brain::forward_with_state` (vrací hidden + outputs), `Brain::hebbian_update(last_in, last_hid, last_out, reward, lr)` — reinforces last decision pathway. `forward` zachován jako wrapper. Test helper `base_cell()` pro struct-update syntax v testech. 15/15 testů (přibyly 2 Hebbian).
+  - `src/main.rs`: `LEARNING_RATE = 0.01`. Helper `lineage_hue(id)` (Knuth integer hash). `setup` přiřadí 200 unikátních `lineage_id`. `cell_reproduces_on_threshold` zachová parent's lineage. `cells_brain_act` volá `forward_with_state`, ukládá `last_*` na cell. `cell_eats_food` triggeruje `hebbian_update(reward=1.0)` na eat. `pack_cell_tag` čte `lineage_hue(cell.lineage_id)` místo `color_hue`. Stats panel: 2 nové řádky `lineages` a `oldest`.
+  - `src/bin/headless.rs`: stejný mirror. CSV header rozšířen o `lineages` a `oldest` sloupce. Reprodukovatelnost ověřená (seed 42, 20 gen → byte-identical).
+  - **První pozorování (seed 42, 50 gen):** `lineages` 200 → 112 → 45 → 21 → 5 → **1** (plná konvergence v gen 49). Populace také kolabuje 200 → 1 — Hebbian + cycle scarcity peak akcelerovaly selekci silně. Učení dává lepším brainům okamžitou výhodu, dominantní lineage se rozpíná rychle, slabší vymře.
+- **Poznámky:**
+  - Lineage tracking je pure analytical tool — nemění biologii ani selekční tlak. Jen dává okno.
+  - Hebbian dramaticky mění dynamiku. Empirické tunění `LEARNING_RATE` bude nutné — moc velký = brain unstable, moc malý = bez efektu.
+  - **Lamarckian** je velký compromise. Darwinian model = child inherits "innate" (birth) brain, ne current. Sprint 19 možná split innate vs learned.
+  - **Reward = +1 jen při eat.** Mohli bychom přidat reward při predaci (+0.5), penalizaci při ohrožení predátorem (−0.5), atd. Sprint 18 je jen baseline.
+  - **Memory cost per cell:** +76 bytes (last activations). Pro 1000 cells = 76 KB. Negligible.
+  - **Bez eligibility traces** (exponentially decaying memory) — credit assignment je 1-tick myopic. Pokud učení nezvedne výkon, přidat traces (Sprint 19/20).
+  - **Visualization compromise:** `color_hue` gene se z evolučního pohledu stává neutrální drift — nikdo ho nevidí. Když budeme chtít gen vrátit, můžeme přidat toggle (`K` key) mezi lineage-color a hue-color módem.
+
+## Sprint 19 — sexual-reproduction-and-perf
+
+- **Cíl:** **(A)** přejít z asexuální fission na **pohlavní reprodukci** s mate-finding a crossover-em, **(B)** zoptimalizovat smell field (~25 % CPU času) přes snížení gridu. Sex zpomalí populační růst, ale otevírá genetickou pestrost přes recombinaci. Sprint 18 byla rychlá Lamarckian propagation učení; sex přidá Mendelovský mixing — dva mechanismy v napětí.
+
+  **A) Pohlavní reprodukce s mate choice:**
+  - **Mate selection** v `cell_reproduces_on_threshold`: snapshotni fertilní (`energy ≥ REPRODUCE_THRESHOLD`) buňky do `Vec<(Entity, pos, ...)>`. Pro každou nepárovanou fertilní cell najdi nejbližšího nepárovaného partnera v `MATING_RADIUS = 30.0`. Greedy pairing přes O(N²) na fertile pool (typicky ~tens cells, manageable).
+  - **Crossover:**
+    - `Genome::crossover(a, b, rng)` — per-gene uniform (50/50 každý scalar gene).
+    - `Brain::crossover(a, b, rng)` — **per-row uniform**: každý hidden neuron (`w1[i]`+`b1[i]`) a každý output neuron (`w2[i]`+`b2[i]`) z jednoho rodiče. Preserves coordinated weight patterns lepe než per-weight uniform.
+  - **Energy:** oba rodiče ztratí 50 % energie, child dostane sumu příspěvků (`a/2 + b/2`). Total energy zachována.
+  - **Population growth:** **1 child per 2 rodiče** (proti asexual 1 child per 1 rodič). Růst populace ~poloviční, kompenzace za vyšší diverzitu.
+  - **Lineage:** child kopíruje **parent A's lineage** (initiator). Sprint 18 tracking pokračuje, jen s mixed genomes.
+  - **Per-tick:** `paired: HashSet<Entity>` zabraňuje double-mating. Pro mating: lookup obou rodičů přes `cells.get_many_mut([a, b])`, halve energy, crossover + mutate, spawn child.
+
+  **B) Smell field perf optimization:**
+  - `SMELL_GRID_RES: 128 → 64`. World grid cell size 1920/64 = **30 sim units** = 6× CELL_RADIUS. Coarser, ale smell diffuse/decay je local — gradient na nearby food zůstává funkční.
+  - **4× méně grid cells** → 4× rychlejší Jacobi step. Očekávaný total speedup ~2–3× (smell field byl ~25 % CPU).
+  - `SMELL_SAMPLE_EPSILON = 10.0` zůstává — menší než cell size 30, gradient computation samples z bucket cell value (no interpolation).
+  - Pokud blocky artefakty na obrazovce vidět, alternativa: 128 + stride update (každý 2. tick s 2× dt).
+
+- **Konstanty:** `MATING_RADIUS = 30.0`, `SMELL_GRID_RES: 128 → 64`.
+
+- **Lib.rs API:**
+  - `Genome::crossover(a: &Genome, b: &Genome, rng) -> Genome`
+  - `Brain::crossover(a: &Brain, b: &Brain, rng) -> Brain`
+
+- **Výstup:**
+  - `src/lib.rs`: `Genome::crossover(a, b, rng)` per-gene uniform, `Brain::crossover(a, b, rng)` per-row uniform (každý hidden + output neuron's whole row z jednoho rodiče). Test `crossover_picks_genes_from_either_parent`. 16/16 testů.
+  - `src/main.rs` + `src/bin/headless.rs`: `MATING_RADIUS = 30.0`. `SMELL_GRID_RES: 128 → 64`. `Genome` přidaný do imports.
+  - **`cell_reproduces_on_threshold` přepsán na sexual:** snapshotuje fertile cells, greedy O(N²) pairing v `MATING_RADIUS`, paired set zabraňuje double-mating. Pro každý mating: `cells.get_many_mut([a, b])`, halve obě energie, crossover + mutate genome, child z midpoint pozice, energy = sum_of_halves. Lineage z parent A.
+  - Headless `reproduce`: stejný logic přes index-pair (`split_at_mut` pattern pro dual mut borrow).
+  - **Performance:** 9721 ticks/s (z 6321 s smell res 128). ~1.5× speedup pro typical run, na pozdějších fázích (méně cells) můžou být víc.
+  - **Reprodukovatelnost ověřená** (seed 42, 20 gen → byte-identical).
+  - **Pozorovaná dynamika (seed 42, 50 gen):** `cells` 200 → 3 (vs Sprint 18 200 → 1 v gen 49 — sex dává trochu víc resilience). `lineages` 200 → 3 — i s genomic mixing konvergence pokračuje. `spd_avg` se evolvuje pomaleji (60 → 64 vs Sprint 18 60 → 82) — recombinace promíchává adaptace, žádný "winner takes all".
+- **Poznámky:**
+  - **Sex zpomaluje evoluci** — pop growth halved. S balance pass možná boost food density nebo lower REPRODUCE_THRESHOLD aby se kompenzovala.
+  - **Greedy pairing** není optimal. Future Sprint by mohl přidat preference gene (= "kompatibilita" — která se podobá pak je víc lákavá), reálná mate choice.
+  - **Lineage z parent A** je arbitrární. Alternativa: hash(A, B) jako nová ID (speciation events). Pro Sprint 19 jednoduchost.
+  - **Per-row Brain crossover:** kompromis mezi per-weight (víc disruptive) a per-layer (méně mixování). Empirické tunění může být potřeba.
+  - **Sex + Hebbian interakce zajímavá:** Hebbian tlačí učení (Lamarckian-like), crossover pak mixuje naučené brainy. Lamarckian aspect Sprintu 18 je sexem rozmlžený.
+  - **Smell res 64 risks:** gradient na hraně grid cellu je discontinuous (sample epsilon 10 < cell size 30 = gradient closure ignoruje sub-cell variation). Cells možná uvidí "jezera" konstantního smell. Empirické.
+
+## Sprint 20 — stabilization
+
+- **Cíl:** ekosystém po Sprintu 19 stabilně kolaboval (200 → 3 cells během 50 gen). Sprint 20 = empirický balance pass — najít konstanty, které udrží populaci ve stabilní rovnováze ~300-700 cells, ne extinct ani cap. Po stabilizaci budou cognitive sprinty (eligibility traces, smarter sensing, NEAT-style topology) měřitelné.
+
+  **Hypotézy o příčinách kolapsu:**
+  1. **Sex potřebuje proximity:** `MATING_RADIUS = 30` v 1920×1080 světě. Při 50 cells je avg distance ~200 — sex přestává fungovat při low density. Death spiral.
+  2. **Sex zpomalí growth:** 1 child per 2 parents (vs 1 per 1 asexual). Při sniženém growth + stejné mortality → kolapse.
+  3. **Hebbian aggressively konverguje:** dominantní lineage rychle zabere zdroje. Sprint 18 už dáno, ale interakce se sexem (mixování brainů přes recombinaci) možná destabilizuje.
+  4. **Cycle stress (gen 37.5)** přijde když je populace ještě "naivní" — selekce nestihne najít balance.
+
+  **Plán:**
+  - Empirický experimenter na headless: spustit s různými settings, najít ty, co dávají stabilní populaci 300-700 přes 200 generací.
+  - **Kandidáti tunings:**
+    - `MATING_RADIUS: 30 → 100` (cells najdou partnera i v sparse populaci)
+    - `REPRODUCE_THRESHOLD: 200 → 150` (faster pairing, kompenzuje sexual halving)
+    - `CYCLE_AMPLITUDE: 0.3 → 0.15` (mild stress, nezvládne to ještě naivní populaci)
+    - `LEARNING_RATE: 0.01 → 0.005` (méně dominantní Hebbian, víc evoluční time)
+    - `WORLD_UNITS_PER_FOOD: 3000 → 2500` (mírně víc jídla)
+  - Iterativní: měnit po jedné, sledovat efekt na trajektorii.
+
+- **Výstup:**
+  - **Angular energy fix:** `PhysicsConfig.angular_energy_cost` oddělen od linear `energy_cost_per_v_sq`. Spinning-in-place byl degenerate local minimum: rotační drain `body_size² × ω² × 0.0008` ≈ 0.05/gen, vision/body ~10/gen. Spinning byl prakticky zdarma → buňky se točily na místě a Hebbian to občas reinforced. Nový `ANGULAR_ENERGY_COST = 0.05` (60× vyšší) → spinning ~3/sec ≈ srovnatelné s pohybem.
+  - **Test `step_drains_energy_from_rotation` updated** + nový regression `step_rotation_cost_independent_of_linear_cost` (linear cost 99.0, angular 0.0 — spinning cell nesmí ztratit energii). 17/17 testů.
+  - **Konstanty po stabilizaci** (best zatím nalezené): `WORLD_UNITS_PER_FOOD = 2600`, `REPRODUCE_THRESHOLD = 150`, `MATING_RADIUS = 100`, `CYCLE_AMPLITUDE = 0.15`, `LEARNING_RATE = 0.005`, `ANGULAR_ENERGY_COST = 0.05`.
+  - **Pozorovaná dynamika (seed 0, 200 gen):** populace 200 → bottleneck 104 (gen 19) → recovery → cap 1000 (gen 34). **Stabilní, ale homogenní** — `lineages` 200 → 16 v gen 38, dále drift dolů. Roztočení vymizelo.
+- **Poznámky:**
+  - **Stabilizace boom-bust nedořešena:** Empirické tunings food/threshold dávají buď cap, nebo near-extinction, nebo mid-stuck. Z podstaty vychází: ~5 % random brainů je funkčních pohybovačů, zbytek hladoví, pak několik klonů zaplaví svět.
+  - **Stable ≠ healthy:** populace cap 1000 s 16 liniemi je ekvivalent monokultury. Diverzita nutná pro pokračování evoluce — adresováno v Sprint 21+ (prostorová heterogenita, niche differentiation, reprodukční izolace).
+  - Stabilizace je iterativní — Sprint 20 najde rozumné defaults, ale finální tuning bude průběžný napříč budoucími sprinty.
+  - **Asexuální fallback** (cell se rozdělí asexuálně pokud nikdo k pářit ve `MATING_RADIUS`) by byl elegantnější fix než větší radius — biologicky reálné. Pokud tunings nestačí, Sprint 21 fallback.
+  - **Initial brain bias:** všechno random startuje. Mohl by pomoct mírný positive bias na thrust output (cells startují mírně jdoucí dopředu místo random walk). Hack ale efektivní.
   - **Empirické tunění bude potřeba**: `DRAG_COEFFICIENT`, `ENERGY_COST_PER_V_SQ`, `MAX_TORQUE` (přes `turn_rate` gene), `SMELL_DIFFUSION`/`DECAY`/`PER_FOOD`. První běh téměř určitě skončí extinction, balance přes několik iterací.
   - **Headless harness ze Sprintu 15 je teď neocenitelný** — bez něj by se 5 různých konstant ladilo přes manuální okno, hodiny ztracené. S headless: changes → recompile → 30 replikátů × 200 gen = pár minut → CSV → diagnose.
   - Smell sample epsilon 10 sim units = ~0.7 grid cells. Pro robust gradient možná zvýšit (15-20). Empirické.

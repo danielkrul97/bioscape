@@ -6,8 +6,9 @@ Cílem výzkumného projektu Bioscape je vytvořit simulaci evoluce, abych pocho
 
 - **Engine:** Bevy 0.18 (ECS, 2D rendering přes wgpu). `default-features = false` plus ručně vybraný feature set bez `bevy_gilrs` a `audio` — projekt nepotřebuje gamepad ani zvuk a tahle volba odstraňuje závislost na systémových `libudev-dev` / `libasound2-dev`.
 - **Split kódu:**
-  - `src/lib.rs` — čistá simulační logika (`Cell`, `step()`, …), bez Bevy. Pojede i headless (batch experimenty s `indicatif`/`textplots` v dev-deps).
+  - `src/lib.rs` — čistá simulační logika (`Cell`, `step()`, `WorldMap`, …), bez Bevy. Drží taky všechny sdílené `pub const` sim parametry + `MUTATION_CONFIG` / `PHYSICS_CONFIG` — **single source of truth** pro renderer i headless. Nové tuneables, které ovlivňují simulaci, patří sem; renderer/headless-only knoby zůstávají ve svých binárkách.
   - `src/main.rs` — Bevy app, který drží svět v ECS a synchronizuje `Cell` stav s `Transform`em.
+  - `src/bin/headless.rs` — bezokenní harness pro batch experimenty (CSV log per generaci, deterministický seed). Konzumuje stejné parametry z `lib.rs` jako `main.rs`, takže seed reprodukuje identický běh napříč rendererem a headlessem.
 - **GPU:** Bevy táhne wgpu interně pro rendering. Pro vlastní compute kernely je v `Cargo.toml` opt-in feature `gpu` (přímý `wgpu` + `bytemuck` + `pollster`).
 - **Dev smyčka:** `cargo run --features dev` zapne `bevy/dynamic_linking` pro rychlou inkrementální iteraci po prvním buildu.
 

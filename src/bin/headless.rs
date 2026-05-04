@@ -7,7 +7,15 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    Cell, Food, MutationConfig, PhysicsConfig, SimClock, SmellField, BRAIN_INPUTS,
+    Cell, Food, Genome, SimClock, SmellField, WorldMap, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS,
+    CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DRAG_COEFFICIENT,
+    EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
+    INITIAL_CELLS, LEARNING_RATE, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    MUTATION_CONFIG, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK,
+    REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES,
+    SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION,
+    WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED,
+    WORLD_UNITS_PER_FOOD,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -15,53 +23,8 @@ use std::env;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
-// Constants mirror src/main.rs — keep in sync until they get hoisted to lib.rs.
-const CELL_RADIUS: f32 = 5.0;
-const INITIAL_CELLS: usize = 200;
-const FIXED_TIMESTEP_HZ: f32 = 60.0;
-const TICKS_PER_GENERATION: u64 = 600;
-const GENERATIONS_PER_EPOCH: u64 = 100;
-const DRAG_COEFFICIENT: f32 = 0.005;
-const ANGULAR_DRAG: f32 = 1.0;
-const ENERGY_COST_PER_V_SQ: f32 = 0.0008;
-const VISION_COST_PER_RADIUS: f32 = 0.02;
-const FOOD_VALUE: f32 = 20.0;
-const WORLD_UNITS_PER_FOOD: f32 = 3000.0;
-const FOOD_SPAWN_RATE: usize = 5;
-const EAT_RADIUS: f32 = 8.0;
-const REPRODUCE_THRESHOLD: f32 = 200.0;
-const MAX_POPULATION: usize = 1000;
-const CARRION_FOOD_COUNT: usize = 2;
-const BODY_COST_FACTOR: f32 = 0.8;
-const SIZE_RATIO_THRESHOLD: f32 = 1.3;
-const PREDATION_DRAIN_PER_TICK: f32 = 3.0;
-const PREDATION_GAIN_PER_TICK: f32 = 1.5;
-const CYCLE_GEN_PERIOD: u64 = 50;
-const CYCLE_AMPLITUDE: f32 = 0.3;
-const SMELL_GRID_RES: usize = 128;
-const SMELL_DIFFUSION: f32 = 0.15;
-const SMELL_DECAY: f32 = 0.3;
-const SMELL_PER_FOOD: f32 = 1.0;
-const SMELL_SAMPLE_EPSILON: f32 = 10.0;
-const SMELL_NORMALIZATION_GAIN: f32 = 0.5;
-const MAX_SPAWN_ATTEMPTS: usize = 5;
-const MUTATION_CONFIG: MutationConfig = MutationConfig {
-    sigma_speed: 3.0,
-    sigma_hue: 5.0,
-    sigma_vision: 3.0,
-    sigma_turn_rate: 0.3,
-    sigma_body_size: 0.05,
-    sigma_brain: 0.2,
-};
-const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
-    drag: DRAG_COEFFICIENT,
-    angular_drag: ANGULAR_DRAG,
-    energy_cost_per_v_sq: ENERGY_COST_PER_V_SQ,
-    vision_cost_per_radius: VISION_COST_PER_RADIUS,
-    body_cost_factor: BODY_COST_FACTOR,
-};
-// Full-HD-equivalent world. Headless has no window, fixed extent so seeds
-// reproduce identically across machines.
+// Headless has no window — fixed extent (Full-HD-equivalent) so seeds
+// reproduce identically across machines. Sim parameters live in `bioscape`.
 const WORLD_HALF: [f32; 2] = [960.0, 540.0];
 
 struct World {
@@ -70,12 +33,22 @@ struct World {
     clock: SimClock,
     density_factor: f32,
     smell: SmellField,
+    map: WorldMap,
+    // Persistent scratch — sized like cells/foods, reused per tick to avoid
+    // hot-loop allocations.
+    positions_scratch: Vec<[f32; 2]>,
+    body_sizes_scratch: Vec<f32>,
+    food_positions_scratch: Vec<[f32; 2]>,
+    deltas_scratch: Vec<[f32; 2]>,
+    energy_deltas_scratch: Vec<f32>,
+    eaten_scratch: Vec<bool>,
 }
 
 impl World {
     fn new(rng: &mut impl Rng) -> Self {
+        let map = WorldMap::new(WORLD_MAP_RES, WORLD_MAP_BASE_RES, WORLD_HALF, WORLD_MAP_SEED);
         let cells = (0..INITIAL_CELLS)
-            .map(|_| Cell::random(rng, WORLD_HALF))
+            .map(|i| Cell::random(rng, WORLD_HALF, i as u64, 0))
             .collect();
         let target = food_target(1.0);
         let foods = (0..target).map(|_| Food::random(rng, WORLD_HALF)).collect();
@@ -85,6 +58,13 @@ impl World {
             clock: SimClock::new(TICKS_PER_GENERATION, GENERATIONS_PER_EPOCH),
             density_factor: 1.0,
             smell: SmellField::new(SMELL_GRID_RES, WORLD_HALF),
+            map,
+            positions_scratch: Vec::new(),
+            body_sizes_scratch: Vec::new(),
+            food_positions_scratch: Vec::new(),
+            deltas_scratch: Vec::new(),
+            energy_deltas_scratch: Vec::new(),
+            eaten_scratch: Vec::new(),
         }
     }
 
@@ -118,9 +98,18 @@ impl World {
     }
 
     fn brain_act(&mut self, dt: f32) {
-        let positions: Vec<[f32; 2]> = self.cells.iter().map(|c| c.position).collect();
-        let body_sizes: Vec<f32> = self.cells.iter().map(|c| c.genome.body_size).collect();
-        let food_positions: Vec<[f32; 2]> = self.foods.iter().map(|f| f.position).collect();
+        self.positions_scratch.clear();
+        self.positions_scratch
+            .extend(self.cells.iter().map(|c| c.position));
+        self.body_sizes_scratch.clear();
+        self.body_sizes_scratch
+            .extend(self.cells.iter().map(|c| c.genome.body_size));
+        self.food_positions_scratch.clear();
+        self.food_positions_scratch
+            .extend(self.foods.iter().map(|f| f.position));
+        let positions = &self.positions_scratch;
+        let body_sizes = &self.body_sizes_scratch;
+        let food_positions = &self.food_positions_scratch;
 
         for i in 0..self.cells.len() {
             let pos = self.cells[i].position;
@@ -129,7 +118,7 @@ impl World {
 
             let mut best_food: Option<[f32; 2]> = None;
             let mut best_food_d2 = f32::MAX;
-            for &fp in &food_positions {
+            for &fp in food_positions {
                 let dx = fp[0] - pos[0];
                 let dy = fp[1] - pos[1];
                 let d2 = dx * dx + dy * dy;
@@ -178,7 +167,10 @@ impl World {
             inputs[7] = (grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
             inputs[8] = (grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
 
-            let outputs = cell.genome.brain.forward(&inputs);
+            let (hidden, outputs) = cell.genome.brain.forward_with_state(&inputs);
+            cell.last_inputs = inputs;
+            cell.last_hidden = hidden;
+            cell.last_outputs = outputs;
             let turn_signal = outputs[0];
             let thrust_norm = (outputs[1] + 1.0) * 0.5;
 
@@ -203,28 +195,34 @@ impl World {
 
     fn resolve_collisions(&mut self) {
         let n = self.cells.len();
-        let positions: Vec<[f32; 2]> = self.cells.iter().map(|c| c.position).collect();
-        let body_sizes: Vec<f32> = self.cells.iter().map(|c| c.genome.body_size).collect();
-        let mut deltas: Vec<[f32; 2]> = vec![[0.0, 0.0]; n];
+        self.positions_scratch.clear();
+        self.positions_scratch
+            .extend(self.cells.iter().map(|c| c.position));
+        self.body_sizes_scratch.clear();
+        self.body_sizes_scratch
+            .extend(self.cells.iter().map(|c| c.genome.body_size));
+        self.deltas_scratch.clear();
+        self.deltas_scratch.resize(n, [0.0, 0.0]);
         for i in 0..n {
             for j in 0..n {
                 if i == j {
                     continue;
                 }
-                let pair_r = CELL_RADIUS * (body_sizes[i] + body_sizes[j]);
+                let pair_r =
+                    CELL_RADIUS * (self.body_sizes_scratch[i] + self.body_sizes_scratch[j]);
                 let pair_r2 = pair_r * pair_r;
-                let dx = positions[i][0] - positions[j][0];
-                let dy = positions[i][1] - positions[j][1];
+                let dx = self.positions_scratch[i][0] - self.positions_scratch[j][0];
+                let dy = self.positions_scratch[i][1] - self.positions_scratch[j][1];
                 let d2 = dx * dx + dy * dy;
                 if d2 < pair_r2 && d2 > 0.0 {
                     let d = d2.sqrt();
                     let overlap = pair_r - d;
-                    deltas[i][0] += (dx / d) * overlap * 0.5;
-                    deltas[i][1] += (dy / d) * overlap * 0.5;
+                    self.deltas_scratch[i][0] += (dx / d) * overlap * 0.5;
+                    self.deltas_scratch[i][1] += (dy / d) * overlap * 0.5;
                 }
             }
         }
-        for (cell, delta) in self.cells.iter_mut().zip(deltas.iter()) {
+        for (cell, delta) in self.cells.iter_mut().zip(self.deltas_scratch.iter()) {
             cell.position[0] += delta[0];
             cell.position[1] += delta[1];
         }
@@ -232,41 +230,49 @@ impl World {
 
     fn predate(&mut self) {
         let n = self.cells.len();
-        let positions: Vec<[f32; 2]> = self.cells.iter().map(|c| c.position).collect();
-        let body_sizes: Vec<f32> = self.cells.iter().map(|c| c.genome.body_size).collect();
-        let mut energy_deltas: Vec<f32> = vec![0.0; n];
+        self.positions_scratch.clear();
+        self.positions_scratch
+            .extend(self.cells.iter().map(|c| c.position));
+        self.body_sizes_scratch.clear();
+        self.body_sizes_scratch
+            .extend(self.cells.iter().map(|c| c.genome.body_size));
+        self.energy_deltas_scratch.clear();
+        self.energy_deltas_scratch.resize(n, 0.0);
         for i in 0..n {
             for j in 0..n {
                 if i == j {
                     continue;
                 }
-                let size_a = body_sizes[i];
-                let size_b = body_sizes[j];
+                let size_a = self.body_sizes_scratch[i];
+                let size_b = self.body_sizes_scratch[j];
                 if size_a < SIZE_RATIO_THRESHOLD * size_b {
                     continue;
                 }
                 let pair_r = CELL_RADIUS * (size_a + size_b);
                 let pair_r2 = pair_r * pair_r;
-                let dx = positions[i][0] - positions[j][0];
-                let dy = positions[i][1] - positions[j][1];
+                let dx = self.positions_scratch[i][0] - self.positions_scratch[j][0];
+                let dy = self.positions_scratch[i][1] - self.positions_scratch[j][1];
                 let d2 = dx * dx + dy * dy;
                 if d2 < pair_r2 {
-                    energy_deltas[i] += PREDATION_GAIN_PER_TICK;
-                    energy_deltas[j] -= PREDATION_DRAIN_PER_TICK;
+                    self.energy_deltas_scratch[i] += PREDATION_GAIN_PER_TICK;
+                    self.energy_deltas_scratch[j] -= PREDATION_DRAIN_PER_TICK;
                 }
             }
         }
-        for (cell, delta) in self.cells.iter_mut().zip(energy_deltas.iter()) {
+        for (cell, delta) in self.cells.iter_mut().zip(self.energy_deltas_scratch.iter()) {
             cell.energy += delta;
         }
     }
 
     fn eat_food(&mut self) {
-        let mut eaten = vec![false; self.foods.len()];
+        self.eaten_scratch.clear();
+        self.eaten_scratch.resize(self.foods.len(), false);
+        let eaten = &mut self.eaten_scratch;
         for cell in &mut self.cells {
             let pos = cell.position;
             let eat_r = EAT_RADIUS * cell.genome.body_size;
             let r2 = eat_r * eat_r;
+            let mut ate = false;
             for (flag, food) in eaten.iter_mut().zip(self.foods.iter()) {
                 if *flag {
                     continue;
@@ -274,10 +280,23 @@ impl World {
                 let dx = pos[0] - food.position[0];
                 let dy = pos[1] - food.position[1];
                 if dx * dx + dy * dy <= r2 {
-                    cell.energy += FOOD_VALUE;
+                    cell.energy += FOOD_VALUE * food_multiplier(self.map.sample(food.position));
                     *flag = true;
+                    ate = true;
                     break;
                 }
+            }
+            if ate {
+                let last_inputs = cell.last_inputs;
+                let last_hidden = cell.last_hidden;
+                let last_outputs = cell.last_outputs;
+                cell.genome.brain.hebbian_update(
+                    &last_inputs,
+                    &last_hidden,
+                    &last_outputs,
+                    1.0,
+                    LEARNING_RATE,
+                );
             }
         }
         for j in (0..eaten.len()).rev() {
@@ -319,30 +338,94 @@ impl World {
         if current_pop >= MAX_POPULATION {
             return;
         }
-        let mut budget = MAX_POPULATION - current_pop;
-        let mut to_spawn: Vec<Cell> = Vec::new();
-        for cell in self.cells.iter_mut() {
-            if budget == 0 {
+        let budget = MAX_POPULATION - current_pop;
+
+        // Snapshot fertile (idx, position) — pair indices, not entities.
+        let fertile: Vec<(usize, [f32; 2])> = self
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.energy >= REPRODUCE_THRESHOLD)
+            .map(|(i, c)| (i, c.position))
+            .collect();
+
+        // Greedy O(N²) pairing on fertile indices.
+        let mut paired: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut matings: Vec<(usize, usize)> = Vec::new();
+        let mating_r2 = MATING_RADIUS * MATING_RADIUS;
+        for i_outer in 0..fertile.len() {
+            if matings.len() >= budget {
                 break;
             }
-            if cell.energy < REPRODUCE_THRESHOLD {
+            let (a, pos_a) = fertile[i_outer];
+            if paired.contains(&a) {
                 continue;
             }
-            cell.energy *= 0.5;
-            let child_genome = cell.genome.mutate(rng, &MUTATION_CONFIG);
+            let mut best: Option<(usize, f32)> = None;
+            for (j_outer, &(b, pos_b)) in fertile.iter().enumerate() {
+                if i_outer == j_outer {
+                    continue;
+                }
+                if paired.contains(&b) {
+                    continue;
+                }
+                let dx = pos_a[0] - pos_b[0];
+                let dy = pos_a[1] - pos_b[1];
+                let d2 = dx * dx + dy * dy;
+                if d2 <= mating_r2 && best.is_none_or(|(_, bd2)| d2 < bd2) {
+                    best = Some((b, d2));
+                }
+            }
+            if let Some((b, _)) = best {
+                paired.insert(a);
+                paired.insert(b);
+                matings.push((a, b));
+            }
+        }
+
+        let mut to_spawn: Vec<Cell> = Vec::new();
+        for (a, b) in matings {
+            // Borrow both cells mutably via split: one of them gets pulled out
+            // first, then the other from the remaining slice.
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            let (left, right) = self.cells.split_at_mut(hi);
+            let cell_lo = &mut left[lo];
+            let cell_hi = &mut right[0];
+            let (cell_a, cell_b) = if a < b {
+                (cell_lo, cell_hi)
+            } else {
+                (cell_hi, cell_lo)
+            };
+
+            let energy_a = cell_a.energy * 0.5;
+            let energy_b = cell_b.energy * 0.5;
+            cell_a.energy *= 0.5;
+            cell_b.energy *= 0.5;
+
+            let child_genome = Genome::crossover(&cell_a.genome, &cell_b.genome, rng)
+                .mutate(rng, &MUTATION_CONFIG);
+
             let direction = rng.random_range(0.0..std::f32::consts::TAU);
+            let mid_pos = [
+                (cell_a.position[0] + cell_b.position[0]) * 0.5,
+                (cell_a.position[1] + cell_b.position[1]) * 0.5,
+            ];
             to_spawn.push(Cell {
-                position: cell.position,
+                position: mid_pos,
                 velocity: [
                     direction.cos() * child_genome.max_speed,
                     direction.sin() * child_genome.max_speed,
                 ],
                 angular_velocity: 0.0,
-                energy: cell.energy,
+                energy: energy_a + energy_b,
                 heading: direction,
+                lineage_id: cell_a.lineage_id,
+                lineage_birth_gen: cell_a.lineage_birth_gen,
+                last_inputs: [0.0; BRAIN_INPUTS],
+                last_hidden: [0.0; BRAIN_HIDDEN],
+                last_outputs: [0.0; BRAIN_OUTPUTS],
                 genome: child_genome,
             });
-            budget -= 1;
         }
         self.cells.extend(to_spawn);
     }
@@ -368,6 +451,10 @@ impl World {
     }
 }
 
+fn food_multiplier(noise: f32) -> f32 {
+    WORLD_MAP_FOOD_FLOOR + WORLD_MAP_FOOD_AMP * noise
+}
+
 fn food_target(factor: f32) -> usize {
     let area = (2.0 * WORLD_HALF[0]) * (2.0 * WORLD_HALF[1]);
     ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0)) as usize
@@ -378,7 +465,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     if n == 0 {
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,{},{:.3}",
+            "{},0,0,0,0,0,0,0,{},{:.3},0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor
@@ -390,6 +477,9 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let mut vis_sumsq = 0.0_f64;
     let mut size_sum = 0.0_f64;
     let mut size_sumsq = 0.0_f64;
+    let mut lineages: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut oldest_age: u64 = 0;
+    let current_gen = world.clock.generation;
     for c in &world.cells {
         let s = c.genome.max_speed as f64;
         let v = c.genome.vision_radius as f64;
@@ -400,6 +490,11 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         vis_sumsq += v * v;
         size_sum += bs;
         size_sumsq += bs * bs;
+        lineages.insert(c.lineage_id);
+        let age = current_gen.saturating_sub(c.lineage_birth_gen);
+        if age > oldest_age {
+            oldest_age = age;
+        }
     }
     let nf = n as f64;
     let spd_m = spd_sum / nf;
@@ -410,7 +505,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let size_d = ((size_sumsq / nf) - size_m * size_m).max(0.0).sqrt();
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.4},{},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.4},{},{:.3},{},{}",
         world.clock.generation,
         n,
         spd_m,
@@ -421,6 +516,8 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         size_d,
         world.foods.len(),
         world.density_factor,
+        lineages.len(),
+        oldest_age,
     )
 }
 
@@ -440,7 +537,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,size_avg,size_dev,food,density"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,size_avg,size_dev,food,density,lineages,oldest"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();
