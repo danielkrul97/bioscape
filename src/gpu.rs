@@ -1525,6 +1525,19 @@ pub struct CellsGpu {
     /// Sprint 62: motor batch readback. velocity_rb už existuje (Sprint 51).
     angular_velocity_rb: wgpu::Buffer,
     pitch_velocity_rb: wgpu::Buffer,
+    /// Sprint 63: step on GPU — kinematics + drag + energy + bounce per cell.
+    /// Position mutated each tick (integrate_kinematics + bounce). Age/cooldown
+    /// incremented. Body_dims (length/width/height) constant per cell post-morph.
+    /// Aux (spike/shell/vision/attack) per-tick recomputed (attack from outputs).
+    position_buf: wgpu::Buffer,
+    age_buf: wgpu::Buffer,
+    cooldown_buf: wgpu::Buffer,
+    body_dims_buf: wgpu::Buffer,
+    aux_buf: wgpu::Buffer,
+    position_rb: wgpu::Buffer,
+    age_rb: wgpu::Buffer,
+    cooldown_rb: wgpu::Buffer,
+    energy_rb: wgpu::Buffer,
     last_hidden_rb: wgpu::Buffer,
     last_outputs_rb: wgpu::Buffer,
     velocities_rb: wgpu::Buffer,
@@ -1583,6 +1596,16 @@ impl CellsGpu {
         let pitch_velocity_buf = mk("cells-pitch-vel", n * f, stor_dst_src);
         let angular_velocity_rb = mk("cells-ang-vel-rb", n * f, read);
         let pitch_velocity_rb = mk("cells-pitch-vel-rb", n * f, read);
+        // Sprint 63: step shader buffers.
+        let position_buf = mk("cells-position", n * 3 * f, stor_dst_src);
+        let age_buf = mk("cells-age", n * 4, stor_dst_src);
+        let cooldown_buf = mk("cells-cooldown", n * 4, stor_dst_src);
+        let body_dims_buf = mk("cells-body-dims", n * 3 * f, stor_dst_src);
+        let aux_buf = mk("cells-aux", n * 4 * f, stor_dst_src);
+        let position_rb = mk("cells-position-rb", n * 3 * f, read);
+        let age_rb = mk("cells-age-rb", n * 4, read);
+        let cooldown_rb = mk("cells-cooldown-rb", n * 4, read);
+        let energy_rb = mk("cells-energy-rb", n * f, read);
         let last_hidden_rb = mk("cells-hidden-rb", n * (BRAIN_HIDDEN as u64) * f, read);
         let last_outputs_rb = mk("cells-outputs-rb", n * (BRAIN_OUTPUTS as u64) * f, read);
         let velocities_rb = mk("cells-velocities-rb", n * 3 * f, read);
@@ -1620,6 +1643,15 @@ impl CellsGpu {
             pitch_velocity_buf,
             angular_velocity_rb,
             pitch_velocity_rb,
+            position_buf,
+            age_buf,
+            cooldown_buf,
+            body_dims_buf,
+            aux_buf,
+            position_rb,
+            age_rb,
+            cooldown_rb,
+            energy_rb,
             last_hidden_rb,
             last_outputs_rb,
             velocities_rb,
@@ -1651,6 +1683,159 @@ impl CellsGpu {
     pub fn turn_rate_buffer(&self) -> &wgpu::Buffer { &self.turn_rate_buf }
     pub fn angular_velocity_buffer(&self) -> &wgpu::Buffer { &self.angular_velocity_buf }
     pub fn pitch_velocity_buffer(&self) -> &wgpu::Buffer { &self.pitch_velocity_buf }
+    /// Sprint 63: step shader buffery.
+    pub fn position_buffer(&self) -> &wgpu::Buffer { &self.position_buf }
+    pub fn age_buffer(&self) -> &wgpu::Buffer { &self.age_buf }
+    pub fn cooldown_buffer(&self) -> &wgpu::Buffer { &self.cooldown_buf }
+    pub fn body_dims_buffer(&self) -> &wgpu::Buffer { &self.body_dims_buf }
+    pub fn aux_buffer(&self) -> &wgpu::Buffer { &self.aux_buf }
+
+    /// Sprint 63: upload positions (3D per cell, packed).
+    pub fn upload_positions(&self, positions: &[[f32; 3]]) {
+        let mut packed: Vec<f32> = Vec::with_capacity(positions.len() * 3);
+        for p in positions { packed.extend_from_slice(p); }
+        self.queue.write_buffer(&self.position_buf, 0, bytemuck::cast_slice(&packed));
+    }
+
+    /// Sprint 63: upload age + cooldown (u32 per cell).
+    pub fn upload_age_cooldown(&self, ages: &[u32], cooldowns: &[u32]) {
+        debug_assert_eq!(ages.len(), cooldowns.len());
+        self.queue.write_buffer(&self.age_buf, 0, bytemuck::cast_slice(ages));
+        self.queue.write_buffer(&self.cooldown_buf, 0, bytemuck::cast_slice(cooldowns));
+    }
+
+    /// Sprint 63: upload body dimensions (3 × f32 per cell: length, width, height).
+    pub fn upload_body_dims(&self, body_dims: &[[f32; 3]]) {
+        let mut packed: Vec<f32> = Vec::with_capacity(body_dims.len() * 3);
+        for d in body_dims { packed.extend_from_slice(d); }
+        self.queue.write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(&packed));
+    }
+
+    /// Sprint 63: upload aux (4 × f32 per cell: spike, shell, vision, attack).
+    /// Attack je per-tick recomputed z brain output[6]; ostatní jsou per-cell
+    /// konstanty (genome). Lazy per-tick upload pro consistency.
+    pub fn upload_aux(&self, aux: &[[f32; 4]]) {
+        let mut packed: Vec<f32> = Vec::with_capacity(aux.len() * 4);
+        for a in aux { packed.extend_from_slice(a); }
+        self.queue.write_buffer(&self.aux_buf, 0, bytemuck::cast_slice(&packed));
+    }
+
+    /// Sprint 63: combined batch readback po brain_act + step pipeline.
+    /// Mirror `download_brain_motor_batch` ale rozšířen o position/age/cooldown/
+    /// energy. Single Wait barrier pro all 9 buffers.
+    #[allow(clippy::type_complexity)]
+    pub fn download_full_batch(
+        &self,
+        n: usize,
+    ) -> (
+        Vec<[f32; BRAIN_HIDDEN]>,
+        Vec<[f32; BRAIN_OUTPUTS]>,
+        Vec<[f32; 3]>,  // velocities
+        Vec<f32>,        // angular velocities
+        Vec<f32>,        // pitch velocities
+        Vec<[f32; 3]>,  // positions
+        Vec<u32>,        // ages
+        Vec<u32>,        // cooldowns
+        Vec<f32>,        // energies
+    ) {
+        if n == 0 {
+            return (
+                Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            );
+        }
+        assert!(n <= self.capacity);
+        let h_bytes = (n * BRAIN_HIDDEN * 4) as u64;
+        let o_bytes = (n * BRAIN_OUTPUTS * 4) as u64;
+        let v_bytes = (n * 3 * 4) as u64;
+        let a_bytes = (n * 4) as u64;
+        let p_bytes = (n * 4) as u64;
+        let pos_bytes = (n * 3 * 4) as u64;
+        let age_bytes = (n * 4) as u64;
+        let cd_bytes = (n * 4) as u64;
+        let e_bytes = (n * 4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-download-full"),
+        });
+        encoder.copy_buffer_to_buffer(&self.last_hidden_buf, 0, &self.last_hidden_rb, 0, h_bytes);
+        encoder.copy_buffer_to_buffer(&self.last_outputs_buf, 0, &self.last_outputs_rb, 0, o_bytes);
+        encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_rb, 0, v_bytes);
+        encoder.copy_buffer_to_buffer(&self.angular_velocity_buf, 0, &self.angular_velocity_rb, 0, a_bytes);
+        encoder.copy_buffer_to_buffer(&self.pitch_velocity_buf, 0, &self.pitch_velocity_rb, 0, p_bytes);
+        encoder.copy_buffer_to_buffer(&self.position_buf, 0, &self.position_rb, 0, pos_bytes);
+        encoder.copy_buffer_to_buffer(&self.age_buf, 0, &self.age_rb, 0, age_bytes);
+        encoder.copy_buffer_to_buffer(&self.cooldown_buf, 0, &self.cooldown_rb, 0, cd_bytes);
+        encoder.copy_buffer_to_buffer(&self.energy_buf, 0, &self.energy_rb, 0, e_bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let h_s = self.last_hidden_rb.slice(0..h_bytes);
+        let o_s = self.last_outputs_rb.slice(0..o_bytes);
+        let v_s = self.velocities_rb.slice(0..v_bytes);
+        let a_s = self.angular_velocity_rb.slice(0..a_bytes);
+        let p_s = self.pitch_velocity_rb.slice(0..p_bytes);
+        let pos_s = self.position_rb.slice(0..pos_bytes);
+        let age_s = self.age_rb.slice(0..age_bytes);
+        let cd_s = self.cooldown_rb.slice(0..cd_bytes);
+        let e_s = self.energy_rb.slice(0..e_bytes);
+        for s in [&h_s, &o_s, &v_s, &a_s, &p_s, &pos_s, &age_s, &cd_s, &e_s] {
+            s.map_async(wgpu::MapMode::Read, |_| {});
+        }
+        self.device.poll(wgpu::Maintain::Wait);
+        let h_data = h_s.get_mapped_range();
+        let o_data = o_s.get_mapped_range();
+        let v_data = v_s.get_mapped_range();
+        let a_data = a_s.get_mapped_range();
+        let p_data = p_s.get_mapped_range();
+        let pos_data = pos_s.get_mapped_range();
+        let age_data = age_s.get_mapped_range();
+        let cd_data = cd_s.get_mapped_range();
+        let e_data = e_s.get_mapped_range();
+        let h_f: &[f32] = bytemuck::cast_slice(&h_data);
+        let o_f: &[f32] = bytemuck::cast_slice(&o_data);
+        let v_f: &[f32] = bytemuck::cast_slice(&v_data);
+        let a_f: &[f32] = bytemuck::cast_slice(&a_data);
+        let p_f: &[f32] = bytemuck::cast_slice(&p_data);
+        let pos_f: &[f32] = bytemuck::cast_slice(&pos_data);
+        let age_u: &[u32] = bytemuck::cast_slice(&age_data);
+        let cd_u: &[u32] = bytemuck::cast_slice(&cd_data);
+        let e_f: &[f32] = bytemuck::cast_slice(&e_data);
+        let hidden: Vec<[f32; BRAIN_HIDDEN]> = (0..n)
+            .map(|i| {
+                let mut a = [0.0_f32; BRAIN_HIDDEN];
+                a.copy_from_slice(&h_f[i * BRAIN_HIDDEN..(i + 1) * BRAIN_HIDDEN]);
+                a
+            })
+            .collect();
+        let outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
+            .map(|i| {
+                let mut a = [0.0_f32; BRAIN_OUTPUTS];
+                a.copy_from_slice(&o_f[i * BRAIN_OUTPUTS..(i + 1) * BRAIN_OUTPUTS]);
+                a
+            })
+            .collect();
+        let velocities: Vec<[f32; 3]> = (0..n)
+            .map(|i| [v_f[i * 3], v_f[i * 3 + 1], v_f[i * 3 + 2]])
+            .collect();
+        let angular: Vec<f32> = a_f[..n].to_vec();
+        let pitch_vels: Vec<f32> = p_f[..n].to_vec();
+        let positions: Vec<[f32; 3]> = (0..n)
+            .map(|i| [pos_f[i * 3], pos_f[i * 3 + 1], pos_f[i * 3 + 2]])
+            .collect();
+        let ages: Vec<u32> = age_u[..n].to_vec();
+        let cooldowns: Vec<u32> = cd_u[..n].to_vec();
+        let energies: Vec<f32> = e_f[..n].to_vec();
+        drop(h_data); drop(o_data); drop(v_data); drop(a_data); drop(p_data);
+        drop(pos_data); drop(age_data); drop(cd_data); drop(e_data);
+        self.last_hidden_rb.unmap();
+        self.last_outputs_rb.unmap();
+        self.velocities_rb.unmap();
+        self.angular_velocity_rb.unmap();
+        self.pitch_velocity_rb.unmap();
+        self.position_rb.unmap();
+        self.age_rb.unmap();
+        self.cooldown_rb.unmap();
+        self.energy_rb.unmap();
+        (hidden, outputs, velocities, angular, pitch_vels, positions, ages, cooldowns, energies)
+    }
 
     /// Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim init +
     /// při reproduce (sparse). Sprint 61 `upload_metadata` je per-tick mutable
@@ -3324,6 +3509,57 @@ impl StepGpu {
         self.cooldown_rb.unmap();
         self.energy_rb.unmap();
         result
+    }
+
+    /// Sprint 63: persistent variant — bind CellsGpu shared buffery (position,
+    /// velocity, heading, pitch, ang_vel, pitch_vel, age, cooldown, energy,
+    /// body_dims, aux) místo vlastních duplikátů. Step shader mutuje vše
+    /// in-place; readback je v hot loop přes `download_full_batch`.
+    pub fn dispatch_with_cells(
+        &mut self,
+        cells: &CellsGpu,
+        num_cells: usize,
+        params: StepParamsGpu,
+    ) {
+        if num_cells == 0 {
+            return;
+        }
+        let mut params = params;
+        params.num_cells = num_cells as u32;
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("step-bg-cells"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells.position_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cells.velocities_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells.heading_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cells.pitch_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cells.angular_velocity_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: cells.pitch_velocity_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: cells.age_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: cells.cooldown_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: cells.energy_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: cells.body_dims_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: cells.aux_buffer().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("step-dispatch-cells-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("step-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (num_cells as u32 + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 }
 

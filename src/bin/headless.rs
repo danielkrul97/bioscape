@@ -26,10 +26,12 @@ use bioscape::{
     gpu::{
         BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
         PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
+        StepGpu, StepParamsGpu,
     },
-    BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS, DAMAGE_NORMALIZATION_GAIN,
-    DENSITY_NORM_COUNT, DRAG_COEFFICIENT, PHEROMONE_NORMALIZATION_GAIN, SMELL_NORMALIZATION_GAIN,
-    THERMAL_NOISE,
+    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_INPUTS_SENSORY,
+    BRAIN_OUTPUTS, DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT,
+    GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN, SHELL_COST_PER_SEC,
+    SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -166,6 +168,9 @@ struct GpuFullState {
     /// Fused s brownian dispatch v brain_act → single batch readback eliminuje
     /// round-trip #2 (hidden+outputs) i round-trip #3 (velocities).
     motor: MotorGpu,
+    /// Sprint 63: step on GPU (kinematics + drag + energy + bounce).
+    /// Fused do brain_act batch readback. Skip CPU `step` fáze v `--gpu-full`.
+    step: StepGpu,
 }
 
 impl World {
@@ -524,7 +529,7 @@ impl World {
         let vision_radii: Vec<f32> = self.cells.iter().map(|c| c.genome.vision_radius).collect();
         let food_positions: Vec<[f32; 3]> = self.foods.iter().map(|f| f.position).collect();
 
-        // Per-cell metadata pro populate_inputs + motor shaders.
+        // Per-cell metadata pro populate_inputs + motor + step shaders.
         let energies: Vec<f32> = self.cells.iter().map(|c| c.energy).collect();
         let headings: Vec<f32> = self.cells.iter().map(|c| c.heading).collect();
         let pitches: Vec<f32> = self.cells.iter().map(|c| c.pitch).collect();
@@ -539,6 +544,44 @@ impl World {
         // mění turn_rate u nových childů, takže pre-tick refresh je safer
         // než per-event sparse update. ~4 KB/tick negligible.
         let turn_rates: Vec<f32> = self.cells.iter().map(|c| c.genome.turn_rate).collect();
+        // Sprint 63: step shader needs position/age/cooldown/body_dims/aux.
+        // Apply_morph CPU has run earlier this tick → phenotype bytes current.
+        let positions_for_step: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
+        let ages: Vec<u32> = self.cells.iter().map(|c| c.age as u32).collect();
+        let cooldowns: Vec<u32> = self
+            .cells
+            .iter()
+            .map(|c| c.reproduce_cooldown_ticks)
+            .collect();
+        let body_dims: Vec<[f32; 3]> = self
+            .cells
+            .iter()
+            .map(|c| {
+                [
+                    c.phenotype.body_length,
+                    c.phenotype.body_width,
+                    c.phenotype.body_height,
+                ]
+            })
+            .collect();
+        // Sprint 63: aux = [spike_length, shell_thickness, vision_radius, attack_strength].
+        // Attack je per-tick z `cell.last_outputs[6].max(0.0)` — populated po
+        // brain forward (Sprint 62 phase 6). Tady CPU snapshot dává přístup
+        // k *předchozí* tick last_outputs (1-tick delay shell_absorb-like).
+        // To matchne lib `Cell::apply_energy_costs` semantiku (čte předchozí
+        // post-brain attack signal).
+        let aux: Vec<[f32; 4]> = self
+            .cells
+            .iter()
+            .map(|c| {
+                [
+                    c.phenotype.spike_length,
+                    c.phenotype.shell_thickness,
+                    c.genome.vision_radius,
+                    c.last_outputs[6].max(0.0),
+                ]
+            })
+            .collect();
 
         let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
 
@@ -554,6 +597,11 @@ impl World {
         gpu.cells.upload_velocities(&velocities);
         gpu.cells.upload_angular_pitch(&angular_vels, &pitch_vels);
         gpu.cells.upload_turn_rates(&turn_rates);
+        // Sprint 63: step shader uploads.
+        gpu.cells.upload_positions(&positions_for_step);
+        gpu.cells.upload_age_cooldown(&ages, &cooldowns);
+        gpu.cells.upload_body_dims(&body_dims);
+        gpu.cells.upload_aux(&aux);
 
         // Phase 3: GPU spatial hash dispatch (no readback).
         gpu.cell_hash.dispatch(&positions);
@@ -625,13 +673,53 @@ impl World {
         gpu.brownian
             .compute_persistent(&gpu.cells, n, THERMAL_NOISE, dt, has_z);
 
-        // Phase 9: single batch readback (round-trip #1 a #2 a #3 collapsed
-        // do jednoho Wait barrier). Hidden + outputs pro Hebbian/predate/emit;
-        // velocity + ang_vel + pitch_vel pro CPU step kinematics.
-        let (hiddens, outputs, new_vels, new_ang, new_pitch) =
-            gpu.cells.download_brain_motor_batch(n);
+        // Phase 9: GPU step.dispatch_with_cells. Mirror lib Cell::step
+        // (kinematics + drag + energy costs + world bounce). Mutuje position/
+        // velocity/heading/pitch/ang_vel/pitch_vel/age/cooldown/energy.
+        // Sprint 63: skip CPU `step` fáze v `--gpu-full`.
+        let step_params = StepParamsGpu {
+            num_cells: n as u32,
+            _pad_a0: 0,
+            _pad_a1: 0,
+            _pad_a2: 0,
+            dt,
+            world_half_x: WORLD_HALF[0],
+            world_half_y: WORLD_HALF[1],
+            world_half_z: WORLD_HALF[2],
+            gravity: PHYS_GRAVITY,
+            drag: PHYSICS_CONFIG.drag,
+            angular_drag: PHYSICS_CONFIG.angular_drag,
+            energy_cost_per_v_sq: PHYSICS_CONFIG.energy_cost_per_v_sq,
+            angular_energy_cost: PHYSICS_CONFIG.angular_energy_cost,
+            vision_cost_per_radius: PHYSICS_CONFIG.vision_cost_per_radius,
+            body_cost_factor: PHYSICS_CONFIG.body_cost_factor,
+            age_decay_per_sec: AGE_DECAY_PER_SEC,
+            fixed_timestep_hz: FIXED_TIMESTEP_HZ,
+            spike_cost_per_sec: SPIKE_COST_PER_SEC,
+            shell_cost_per_sec: SHELL_COST_PER_SEC,
+            attack_cost_per_sec: ATTACK_COST_PER_SEC,
+            pitch_clamp: core::f32::consts::FRAC_PI_6 * 0.5,
+        };
+        gpu.step.dispatch_with_cells(&gpu.cells, n, step_params);
 
-        // Phase 10: CPU writeback. NO apply_brain_motor (motor byl GPU-side).
+        // Phase 10: single batch readback (Sprint 63: 9 buffers fused do
+        // jednoho Wait barrier). Hidden + outputs pro Hebbian/predate/emit;
+        // velocity + ang_vel + pitch_vel + position + age + cooldown + energy
+        // pro CPU phases (eat_food, predate, collisions, reproduce, hazards).
+        let (
+            hiddens,
+            outputs,
+            new_vels,
+            new_ang,
+            new_pitch,
+            new_pos,
+            new_ages,
+            new_cooldowns,
+            new_energies,
+        ) = gpu.cells.download_full_batch(n);
+
+        // Phase 11: CPU writeback. NO apply_brain_motor + NO Cell::step CPU
+        // (oba byly GPU-side). damage_accum reset (mirror populate_inputs).
         self.cells
             .par_iter_mut()
             .enumerate()
@@ -641,7 +729,10 @@ impl World {
                 cell.velocity = new_vels[i];
                 cell.angular_velocity = new_ang[i];
                 cell.pitch_velocity = new_pitch[i];
-                // damage_accum reset (mirror populate_inputs GPU side-effect).
+                cell.position = new_pos[i];
+                cell.age = new_ages[i] as u64;
+                cell.reproduce_cooldown_ticks = new_cooldowns[i];
+                cell.energy = new_energies[i];
                 cell.damage_accum = 0.0;
             });
     }
@@ -834,6 +925,17 @@ impl World {
     }
 
     fn step(&mut self, dt: f32) {
+        // Sprint 63: GPU step je fused do `brain_act_gpu_full` (Phase 9).
+        // Tato fáze je v `--gpu-full` no-op; kinematics + drag + energy +
+        // bounce už proběhly přes StepGpu shader, position/velocity/age/
+        // cooldown/energy jsou writebackd v batch readback Phase 10-11.
+        #[cfg(feature = "gpu")]
+        {
+            if self.gpu_full.is_some() {
+                let _ = dt;
+                return;
+            }
+        }
         // Sprint 57: stejně jako apply_morph, ~16 us sekvenčně vs ~30 us
         // paralelně — work per cell je příliš malý pro rayon. Sekvenční win.
         for cell in &mut self.cells {
@@ -1716,6 +1818,7 @@ fn main() {
             let sensor = SensorGatherGpu::with_context(&ctx, cap, food_capacity)?;
             let populate = PopulateInputsGpu::with_context(&ctx)?;
             let motor = MotorGpu::with_context(&ctx, cap)?;
+            let step = StepGpu::with_context(&ctx, cap)?;
             // Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim
             // init; reproduce volá `upload_turn_rates` znovu (per-event sparse).
             let turn_rates: Vec<f32> = world.cells.iter().map(|c| c.genome.turn_rate).collect();
@@ -1732,12 +1835,13 @@ fn main() {
                 sensor,
                 populate,
                 motor,
+                step,
             })
         };
         match init() {
             Ok(state) => {
                 eprintln!(
-                    "gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor (cap {} cells, {} field sources)",
+                    "gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
                 world.gpu_full = Some(state);
