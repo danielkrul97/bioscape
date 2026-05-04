@@ -6,6 +6,7 @@
 use core::f32::consts::TAU;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
 
@@ -302,12 +303,87 @@ pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     body_cost_factor: BODY_COST_FACTOR,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Brain {
+    #[serde(with = "serde_arrays_w1")]
     pub w1: [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN],
     pub b1: [f32; BRAIN_HIDDEN],
+    #[serde(with = "serde_arrays_w2")]
     pub w2: [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
     pub b2: [f32; BRAIN_OUTPUTS],
+}
+
+// Sprint 48: serde 1 has native const-generic support pro `[T; N]` ale
+// nested fixed arrays (`[[f32; 36]; 16]`) potřebují manual workaround.
+// Encode jako flat Vec<f32> length × 36, decode reverse.
+mod serde_arrays_w1 {
+    use super::{BRAIN_HIDDEN, BRAIN_INPUTS};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(
+        w: &[[f32; BRAIN_INPUTS]; BRAIN_HIDDEN],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let flat: Vec<f32> = w.iter().flat_map(|row| row.iter().copied()).collect();
+        flat.serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[[f32; BRAIN_INPUTS]; BRAIN_HIDDEN], D::Error> {
+        let flat: Vec<f32> = Vec::deserialize(d)?;
+        if flat.len() != BRAIN_HIDDEN * BRAIN_INPUTS {
+            return Err(serde::de::Error::custom("w1 length mismatch"));
+        }
+        let mut out = [[0.0_f32; BRAIN_INPUTS]; BRAIN_HIDDEN];
+        for (i, row) in out.iter_mut().enumerate() {
+            row.copy_from_slice(&flat[i * BRAIN_INPUTS..(i + 1) * BRAIN_INPUTS]);
+        }
+        Ok(out)
+    }
+}
+
+mod serde_arrays_w2 {
+    use super::{BRAIN_HIDDEN, BRAIN_OUTPUTS};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(
+        w: &[[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let flat: Vec<f32> = w.iter().flat_map(|row| row.iter().copied()).collect();
+        flat.serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS], D::Error> {
+        let flat: Vec<f32> = Vec::deserialize(d)?;
+        if flat.len() != BRAIN_OUTPUTS * BRAIN_HIDDEN {
+            return Err(serde::de::Error::custom("w2 length mismatch"));
+        }
+        let mut out = [[0.0_f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS];
+        for (i, row) in out.iter_mut().enumerate() {
+            row.copy_from_slice(&flat[i * BRAIN_HIDDEN..(i + 1) * BRAIN_HIDDEN]);
+        }
+        Ok(out)
+    }
+}
+
+// Sprint 48: serde 1 native podpora `[T; N]` jen pro N ≤ 32. `BRAIN_INPUTS` = 36.
+mod serde_arr_inputs {
+    use super::BRAIN_INPUTS;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(a: &[f32; BRAIN_INPUTS], s: S) -> Result<S::Ok, S::Error> {
+        a.as_slice().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[f32; BRAIN_INPUTS], D::Error> {
+        let v: Vec<f32> = Vec::deserialize(d)?;
+        if v.len() != BRAIN_INPUTS {
+            return Err(serde::de::Error::custom("inputs length mismatch"));
+        }
+        let mut a = [0.0_f32; BRAIN_INPUTS];
+        a.copy_from_slice(&v);
+        Ok(a)
+    }
 }
 
 impl Brain {
@@ -441,7 +517,7 @@ impl Brain {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MutationConfig {
     pub sigma_speed: f32,
     pub sigma_hue: f32,
@@ -455,7 +531,7 @@ pub struct MutationConfig {
     pub sigma_brain: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Genome {
     pub max_speed: f32,
     pub color_hue: f32,
@@ -537,7 +613,7 @@ fn gaussian(rng: &mut impl Rng) -> f32 {
     (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PhysicsConfig {
     pub drag: f32,
     pub angular_drag: f32,
@@ -556,7 +632,7 @@ pub struct PhysicsConfig {
 /// (řízeno brain output[3..6]). **Genotyp/fenotyp split**: runtime morph
 /// modifikuje `Phenotype`, ne `Genome`. Dítě dostane svůj fresh phenotype
 /// z rodičovského genomu — žádný Lamarckismus.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Phenotype {
     pub body_length: f32,
     pub body_width: f32,
@@ -636,7 +712,7 @@ impl Phenotype {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Cell {
     pub position: [f32; 3],
     pub velocity: [f32; 3],
@@ -660,6 +736,7 @@ pub struct Cell {
     pub lineage_birth_gen: u64,
     // Recent activations from the last brain forward pass — Hebbian updates
     // read these to credit-assign on reward events (myopic, 1-tick window).
+    #[serde(with = "serde_arr_inputs")]
     pub last_inputs: [f32; BRAIN_INPUTS],
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
@@ -988,7 +1065,7 @@ impl Cell {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Food {
     pub position: [f32; 3],
     /// Sprint 42: ticks od spawnu. Drives decay of `value_factor`. Init 0
@@ -1226,7 +1303,7 @@ pub fn make_mating_child(parent_a: &Cell, parent_b: &Cell, rng: &mut impl Rng) -
 /// 2D scalar field with explicit-Jacobi diffusion and exponential decay.
 /// Doublet (`grid` + `scratch`) for in-place stepping. Cells tagged at
 /// food positions seed the field; cells read its gradient as a smell input.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmellField {
     pub resolution: usize,
     pub world_half: [f32; 2],
@@ -1314,7 +1391,7 @@ impl SmellField {
 ///
 /// Use case: prostorová modulace mechaniky, která má být nehomogenní —
 /// food_richness, hazard, terrain drag, atd. (Sprint 21 = food_richness.)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldMap {
     pub resolution: usize,
     pub world_half: [f32; 2],
@@ -1452,7 +1529,7 @@ impl<Id: Copy + Eq + Hash, P: Copy> SpatialGrid<Id, P> {
 /// méně kandidátů. Renderer v `main.rs` má svůj vlastní knob.
 pub const GRID_CELL_SIZE: f32 = 64.0;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SimClock {
     pub tick: u64,
     pub generation: u64,

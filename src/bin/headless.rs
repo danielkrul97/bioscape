@@ -25,8 +25,10 @@ use bioscape::{gpu::BrainGpu, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::time::Instant;
 
 // Headless has no window — fixed extent so seeds reproduce identically across
@@ -38,6 +40,35 @@ use std::time::Instant;
 // SmellField/Pheromone zůstávají 2D (xy projekce); plné volumetric 3D pole
 // je odložené.
 const WORLD_HALF: [f32; 3] = [960.0, 540.0, 2.0];
+
+/// Sprint 48: versioned binary header pro checkpoint files.
+const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
+const CHECKPOINT_VERSION: u32 = 1;
+
+/// Sprint 48: serializovatelný snapshot sim state. Skip fields:
+/// - SpatialGrid (rebuild from cells/foods on load)
+/// - bench_timings (per-tick diagnostic, ne state)
+/// - GPU subsystémy (re-init on load)
+/// - scratch Vecs (re-alloc lazily)
+/// RNG state se NEUKLÁDÁ — load resetuje RNG ze --seed argument. Pro full
+/// reproducibility add chacha state serializace v pozdějším sprintu.
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    version: u32,
+    cells: Vec<Cell>,
+    foods: Vec<Food>,
+    clock: SimClock,
+    density_factor: f32,
+    smell: SmellField,
+    pheromone: SmellField,
+    map: WorldMap,
+    births_gen: u64,
+    deaths_gen: u64,
+    fertile_ticks_gen: u64,
+    predation_events_gen: u64,
+    mating_radius: f32,
+    max_population: usize,
+}
 
 /// Sprint 43: per-fáze accumulator (mikrosekundy). World::tick zvyšuje každou
 /// dobu a main je čte/resetuje per generation. Default je all-zero.
@@ -148,6 +179,80 @@ impl World {
             #[cfg(feature = "gpu")]
             gpu: None,
         }
+    }
+
+    /// Sprint 48: snapshot sim state do versioned binary blob. Format:
+    /// `MAGIC[8] | bincode(Checkpoint)`. Idempotent — caller může volat
+    /// průběžně i na konci.
+    fn save_checkpoint(&self, path: &Path) -> std::io::Result<()> {
+        let chk = Checkpoint {
+            version: CHECKPOINT_VERSION,
+            cells: self.cells.clone(),
+            foods: self.foods.clone(),
+            clock: self.clock,
+            density_factor: self.density_factor,
+            smell: self.smell.clone(),
+            pheromone: self.pheromone.clone(),
+            map: self.map.clone(),
+            births_gen: self.births_gen,
+            deaths_gen: self.deaths_gen,
+            fertile_ticks_gen: self.fertile_ticks_gen,
+            predation_events_gen: self.predation_events_gen,
+            mating_radius: self.mating_radius,
+            max_population: self.max_population,
+        };
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(CHECKPOINT_MAGIC)?;
+        bincode::serialize_into(&mut f, &chk)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    }
+
+    /// Sprint 48: rekonstrukce World z binary checkpointu. Magic + version
+    /// validace. RNG, grids, scratch a GPU se re-inicializují (NE z checkpointu).
+    fn load_checkpoint(path: &Path) -> std::io::Result<Self> {
+        let data = std::fs::read(path)?;
+        if data.len() < 8 || &data[..8] != CHECKPOINT_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad checkpoint magic",
+            ));
+        }
+        let chk: Checkpoint = bincode::deserialize(&data[8..])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if chk.version != CHECKPOINT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "checkpoint version {} expected {}",
+                    chk.version, CHECKPOINT_VERSION
+                ),
+            ));
+        }
+        Ok(Self {
+            cells: chk.cells,
+            foods: chk.foods,
+            clock: chk.clock,
+            density_factor: chk.density_factor,
+            smell: chk.smell,
+            pheromone: chk.pheromone,
+            map: chk.map,
+            cell_grid: SpatialGrid::new(GRID_CELL_SIZE),
+            food_grid: SpatialGrid::new(GRID_CELL_SIZE),
+            deltas_scratch: Vec::new(),
+            energy_deltas_scratch: Vec::new(),
+            damage_deltas_scratch: Vec::new(),
+            eaten_scratch: Vec::new(),
+            births_gen: chk.births_gen,
+            deaths_gen: chk.deaths_gen,
+            fertile_ticks_gen: chk.fertile_ticks_gen,
+            predation_events_gen: chk.predation_events_gen,
+            mating_radius: chk.mating_radius,
+            max_population: chk.max_population,
+            bench_timings: PhaseTimings::default(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
+        })
     }
 
     fn tick(&mut self, rng: &mut impl Rng) -> Option<u64> {
@@ -1045,6 +1150,14 @@ fn main() {
     // Sprint 44: `--gpu` flag (filtered před positional parsingem). Bez
     // `--features gpu` se flag tiše ignoruje.
     let want_gpu = raw_args.iter().any(|a| a == "--gpu");
+    // Sprint 48: `--save=PATH` / `--load=PATH` checkpoint flags. Form
+    // `--key=value` aby se PATH ne-leakoval do positional indexingu.
+    let save_path: Option<String> = raw_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--save=").map(|s| s.to_string()));
+    let load_path: Option<String> = raw_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--load=").map(|s| s.to_string()));
     let args: Vec<String> = raw_args
         .iter()
         .filter(|a| !a.starts_with("--"))
@@ -1090,7 +1203,27 @@ fn main() {
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut world = World::new(&mut rng, map_seed, mating_radius, initial_cells, max_population);
+    let mut world = if let Some(path) = load_path.as_ref() {
+        match World::load_checkpoint(Path::new(path)) {
+            Ok(w) => {
+                eprintln!(
+                    "checkpoint: loaded {} (cells={}, foods={}, gen={}, tick={})",
+                    path,
+                    w.cells.len(),
+                    w.foods.len(),
+                    w.clock.generation,
+                    w.clock.tick,
+                );
+                w
+            }
+            Err(e) => {
+                eprintln!("checkpoint: load failed ({e}); starting fresh");
+                World::new(&mut rng, map_seed, mating_radius, initial_cells, max_population)
+            }
+        }
+    } else {
+        World::new(&mut rng, map_seed, mating_radius, initial_cells, max_population)
+    };
 
     #[cfg(feature = "gpu")]
     if want_gpu {
@@ -1192,6 +1325,19 @@ fn main() {
         }
     }
     log.flush().unwrap();
+
+    if let Some(path) = save_path.as_ref() {
+        match world.save_checkpoint(Path::new(path)) {
+            Ok(()) => eprintln!(
+                "checkpoint: saved to {} (cells={}, gen={}, tick={})",
+                path,
+                world.cells.len(),
+                world.clock.generation,
+                world.clock.tick,
+            ),
+            Err(e) => eprintln!("checkpoint: save failed ({e})"),
+        }
+    }
 
     let elapsed = start.elapsed();
     let ticks_per_sec = world.clock.tick as f32 / elapsed.as_secs_f32().max(1e-3);
