@@ -40,7 +40,7 @@ use bioscape::{
     WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD, BRAIN_INPUTS,
 };
 #[cfg(feature = "gpu")]
-use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, GpuContext, HebbianGpu};
+use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu};
 use rand::Rng;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -156,6 +156,17 @@ struct GpuBrainState {
     brain: BrainGpu,
     hebbian: HebbianGpu,
     brownian: BrownianGpu,
+}
+
+/// Sprint 59: separate Resource pro GPU smell + pheromone fields. Oddělen od
+/// `GpuBrainState` aby `update_smell_field` (ResMut<GpuFieldState>) nesoutěžil
+/// s ostatními systemy o brain access. Insert v setup pokud GpuContext init
+/// uspěje; jinak CPU SmellResource path drží.
+#[cfg(feature = "gpu")]
+#[derive(Resource)]
+struct GpuFieldState {
+    smell: FieldGpu,
+    pheromone: FieldGpu,
 }
 
 /// Sprint 52: maps Bevy `Entity` ↔ slot index v `CellsGpu` SoA bufferech.
@@ -498,7 +509,12 @@ fn setup(
         // už slot drží do despawn — ale po Sprint 52 pattern se uvolňují
         // ihned na cell_dies; slack pokrývá race window).
         let cap = MAX_POPULATION + 64;
-        let init = || -> Result<GpuBrainState, String> {
+        // Sprint 59: FieldGpu sources capacity. Per-tick deposit count =
+        // foods (smell) + cells (pheromone). Upper bound přes density cycle peak.
+        let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
+        let field_sources_cap = (initial_food_target + cap) * 2;
+        let world_half = extent.as_array();
+        let init = || -> Result<(GpuBrainState, GpuFieldState), String> {
             let ctx = GpuContext::new()?;
             let cells = CellsGpu::with_context(&ctx, cap);
             cells.upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
@@ -508,15 +524,31 @@ fn setup(
             let brain = BrainGpu::with_context(&ctx, cap)?;
             let hebbian = HebbianGpu::with_context(&ctx, cap)?;
             let brownian = BrownianGpu::with_context(&ctx, cap)?;
-            Ok(GpuBrainState { cells, brain, hebbian, brownian })
+            let smell = FieldGpu::with_context(
+                &ctx,
+                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+                world_half,
+                field_sources_cap,
+            )?;
+            let pheromone = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                world_half,
+                field_sources_cap,
+            )?;
+            Ok((
+                GpuBrainState { cells, brain, hebbian, brownian },
+                GpuFieldState { smell, pheromone },
+            ))
         };
         match init() {
-            Ok(state) => {
+            Ok((brain_state, field_state)) => {
                 info!(
-                    "renderer-gpu: persistent brain weights + GPU Hebbian + GPU Brownian (cap {})",
-                    cap
+                    "renderer-gpu: persistent brain weights + Hebbian + Brownian + Field (cap {} cells, {} field sources)",
+                    cap, field_sources_cap
                 );
-                commands.insert_resource(state);
+                commands.insert_resource(brain_state);
+                commands.insert_resource(field_state);
             }
             Err(e) => {
                 warn!("renderer-gpu: init failed ({}); falling back to CPU compute", e);
@@ -825,11 +857,30 @@ fn update_smell_field(
     time: Res<Time>,
     foods: Query<&FoodEntity>,
     mut smell: ResMut<SmellResource>,
+    #[cfg(feature = "gpu")] gpu_field: Option<ResMut<GpuFieldState>>,
     mut diag: Diagnostics,
 ) {
     let t = Instant::now();
     let dt = time.delta_secs();
     diag.add_measurement(&DIAG_FOOD_COUNT, || foods.iter().count() as f64);
+
+    // Sprint 59: pokud GpuFieldState available, GPU deposit + diffuse, readback
+    // do CPU SmellResource pro sensor gather (gradient_at v cells_brain_act).
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu) = gpu_field {
+        for food in &foods {
+            gpu.smell.add_source(
+                [food.0.position[0], food.0.position[1], food.0.position[2]],
+                SMELL_PER_FOOD * dt,
+            );
+        }
+        gpu.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
+        let grid = gpu.smell.download();
+        smell.0.replace_grid_from(&grid);
+        diag.add_measurement(&DIAG_SMELL, || t.elapsed().as_secs_f64() * 1000.0);
+        return;
+    }
+
     for food in &foods {
         smell
             .0
@@ -842,6 +893,7 @@ fn update_smell_field(
 fn update_pheromone_field(
     time: Res<Time>,
     mut pheromone: ResMut<PheromoneResource>,
+    #[cfg(feature = "gpu")] gpu_field: Option<ResMut<GpuFieldState>>,
     mut diag: Diagnostics,
 ) {
     // Diffuse + decay BEFORE this tick's emissions (in emit_pheromones, which
@@ -849,6 +901,17 @@ fn update_pheromone_field(
     // ze stavu pole na konci minulého ticku, žádný self-feedback.
     let t = Instant::now();
     let dt = time.delta_secs();
+
+    // Sprint 59: GPU step + readback pokud field state available.
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu) = gpu_field {
+        gpu.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+        let grid = gpu.pheromone.download();
+        pheromone.0.replace_grid_from(&grid);
+        diag.add_measurement(&DIAG_PHEROMONE, || t.elapsed().as_secs_f64() * 1000.0);
+        return;
+    }
+
     pheromone.0.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
     diag.add_measurement(&DIAG_PHEROMONE, || t.elapsed().as_secs_f64() * 1000.0);
 }
@@ -856,9 +919,29 @@ fn update_pheromone_field(
 fn emit_pheromones(
     time: Res<Time>,
     mut pheromone: ResMut<PheromoneResource>,
+    #[cfg(feature = "gpu")] gpu_field: Option<ResMut<GpuFieldState>>,
     mut cells: Query<&mut CellEntity, Without<Dying>>,
 ) {
     let dt = time.delta_secs();
+
+    // Sprint 59: deposit do GPU pending_sources (flushed v dalším ticku
+    // update_pheromone_field step). CPU pheromone.grid není updated — sensor
+    // gather už proběhl s pre-emission stavem.
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu) = gpu_field {
+        for mut cell in &mut cells {
+            let mod_strength = cell.0.last_outputs[2].max(0.0);
+            let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+            let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+            gpu.pheromone.add_source(
+                [cell.0.position[0], cell.0.position[1], cell.0.position[2]],
+                rate * dt,
+            );
+            cell.0.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+        }
+        return;
+    }
+
     for mut cell in &mut cells {
         let mod_strength = cell.0.last_outputs[2].max(0.0);
         let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;

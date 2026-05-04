@@ -642,11 +642,119 @@ plně 3D s 7-point Jacobi diffusion.
     - `SpatialGrid` `FxHashMap` → dense `Vec` (Sprint 57 deferred).
     - 3D voxel rendering, ghost cell visual wrap.
 
-## Sprinty 59–62 — open-ended
+## Sprint 59 — GPU FieldGpu hot-path wire-up
 
-- **Sprint 59+:** GPU FieldGpu/SensorGather hot-path wire-up, případně
-  `SpatialGrid` dense Vec layout (žádný hash).
-- **Sprint 59+:** 3D voxel rendering, ghost cell visual wrap.
-- **Sprint 60+:** progressive z expansion (z=30, z=50).
-- **Sprint 61+:** thermal stratification (temperature field z-gradient).
-- **Sprint 62+:** light field z-attenuation (photic vs aphotic zones).
+- **Cíl:** dokončit Sprint 56 deferred item — `FieldGpu` (3D 7-point Jacobi)
+  zapojen do `--gpu-full` headless a renderer GPU default hot path. Smell +
+  pheromone fields běží na GPU; CPU `SmellField` slouží jako shadow buffer
+  pro sensor gather (`gradient_at`, `sample`) — Sprint 60+ rewire sensor
+  gather na `SensorGatherGpu` čte direct GPU storage buffer, eliminuje
+  per-tick readback.
+
+  **Plán implementace:**
+
+  *Body 1 — `SmellField::replace_grid_from(&[f32])`:*
+  - Pub setter co `copy_from_slice` na private `grid` Vec. Volá GPU readback
+    path po každém `step()`. Žádná validace mimo `debug_assert_eq!` na délku
+    — caller (Sprint 59 wire) zajišťuje `[res_x × res_y × res_z]` match.
+
+  *Body 2 — Headless `GpuFullState`:*
+  - `smell: FieldGpu` + `pheromone: FieldGpu` přidány do struct.
+  - Init capacity per FieldGpu: `(food_target(peak_density) + max_population) × 2`
+    (worst case: density cycle peak → food count + cells co emit pheromones,
+    × 2 safety pro auto-realloc trigger margin). Sdílí GpuContext s
+    BrainGpu/CellsGpu/HebbianGpu/BrownianGpu (Sprint 47 pattern).
+  - `update_smell` GPU path: foods loop `gpu.smell.add_source(pos, amount)` →
+    `gpu.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt)` → `gpu.smell.download()`
+    → `self.smell.replace_grid_from(&grid)`. CPU SmellField shadow je sync.
+  - `update_pheromone` GPU path: `gpu.pheromone.step()` → readback. Žádný
+    deposit zde; emise z předchozího ticku se flushují přes `pending_sources`
+    bufferu.
+  - `emit_pheromones` GPU path: cells loop `gpu.pheromone.add_source(pos, rate*dt)`.
+    Sources se akumulují do `pending_sources`, deposit shader spustí v dalším
+    ticku `update_pheromone` — match Sprint 38 "diffuse before emit" semantiku
+    (žádný self-feedback).
+
+  *Body 3 — Renderer `GpuFieldState` Resource:*
+  - Separate Bevy Resource od `GpuBrainState` aby `update_smell_field`
+    (ResMut<GpuFieldState>) nezpůsobil schedule contention s ostatními
+    systémy přistupujícími na brain GPU.
+  - Setup init mirroruje headless: `food_target(extent, peak_density)` +
+    `MAX_POPULATION` × 2. Insert Resource pokud GpuContext OK, jinak
+    Resource None a CPU SmellResource path drží.
+  - 3 systems updated: `update_smell_field` / `update_pheromone_field` /
+    `emit_pheromones` přijímají `Option<ResMut<GpuFieldState>>` a větví na
+    GPU vs CPU path. CPU SmellResource se vždy plní (přímo nebo přes readback)
+    — sensor gather (`cells_brain_act`) zůstává CPU `gradient_at` nezměněn.
+
+- **Konstanty:** žádné nové. Field sources capacity je derived `food_target ×
+  density_peak + MAX_POPULATION` × 2.
+
+- **Výstup:**
+  - `src/lib.rs`: `SmellField::replace_grid_from(&[f32])` setter.
+  - `src/bin/headless.rs`: `GpuFullState` rozšířen o `smell + pheromone`
+    `FieldGpu`. 3 hot path systems větví na GPU. Init log oznámí
+    `field sources capacity`.
+  - `src/main.rs`: `GpuFieldState` Resource. Setup init creates + inserts.
+    3 hot path systems větví na GPU.
+  - **Test suite: 73/73 pass** (jeden flaky `random_brain_average_thrust_is_positive`
+    — Sprint 57 dokumentovaný, prošel re-runem; ne-Sprint-59 issue).
+  - **Smoke seed=0, 60 gen, 1000 cells, default world s `--gpu-full`:**
+    - **Wall-clock 104 s = 345 ticks/s** (vs Sprint 58 CPU-only 977 ticks/s
+      = **2.8× POMALEJŠÍ**).
+    - Per-fáze us avg: update_smell 423 (CPU 211, GPU 2.0× pomalejší),
+      update_pheromone 377 (CPU 73, 5.2×), brain_act 967 (CPU 333, 2.9×),
+      apply_brownian 240 (CPU 26, 9.2×), reproduce 464 (CPU 24, 19×).
+      **Hlavní viník: per-tick `device.poll(Wait)` round-trip × N readback
+      pointů.** Field readback × 2/tick + brain hidden/outputs/velocities
+      readback se sečtou.
+    - Pop final 499 (vs CPU 572, –13 % drift). Trajektorie qualitativně
+      stejná (pop saturate na MAX_POPULATION → steady-state ~500), žádná
+      extinkce. Atomic CAS deposit drift v noise rangi pro evoluci.
+  - **Renderer launch:** `cargo run --release` startuje, info log oznámí
+    "renderer-gpu: ... + Field (cap N cells, M field sources)", žádný
+    panic. 8s SIGTERM exit clean.
+
+- **Poznámky:**
+  - **GPU verze je per-tick POMALEJŠÍ než CPU paralelní path.** Smoke ukazuje
+    345 ticks/s s `--gpu-full` vs 977 ticks/s pure CPU (Sprint 57+58
+    paralelní stencil + FxHashMap + eat_food refactor). Důvod: per-tick
+    `device.poll(Wait)` round-trip × N readback pointů (smell + pheromone
+    field × 2/tick + hidden + outputs + velocities z brain/brownian).
+    PCIe latence dominuje; bandwidth (~60 MB/s) je pod limity. Pro grid
+    64×64×16 je CPU paralelní stencil (16 z-rovin × 12 cores) přímý win.
+    GPU má smysl při bigger grid (256³+) nebo full-GPU loop bez per-tick
+    readback (cíl Sprint 60).
+  - **Atomic CAS deposit drift:** Sprint 56 dokumentuje že GPU deposit
+    používá `bitcast<u32>` ↔ `bitcast<f32>` CAS loop (Naga storage pointer
+    omezení). Pořadí přídavků je non-deterministické per-thread → ULP-level
+    drift na grid hodnotách. Pro evolution sim trajectory je drift v noise
+    rangi (1e-3 absolute < 1% smell field max amplitude = ~1.0).
+  - **CPU SmellField shadow:** sensor gather zůstává CPU (`gradient_at`
+    central-differences sample). Readback po každém step() znamená že
+    CPU shadow je vždy current pre-emit. Sprint 60 cíl: SensorGatherGpu
+    čte field z GPU storage buffer přes `current_grid_buffer()`,
+    eliminuje per-tick readback.
+  - **CPU fallback:** pokud GpuContext init selže (no Vulkan/Metal/DX),
+    headless `gpu_full = None` + renderer `GpuFieldState` Resource neexistuje.
+    `Option<ResMut<>>` v systému None → CPU SmellResource path. Žádný
+    runtime overhead pokud GPU není.
+  - **Co Sprint 59 NEŘEŠÍ (Sprint 60+):**
+    - SensorGatherGpu wire-up: sensor gather zůstává CPU. Sprint 56 SensorGatherGpu
+      output stride 15 (3D gradients) je ready, ale wire-up znamená i
+      `SensorRow` snapshot upload + `apply_brain_motor` motor refactor.
+    - GPU full tick pipeline (no per-tick readback): cílí Sprint 60+. 
+      SensorGatherGpu může číst FieldGpu storage buffer direct (Sprint 50
+      `current_grid_buffer()` accessor existuje), eliminuje smell+pheromone
+      readback × 2/tick.
+    - Renderer `world_map_image` overlay update (CPU SmellField changes
+      reflektují v atlas image). Aktuální readback flow zachová overlay
+      funkcionalitu.
+
+## Sprinty 60–62 — open-ended
+
+- **Sprint 60+:** SensorGatherGpu wire-up + GPU full tick pipeline (no
+  per-tick CPU readback pro fields).
+- **Sprint 60+:** 3D voxel rendering, ghost cell visual wrap.
+- **Sprint 61+:** progressive z expansion (z=30, z=50).
+- **Sprint 62+:** thermal stratification (temperature field z-gradient).

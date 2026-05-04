@@ -23,7 +23,7 @@ use bioscape::{
 };
 #[cfg(feature = "gpu")]
 use bioscape::{
-    gpu::{BrainGpu, BrownianGpu, CellsGpu, GpuContext, HebbianGpu},
+    gpu::{BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu},
     BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS,
 };
 use rand::rngs::StdRng;
@@ -141,6 +141,13 @@ struct GpuFullState {
     brain: BrainGpu,
     hebbian: HebbianGpu,
     brownian: BrownianGpu,
+    /// Sprint 59: GPU smell + pheromone field (3D 7-point Jacobi). Per tick:
+    /// `add_source` deposit (foods/cells), `step()` dispatch (deposit + diffuse
+    /// shadery), `download()` readback do CPU `SmellField.grid` shadow pro CPU
+    /// sensor gather (gradient_at). Atomic CAS deposit drift acceptable
+    /// (Sprint 56: 1e-3 absolute tolerance).
+    smell: FieldGpu,
+    pheromone: FieldGpu,
 }
 
 impl World {
@@ -372,6 +379,21 @@ impl World {
     }
 
     fn update_smell(&mut self, dt: f32) {
+        // Sprint 59: pokud --gpu-full, deposit + diffuse na GPU. Readback
+        // do CPU SmellField.grid pro sensor gather (gradient_at).
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_full.as_mut() {
+            for food in &self.foods {
+                gpu.smell.add_source(
+                    [food.position[0], food.position[1], food.position[2]],
+                    SMELL_PER_FOOD * dt,
+                );
+            }
+            gpu.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
+            let grid = gpu.smell.download();
+            self.smell.replace_grid_from(&grid);
+            return;
+        }
         for food in &self.foods {
             self.smell
                 .add_source([food.position[0], food.position[1], food.position[2]], SMELL_PER_FOOD * dt);
@@ -384,10 +406,36 @@ impl World {
         // emit_pheromones, called after brain_act). Cells thus read the
         // gradient ze stavu pole na předchozí tick — prevents instant
         // self-feedback (cell vidí svůj vlastní právě emitovaný puff).
+        // Sprint 59: GPU step + readback pokud --gpu-full.
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_full.as_mut() {
+            gpu.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+            let grid = gpu.pheromone.download();
+            self.pheromone.replace_grid_from(&grid);
+            return;
+        }
         self.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
     }
 
     fn emit_pheromones(&mut self, dt: f32) {
+        // Sprint 59: pokud --gpu-full, deposit do GPU pending_sources (flushed
+        // at next tick's update_pheromone step()). CPU pheromone.grid není
+        // updated — sensor gather už proběhl s pre-emission state (Sprint 38
+        // semantika "no self-feedback within tick").
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_full.as_mut() {
+            for cell in &mut self.cells {
+                let mod_strength = cell.last_outputs[2].max(0.0);
+                let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+                let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+                gpu.pheromone.add_source(
+                    [cell.position[0], cell.position[1], cell.position[2]],
+                    rate * dt,
+                );
+                cell.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+            }
+            return;
+        }
         for cell in &mut self.cells {
             let mod_strength = cell.last_outputs[2].max(0.0);
             let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
@@ -1537,6 +1585,10 @@ fn main() {
     #[cfg(feature = "gpu")]
     if want_gpu_full {
         let cap = initial_cells.max(max_population).max(64);
+        // Sprint 59: FieldGpu sources capacity. Per-tick deposit count =
+        // foods (smell) + cells (pheromone). food_target může bumpnout přes
+        // density cycles (CYCLE_AMPLITUDE), s safety margin × 2.
+        let field_sources_cap = (food_target(1.0 + CYCLE_AMPLITUDE) + max_population) * 2;
         let init = || -> Result<GpuFullState, String> {
             let ctx = GpuContext::new()?;
             let cells_gpu = CellsGpu::with_context(&ctx, cap);
@@ -1547,18 +1599,33 @@ fn main() {
             let brain = BrainGpu::with_context(&ctx, cap)?;
             let hebbian = HebbianGpu::with_context(&ctx, cap)?;
             let brownian = BrownianGpu::with_context(&ctx, cap)?;
+            // Sprint 59: smell + pheromone FieldGpu instances, sdílí GpuContext.
+            let smell = FieldGpu::with_context(
+                &ctx,
+                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+                WORLD_HALF,
+                field_sources_cap,
+            )?;
+            let pheromone = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                WORLD_HALF,
+                field_sources_cap,
+            )?;
             Ok(GpuFullState {
                 cells: cells_gpu,
                 brain,
                 hebbian,
                 brownian,
+                smell,
+                pheromone,
             })
         };
         match init() {
             Ok(state) => {
                 eprintln!(
-                    "gpu-full: persistent brain weights + GPU Hebbian + GPU Brownian (capacity {})",
-                    cap
+                    "gpu-full: persistent brain weights + GPU Hebbian + GPU Brownian + GPU Field (capacity {} cells, {} field sources)",
+                    cap, field_sources_cap
                 );
                 world.gpu_full = Some(state);
             }

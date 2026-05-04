@@ -1460,6 +1460,14 @@ impl SmellField {
         &self.grid
     }
 
+    /// Sprint 59: replace grid contents from external source (GPU readback).
+    /// Used for FieldGpu wire-up — GPU computes diffuse+deposit, downloads
+    /// snapshot, CPU SmellField holds it pro sensor gather (`gradient_at` + `sample`).
+    pub fn replace_grid_from(&mut self, data: &[f32]) {
+        debug_assert_eq!(data.len(), self.grid.len());
+        self.grid.copy_from_slice(data);
+    }
+
     /// 3D central differences at `pos ± epsilon` along each axis. Returns
     /// `[d/dx, d/dy, d/dz]`. Out-of-bounds samples count as 0.
     pub fn gradient_at(&self, pos: [f32; 3], epsilon: f32) -> [f32; 3] {
