@@ -1517,6 +1517,14 @@ pub struct CellsGpu {
     damage_accum_buf: wgpu::Buffer,
     max_speed_buf: wgpu::Buffer,
     eff_radius_buf: wgpu::Buffer,
+    /// Sprint 62: motor on GPU — turn_rate per-cell konstanta (genome),
+    /// angular/pitch velocities mutated by motor shader.
+    turn_rate_buf: wgpu::Buffer,
+    angular_velocity_buf: wgpu::Buffer,
+    pitch_velocity_buf: wgpu::Buffer,
+    /// Sprint 62: motor batch readback. velocity_rb už existuje (Sprint 51).
+    angular_velocity_rb: wgpu::Buffer,
+    pitch_velocity_rb: wgpu::Buffer,
     last_hidden_rb: wgpu::Buffer,
     last_outputs_rb: wgpu::Buffer,
     velocities_rb: wgpu::Buffer,
@@ -1569,6 +1577,12 @@ impl CellsGpu {
         let damage_accum_buf = mk("cells-damage", n * f, stor_dst_src);
         let max_speed_buf = mk("cells-max-speed", n * f, stor_dst_src);
         let eff_radius_buf = mk("cells-eff-radius", n * f, stor_dst_src);
+        // Sprint 62: motor shader buffers.
+        let turn_rate_buf = mk("cells-turn-rate", n * f, stor_dst_src);
+        let angular_velocity_buf = mk("cells-ang-vel", n * f, stor_dst_src);
+        let pitch_velocity_buf = mk("cells-pitch-vel", n * f, stor_dst_src);
+        let angular_velocity_rb = mk("cells-ang-vel-rb", n * f, read);
+        let pitch_velocity_rb = mk("cells-pitch-vel-rb", n * f, read);
         let last_hidden_rb = mk("cells-hidden-rb", n * (BRAIN_HIDDEN as u64) * f, read);
         let last_outputs_rb = mk("cells-outputs-rb", n * (BRAIN_OUTPUTS as u64) * f, read);
         let velocities_rb = mk("cells-velocities-rb", n * 3 * f, read);
@@ -1601,6 +1615,11 @@ impl CellsGpu {
             damage_accum_buf,
             max_speed_buf,
             eff_radius_buf,
+            turn_rate_buf,
+            angular_velocity_buf,
+            pitch_velocity_buf,
+            angular_velocity_rb,
+            pitch_velocity_rb,
             last_hidden_rb,
             last_outputs_rb,
             velocities_rb,
@@ -1628,6 +1647,157 @@ impl CellsGpu {
     pub fn damage_accum_buffer(&self) -> &wgpu::Buffer { &self.damage_accum_buf }
     pub fn max_speed_buffer(&self) -> &wgpu::Buffer { &self.max_speed_buf }
     pub fn eff_radius_buffer(&self) -> &wgpu::Buffer { &self.eff_radius_buf }
+    /// Sprint 62: motor shader buffery (turn_rate read, angular/pitch velocities rw).
+    pub fn turn_rate_buffer(&self) -> &wgpu::Buffer { &self.turn_rate_buf }
+    pub fn angular_velocity_buffer(&self) -> &wgpu::Buffer { &self.angular_velocity_buf }
+    pub fn pitch_velocity_buffer(&self) -> &wgpu::Buffer { &self.pitch_velocity_buf }
+
+    /// Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim init +
+    /// při reproduce (sparse). Sprint 61 `upload_metadata` je per-tick mutable
+    /// (energy/heading/pitch/damage/max_speed/eff_radius).
+    pub fn upload_turn_rates(&self, turn_rates: &[f32]) {
+        self.queue.write_buffer(&self.turn_rate_buf, 0, bytemuck::cast_slice(turn_rates));
+    }
+
+    /// Sprint 62: upload current angular + pitch velocity (Cell::angular_velocity,
+    /// Cell::pitch_velocity). Volá se před brain_act_gpu_full.
+    pub fn upload_angular_pitch(&self, angular: &[f32], pitches: &[f32]) {
+        debug_assert_eq!(angular.len(), pitches.len());
+        self.queue.write_buffer(&self.angular_velocity_buf, 0, bytemuck::cast_slice(angular));
+        self.queue.write_buffer(&self.pitch_velocity_buf, 0, bytemuck::cast_slice(pitches));
+    }
+
+    /// Sprint 62: batch readback motor results (velocities + angular + pitch).
+    /// Single Wait barrier místo 3× separate downloads. Volá se po motor +
+    /// brownian dispatch v brain_act_gpu_full.
+    pub fn download_motor_state(
+        &self,
+        n: usize,
+    ) -> (Vec<[f32; 3]>, Vec<f32>, Vec<f32>) {
+        if n == 0 {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        assert!(n <= self.capacity);
+        let v_bytes = (n * 3 * 4) as u64;
+        let a_bytes = (n * 4) as u64;
+        let p_bytes = (n * 4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-download-motor"),
+        });
+        encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_rb, 0, v_bytes);
+        encoder.copy_buffer_to_buffer(&self.angular_velocity_buf, 0, &self.angular_velocity_rb, 0, a_bytes);
+        encoder.copy_buffer_to_buffer(&self.pitch_velocity_buf, 0, &self.pitch_velocity_rb, 0, p_bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let v_s = self.velocities_rb.slice(0..v_bytes);
+        let a_s = self.angular_velocity_rb.slice(0..a_bytes);
+        let p_s = self.pitch_velocity_rb.slice(0..p_bytes);
+        v_s.map_async(wgpu::MapMode::Read, |_| {});
+        a_s.map_async(wgpu::MapMode::Read, |_| {});
+        p_s.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let v_data = v_s.get_mapped_range();
+        let a_data = a_s.get_mapped_range();
+        let p_data = p_s.get_mapped_range();
+        let v_f: &[f32] = bytemuck::cast_slice(&v_data);
+        let a_f: &[f32] = bytemuck::cast_slice(&a_data);
+        let p_f: &[f32] = bytemuck::cast_slice(&p_data);
+        let velocities: Vec<[f32; 3]> = (0..n)
+            .map(|i| [v_f[i * 3], v_f[i * 3 + 1], v_f[i * 3 + 2]])
+            .collect();
+        let angular: Vec<f32> = a_f[..n].to_vec();
+        let pitch_vels: Vec<f32> = p_f[..n].to_vec();
+        drop(v_data);
+        drop(a_data);
+        drop(p_data);
+        self.velocities_rb.unmap();
+        self.angular_velocity_rb.unmap();
+        self.pitch_velocity_rb.unmap();
+        (velocities, angular, pitch_vels)
+    }
+
+    /// Sprint 62: combined batch readback hidden + outputs + motor state v
+    /// jediném Wait barrier. Volá se na konci brain_act_gpu_full po
+    /// brain.forward + motor.dispatch + brownian.dispatch sequence.
+    pub fn download_brain_motor_batch(
+        &self,
+        n: usize,
+    ) -> (
+        Vec<[f32; BRAIN_HIDDEN]>,
+        Vec<[f32; BRAIN_OUTPUTS]>,
+        Vec<[f32; 3]>,
+        Vec<f32>,
+        Vec<f32>,
+    ) {
+        if n == 0 {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        assert!(n <= self.capacity);
+        let h_bytes = (n * BRAIN_HIDDEN * 4) as u64;
+        let o_bytes = (n * BRAIN_OUTPUTS * 4) as u64;
+        let v_bytes = (n * 3 * 4) as u64;
+        let a_bytes = (n * 4) as u64;
+        let p_bytes = (n * 4) as u64;
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-download-batch"),
+        });
+        encoder.copy_buffer_to_buffer(&self.last_hidden_buf, 0, &self.last_hidden_rb, 0, h_bytes);
+        encoder.copy_buffer_to_buffer(&self.last_outputs_buf, 0, &self.last_outputs_rb, 0, o_bytes);
+        encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_rb, 0, v_bytes);
+        encoder.copy_buffer_to_buffer(&self.angular_velocity_buf, 0, &self.angular_velocity_rb, 0, a_bytes);
+        encoder.copy_buffer_to_buffer(&self.pitch_velocity_buf, 0, &self.pitch_velocity_rb, 0, p_bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let h_s = self.last_hidden_rb.slice(0..h_bytes);
+        let o_s = self.last_outputs_rb.slice(0..o_bytes);
+        let v_s = self.velocities_rb.slice(0..v_bytes);
+        let a_s = self.angular_velocity_rb.slice(0..a_bytes);
+        let p_s = self.pitch_velocity_rb.slice(0..p_bytes);
+        h_s.map_async(wgpu::MapMode::Read, |_| {});
+        o_s.map_async(wgpu::MapMode::Read, |_| {});
+        v_s.map_async(wgpu::MapMode::Read, |_| {});
+        a_s.map_async(wgpu::MapMode::Read, |_| {});
+        p_s.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let h_data = h_s.get_mapped_range();
+        let o_data = o_s.get_mapped_range();
+        let v_data = v_s.get_mapped_range();
+        let a_data = a_s.get_mapped_range();
+        let p_data = p_s.get_mapped_range();
+        let h_f: &[f32] = bytemuck::cast_slice(&h_data);
+        let o_f: &[f32] = bytemuck::cast_slice(&o_data);
+        let v_f: &[f32] = bytemuck::cast_slice(&v_data);
+        let a_f: &[f32] = bytemuck::cast_slice(&a_data);
+        let p_f: &[f32] = bytemuck::cast_slice(&p_data);
+        let hidden: Vec<[f32; BRAIN_HIDDEN]> = (0..n)
+            .map(|i| {
+                let mut a = [0.0_f32; BRAIN_HIDDEN];
+                a.copy_from_slice(&h_f[i * BRAIN_HIDDEN..(i + 1) * BRAIN_HIDDEN]);
+                a
+            })
+            .collect();
+        let outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
+            .map(|i| {
+                let mut a = [0.0_f32; BRAIN_OUTPUTS];
+                a.copy_from_slice(&o_f[i * BRAIN_OUTPUTS..(i + 1) * BRAIN_OUTPUTS]);
+                a
+            })
+            .collect();
+        let velocities: Vec<[f32; 3]> = (0..n)
+            .map(|i| [v_f[i * 3], v_f[i * 3 + 1], v_f[i * 3 + 2]])
+            .collect();
+        let angular: Vec<f32> = a_f[..n].to_vec();
+        let pitch_vels: Vec<f32> = p_f[..n].to_vec();
+        drop(h_data);
+        drop(o_data);
+        drop(v_data);
+        drop(a_data);
+        drop(p_data);
+        self.last_hidden_rb.unmap();
+        self.last_outputs_rb.unmap();
+        self.velocities_rb.unmap();
+        self.angular_velocity_rb.unmap();
+        self.pitch_velocity_rb.unmap();
+        (hidden, outputs, velocities, angular, pitch_vels)
+    }
 
     /// Sprint 61: bulk upload metadata pro populate_inputs shader. Sloučeno
     /// do jediného call pro jasnost — všechna pole jsou per-cell f32.
@@ -2460,11 +2630,11 @@ impl HebbianGpu {
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
-struct MotorParams {
-    num_cells: u32,
-    dt: f32,
-    drag_coefficient: f32,
-    _pad0: u32,
+pub struct MotorParams {
+    pub num_cells: u32,
+    pub dt: f32,
+    pub drag_coefficient: f32,
+    pub _pad0: u32,
 }
 
 pub struct MotorGpu {
@@ -2738,6 +2908,63 @@ impl MotorGpu {
         self.angular_readback.unmap();
         self.pitch_vel_readback.unmap();
         (velocities, angular, pitch_vel)
+    }
+
+    /// Sprint 62: persistent variant — bind CellsGpu shared buffery (last_outputs,
+    /// heading, pitch, max_speed, turn_rate, eff_radius, velocity, angular_velocity,
+    /// pitch_velocity) místo own duplicates. Brain forward už zapsal last_outputs,
+    /// motor čte direct + mutuje velocity buffers in-place. No readback — output
+    /// stays GPU-side pro chained brownian / batch readback v hot loop.
+    pub fn dispatch_with_cells(
+        &mut self,
+        cells: &CellsGpu,
+        num_cells: usize,
+        dt: f32,
+        drag_coefficient: f32,
+    ) {
+        if num_cells == 0 {
+            return;
+        }
+        let params = MotorParams {
+            num_cells: num_cells as u32,
+            dt,
+            drag_coefficient,
+            _pad0: 0,
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        // Per-call bind group s cells accessory (vlastní bind_group field je
+        // pre-Sprint-62 standalone, drží MotorGpu duplicate buffery).
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("motor-bg-cells"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells.last_outputs_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cells.heading_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells.pitch_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cells.max_speed_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cells.turn_rate_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: cells.eff_radius_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: cells.velocities_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: cells.angular_velocity_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: cells.pitch_velocity_buffer().as_entire_binding() },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("motor-dispatch-cells-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("motor-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (num_cells as u32 + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 }
 

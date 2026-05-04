@@ -1004,11 +1004,104 @@ plně 3D s 7-point Jacobi diffusion.
       stack profitabilita roste s N — 5k+ cells je expected break-even
       vs CPU baseline.
 
-## Sprinty 62 — open-ended
+## Sprint 62 — motor + brownian fuze (single Wait barrier)
 
-- **Sprint 62+:** Motor on GPU (`motor.wgsl` wire) → eliminate round-trip
-  #2. Plus full GPU step/eat/predate/collision Sprint 63+.
-- **Sprint 62+:** Renderer GPU populate_inputs.
-- **Sprint 62+:** Bigger workload benchmark (5k–10k cells, larger grid).
-- **Sprint 62+:** 3D voxel rendering, ghost cell visual wrap.
-- **Sprint 62+:** progressive z expansion (z=30, z=50).
+- **Cíl:** eliminovat round-trip #2 (hidden+outputs 96 KB) i round-trip #3
+  (velocities 12 KB) sloučením motor + brownian dispatch s brain forward
+  do jedinné GPU pipeline. Single batch readback `download_brain_motor_batch`
+  na konci brain_act_gpu_full = 1 `device.poll(Wait)` per tick (vs Sprint 61 2×).
+  `apply_brownian` fáze v `--gpu-full` se stává no-op (work fused).
+
+  **Plán implementace:**
+
+  *Body 1 — `CellsGpu` motor buffery:*
+  - Add `turn_rate_buf`, `angular_velocity_buf`, `pitch_velocity_buf` +
+    readback variants. Plus accessory + `upload_turn_rates` /
+    `upload_angular_pitch` helpers.
+
+  *Body 2 — `MotorGpu::dispatch_with_cells`:*
+  - Variant of `compute()` co bind `&CellsGpu` shared buffery (last_outputs,
+    heading, pitch, max_speed, turn_rate, eff_radius, velocity, ang_vel,
+    pitch_vel) místo own duplicate buffers. Shader (Sprint 50 `motor.wgsl`)
+    beze změny — mirror lib::Cell::apply_brain_motor 1:1.
+
+  *Body 3 — `CellsGpu::download_brain_motor_batch`:*
+  - Single Wait barrier readback 5 buffers: hidden, outputs, velocity,
+    angular_vel, pitch_vel. 5× `copy_buffer_to_buffer` + 5× `map_async` +
+    1× `device.poll(Wait)`. Total bytes ~110 KB/tick.
+
+  *Body 4 — `brain_act_gpu_full` 10-fáze refactor:*
+  - Phase 7-8: motor.dispatch_with_cells + brownian.compute_persistent
+    fused (sequential dispatches, no Wait between). Brownian už používá
+    CellsGpu.velocities_buffer direct (Sprint 51).
+  - Phase 9: download_brain_motor_batch (single Wait).
+  - Phase 10: CPU writeback all 5 vec do cell state. NO `apply_brain_motor`
+    (motor byl GPU-side). damage_accum reset.
+
+  *Body 5 — `apply_brownian` fáze skip v `--gpu-full`:*
+  - Pokud `gpu_full.is_some()`, fáze early-return (work proběhl v brain_act
+    Phase 8). `apply_brownian_gpu` standalone metoda zachována jako
+    `#[allow(dead_code)]` pro Sprint 63+ test path.
+
+  *Body 6 — Per-tick `upload_turn_rates`:*
+  - Reproduce mění turn_rate u nových childů. Per-tick refresh (~4 KB/tick)
+    je safer než per-event sparse update; negligible bandwidth.
+
+- **Konstanty:** žádné nové. Re-export `DRAG_COEFFICIENT` + `THERMAL_NOISE`
+  z lib.
+
+- **Výstup:**
+  - `src/gpu.rs`:
+    - `CellsGpu` rozšířen o 5 buffers (turn_rate, ang_vel, pitch_vel,
+      ang_vel_rb, pitch_vel_rb) + accessory + 2 upload helpers + 2 download
+      helpers (`download_motor_state`, `download_brain_motor_batch`).
+    - `MotorGpu::dispatch_with_cells` variant. `MotorParams` pub.
+  - `src/bin/headless.rs`:
+    - `GpuFullState` přidává `motor: MotorGpu`. Init uploaduje turn_rates
+      jednou, brain_act_gpu_full uploaduje per tick (lazy).
+    - `brain_act_gpu_full` 10-fáze pipeline: motor + brownian fused, single
+      batch readback.
+    - `apply_brownian` early-return v `--gpu-full`.
+  - **Test suite: 73/73 pass**.
+  - **Smoke seed=0, 60 gen, 1000 cells, default world s `--gpu-full`:**
+    - **Wall-clock 133 s = 270 ticks/s** (Sprint 61 265, +1.9 %; Sprint 58
+      CPU 977 = stále **3.6× slower**).
+    - Per-fáze us avg: brain_act 3463 (Sprint 61 3341, +122),
+      apply_brownian 0.05 (Sprint 61 142, –142, fused ✓).
+      **Combined brain+brownian: 3463 vs 3483 (Sprint 61) = -20 µs net.**
+    - Pop final 487 (Sprint 61 548, CPU 572) — drift v rangi předchozí
+      atomic CAS noise; žádná extinkce.
+
+- **Závěr Sprint 60-62 série:**
+
+  | Sprint | --gpu-full ticks/s | vs CPU 977 |
+  |--------|-------------------|------------|
+  | 59 (field-GPU + readback) | 345 | -65 % |
+  | 60 (sensor-GPU) | 222 | -77 % |
+  | 61 (populate-GPU, no sensor RT) | 265 | -73 % |
+  | **62 (motor + brownian fused, 1 RT/tick)** | **270** | **-72 %** |
+
+  GPU full pipeline pro 1000 cells / 64×64×16 grid je **fundamentálně
+  net-negative**. Per-dispatch overhead (~50-200 µs `device.poll` round-trip
+  + per-encoder submit cost) dominuje sub-millisecond CPU work (Sprint 57+58
+  paralelní baseline). 5+ GPU dispatches/tick v brain_act fázi (spatial_hash×2,
+  sensor, populate, brain, motor, brownian) sčítají do ~600-1200 µs jen na
+  dispatch overhead. CPU paralelní cesta nemá tento per-call overhead — jen
+  rayon spawn (~5 µs) + L1 cache friendly access.
+
+  **GPU win se objeví při bigger workload** — per-cell GPU compute time
+  roste lineárně s N, ale per-dispatch overhead je fixed. Break-even
+  očekáván 5k–10k cells. Sprint 63+ benchmark verifikuje.
+
+- **Poznámky:**
+  - **Round-trip status po Sprint 62: 1 `device.poll(Wait)` per tick** —
+    minimum dosažitelný bez full-GPU sim loop (eat_food / predate /
+    collisions / step na CPU stále vyžadují readback positions/energy).
+  - **Sprint 63+ kandidáti:**
+    - GPU step/eat/predate/collision (Sprint 50 standalone shadery wire).
+      Plný GPU loop = 0 RT/tick (CSV log readback only at gen-end).
+    - Bigger workload smoke: spustit `--gpu-full` při 5k a 10k cells.
+      Compare s CPU paralelní baseline. Identify break-even point.
+    - GPU spatial_hash bucket capacity bump pro bigger world (current
+      fixed 64×32×4 = ±1024/±512 worldová krytí).
+    - Renderer mirror Sprint 60-62 GPU pipeline (currently Sprint 59 path).

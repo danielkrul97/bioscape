@@ -24,11 +24,12 @@ use bioscape::{
 #[cfg(feature = "gpu")]
 use bioscape::{
     gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, PopulateInputsGpu,
-        PopulateInputsParams, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
+        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
+        PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
     },
     BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS, DAMAGE_NORMALIZATION_GAIN,
-    DENSITY_NORM_COUNT, PHEROMONE_NORMALIZATION_GAIN, SMELL_NORMALIZATION_GAIN,
+    DENSITY_NORM_COUNT, DRAG_COEFFICIENT, PHEROMONE_NORMALIZATION_GAIN, SMELL_NORMALIZATION_GAIN,
+    THERMAL_NOISE,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -161,6 +162,10 @@ struct GpuFullState {
     /// Sprint 61: GPU populate_brain_inputs shader fuze sensor output + cell
     /// metadata → brain inputs buffer. Eliminuje sensor 60 KB readback round-trip.
     populate: PopulateInputsGpu,
+    /// Sprint 62: motor on GPU (apply brain outputs → velocity/ang_vel/pitch_vel).
+    /// Fused s brownian dispatch v brain_act → single batch readback eliminuje
+    /// round-trip #2 (hidden+outputs) i round-trip #3 (velocities).
+    motor: MotorGpu,
 }
 
 impl World {
@@ -351,8 +356,11 @@ impl World {
     fn apply_brownian(&mut self, rng: &mut impl Rng, dt: f32) {
         #[cfg(feature = "gpu")]
         {
+            // Sprint 62: brownian je fused do `brain_act_gpu_full` pipeline
+            // (motor → brownian → batch readback). Tato fáze je v `--gpu-full`
+            // no-op aby se neaplikoval brownian dvakrát.
             if self.gpu_full.is_some() {
-                self.apply_brownian_gpu(dt);
+                let _ = dt;
                 return;
             }
         }
@@ -369,7 +377,10 @@ impl World {
     /// Sprint 51: GPU brownian s xoshiro128++ per-cell RNG. Upload velocities,
     /// dispatch, download. Ne-deterministic vs CPU (different PRNG), ale
     /// deterministic across GPU runs (xoshiro state seedovaný z cell.lineage_id).
+    /// Sprint 62: nyní fused do brain_act_gpu_full pipeline; tato standalone
+    /// metoda je dead code preserved pro Sprint 63+ test path.
     #[cfg(feature = "gpu")]
+    #[allow(dead_code)]
     fn apply_brownian_gpu(&mut self, dt: f32) {
         let n = self.cells.len();
         if n == 0 {
@@ -472,24 +483,25 @@ impl World {
         self.brain_act(dt);
     }
 
-    /// Sprint 51/60/61: --gpu-full brain_act.
-    /// Sprint 61 pipeline (no sensor readback):
-    ///   1. CPU snapshot positions/eff_radii/vision_radii/food_positions
-    ///      + cell metadata (energies, headings, pitches, damage_accums,
-    ///      max_speeds).
-    ///   2. CellsGpu.upload_metadata + apply_shell_absorb CPU pass (mutuje
-    ///      damage_accum *před* uploadem; lib `apply_shell_absorb` se musí
-    ///      mirror v shaderu nebo CPU pre-pass).
-    ///   3. GPU spatial hash dispatch cell + food (no readback).
-    ///   4. GPU SensorGather dispatch_no_readback (output stays in GPU buffer).
-    ///   5. GPU PopulateInputs shader: čte sensor output + cell metadata →
-    ///      píše do `last_inputs_buf` GPU storage. Reset damage_accum_buf in-shader.
-    ///   6. GPU brain forward_persistent (čte `last_inputs_buf` direct).
-    ///   7. Download hidden + outputs (round-trip #2 — Sprint 62 motor on GPU
-    ///      eliminuje).
-    ///   8. CPU motor + writeback last_hidden/last_outputs.
-    /// Eliminuje 60 KB sensor readback (Sprint 60 round-trip #1) + 4× CPU
-    /// SpatialGrid rebuild (broad-phase v Sprint 60).
+    /// Sprint 51/60/61/62: --gpu-full brain_act.
+    /// Sprint 62 pipeline (single Wait barrier):
+    ///   1. CPU `apply_shell_absorb` + snapshot.
+    ///   2. CellsGpu uploads (metadata + velocity + ang_vel + pitch_vel).
+    ///   3. GPU spatial_hash dispatch cell + food (no readback).
+    ///   4. GPU SensorGather dispatch_no_readback (output stays GPU).
+    ///   5. GPU PopulateInputs (čte sensor + cells, píše last_inputs).
+    ///   6. GPU brain.forward_persistent (čte last_inputs, píše last_hidden + last_outputs).
+    ///   7. **GPU motor.dispatch_with_cells** (Sprint 62: čte last_outputs +
+    ///      heading/pitch/turn_rate/eff_radius/max_speed, mutuje velocity +
+    ///      angular_velocity + pitch_velocity).
+    ///   8. **GPU brownian.compute_persistent** (Sprint 51 + 62 fuze: mutuje
+    ///      velocity v stejném pipeline chain — apply_brownian fáze v
+    ///      `--gpu-full` se stává no-op).
+    ///   9. **`download_brain_motor_batch`** (Sprint 62 NEW): single Wait pro
+    ///      hidden + outputs + velocity + angular_vel + pitch_vel. 1 RT/tick.
+    ///   10. CPU writeback all 5 buffers + apply_brain_motor je SKIPPED (motor
+    ///       byl GPU-side).
+    /// Round-trip status: 1× `device.poll(Wait)` per tick (vs Sprint 61 2×).
     #[cfg(feature = "gpu")]
     fn brain_act_gpu_full(&mut self, dt: f32) {
         let n = self.cells.len();
@@ -512,19 +524,25 @@ impl World {
         let vision_radii: Vec<f32> = self.cells.iter().map(|c| c.genome.vision_radius).collect();
         let food_positions: Vec<[f32; 3]> = self.foods.iter().map(|f| f.position).collect();
 
-        // Per-cell metadata pro populate_inputs shader.
+        // Per-cell metadata pro populate_inputs + motor shaders.
         let energies: Vec<f32> = self.cells.iter().map(|c| c.energy).collect();
         let headings: Vec<f32> = self.cells.iter().map(|c| c.heading).collect();
         let pitches: Vec<f32> = self.cells.iter().map(|c| c.pitch).collect();
         let damage_accums: Vec<f32> = self.cells.iter().map(|c| c.damage_accum).collect();
         let max_speeds: Vec<f32> = self.cells.iter().map(|c| c.genome.max_speed).collect();
         let velocities: Vec<[f32; 3]> = self.cells.iter().map(|c| c.velocity).collect();
+        // Sprint 62: motor čte angular_velocity + pitch_velocity. Upload current
+        // state — motor shader mutuje a download_brain_motor_batch sync zpět.
+        let angular_vels: Vec<f32> = self.cells.iter().map(|c| c.angular_velocity).collect();
+        let pitch_vels: Vec<f32> = self.cells.iter().map(|c| c.pitch_velocity).collect();
+        // Sprint 62: turn_rate per-tick upload (lazy approach) — reproduce
+        // mění turn_rate u nových childů, takže pre-tick refresh je safer
+        // než per-event sparse update. ~4 KB/tick negligible.
+        let turn_rates: Vec<f32> = self.cells.iter().map(|c| c.genome.turn_rate).collect();
 
         let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
 
-        // Phase 2: upload cell metadata + velocities (Sprint 51 brownian path
-        // už uploaduje velocities, ale brain_act je před brownian → upload
-        // tady aby populate_inputs viděl current state).
+        // Phase 2: upload cell metadata + velocities + angular/pitch velocities.
         gpu.cells.upload_metadata(
             &energies,
             &headings,
@@ -534,6 +552,8 @@ impl World {
             &eff_radii,
         );
         gpu.cells.upload_velocities(&velocities);
+        gpu.cells.upload_angular_pitch(&angular_vels, &pitch_vels);
+        gpu.cells.upload_turn_rates(&turn_rates);
 
         // Phase 3: GPU spatial hash dispatch (no readback).
         gpu.cell_hash.dispatch(&positions);
@@ -588,24 +608,41 @@ impl World {
         gpu.populate
             .dispatch(&gpu.cells, &gpu.sensor, populate_params);
 
-        // Phase 6: GPU brain forward_persistent. Čte `last_inputs_buf` direct.
+        // Phase 6: GPU brain forward_persistent. Čte `last_inputs_buf` direct,
+        // píše last_hidden + last_outputs storage buffers.
         gpu.brain.forward_persistent(&gpu.cells, n);
 
-        // Phase 7: download hidden + outputs (Sprint 62 cíl: motor na GPU
-        // eliminuje tento readback).
-        let (hiddens, outputs) = gpu.cells.download_hidden_outputs(n);
+        // Phase 7: GPU motor.dispatch_with_cells. Čte last_outputs + heading/
+        // pitch/turn_rate/eff_radius/max_speed, mutuje velocity/angular_vel/
+        // pitch_vel buffery in-place. Mirror lib::Cell::apply_brain_motor.
+        gpu.motor
+            .dispatch_with_cells(&gpu.cells, n, dt, DRAG_COEFFICIENT);
 
-        // Phase 8: CPU motor + writeback. CPU damage_accum reset (mirror GPU
-        // shader side-effect — populate_inputs shader už `damage_accums[i] = 0`
-        // na GPU side, takže další upload bude 0).
+        // Phase 8: GPU brownian dispatch (Sprint 51 path). Mutuje velocity_buf
+        // s xoshiro128++ per-cell noise. Fused do brain_act → apply_brownian
+        // fáze v `--gpu-full` skipne (compute už proběhl).
+        let has_z = WORLD_HALF[2] > 0.0;
+        gpu.brownian
+            .compute_persistent(&gpu.cells, n, THERMAL_NOISE, dt, has_z);
+
+        // Phase 9: single batch readback (round-trip #1 a #2 a #3 collapsed
+        // do jednoho Wait barrier). Hidden + outputs pro Hebbian/predate/emit;
+        // velocity + ang_vel + pitch_vel pro CPU step kinematics.
+        let (hiddens, outputs, new_vels, new_ang, new_pitch) =
+            gpu.cells.download_brain_motor_batch(n);
+
+        // Phase 10: CPU writeback. NO apply_brain_motor (motor byl GPU-side).
         self.cells
             .par_iter_mut()
             .enumerate()
             .for_each(|(i, cell)| {
                 cell.last_hidden = hiddens[i];
                 cell.last_outputs = outputs[i];
+                cell.velocity = new_vels[i];
+                cell.angular_velocity = new_ang[i];
+                cell.pitch_velocity = new_pitch[i];
+                // damage_accum reset (mirror populate_inputs GPU side-effect).
                 cell.damage_accum = 0.0;
-                cell.apply_brain_motor(&outputs[i], dt);
             });
     }
 
@@ -1678,6 +1715,11 @@ fn main() {
             )?;
             let sensor = SensorGatherGpu::with_context(&ctx, cap, food_capacity)?;
             let populate = PopulateInputsGpu::with_context(&ctx)?;
+            let motor = MotorGpu::with_context(&ctx, cap)?;
+            // Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim
+            // init; reproduce volá `upload_turn_rates` znovu (per-event sparse).
+            let turn_rates: Vec<f32> = world.cells.iter().map(|c| c.genome.turn_rate).collect();
+            cells_gpu.upload_turn_rates(&turn_rates);
             Ok(GpuFullState {
                 cells: cells_gpu,
                 brain,
@@ -1689,12 +1731,13 @@ fn main() {
                 food_hash,
                 sensor,
                 populate,
+                motor,
             })
         };
         match init() {
             Ok(state) => {
                 eprintln!(
-                    "gpu-full: persistent brain weights + Hebbian + Brownian + Field + SensorGather + PopulateInputs (capacity {} cells, {} field sources)",
+                    "gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor (cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
                 world.gpu_full = Some(state);
