@@ -263,10 +263,9 @@ fn main() {
             }),
             FrameTimeDiagnosticsPlugin::default(),
         ))
-        // Sprint 36: clear color matchnut s LOW richness color z `world_map_image`
-        // (poor zones jsou sytá zelená, rich zones bílá). Margins kolem world
-        // plane tak vizuálně splynou s chudými oblastmi mapy.
-        .insert_resource(ClearColor(Color::srgb(0.10, 0.42, 0.12)))
+        // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`
+        // (rich zones jsou bílé, poor zelené). Margins jsou bílé.
+        .insert_resource(ClearColor(Color::WHITE))
         .init_resource::<LineageMaterials>()
         .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
