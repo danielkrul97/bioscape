@@ -120,12 +120,38 @@ Decade focused on **prostorové struktuře a niche differentiation**. Sprint 20 
     - **Typed pheromones** (multi-channel) s explicitní rolí: alarm = decreases predator approach, mate call = increases reproduction radius.
     - **Cost na DETECTION** ne emission. Detekovat info stojí, vysílat zdarma — opačná dynamika.
 
-## Sprint 25+ — TBD
+## Sprint 25 — pheromone-mediated-mating
+
+- **Cíl:** vyřešit free-rider problem ze Sprintu 24 explicitním payoffem pro emisi — **pouze cells, které aktivně emitují, mohou reprodukovat**. Plus odstranit `BASELINE_EMIT` (predator exploit Sprintu 24). Cells musí "volat" aby našly partnera.
+
+  **Plán:**
+  - `PHEROMONE_BASELINE_EMIT: 0.5 → 0.0` — žádné free-rider signaling.
+  - `MATING_PHEROMONE_THRESHOLD = 0.2` — fertile filter v `reproduce` přidává podmínku `last_outputs[2] > THRESHOLD`.
+  - `INNATE_PHEROMONE_BIAS = 1.0` — bias na `b2[2]` v `Brain::random` aby random brains byly už od gen 0 nad threshold (jinak ~25 % mating rate, extinction).
+
+- **Výstup:**
+  - V1 (no bias): extinkce gen 80 — random brains v polovině případů pod threshold, mating rate kvartován, populace nestihla recovery.
+  - V2 (s bias 1.0): populace přežila. **Pozorovaná dynamika (seed 0, 200 gen):**
+    - gen 10: `ph_emit = 0.588`, pop 105, lineages 54
+    - gen 60: `ph_emit = 0.991` (saturace ~max), pop 952 (cap), lineages 5
+    - gen 200: `ph_emit = 1.000`, pop 243, **lineages 1**, size_avg 5.0
+- **Poznámky:**
+  - **Mechanismus funguje:** mating-gated emission selektuje pro emisi. `ph_emit` MONOTÓNNĚ ROSTE z 0 na 1.0 (vs Sprint 24 kde padalo na 0). Selekce favorizuje signal — cells co nemluví, nereprodukují.
+  - **Predator-eavesdropping problem zůstává.** Saturated emission (ph_emit = 1.0) znamená každá fertile cell je "loud" → predátoři je najdou přes pheromone gradient. Giant regime se vrací, lineages → 1.
+  - **Klíčový research finding:** přes 4 sprinty (22/24/25-v1/25-v2) se **giants + monokultura** opakuje vždy, kdy existuje detektivovatelný cell-emitted signal. Sprint 23 (žádný pheromone) byl JEDINÝ s persistentní diverzitou (20 linií).
+  - **Predátoři jsou v této simulaci zlatý strop.** Velký + rychlý cell s informací o ostatních cells dominuje vše. Niching mechaniky (hazard, pheromone) buď nestačí, nebo se obrátí proti.
+  - **Možné Sprint 26+ směry pro skutečnou diverzitu:**
+    - **Disable predation entirely** — vrátí se Sprint 23 dynamika. Pheromone pak může být skutečně mate-finding bez exploit.
+    - **Predator gene** — cell musí explicitně být "predator type" aby mohla predovat. Generalists nepredují, jen scavenge.
+    - **Pheromone receivers** — cells mají gen "kdo přijímá můj signal" (kin signaling). Predator nemá receiver, slepý k pheromone.
+    - **Cost na DETEKCI místo emisi** — opačná dynamika, předator platí za sledování.
+
+## Sprint 26+ — TBD
 
 Možné směry:
 - **Spatial speciation analytics** — CSV stats per region (svět rozdělen na N×N kvadrantů, lineage count + dominant genome per region). Přímo testovatelná hypotéza spatial niching.
+- **Predator gating** — explicit "predator gene" / type, jen specialist eats; generalist nemůže. Eliminuje zlatou-strop dynamiku.
 - **Reprodukční izolace** přes `genome_distance(a, b) < threshold` (NEAT-style speciation) — pojistka pro persistenci diverzity.
-- **Pheromone v2: typed signals** — multi-channel s explicit payoff (alarm, mate call), zkusit dosáhnout adaptivní komunikace.
 - **Mobilní hrozby** — wandering predator entities, navigační AI challenge (brain musí zpracovat hrozbu jako další gradient).
 - **Multi-food types** — různé typy jídla s různými energetickými profily, food-side niching.
 - **Terrain drag** (třetí WorldMap vrstva) — pohyblivost varíuje s pozicí.

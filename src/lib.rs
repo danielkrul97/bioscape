@@ -26,6 +26,10 @@ pub const BRAIN_OUTPUTS: usize = 3;
 /// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce
 /// hodnotu doladí — bias je jen jumpstart.
 pub const INNATE_THRUST_BIAS: f32 = 2.0;
+/// Inicializační bias na pheromone output (b2[2]). Sprint 25 vyžaduje aktivní
+/// emisi pro reprodukci — bez biasu jen ~25 % párů projde threshold. S bias
+/// 1.0 většina random brainů emituje nad threshold v gen 0; selekce pak ladí.
+pub const INNATE_PHEROMONE_BIAS: f32 = 1.0;
 
 // Shared sim parameters consumed by both the Bevy renderer (`src/main.rs`)
 // and the headless harness (`src/bin/headless.rs`). Single source of truth —
@@ -63,17 +67,22 @@ pub const HAZARD_FLOOR: f32 = 0.0;
 pub const HAZARD_AMP: f32 = 1.0;
 
 // Pheromone signaling layer. 2D scalar field jako SmellField, ale zdroje jsou
-// cells (ne food). Každá živá cell přidává `BASELINE` zdarma + brain output[2]
-// modulátor (jen kladný, stojí energii). Brain detekuje gradient přes
-// `inputs[11..13]`. Diffusion + decay stejné jako smell.
+// cells. Sprint 25: BASELINE = 0 (žádné free-rider, žádný predator exploit z
+// Sprint 24). Cells musí aktivně emitovat brain output[2] aby vznikl signál,
+// **a aby byly způsobilé k reprodukci** — `MATING_PHEROMONE_THRESHOLD` gating.
+// Brain detekuje gradient přes `inputs[11..13]`. Cost ∝ emise.
 pub const PHEROMONE_GRID_RES: usize = 64;
 pub const PHEROMONE_DIFFUSION: f32 = 0.15;
 pub const PHEROMONE_DECAY: f32 = 0.3;
-pub const PHEROMONE_BASELINE_EMIT: f32 = 0.5;
+pub const PHEROMONE_BASELINE_EMIT: f32 = 0.0;
 pub const PHEROMONE_BRAIN_MOD: f32 = 1.0;
 pub const PHEROMONE_COST_PER_RATE: f32 = 1.0;
 pub const PHEROMONE_SAMPLE_EPSILON: f32 = 10.0;
 pub const PHEROMONE_NORMALIZATION_GAIN: f32 = 0.5;
+/// Cell musí mít `last_outputs[2] > THRESHOLD` aby byla eligible pro mating.
+/// Mating je tak podmíněn aktivní emisí — selektuje proti tichým cells, které
+/// by jinak free-ride na public goods of pheromone field.
+pub const MATING_PHEROMONE_THRESHOLD: f32 = 0.2;
 pub const MAX_SPAWN_ATTEMPTS: usize = 5;
 pub const CARRION_FOOD_COUNT: usize = 2;
 
@@ -150,6 +159,9 @@ impl Brain {
         // (random walk stuck) k mean ~0.7 (consistent forward motion). Hebbian
         // + selekce dál ladí; tohle jen řeší kallové cells co se nehýbou.
         b2[1] += INNATE_THRUST_BIAS;
+        // Innate pheromone bias: Sprint 25 vyžaduje active emisi pro mating.
+        // Bez biasu by se polovina random cells nemohla reprodukovat.
+        b2[2] += INNATE_PHEROMONE_BIAS;
         Self { w1, b1, w2, b2 }
     }
 
