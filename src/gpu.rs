@@ -10,7 +10,57 @@
 
 use crate::{Brain, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS};
 use bytemuck::{Pod, Zeroable};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+// ============================================================================
+// Sprint 47: shared GPU context — jeden device pro všechny subsystémy
+// ============================================================================
+
+/// Sprint 47: sdílený wgpu device + queue (Arc, protože `wgpu::Device` v 23
+/// není `Clone`). Každý subsystém (BrainGpu, FieldGpu, SpatialHashGpu, StatsGpu)
+/// si naklonuje `Arc::clone` handles z `GpuContext`. Předtím každý subsystém
+/// vyrobil vlastní device → 4× duplicitních adapterů, žádné sdílení resourců.
+/// Pro Sprint 47+ pipelines (full GPU tick) je shared device **nutnost** —
+/// jedna queue submission ordering, jedna device-lifetime, shared command
+/// encoding.
+#[derive(Clone)]
+pub struct GpuContext {
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
+}
+
+impl GpuContext {
+    pub fn new() -> Result<Self, String> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            },
+        ))
+        .ok_or_else(|| "no suitable wgpu adapter".to_string())?;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("bioscape-shared"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))
+        .map_err(|e| format!("device request failed: {e:?}"))?;
+        Ok(Self {
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+        })
+    }
+}
+
+// ============================================================================
+// Sprint 44: GPU brain forward batch
+// ============================================================================
 
 /// Počet f32 váh per cell — packing musí matchnout WGSL shader.
 pub const BRAIN_WEIGHTS_PER_CELL: usize =
@@ -38,8 +88,8 @@ struct Params {
 }
 
 pub struct BrainGpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
@@ -57,29 +107,22 @@ pub struct BrainGpu {
 }
 
 impl BrainGpu {
+    pub fn with_context(ctx: &GpuContext, capacity: usize) -> Result<Self, String> {
+        Self::with_device_inner(Arc::clone(&ctx.device), Arc::clone(&ctx.queue), capacity)
+    }
+
     pub fn new(capacity: usize) -> Result<Self, String> {
         assert!(capacity > 0, "BrainGpu capacity must be > 0");
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            },
-        ))
-        .ok_or_else(|| "no suitable wgpu adapter".to_string())?;
+        let ctx = GpuContext::new()?;
+        Self::with_device_inner(ctx.device, ctx.queue, capacity)
+    }
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("bioscape-brain-gpu"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
-        .map_err(|e| format!("device request failed: {e:?}"))?;
-
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        capacity: usize,
+    ) -> Result<Self, String> {
+        assert!(capacity > 0, "BrainGpu capacity must be > 0");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brain_forward"),
             source: wgpu::ShaderSource::Wgsl(
@@ -467,8 +510,8 @@ struct HashParams {
 }
 
 pub struct SpatialHashGpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     pipeline_count: wgpu::ComputePipeline,
     pipeline_prefix: wgpu::ComputePipeline,
     pipeline_scatter: wgpu::ComputePipeline,
@@ -489,35 +532,26 @@ pub struct SpatialHashGpu {
 impl SpatialHashGpu {
     pub fn new(capacity: usize, cell_size: f32) -> Result<Self, String> {
         assert!(capacity > 0);
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            },
-        ))
-        .ok_or_else(|| "no suitable wgpu adapter".to_string())?;
-
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("bioscape-hash-gpu"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
-        .map_err(|e| format!("device request failed: {e:?}"))?;
-
-        Self::with_device(device, queue, capacity, cell_size)
+        let ctx = GpuContext::new()?;
+        Self::with_device_inner(ctx.device, ctx.queue, capacity, cell_size)
     }
 
-    /// Konstruktor pro reuse existujícího wgpu device (např. sdílení s
-    /// `BrainGpu`). Sprint 47 bude jeden device pro všechny GPU subsystémy.
-    pub fn with_device(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
+    pub fn with_context(
+        ctx: &GpuContext,
+        capacity: usize,
+        cell_size: f32,
+    ) -> Result<Self, String> {
+        Self::with_device_inner(
+            Arc::clone(&ctx.device),
+            Arc::clone(&ctx.queue),
+            capacity,
+            cell_size,
+        )
+    }
+
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
         capacity: usize,
         cell_size: f32,
     ) -> Result<Self, String> {
@@ -900,8 +934,8 @@ struct FieldParams {
 }
 
 pub struct FieldGpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     pipeline_deposit: wgpu::ComputePipeline,
     pipeline_diffuse: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -928,33 +962,29 @@ impl FieldGpu {
         sources_capacity: usize,
     ) -> Result<Self, String> {
         assert!(resolution >= 2 && sources_capacity > 0);
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            },
-        ))
-        .ok_or_else(|| "no suitable wgpu adapter".to_string())?;
-
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("bioscape-field-gpu"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
-        .map_err(|e| format!("device request failed: {e:?}"))?;
-
-        Self::with_device(device, queue, resolution, world_half, sources_capacity)
+        let ctx = GpuContext::new()?;
+        Self::with_device_inner(ctx.device, ctx.queue, resolution, world_half, sources_capacity)
     }
 
-    pub fn with_device(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
+    pub fn with_context(
+        ctx: &GpuContext,
+        resolution: usize,
+        world_half: [f32; 2],
+        sources_capacity: usize,
+    ) -> Result<Self, String> {
+        assert!(resolution >= 2 && sources_capacity > 0);
+        Self::with_device_inner(
+            Arc::clone(&ctx.device),
+            Arc::clone(&ctx.queue),
+            resolution,
+            world_half,
+            sources_capacity,
+        )
+    }
+
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
         resolution: usize,
         world_half: [f32; 2],
         sources_capacity: usize,
@@ -1282,6 +1312,350 @@ impl FieldGpu {
     }
 }
 
+// ============================================================================
+// Sprint 47: GPU stats reduction (single-workgroup tree reduce)
+// ============================================================================
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
+struct StatsParams {
+    num_cells: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CellStats {
+    pub sum_x: f32,
+    pub sum_y: f32,
+    pub sum_z: f32,
+    pub sum_speed_sq: f32,
+    pub sum_energy: f32,
+}
+
+pub struct StatsGpu {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    capacity: usize,
+    params_buf: wgpu::Buffer,
+    positions_buf: wgpu::Buffer,
+    velocities_buf: wgpu::Buffer,
+    energies_buf: wgpu::Buffer,
+    output_buf: wgpu::Buffer,
+    output_readback: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    pos_packed: Vec<f32>,
+    vel_packed: Vec<f32>,
+}
+
+impl StatsGpu {
+    pub fn with_context(ctx: &GpuContext, capacity: usize) -> Result<Self, String> {
+        Self::with_device_inner(Arc::clone(&ctx.device), Arc::clone(&ctx.queue), capacity)
+    }
+
+    pub fn new(capacity: usize) -> Result<Self, String> {
+        let ctx = GpuContext::new()?;
+        Self::with_device_inner(ctx.device, ctx.queue, capacity)
+    }
+
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        capacity: usize,
+    ) -> Result<Self, String> {
+        assert!(capacity > 0);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cell_stats"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/cell_stats.wgsl").into()),
+        });
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("stats-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("stats-pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("stats-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("reduce"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("stats-params"),
+            contents: bytemuck::bytes_of(&StatsParams::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let (positions_buf, velocities_buf, energies_buf, output_buf, output_readback) =
+            Self::alloc_buffers(&device, capacity);
+        let bind_group = Self::make_bind_group(
+            &device,
+            &bind_group_layout,
+            &params_buf,
+            &positions_buf,
+            &velocities_buf,
+            &energies_buf,
+            &output_buf,
+        );
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            bind_group_layout,
+            capacity,
+            params_buf,
+            positions_buf,
+            velocities_buf,
+            energies_buf,
+            output_buf,
+            output_readback,
+            bind_group,
+            pos_packed: Vec::new(),
+            vel_packed: Vec::new(),
+        })
+    }
+
+    fn alloc_buffers(
+        device: &wgpu::Device,
+        capacity: usize,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+        let pos_size = (capacity * 3 * std::mem::size_of::<f32>()) as u64;
+        let energy_size = (capacity * std::mem::size_of::<f32>()) as u64;
+        let output_size = (8 * std::mem::size_of::<f32>()) as u64;
+        let positions_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats-positions"),
+            size: pos_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let velocities_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats-velocities"),
+            size: pos_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let energies_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats-energies"),
+            size: energy_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats-output"),
+            size: output_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let output_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats-readback"),
+            size: output_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        (positions_buf, velocities_buf, energies_buf, output_buf, output_readback)
+    }
+
+    fn make_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        params: &wgpu::Buffer,
+        positions: &wgpu::Buffer,
+        velocities: &wgpu::Buffer,
+        energies: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stats-bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: velocities.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: energies.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: output.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn ensure_capacity(&mut self, n: usize) {
+        if n <= self.capacity {
+            return;
+        }
+        let new_cap = (self.capacity * 2).max(n);
+        let (p, v, e, o, or_) = Self::alloc_buffers(&self.device, new_cap);
+        self.positions_buf = p;
+        self.velocities_buf = v;
+        self.energies_buf = e;
+        self.output_buf = o;
+        self.output_readback = or_;
+        self.bind_group = Self::make_bind_group(
+            &self.device,
+            &self.bind_group_layout,
+            &self.params_buf,
+            &self.positions_buf,
+            &self.velocities_buf,
+            &self.energies_buf,
+            &self.output_buf,
+        );
+        self.capacity = new_cap;
+    }
+
+    /// Compute reduction over per-cell SoA. Single workgroup tree reduce → 5
+    /// floats v `output[0..5]`. Caller obvykle dělí sumy `n` aby získal mean.
+    pub fn compute(
+        &mut self,
+        positions: &[[f32; 3]],
+        velocities: &[[f32; 3]],
+        energies: &[f32],
+    ) -> CellStats {
+        let n = positions.len();
+        assert_eq!(velocities.len(), n);
+        assert_eq!(energies.len(), n);
+        if n == 0 {
+            return CellStats::default();
+        }
+        self.ensure_capacity(n);
+
+        self.pos_packed.clear();
+        self.pos_packed.reserve(n * 3);
+        for p in positions {
+            self.pos_packed.extend_from_slice(p);
+        }
+        self.vel_packed.clear();
+        self.vel_packed.reserve(n * 3);
+        for v in velocities {
+            self.vel_packed.extend_from_slice(v);
+        }
+
+        let params = StatsParams {
+            num_cells: n as u32,
+            ..StatsParams::default()
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(
+            &self.positions_buf,
+            0,
+            bytemuck::cast_slice(&self.pos_packed),
+        );
+        self.queue.write_buffer(
+            &self.velocities_buf,
+            0,
+            bytemuck::cast_slice(&self.vel_packed),
+        );
+        self.queue
+            .write_buffer(&self.energies_buf, 0, bytemuck::cast_slice(energies));
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("stats-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("stats-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let bytes = (8 * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.output_buf, 0, &self.output_readback, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.output_readback.slice(0..bytes);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        let stats = CellStats {
+            sum_x: floats[0],
+            sum_y: floats[1],
+            sum_z: floats[2],
+            sum_speed_sq: floats[3],
+            sum_energy: floats[4],
+        };
+        drop(data);
+        self.output_readback.unmap();
+        stats
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,5 +1840,136 @@ mod tests {
             "field GPU vs CPU max diff = {} (expected < 1e-3)",
             max_diff
         );
+    }
+
+    /// Sprint 47: StatsGpu reduction parity vs naive CPU sum. Tolerance 1e-2
+    /// kvůli f32 sum non-associativity v 1024-element tree reduce.
+    #[test]
+    fn stats_gpu_matches_cpu_sums() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let n = 1024;
+        let positions: Vec<[f32; 3]> = (0..n)
+            .map(|_| {
+                [
+                    rng.random_range(-1000.0_f32..1000.0),
+                    rng.random_range(-500.0_f32..500.0),
+                    rng.random_range(-2.0_f32..2.0),
+                ]
+            })
+            .collect();
+        let velocities: Vec<[f32; 3]> = (0..n)
+            .map(|_| {
+                [
+                    rng.random_range(-50.0_f32..50.0),
+                    rng.random_range(-50.0_f32..50.0),
+                    rng.random_range(-5.0_f32..5.0),
+                ]
+            })
+            .collect();
+        let energies: Vec<f32> = (0..n)
+            .map(|_| rng.random_range(0.0_f32..150.0))
+            .collect();
+
+        let mut gpu = match StatsGpu::new(n) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: no GPU adapter ({e})");
+                return;
+            }
+        };
+        let gpu_stats = gpu.compute(&positions, &velocities, &energies);
+
+        let cpu_sum_x: f32 = positions.iter().map(|p| p[0]).sum();
+        let cpu_sum_y: f32 = positions.iter().map(|p| p[1]).sum();
+        let cpu_sum_z: f32 = positions.iter().map(|p| p[2]).sum();
+        let cpu_sum_speed_sq: f32 = velocities
+            .iter()
+            .map(|v| v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+            .sum();
+        let cpu_sum_energy: f32 = energies.iter().sum();
+
+        let close = |a: f32, b: f32, scale: f32| {
+            let d = (a - b).abs();
+            assert!(d < scale * 1e-3 + 1e-3, "diff = {d}, a={a}, b={b}");
+        };
+        close(gpu_stats.sum_x, cpu_sum_x, cpu_sum_x.abs());
+        close(gpu_stats.sum_y, cpu_sum_y, cpu_sum_y.abs());
+        close(gpu_stats.sum_z, cpu_sum_z, cpu_sum_z.abs());
+        close(gpu_stats.sum_speed_sq, cpu_sum_speed_sq, cpu_sum_speed_sq.abs());
+        close(gpu_stats.sum_energy, cpu_sum_energy, cpu_sum_energy.abs());
+    }
+
+    /// Sprint 47: integration test sdíleného `GpuContext` napříč 4 subsystémy.
+    /// Každý úspěšně inicializuje skrz `with_context` a doběhne jeden mini
+    /// pipeline cycle (brain forward → spatial hash → field step → stats reduce)
+    /// na sdíleném device. Verifikuje, že device-lifetime + bind group ownership
+    /// se ne-konfliktuje.
+    #[test]
+    fn gpu_context_shared_across_subsystems() {
+        let ctx = match GpuContext::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip: no GPU adapter ({e})");
+                return;
+            }
+        };
+        let n = 64;
+        let mut rng = StdRng::seed_from_u64(19);
+
+        let mut brain_gpu = BrainGpu::with_context(&ctx, n).expect("BrainGpu init");
+        let mut hash_gpu =
+            SpatialHashGpu::with_context(&ctx, n, 64.0).expect("SpatialHashGpu init");
+        let mut field_gpu =
+            FieldGpu::with_context(&ctx, 16, [320.0, 320.0], 32).expect("FieldGpu init");
+        let mut stats_gpu = StatsGpu::with_context(&ctx, n).expect("StatsGpu init");
+
+        let brains: Vec<Brain> = (0..n).map(|_| Brain::random(&mut rng)).collect();
+        let inputs: Vec<[f32; BRAIN_INPUTS]> = (0..n)
+            .map(|_| {
+                let mut a = [0.0_f32; BRAIN_INPUTS];
+                for v in a.iter_mut() {
+                    *v = rng.random_range(-1.0_f32..1.0);
+                }
+                a
+            })
+            .collect();
+        let positions: Vec<[f32; 3]> = (0..n)
+            .map(|_| {
+                [
+                    rng.random_range(-300.0_f32..300.0),
+                    rng.random_range(-300.0_f32..300.0),
+                    rng.random_range(-2.0_f32..2.0),
+                ]
+            })
+            .collect();
+        let velocities: Vec<[f32; 3]> = (0..n)
+            .map(|_| {
+                [
+                    rng.random_range(-30.0_f32..30.0),
+                    rng.random_range(-30.0_f32..30.0),
+                    0.0,
+                ]
+            })
+            .collect();
+        let energies: Vec<f32> = (0..n).map(|_| 50.0).collect();
+
+        let mut h = vec![[0.0_f32; BRAIN_HIDDEN]; n];
+        let mut o = vec![[0.0_f32; BRAIN_OUTPUTS]; n];
+        brain_gpu.forward_batch(&inputs, &brains, &mut h, &mut o);
+
+        let (offsets, sorted) = hash_gpu.rebuild(&positions);
+        assert_eq!(offsets.len(), GPU_HASH_NUM_BUCKETS + 1);
+        assert_eq!(sorted.len(), n);
+        assert_eq!(offsets[GPU_HASH_NUM_BUCKETS] as usize, n);
+
+        for (pos, _) in positions.iter().zip(0..n) {
+            field_gpu.add_source([pos[0], pos[1]], 1.0);
+        }
+        field_gpu.step(0.15, 0.3, 1.0 / 60.0);
+        let grid = field_gpu.download();
+        assert_eq!(grid.len(), 16 * 16);
+
+        let stats = stats_gpu.compute(&positions, &velocities, &energies);
+        assert!(stats.sum_energy > 0.0);
     }
 }
