@@ -263,7 +263,10 @@ fn main() {
             }),
             FrameTimeDiagnosticsPlugin::default(),
         ))
-        .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.08)))
+        // Sprint 36: clear color matchnut s mid-richness green ground plane
+        // (world_map_image emituje zelený biome — viz `world_map_image`).
+        // Black margins kolem world plane se tak vizuálně rozpustí.
+        .insert_resource(ClearColor(Color::srgb(0.12, 0.42, 0.14)))
         .init_resource::<LineageMaterials>()
         .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
