@@ -10,12 +10,12 @@ use bioscape::{
     Cell, Food, Genome, SimClock, SmellField, WorldMap, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS,
     CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DRAG_COEFFICIENT,
     EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
-    INITIAL_CELLS, LEARNING_RATE, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
-    MUTATION_CONFIG, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK,
-    REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES,
-    SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION,
-    WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED,
-    WORLD_UNITS_PER_FOOD,
+    HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, INITIAL_CELLS, LEARNING_RATE, MATING_RADIUS,
+    MAX_POPULATION, MAX_SPAWN_ATTEMPTS, MUTATION_CONFIG, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK,
+    PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION,
+    SMELL_GRID_RES, SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
+    TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
+    WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -80,6 +80,7 @@ impl World {
         self.update_smell(dt);
         self.brain_act(dt);
         self.step(dt);
+        self.apply_hazards(dt);
         self.resolve_collisions();
         self.predate();
         self.eat_food();
@@ -166,6 +167,8 @@ impl World {
             let grad = self.smell.gradient_at(pos, SMELL_SAMPLE_EPSILON);
             inputs[7] = (grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
             inputs[8] = (grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
+            inputs[9] = cell.heading.cos();
+            inputs[10] = cell.heading.sin();
 
             let (hidden, outputs) = cell.genome.brain.forward_with_state(&inputs);
             cell.last_inputs = inputs;
@@ -190,6 +193,13 @@ impl World {
     fn step(&mut self, dt: f32) {
         for cell in &mut self.cells {
             cell.step(dt, WORLD_HALF, &PHYSICS_CONFIG);
+        }
+    }
+
+    fn apply_hazards(&mut self, dt: f32) {
+        for cell in &mut self.cells {
+            let noise = self.map.sample(cell.position);
+            cell.energy -= hazard_drain(noise) * dt;
         }
     }
 
@@ -453,6 +463,10 @@ impl World {
 
 fn food_multiplier(noise: f32) -> f32 {
     WORLD_MAP_FOOD_FLOOR + WORLD_MAP_FOOD_AMP * noise
+}
+
+fn hazard_drain(noise: f32) -> f32 {
+    HAZARD_DRAIN_PER_SEC * (HAZARD_FLOOR + HAZARD_AMP * noise)
 }
 
 fn food_target(factor: f32) -> usize {

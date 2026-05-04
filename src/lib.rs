@@ -13,9 +13,14 @@ const MIN_VISION: f32 = 1.0;
 const MIN_TURN_RATE: f32 = 0.1;
 const MIN_BODY_SIZE: f32 = 0.3;
 pub const INITIAL_ENERGY: f32 = 100.0;
-pub const BRAIN_INPUTS: usize = 9;
+pub const BRAIN_INPUTS: usize = 11;
 pub const BRAIN_HIDDEN: usize = 8;
 pub const BRAIN_OUTPUTS: usize = 2;
+/// Inicializační bias na thrust output bin v `Brain::random`. Bez něj má ~½
+/// random brainů thrust output blízko nuly (cell se sotva hýbe), což vytvářelo
+/// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce
+/// hodnotu doladí — bias je jen jumpstart.
+pub const INNATE_THRUST_BIAS: f32 = 2.0;
 
 // Shared sim parameters consumed by both the Bevy renderer (`src/main.rs`)
 // and the headless harness (`src/bin/headless.rs`). Single source of truth —
@@ -42,6 +47,15 @@ pub const BODY_COST_FACTOR: f32 = 0.8;
 pub const FOOD_VALUE: f32 = 20.0;
 pub const FOOD_SPAWN_RATE: usize = 5;
 pub const WORLD_UNITS_PER_FOOD: f32 = 2600.0;
+// Environmentální hazard layer: passive energy drain v "nebezpečných" zónách.
+// Zónová mapa jde z `WorldMap` noise — POSITIVNÍ korelace s food richness:
+// bohaté oblasti = nebezpečné (high reward, high risk), chudé = bezpečné.
+// Vytváří trade-off niche: efficient cell může těžit rich-dangerous, slabší
+// se uchýlí do safe-poor a žije s méně food. Drain za sec při noise=1:
+// HAZARD_FLOOR + HAZARD_AMP = celkový max. Ladí se pouze v binárkách.
+pub const HAZARD_DRAIN_PER_SEC: f32 = 0.5;
+pub const HAZARD_FLOOR: f32 = 0.0;
+pub const HAZARD_AMP: f32 = 1.0;
 pub const MAX_SPAWN_ATTEMPTS: usize = 5;
 pub const CARRION_FOOD_COUNT: usize = 2;
 
@@ -113,6 +127,11 @@ impl Brain {
             }
             *bias = gaussian(rng);
         }
+        // Innate thrust bias: bumps b2[1] (thrust output) above zero. Posune
+        // distribuci `thrust_norm = (tanh(b2 + ...) + 1) / 2` od mean ~0.5
+        // (random walk stuck) k mean ~0.7 (consistent forward motion). Hebbian
+        // + selekce dál ladí; tohle jen řeší kallové cells co se nehýbou.
+        b2[1] += INNATE_THRUST_BIAS;
         Self { w1, b1, w2, b2 }
     }
 
@@ -1002,6 +1021,34 @@ mod tests {
         assert_eq!(outside_pos, m.field()[m.resolution * m.resolution - 1]);
         assert_eq!(outside_neg, m.field()[0]);
         assert!((0.0..=1.0).contains(&inside));
+    }
+
+    #[test]
+    fn random_brain_average_thrust_is_positive() {
+        // Innate thrust bias musí dělat to, k čemu existuje: random buňky
+        // mají ze startu thrust output kladný v průměru, takže se hýbou
+        // dopředu místo zacyklení v rozporu mezi turn a thrust.
+        let mut rng = rand::rng();
+        let n = 200;
+        let zero_inputs = [0.0_f32; BRAIN_INPUTS];
+        let mut sum = 0.0_f64;
+        let mut count_positive = 0;
+        for _ in 0..n {
+            let brain = Brain::random(&mut rng);
+            let thrust = brain.forward(&zero_inputs)[1];
+            sum += thrust as f64;
+            if thrust > 0.0 {
+                count_positive += 1;
+            }
+        }
+        let mean = sum / n as f64;
+        assert!(mean > 0.3, "expected mean thrust > 0.3, got {}", mean);
+        assert!(
+            count_positive > n * 3 / 4,
+            "expected >75% positive, got {}/{}",
+            count_positive,
+            n
+        );
     }
 
     #[test]

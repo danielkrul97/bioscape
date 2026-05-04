@@ -11,12 +11,12 @@ use bioscape::{
     Cell, Food, Genome, SimClock, SmellField, WorldMap, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS,
     CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DRAG_COEFFICIENT,
     EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
-    INITIAL_CELLS, LEARNING_RATE, MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
-    MUTATION_CONFIG, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK,
-    REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES,
-    SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION,
-    WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_SEED,
-    WORLD_UNITS_PER_FOOD,
+    HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, INITIAL_CELLS, LEARNING_RATE, MATING_RADIUS,
+    MAX_POPULATION, MAX_SPAWN_ATTEMPTS, MUTATION_CONFIG, PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK,
+    PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION,
+    SMELL_GRID_RES, SMELL_NORMALIZATION_GAIN, SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON,
+    TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
+    WORLD_MAP_RES, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 use cell_material::{pack_cell_tag, CellMaterial, CellMaterialPlugin};
 use rand::Rng;
@@ -216,6 +216,7 @@ fn main() {
                 update_smell_field,
                 cells_brain_act,
                 step_cells,
+                apply_environmental_hazards,
                 rebuild_cell_grid,
                 resolve_cell_collisions,
                 cell_predates_on_neighbor,
@@ -339,6 +340,10 @@ fn food_multiplier(noise: f32) -> f32 {
     WORLD_MAP_FOOD_FLOOR + WORLD_MAP_FOOD_AMP * noise
 }
 
+fn hazard_drain(noise: f32) -> f32 {
+    HAZARD_DRAIN_PER_SEC * (HAZARD_FLOOR + HAZARD_AMP * noise)
+}
+
 fn food_target(extent: &WorldExtent, factor: f32) -> usize {
     let area = (2.0 * extent.half_x) * (2.0 * extent.half_y);
     ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0)) as usize
@@ -432,6 +437,18 @@ fn step_cells(
     }
 }
 
+fn apply_environmental_hazards(
+    time: Res<Time>,
+    world_map: Res<WorldMapResource>,
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+) {
+    let dt = time.delta_secs();
+    for mut cell in &mut cells {
+        let noise = world_map.0.sample(cell.0.position);
+        cell.0.energy -= hazard_drain(noise) * dt;
+    }
+}
+
 fn update_smell_field(
     time: Res<Time>,
     foods: Query<&FoodEntity>,
@@ -508,6 +525,8 @@ fn cells_brain_act(
         let grad = smell.0.gradient_at(pos, SMELL_SAMPLE_EPSILON);
         inputs[7] = (grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
         inputs[8] = (grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
+        inputs[9] = cell.0.heading.cos();
+        inputs[10] = cell.0.heading.sin();
 
         let (hidden, outputs) = cell.0.genome.brain.forward_with_state(&inputs);
         cell.0.last_inputs = inputs;
