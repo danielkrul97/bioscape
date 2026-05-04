@@ -954,6 +954,82 @@ impl SpatialHashGpu {
         (offsets, sorted)
     }
 
+    /// Sprint 60: variant of `rebuild()` bez per-tick readback. Just submits
+    /// count → prefix → scatter dispatch a vrací. Použito v full-GPU sensor
+    /// pipeline kde offsets/sorted čte SensorGatherGpu shader direct přes
+    /// `offsets_buffer()` / `sorted_buffer()` accessory. Eliminuje 2× `device.poll(Wait)`
+    /// round-trip per tick (cell hash + food hash).
+    pub fn dispatch(&mut self, positions: &[[f32; 3]]) {
+        let n = positions.len();
+        if n == 0 {
+            return;
+        }
+        self.ensure_capacity(n);
+
+        self.queue.write_buffer(
+            &self.counts_buf,
+            0,
+            &vec![0u8; GPU_HASH_NUM_BUCKETS * 4],
+        );
+
+        self.positions_packed.clear();
+        self.positions_packed.reserve(n * 3);
+        for p in positions {
+            self.positions_packed.push(p[0]);
+            self.positions_packed.push(p[1]);
+            self.positions_packed.push(p[2]);
+        }
+
+        let params = HashParams {
+            num_cells: n as u32,
+            cell_size: self.cell_size,
+            world_half_x: self.world_half_xy[0],
+            world_half_y: self.world_half_xy[1],
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(
+            &self.positions_buf,
+            0,
+            bytemuck::cast_slice(&self.positions_packed),
+        );
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hash-dispatch-encoder"),
+            });
+        let workgroups = ((n as u32) + 63) / 64;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-count-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_count);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-prefix-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_prefix);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-scatter-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_scatter);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
     /// Sprint 49: accessor pro chained shadery (NeighborsGpu) — bind hash
     /// buffery jako read-only ne další pass. Buffery jsou platné dokud
     /// SpatialHashGpu žije.
@@ -3762,28 +3838,23 @@ impl SensorGatherGpu {
         for i in 0..n {
             let off = i * 15;
             let has_food = f[off + 3] > 0.5;
+            // Sprint 60: SensorRow nese signed min-image delta (toroidal-aware,
+            // matches `BrainSensors.nearest_food/cell` Sprint 54 sémantiku).
+            // Pre-Sprint-60 byla `positions[i] + delta` rekonstrukce absolutní
+            // pozice — chybné přes wrap (cell na x=-950 + delta=60 = -890,
+            // ne ghost +1010). Caller ukládá delta direct do BrainSensors.
             let nearest_food = if has_food {
-                Some([
-                    positions[i][0] + f[off + 0],
-                    positions[i][1] + f[off + 1],
-                    positions[i][2] + f[off + 2],
-                ])
+                Some([f[off], f[off + 1], f[off + 2]])
             } else {
                 None
             };
             let radius = f[off + 7];
             let nearest_cell = if radius >= 0.0 {
-                Some((
-                    [
-                        positions[i][0] + f[off + 4],
-                        positions[i][1] + f[off + 5],
-                        positions[i][2] + f[off + 6],
-                    ],
-                    radius,
-                ))
+                Some(([f[off + 4], f[off + 5], f[off + 6]], radius))
             } else {
                 None
             };
+            let _ = positions;
             let count_bits = f[off + 14].to_bits();
             out.push(SensorRow {
                 nearest_food,

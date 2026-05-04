@@ -751,10 +751,154 @@ plně 3D s 7-point Jacobi diffusion.
       reflektují v atlas image). Aktuální readback flow zachová overlay
       funkcionalitu.
 
-## Sprinty 60–62 — open-ended
+## Sprint 60 — SensorGatherGpu wire-up (headless --gpu-full)
 
-- **Sprint 60+:** SensorGatherGpu wire-up + GPU full tick pipeline (no
-  per-tick CPU readback pro fields).
-- **Sprint 60+:** 3D voxel rendering, ghost cell visual wrap.
-- **Sprint 61+:** progressive z expansion (z=30, z=50).
-- **Sprint 62+:** thermal stratification (temperature field z-gradient).
+- **Cíl:** eliminovat per-tick FieldGpu readback ze Sprintu 59 wire-upem
+  SensorGatherGpu (Sprint 56 ready, dosud test-only). GPU sensor shader
+  čte FieldGpu smell + pheromone storage buffer **direct** (přes
+  `current_grid_buffer()` accessor) — žádný `device.poll(Wait)` round-trip
+  na 256 KB grid × 2 fields/tick. Plus zapojuje GPU `SpatialHashGpu` jako
+  broad-phase pro sensor (cell + food bucket grids), nahrazuje 4 CPU
+  SpatialGrid rebuilds + lookup smyčky v `brain_act_gpu_full`.
+
+  **Plán implementace:**
+
+  *Body 1 — `SpatialHashGpu::dispatch(positions)`:*
+  - Variant of `rebuild()` bez per-tick readback. Submits count → prefix →
+    scatter compute passes a vrací. Sensor pipeline využije
+    `offsets_buffer()` + `sorted_buffer()` accessory pro chained access
+    (Sprint 49+ pattern: hash buffery vázány read-only do sensor bind
+    group). Eliminuje 2× `device.poll(Wait)` round-trip per tick (cell
+    hash + food hash).
+
+  *Body 2 — `SensorRow` API change (delta vs absolute):*
+  - Pre-Sprint-60 `compute()` rekonstruoval `nearest_food = positions[i] +
+    delta` (absolute pozice). Bylo to chybné přes toroidal wrap — cell na
+    `x=-950` + delta `60` = `-890`, ne ghost `+1010`. Sprint 60 ukládá raw
+    signed delta z shaderu direct → `SensorRow.nearest_food/cell` jsou
+    `Option<[f32; 3]>` (delta), match `BrainSensors` Sprint 54 sémantiku.
+    `populate_brain_inputs(cell, &sensors, vision_r)` konzumuje delta
+    přímo bez `target − pos` math.
+
+  *Body 3 — `GpuFullState` rozšíření (headless):*
+  - Add `cell_hash: SpatialHashGpu`, `food_hash: SpatialHashGpu`, `sensor:
+    SensorGatherGpu` do struct. Init v `setup` po Sprint 47 sdílený
+    GpuContext pattern. Capacity: cells = `MAX_POPULATION + slack`,
+    foods = `food_target(peak_density) × 2`.
+
+  *Body 4 — `brain_act_gpu_full` refactor:*
+  - 7-fáze pipeline:
+    1. CPU snapshot: `Vec<position>`, `Vec<eff_radius>`, `Vec<vision_radius>`
+       z `self.cells`; `Vec<food_position>` z `self.foods`.
+    2. `cell_hash.dispatch(positions)` + `food_hash.dispatch(food_positions)`
+       — submit only, no readback.
+    3. `sensor.compute(...)` čte FieldGpu smell + pheromone storage + hash
+       buffery → `Vec<SensorRow>` (60 KB readback × 1, vs Sprint 59 256 KB
+       readback × 2).
+    4. CPU `populate_brain_inputs` (rayon par_iter_mut zip s sensor_rows):
+       SensorRow → BrainSensors 1:1 (Sprint 60 SensorRow = delta), pak lib
+       helper plní `[f32; BRAIN_INPUTS]` array (energy, speed_norm, heading
+       projection, recurrent state z `cell.last_hidden`).
+    5–7. Identický s pre-Sprint-60: GPU brain forward → download hidden +
+       outputs → CPU motor.
+
+  *Body 5 — `update_smell` / `update_pheromone` no-readback:*
+  - `--gpu-full` cesta volá `gpu.smell.step()` ale NE `gpu.smell.download()`.
+    Sprint 59 `replace_grid_from(&grid)` syncing CPU SmellField shadow je
+    odstraněn — CPU `World.smell` / `pheromone` nejsou updated v `--gpu-full`,
+    sensor shader čte field direct. CPU shadows zůstávají v struct kvůli
+    checkpoint serialization (po Sprint 60 jsou stale v `--gpu-full`).
+  - `emit_pheromones` GPU path beze změny: `gpu.pheromone.add_source(pos,
+    rate*dt)` push do `pending_sources`, flushed v dalším ticku
+    `update_pheromone` `step()`.
+
+  *Body 6 — Renderer beze změny:*
+  - Sprint 60 wire-up je jen pro headless `--gpu-full`. Renderer
+    `GpuFieldState` Resource zachovává Sprint 59 path (per-tick FieldGpu
+    readback do CPU SmellResource). Bevy ECS Query + Commands extrakce pro
+    GPU snapshot pattern je Sprint 61+ refactor (analogický Sprint 58
+    `cell_eats_food` 3-pass).
+
+- **Konstanty:** žádné nové. SensorGatherGpu fixed grid 64×32×4 = 8192
+  buckets; `WORLD_HALF[0]=960` při `GRID_CELL_SIZE=64` → 30×17 buckets
+  active (krytí ±1024 / ±512 = ±960 / ±540 pohodlně).
+
+- **Výstup:**
+  - `src/gpu.rs`: `SpatialHashGpu::dispatch(&[[f32; 3]])` (no readback variant
+    of `rebuild`). `SensorRow` field semantika changed na min-image delta
+    (compute() vrací raw shader output).
+  - `src/bin/headless.rs`: `GpuFullState` přidává `cell_hash + food_hash +
+    sensor`. `brain_act_gpu_full` 7-fáze refactor. `update_smell` /
+    `update_pheromone` odstranily `replace_grid_from` sync.
+  - **Test suite: 73/73 pass** (sensor_gather_gpu_matches_cpu byl už
+    Sprint 56 re-enabled; Sprint 60 SensorRow change netestoval absolute
+    pos vs delta, jen radius/presence/grad — passuje).
+  - **Smoke seed=0, 60 gen, 1000 cells, default world s `--gpu-full`:**
+    - **Wall-clock 162 s = 222 ticks/s** (vs Sprint 58 CPU-only 977 ticks/s
+      = **4.4× POMALEJŠÍ**, vs Sprint 59 GPU s field readback 345 ticks/s
+      = **1.6× POMALEJŠÍ**).
+    - Per-fáze us avg: update_smell 47 (Sprint 59 423, **9× zlepšení** —
+      readback eliminován ✓), update_pheromone 20 (Sprint 59 377, **19×
+      zlepšení** ✓). Field stack je teď pohodlně low-overhead.
+    - ALE **brain_act 4103 us** (Sprint 59 967, Sprint 58 CPU 333) —
+      **+3137 us regrese**. GPU sensor pipeline (3 dispatch points:
+      cell_hash + food_hash + sensor + 1 readback 60 KB) má více
+      `device.poll(Wait)` round-trip než Sprint 59 path (CPU rayon sensor
+      gather + 1 brain forward dispatch).
+    - Pop final 525 (žádná extinkce, atomic CAS drift v noise rangi).
+    - **Net: Sprint 60 kombinuje field stack win s sensor stack ztrátou.
+      Total wall-clock je horší než Sprint 59.**
+
+- **Závěr (nepříjemný):**
+  Sprint 60 dokumentuje že **GPU offload pro current workload (1000 cells,
+  64×64×16 grid, 60 Hz target) je net negative** napříč všemi tested
+  konfiguracemi:
+  - Sprint 51 `--gpu-full` (brain forward + Hebbian + Brownian, CPU
+    sensor + field): rychlost vs CPU-only TBD historicky.
+  - Sprint 59 + GPU FieldGpu (readback): 345 ticks/s = 2.8× slower than CPU.
+  - Sprint 60 + GPU SensorGather (no field readback): 222 ticks/s = 4.4×
+    slower than CPU.
+  Per-tick CPU work je sub-millisecond díky Sprint 57+58 paralelizaci;
+  každý GPU `device.poll(Wait)` round-trip přidá ~50-200 µs (PCIe latence,
+  ne bandwidth). Sčítáním 4-5 sync points/tick se GPU stack stává hot path.
+  GPU má smysl při **bigger workload** (10k+ cells, larger grids, no per-tick
+  readback fully-fused pipeline). Pro current sim scale je CPU paralelní
+  cesta rychlejší.
+
+- **Poznámky:**
+  - **Eliminuje 2× FieldGpu readback (Sprint 59 hlavní bottleneck)** +
+    4× CPU SpatialGrid rebuild (cell_grid + food_grid pro brain_act).
+    Přidává 1× SensorGatherGpu readback (60 KB) + 2× GPU SpatialHash
+    dispatch (no readback). Net win záleží na PCIe latence vs GPU compute
+    time pro sensor shader.
+  - **CPU SmellField shadows jsou v `--gpu-full` stale.** Checkpoint
+    serialization v `--gpu-full` po Sprint 60 ukládá stale CPU state.
+    Pre-Sprint-60 path (CPU only nebo `--gpu` brain-only) zachová
+    deterministic CPU SmellField. Sprint 61+ může přidat readback při
+    checkpoint save (rare event, ne hot path).
+  - **GPU sensor shader bere `field_res` jako jediný param** — sensor
+    používá stejnou rezoluci pro smell i pheromone (`SensorParamsGpu.field_res_x/y/z`).
+    Aktuálně `SMELL_GRID_RES == PHEROMONE_GRID_RES` (=64), `SMELL_GRID_RES_Z
+    == PHEROMONE_GRID_RES_Z` (=16). Pokud konstanty rozejdou, sensor shader
+    vrátí špatné gradient — invariant `smell_resolution == pheromone_resolution`
+    je new constraint.
+  - **Renderer není v Sprint 60 zaznamenán.** Renderer `--gpu` default
+    cesta zůstává Sprint 59 readback pattern. Sprint 61 `cells_brain_act`
+    refactor přes Bevy ECS Query snapshot extrakce + GpuFieldState GPU
+    sensor wire-up.
+  - **Co Sprint 60 NEŘEŠÍ (Sprint 61+):**
+    - Renderer GPU sensor pipeline.
+    - Eliminace SensorRow readback: brain_forward shader by mohl číst
+      sensor output buffer + cell internals direct, fuzed do BRAIN_INPUTS
+      shader-side. Pak NO readback per tick.
+    - Eliminace hidden+outputs readback po brain forward: pokud Hebbian
+      update + motor jsou GPU shadery, hidden+outputs nemusí na CPU.
+    - GPU step / collision / predate / eat shadery (Sprint 50 standalone)
+      wire-up. Plný GPU tick loop bez CPU side-effects.
+
+## Sprinty 61–62 — open-ended
+
+- **Sprint 61+:** Renderer GPU sensor pipeline (mirror Sprint 60 do main.rs).
+- **Sprint 61+:** GPU full tick loop (no per-tick readback).
+- **Sprint 62+:** 3D voxel rendering, ghost cell visual wrap.
+- **Sprint 62+:** progressive z expansion (z=30, z=50).

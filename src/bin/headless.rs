@@ -23,7 +23,10 @@ use bioscape::{
 };
 #[cfg(feature = "gpu")]
 use bioscape::{
-    gpu::{BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu},
+    gpu::{
+        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, SensorGatherGpu,
+        SensorParamsGpu, SensorRow, SpatialHashGpu,
+    },
     BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS,
 };
 use rand::rngs::StdRng;
@@ -141,13 +144,19 @@ struct GpuFullState {
     brain: BrainGpu,
     hebbian: HebbianGpu,
     brownian: BrownianGpu,
-    /// Sprint 59: GPU smell + pheromone field (3D 7-point Jacobi). Per tick:
-    /// `add_source` deposit (foods/cells), `step()` dispatch (deposit + diffuse
-    /// shadery), `download()` readback do CPU `SmellField.grid` shadow pro CPU
-    /// sensor gather (gradient_at). Atomic CAS deposit drift acceptable
-    /// (Sprint 56: 1e-3 absolute tolerance).
+    /// Sprint 59: GPU smell + pheromone field (3D 7-point Jacobi).
+    /// Sprint 60: po wire SensorGatherGpu už NEČTE CPU SmellField shadow —
+    /// sensor shader bere field grid storage buffer direct. Per-tick readback
+    /// eliminován; CPU `World.smell` / `pheromone` zůstávají jen pro
+    /// checkpoint serialization (po `--gpu-full` jsou CPU shadows out-of-date).
     smell: FieldGpu,
     pheromone: FieldGpu,
+    /// Sprint 60: GPU spatial hashes pro sensor broad-phase. Per-tick
+    /// `dispatch()` (no readback) + sensor shader čte `offsets_buffer()` /
+    /// `sorted_buffer()` přes binding group.
+    cell_hash: SpatialHashGpu,
+    food_hash: SpatialHashGpu,
+    sensor: SensorGatherGpu,
 }
 
 impl World {
@@ -379,8 +388,9 @@ impl World {
     }
 
     fn update_smell(&mut self, dt: f32) {
-        // Sprint 59: pokud --gpu-full, deposit + diffuse na GPU. Readback
-        // do CPU SmellField.grid pro sensor gather (gradient_at).
+        // Sprint 60: deposit + diffuse na GPU bez readback. Sensor shader
+        // (SensorGatherGpu) čte field grid přes storage buffer binding
+        // (FieldGpu::current_grid_buffer) — žádná CPU SmellField sync.
         #[cfg(feature = "gpu")]
         if let Some(gpu) = self.gpu_full.as_mut() {
             for food in &self.foods {
@@ -390,8 +400,6 @@ impl World {
                 );
             }
             gpu.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
-            let grid = gpu.smell.download();
-            self.smell.replace_grid_from(&grid);
             return;
         }
         for food in &self.foods {
@@ -406,12 +414,10 @@ impl World {
         // emit_pheromones, called after brain_act). Cells thus read the
         // gradient ze stavu pole na předchozí tick — prevents instant
         // self-feedback (cell vidí svůj vlastní právě emitovaný puff).
-        // Sprint 59: GPU step + readback pokud --gpu-full.
+        // Sprint 60: GPU step bez readback.
         #[cfg(feature = "gpu")]
         if let Some(gpu) = self.gpu_full.as_mut() {
             gpu.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
-            let grid = gpu.pheromone.download();
-            self.pheromone.replace_grid_from(&grid);
             return;
         }
         self.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
@@ -462,94 +468,102 @@ impl World {
         self.brain_act(dt);
     }
 
-    /// Sprint 51: --gpu-full brain_act. Sensor gather + populate_brain_inputs
-    /// (CPU rayon, jako Sprint 44 path), pak GPU forward s persistent weights
-    /// (žádný 30 MB upload), download hidden + outputs, CPU motor.
+    /// Sprint 51: --gpu-full brain_act.
+    /// Sprint 60: sensor gather přesunut na GPU. Pipeline:
+    ///   1. CPU snapshot positions/eff_radii/vision_radii/food_positions.
+    ///   2. GPU spatial hash dispatch cell + food (no readback).
+    ///   3. GPU SensorGather compute (čte FieldGpu grid + spatial hash buffery
+    ///      direct → output `Vec<SensorRow>` přes 60 KB readback).
+    ///   4. CPU populate_brain_inputs konvertuje SensorRow + cell internals
+    ///      (energy, speed, heading projection, damage_accum) na BRAIN_INPUTS.
+    ///   5. GPU brain forward (persistent weights).
+    ///   6. Download hidden + outputs.
+    ///   7. CPU motor apply.
+    /// Eliminuje 2× FieldGpu readback (Sprint 59 overhead) + 4× CPU SpatialGrid
+    /// rebuild (broad-phase).
     #[cfg(feature = "gpu")]
     fn brain_act_gpu_full(&mut self, dt: f32) {
         let n = self.cells.len();
         if n == 0 {
             return;
         }
-        self.cell_grid.rebuild(
-            self.cells
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
-        );
-        self.food_grid.rebuild(
-            self.foods
-                .iter()
-                .enumerate()
-                .map(|(i, f)| (i, f.position, ())),
-        );
-        let cell_grid = &self.cell_grid;
-        let food_grid = &self.food_grid;
-        let smell = &self.smell;
-        let pheromone = &self.pheromone;
 
-        // Phase 1: CPU rayon — sensor gather + populate_brain_inputs.
-        // Sprint 54: toroidal sensor gather přes ghost positions + min-image
-        // delta, ukládá min-imaged delta do BrainSensors.nearest_*.
+        // Phase 1: CPU snapshots pro GPU sensor pipeline.
+        let positions: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
+        let eff_radii: Vec<f32> = self
+            .cells
+            .iter()
+            .map(|c| c.phenotype.effective_radius())
+            .collect();
+        let vision_radii: Vec<f32> = self.cells.iter().map(|c| c.genome.vision_radius).collect();
+        let food_positions: Vec<[f32; 3]> = self.foods.iter().map(|f| f.position).collect();
+
+        let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
+
+        // Phase 2: GPU spatial hash rebuild (no readback — chained do sensor).
+        gpu.cell_hash.dispatch(&positions);
+        gpu.food_hash.dispatch(&food_positions);
+
+        // Phase 3: GPU SensorGather. Bere `&FieldGpu` storage buffer (post
+        // step()) + `&SpatialHashGpu` offsets/sorted buffery. Output = SensorRow
+        // s min-image delta (Sprint 60 SensorRow refactor).
+        let params = SensorParamsGpu {
+            num_cells: n as u32,
+            num_foods: food_positions.len() as u32,
+            hash_cell_size: GRID_CELL_SIZE,
+            world_half_x: WORLD_HALF[0],
+            world_half_y: WORLD_HALF[1],
+            world_half_z: WORLD_HALF[2],
+            field_res_x: SMELL_GRID_RES as u32,
+            field_res_y: SMELL_GRID_RES as u32,
+            field_res_z: SMELL_GRID_RES_Z as u32,
+            field_eps: SMELL_SAMPLE_EPSILON,
+            field_world_half_x: WORLD_HALF[0],
+            field_world_half_y: WORLD_HALF[1],
+            field_world_half_z: WORLD_HALF[2],
+            _pad0: 0,
+        };
+        let sensor_rows: Vec<SensorRow> = gpu.sensor.compute(
+            &positions,
+            &eff_radii,
+            &vision_radii,
+            &food_positions,
+            &gpu.cell_hash,
+            &gpu.food_hash,
+            &gpu.smell,
+            &gpu.pheromone,
+            params,
+        );
+
+        // Phase 4: CPU populate_brain_inputs. SensorRow → BrainSensors je 1:1
+        // (Sprint 60 SensorRow drží min-image delta). par_iter_mut nad cells.
         let inputs_vec: Vec<[f32; BRAIN_INPUTS]> = self
             .cells
             .par_iter_mut()
-            .enumerate()
-            .map(|(i, cell)| {
-                let pos = cell.position;
-                let vision_r = cell.genome.vision_radius;
-                let vr2 = vision_r * vision_r;
-                let mut best_food: Option<[f32; 3]> = None;
-                let mut best_food_d2 = f32::MAX;
-                food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, ()| {
-                    let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
-                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if d2 <= vr2 && d2 < best_food_d2 {
-                        best_food_d2 = d2;
-                        best_food = Some(d);
-                    }
-                });
-                let mut best_cell: Option<([f32; 3], f32)> = None;
-                let mut best_cell_d2 = f32::MAX;
-                let mut neighbors_in_vision: u32 = 0;
-                cell_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |id, op, oradius| {
-                    if id == i {
-                        return;
-                    }
-                    let d = bioscape::min_image_delta(pos, op, WORLD_HALF);
-                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if d2 <= vr2 {
-                        neighbors_in_vision += 1;
-                        if d2 < best_cell_d2 {
-                            best_cell_d2 = d2;
-                            best_cell = Some((d, oradius));
-                        }
-                    }
-                });
-                let pos_xyz = [pos[0], pos[1], pos[2]];
-                let smell_grad = smell.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
-                let pheromone_grad = pheromone.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+            .zip(sensor_rows.par_iter())
+            .map(|(cell, row)| {
                 let sensors = bioscape::BrainSensors {
-                    nearest_food: best_food,
-                    nearest_cell: best_cell,
-                    neighbors_in_vision,
-                    smell_grad,
-                    pheromone_grad,
+                    nearest_food: row.nearest_food,
+                    nearest_cell: row.nearest_cell,
+                    neighbors_in_vision: row.neighbors_in_vision,
+                    smell_grad: row.smell_grad,
+                    pheromone_grad: row.pheromone_grad,
                 };
                 cell.apply_shell_absorb(dt);
+                let vision_r = cell.genome.vision_radius;
                 bioscape::populate_brain_inputs(cell, &sensors, vision_r)
             })
             .collect();
 
-        // Phase 2: upload inputs + GPU forward (persistent weights).
+        // Phase 5: upload inputs + GPU forward (persistent weights).
         let gpu = self.gpu_full.as_ref().expect("gpu_full Some");
         gpu.cells.upload_inputs(&inputs_vec);
         gpu.brain.forward_persistent(&gpu.cells, n);
 
-        // Phase 3: download hidden + outputs.
+        // Phase 6: download hidden + outputs.
         let (hiddens, outputs) = gpu.cells.download_hidden_outputs(n);
 
-        // Phase 4: writeback + motor (CPU).
+        // Phase 7: writeback + motor (CPU).
         self.cells
             .par_iter_mut()
             .enumerate()
@@ -1612,6 +1626,23 @@ fn main() {
                 WORLD_HALF,
                 field_sources_cap,
             )?;
+            // Sprint 60: spatial hashes pro sensor broad-phase. Sdílí
+            // GRID_CELL_SIZE konstantu s CPU SpatialGrid; xy world bounds
+            // pro toroidal bucket wrap.
+            let cell_hash = SpatialHashGpu::with_context(
+                &ctx,
+                cap,
+                GRID_CELL_SIZE,
+                [WORLD_HALF[0], WORLD_HALF[1]],
+            )?;
+            let food_capacity = field_sources_cap;
+            let food_hash = SpatialHashGpu::with_context(
+                &ctx,
+                food_capacity,
+                GRID_CELL_SIZE,
+                [WORLD_HALF[0], WORLD_HALF[1]],
+            )?;
+            let sensor = SensorGatherGpu::with_context(&ctx, cap, food_capacity)?;
             Ok(GpuFullState {
                 cells: cells_gpu,
                 brain,
@@ -1619,12 +1650,15 @@ fn main() {
                 brownian,
                 smell,
                 pheromone,
+                cell_hash,
+                food_hash,
+                sensor,
             })
         };
         match init() {
             Ok(state) => {
                 eprintln!(
-                    "gpu-full: persistent brain weights + GPU Hebbian + GPU Brownian + GPU Field (capacity {} cells, {} field sources)",
+                    "gpu-full: persistent brain weights + Hebbian + Brownian + Field + SensorGather (capacity {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
                 world.gpu_full = Some(state);
