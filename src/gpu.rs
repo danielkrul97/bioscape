@@ -985,14 +985,18 @@ impl SpatialHashGpu {
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 struct FieldParams {
-    resolution: u32,
+    res_x: u32,
+    res_y: u32,
+    res_z: u32,
     num_sources: u32,
     diffusion: f32,
     decay: f32,
     cell_size_x: f32,
     cell_size_y: f32,
+    cell_size_z: f32,
     world_half_x: f32,
     world_half_y: f32,
+    world_half_z: f32,
 }
 
 pub struct FieldGpu {
@@ -1006,35 +1010,34 @@ pub struct FieldGpu {
     params_buf: wgpu::Buffer,
     sources_buf: wgpu::Buffer,
     grid_readback: wgpu::Buffer,
-    bg_round_a: wgpu::BindGroup, // round A: grid_in=A, grid_out=B
-    bg_round_b: wgpu::BindGroup, // round B: grid_in=B, grid_out=A
-    pending_sources: Vec<f32>,   // [px, py, amount] * N
+    bg_round_a: wgpu::BindGroup,
+    bg_round_b: wgpu::BindGroup,
+    pending_sources: Vec<f32>, // [px, py, pz, amount] * N (Sprint 56: 4 floats per source)
     capacity_sources: usize,
-    /// Které grid je "current" = naposled zapsané pole, kam jdou next sources.
-    /// `true` = A, `false` = B. Po každém step() se invertuje.
     current_is_a: bool,
-    resolution: usize,
-    world_half: [f32; 2],
+    /// Sprint 56: 3D resolution + world bounds (xy toroidal, z bounded).
+    resolution: [usize; 3],
+    world_half: [f32; 3],
 }
 
 impl FieldGpu {
     pub fn new(
-        resolution: usize,
-        world_half: [f32; 2],
+        resolution: [usize; 3],
+        world_half: [f32; 3],
         sources_capacity: usize,
     ) -> Result<Self, String> {
-        assert!(resolution >= 2 && sources_capacity > 0);
+        assert!(resolution.iter().all(|&r| r >= 2) && sources_capacity > 0);
         let ctx = GpuContext::new()?;
         Self::with_device_inner(ctx.device, ctx.queue, resolution, world_half, sources_capacity)
     }
 
     pub fn with_context(
         ctx: &GpuContext,
-        resolution: usize,
-        world_half: [f32; 2],
+        resolution: [usize; 3],
+        world_half: [f32; 3],
         sources_capacity: usize,
     ) -> Result<Self, String> {
-        assert!(resolution >= 2 && sources_capacity > 0);
+        assert!(resolution.iter().all(|&r| r >= 2) && sources_capacity > 0);
         Self::with_device_inner(
             Arc::clone(&ctx.device),
             Arc::clone(&ctx.queue),
@@ -1047,8 +1050,8 @@ impl FieldGpu {
     fn with_device_inner(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
-        resolution: usize,
-        world_half: [f32; 2],
+        resolution: [usize; 3],
+        world_half: [f32; 3],
         sources_capacity: usize,
     ) -> Result<Self, String> {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1124,7 +1127,8 @@ impl FieldGpu {
         let pipeline_deposit = make_pipe("deposit", "field-deposit");
         let pipeline_diffuse = make_pipe("diffuse", "field-diffuse");
 
-        let grid_size_bytes = (resolution * resolution * std::mem::size_of::<u32>()) as u64;
+        let grid_size_bytes =
+            (resolution[0] * resolution[1] * resolution[2] * std::mem::size_of::<u32>()) as u64;
         let grid_a = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("field-grid-a"),
             size: grid_size_bytes,
@@ -1150,9 +1154,10 @@ impl FieldGpu {
             contents: bytemuck::bytes_of(&FieldParams::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        // Sprint 56: source = 4 floats (px, py, pz, amount).
         let sources_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("field-sources"),
-            size: (sources_capacity * 3 * std::mem::size_of::<f32>()) as u64,
+            size: (sources_capacity * 4 * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1212,27 +1217,24 @@ impl FieldGpu {
         })
     }
 
-    pub fn resolution(&self) -> usize {
+    pub fn resolution(&self) -> [usize; 3] {
         self.resolution
     }
 
-    pub fn world_half(&self) -> [f32; 2] {
+    pub fn world_half(&self) -> [f32; 3] {
         self.world_half
     }
 
-    fn cell_size_x(&self) -> f32 {
-        (2.0 * self.world_half[0]) / self.resolution as f32
+    fn cell_size(&self, axis: usize) -> f32 {
+        (2.0 * self.world_half[axis]) / self.resolution[axis] as f32
     }
 
-    fn cell_size_y(&self) -> f32 {
-        (2.0 * self.world_half[1]) / self.resolution as f32
-    }
-
-    /// Mirror `SmellField::add_source`: zaregistruje bod-zdroj. Bude
-    /// flushnut na GPU při dalším `step()`.
-    pub fn add_source(&mut self, pos: [f32; 2], amount: f32) {
+    /// Mirror `SmellField::add_source` 3D. Sprint 56: 4 floats per source
+    /// (px, py, pz, amount). Bude flushnut na GPU při dalším `step()`.
+    pub fn add_source(&mut self, pos: [f32; 3], amount: f32) {
         self.pending_sources.push(pos[0]);
         self.pending_sources.push(pos[1]);
+        self.pending_sources.push(pos[2]);
         self.pending_sources.push(amount);
     }
 
@@ -1245,7 +1247,7 @@ impl FieldGpu {
         let new_cap = (self.capacity_sources * 2).max(num_sources);
         self.sources_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("field-sources"),
-            size: (new_cap * 3 * std::mem::size_of::<f32>()) as u64,
+            size: (new_cap * 4 * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1279,11 +1281,11 @@ impl FieldGpu {
         self.bg_round_b = make_bg(&self.grid_b, &self.grid_a, "field-bg-round-b");
     }
 
-    /// Mirror `SmellField::step`: flush pending sources do GPU bufferu, dispatch
-    /// deposit + diffuse, ping-pong swap. `decay_per_sec` se converté na
-    /// `(1 - decay × dt).max(0)` aby matchnul CPU semantiku.
+    /// Mirror `SmellField::step` 3D. Sprint 56: 7-point Jacobi (xy toroidal,
+    /// z bounded). `decay_per_sec` → `(1 - decay × dt).max(0)`.
     pub fn step(&mut self, diffusion: f32, decay_per_sec: f32, dt: f32) {
-        let num_sources = self.pending_sources.len() / 3;
+        // Sprint 56: 4 floats per source (px, py, pz, amount).
+        let num_sources = self.pending_sources.len() / 4;
         self.ensure_sources_capacity(num_sources.max(1));
         if num_sources > 0 {
             self.queue.write_buffer(
@@ -1293,14 +1295,18 @@ impl FieldGpu {
             );
         }
         let params = FieldParams {
-            resolution: self.resolution as u32,
+            res_x: self.resolution[0] as u32,
+            res_y: self.resolution[1] as u32,
+            res_z: self.resolution[2] as u32,
             num_sources: num_sources as u32,
             diffusion,
             decay: (1.0 - decay_per_sec * dt).max(0.0),
-            cell_size_x: self.cell_size_x(),
-            cell_size_y: self.cell_size_y(),
+            cell_size_x: self.cell_size(0),
+            cell_size_y: self.cell_size(1),
+            cell_size_z: self.cell_size(2),
             world_half_x: self.world_half[0],
             world_half_y: self.world_half[1],
+            world_half_z: self.world_half[2],
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -1333,8 +1339,11 @@ impl FieldGpu {
             });
             pass.set_pipeline(&self.pipeline_diffuse);
             pass.set_bind_group(0, bg, &[]);
-            let workgroups_xy = ((self.resolution as u32) + 7) / 8;
-            pass.dispatch_workgroups(workgroups_xy, workgroups_xy, 1);
+            // Sprint 56: 3D dispatch (workgroup_size 4×4×4 v shaderu).
+            let wg_x = ((self.resolution[0] as u32) + 3) / 4;
+            let wg_y = ((self.resolution[1] as u32) + 3) / 4;
+            let wg_z = ((self.resolution[2] as u32) + 3) / 4;
+            pass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
         self.queue.submit(Some(encoder.finish()));
 
@@ -1356,7 +1365,7 @@ impl FieldGpu {
     /// Pomalá operace — kvůli tests + visualization. Sprint 47+ sample přes
     /// GPU compute, žádný readback.
     pub fn download(&mut self) -> Vec<f32> {
-        let n = self.resolution * self.resolution;
+        let n = self.resolution[0] * self.resolution[1] * self.resolution[2];
         let bytes = (n * 4) as u64;
         // Po step() je current_is_a inverted, takže "current" je teď grid_a
         // pokud current_is_a=true (původně bylo b, swap -> a).
@@ -3506,12 +3515,15 @@ pub struct SensorParamsGpu {
     pub world_half_x: f32,
     pub world_half_y: f32,
     pub world_half_z: f32,
-    pub field_resolution: u32,
+    /// Sprint 56: per-axis 3D field params.
+    pub field_res_x: u32,
+    pub field_res_y: u32,
+    pub field_res_z: u32,
     pub field_eps: f32,
     pub field_world_half_x: f32,
     pub field_world_half_y: f32,
+    pub field_world_half_z: f32,
     pub _pad0: u32,
-    pub _pad1: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -3519,8 +3531,9 @@ pub struct SensorRow {
     pub nearest_food: Option<[f32; 3]>,
     pub nearest_cell: Option<([f32; 3], f32)>,
     pub neighbors_in_vision: u32,
-    pub smell_grad: [f32; 2],
-    pub pheromone_grad: [f32; 2],
+    /// Sprint 56: 3D gradient (z-axis added).
+    pub smell_grad: [f32; 3],
+    pub pheromone_grad: [f32; 3],
 }
 
 pub struct SensorGatherGpu {
@@ -3634,8 +3647,9 @@ impl SensorGatherGpu {
         let eff_radii_buf = mk("sensor-eff", nc * f, stor_dst);
         let vision_radii_buf = mk("sensor-vision", nc * f, stor_dst);
         let food_positions_buf = mk("sensor-food-pos", nf * 3 * f, stor_dst);
-        let output_buf = mk("sensor-output", nc * 13 * f, stor_src);
-        let output_rb = mk("sensor-output-rb", nc * 13 * f, read);
+        // Sprint 56: stride 15 (smell_grad.z + pheromone_grad.z).
+        let output_buf = mk("sensor-output", nc * 15 * f, stor_src);
+        let output_rb = mk("sensor-output-rb", nc * 15 * f, read);
 
         Ok(Self {
             device,
@@ -3735,7 +3749,7 @@ impl SensorGatherGpu {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
         }
-        let bytes = (n as u64) * 13 * 4;
+        let bytes = (n as u64) * 15 * 4;
         encoder.copy_buffer_to_buffer(&self.output_buf, 0, &self.output_rb, 0, bytes);
         self.queue.submit(Some(encoder.finish()));
 
@@ -3746,7 +3760,7 @@ impl SensorGatherGpu {
         let f: &[f32] = bytemuck::cast_slice(&data);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let off = i * 13;
+            let off = i * 15;
             let has_food = f[off + 3] > 0.5;
             let nearest_food = if has_food {
                 Some([
@@ -3770,13 +3784,13 @@ impl SensorGatherGpu {
             } else {
                 None
             };
-            let count_bits = f[off + 12].to_bits();
+            let count_bits = f[off + 14].to_bits();
             out.push(SensorRow {
                 nearest_food,
                 nearest_cell,
                 neighbors_in_vision: count_bits,
-                smell_grad: [f[off + 8], f[off + 9]],
-                pheromone_grad: [f[off + 10], f[off + 11]],
+                smell_grad: [f[off + 8], f[off + 9], f[off + 10]],
+                pheromone_grad: [f[off + 11], f[off + 12], f[off + 13]],
             });
         }
         drop(data);
@@ -4509,7 +4523,7 @@ impl StatsGpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Brain;
+    use crate::{Brain, SmellField};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -4628,18 +4642,59 @@ mod tests {
         }
     }
 
-    /// Sprint 46: parity test GPU FieldGpu vs CPU `SmellField`. Stejné sources +
-    /// stejné kroky → grid hodnoty match v ε. Tolerance 1e-3 — atomic float CAS
-    /// loop má potenciální drift kvůli pořadí přídavků (ne-asociativita f32).
-    /// **Sprint 53 #[ignore]:** SmellField přešel na 3D 7-point stencil; FieldGpu
-    /// stále drží 2D 5-point. Test vyžaduje stejnou dimenzionalitu — Sprint 54
-    /// migruje FieldGpu na 3D a re-enabluje.
+    /// Sprint 46/56: parity test GPU FieldGpu vs CPU `SmellField`. Stejné
+    /// 3D sources + stejné step parametry → grid match v ε. Sprint 56
+    /// re-enabled na 3D + toroidal xy / Neumann z. Atomic float CAS loop
+    /// má drift kvůli pořadí přídavků; tolerance 1e-3 absolute.
     #[test]
-    #[ignore]
     fn field_gpu_diffusion_matches_cpu() {
-        // Sprint 53: SmellField se přesunul na 3D, FieldGpu zůstává 2D.
-        // Tělo testu je dočasně skipnuté — Sprint 54 migruje FieldGpu na 3D
-        // a re-enabluje porovnání. Stub-body proto smí být prázdné.
+        let resolution = [16usize, 16, 4];
+        let world_half = [320.0_f32, 320.0, 20.0];
+        let mut gpu = match FieldGpu::new(resolution, world_half, 32) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: no GPU adapter ({e})");
+                return;
+            }
+        };
+        let mut cpu = SmellField::new(resolution, world_half);
+
+        let mut rng = StdRng::seed_from_u64(46);
+        let sources: Vec<([f32; 3], f32)> = (0..16)
+            .map(|_| {
+                (
+                    [
+                        rng.random_range(-300.0_f32..300.0),
+                        rng.random_range(-300.0_f32..300.0),
+                        rng.random_range(-15.0_f32..15.0),
+                    ],
+                    rng.random_range(0.5_f32..2.0),
+                )
+            })
+            .collect();
+
+        let diffusion = 0.15_f32;
+        let decay = 0.5_f32;
+        let dt = 0.1_f32;
+        for _ in 0..6 {
+            for (p, amt) in &sources {
+                cpu.add_source(*p, *amt);
+                gpu.add_source(*p, *amt);
+            }
+            cpu.step(diffusion, decay, dt);
+            gpu.step(diffusion, decay, dt);
+        }
+
+        let cpu_grid = cpu.grid_ref();
+        let gpu_grid = gpu.download();
+        assert_eq!(cpu_grid.len(), gpu_grid.len());
+        for (i, (a, b)) in cpu_grid.iter().zip(gpu_grid.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "i={i} cpu={a} gpu={b} diff={}",
+                a - b
+            );
+        }
     }
 
     /// Sprint 47: StatsGpu reduction parity vs naive CPU sum. Tolerance 1e-2
@@ -4895,18 +4950,221 @@ mod tests {
         }
     }
 
-    /// Sprint 50: full sensor gather GPU vs CPU parity. Cells + foods + 2
-    /// fields. GPU spustí všech subsystémů na shared context, output SoA
-    /// porovnán s CPU equivalent (cell broad-phase + food broad-phase + 2
-    /// gradient_at samples). Drobný drift kvůli atomic float CAS na fields
-    /// — tolerance 1e-2 na gradient values.
-    /// **Sprint 53 #[ignore]:** SmellField přešel na 3D (gradient_at vrací
-    /// `[f32; 3]`). FieldGpu + sensor_gather.wgsl stále drží 2D field
-    /// indexing. Sprint 54 migruje GPU field stack na 3D a re-enabluje.
+    /// Sprint 50/56: full sensor gather GPU vs CPU parity. Cells + foods + 2
+    /// 3D fields. GPU spustí celý subsystém přes shared context, output SoA
+    /// porovnán s CPU brute-force pro nearest cell, nearest food, neighbor
+    /// count + 3D field gradient (smell, pheromone). Atomic float CAS drift
+    /// na field deposit dovoluje tolerance 1e-2 na gradient values.
     #[test]
-    #[ignore]
     fn sensor_gather_gpu_matches_cpu() {
-        // Sprint 53 stub: tělo přesunuto na Sprint 54 (FieldGpu 3D migrace).
+        let ctx = match GpuContext::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip: no GPU adapter ({e})");
+                return;
+            }
+        };
+        let n = 32_usize;
+        let nf = 16_usize;
+        let cell_size = 64.0_f32;
+        let world_half_xy = [320.0_f32, 320.0];
+        let field_resolution = [16usize, 16, 4];
+        let field_world_half = [320.0_f32, 320.0, 20.0];
+
+        let mut rng = StdRng::seed_from_u64(56);
+        let positions: Vec<[f32; 3]> = (0..n)
+            .map(|_| {
+                [
+                    rng.random_range(-200.0_f32..200.0),
+                    rng.random_range(-200.0_f32..200.0),
+                    rng.random_range(-10.0_f32..10.0),
+                ]
+            })
+            .collect();
+        let eff_radii: Vec<f32> = (0..n).map(|_| rng.random_range(1.0_f32..2.5)).collect();
+        let vision_radii: Vec<f32> = (0..n).map(|_| 60.0).collect();
+        let food_positions: Vec<[f32; 3]> = (0..nf)
+            .map(|_| {
+                [
+                    rng.random_range(-200.0_f32..200.0),
+                    rng.random_range(-200.0_f32..200.0),
+                    rng.random_range(-10.0_f32..10.0),
+                ]
+            })
+            .collect();
+
+        let mut cell_hash =
+            SpatialHashGpu::with_context(&ctx, n, cell_size, world_half_xy).expect("cell hash");
+        cell_hash.rebuild(&positions);
+        let mut food_hash =
+            SpatialHashGpu::with_context(&ctx, nf, cell_size, world_half_xy).expect("food hash");
+        food_hash.rebuild(&food_positions);
+
+        let mut smell_gpu =
+            FieldGpu::with_context(&ctx, field_resolution, field_world_half, 64).expect("smell");
+        let mut pheromone_gpu =
+            FieldGpu::with_context(&ctx, field_resolution, field_world_half, 64).expect("phero");
+        let mut smell_cpu = SmellField::new(field_resolution, field_world_half);
+        let mut pheromone_cpu = SmellField::new(field_resolution, field_world_half);
+
+        let smell_sources: Vec<([f32; 3], f32)> = (0..12)
+            .map(|_| {
+                (
+                    [
+                        rng.random_range(-200.0_f32..200.0),
+                        rng.random_range(-200.0_f32..200.0),
+                        rng.random_range(-10.0_f32..10.0),
+                    ],
+                    1.0,
+                )
+            })
+            .collect();
+        let phero_sources: Vec<([f32; 3], f32)> = (0..8)
+            .map(|_| {
+                (
+                    [
+                        rng.random_range(-200.0_f32..200.0),
+                        rng.random_range(-200.0_f32..200.0),
+                        rng.random_range(-10.0_f32..10.0),
+                    ],
+                    1.5,
+                )
+            })
+            .collect();
+
+        for (p, a) in &smell_sources {
+            smell_gpu.add_source(*p, *a);
+            smell_cpu.add_source(*p, *a);
+        }
+        for (p, a) in &phero_sources {
+            pheromone_gpu.add_source(*p, *a);
+            pheromone_cpu.add_source(*p, *a);
+        }
+        let diffusion = 0.15_f32;
+        let decay = 0.5_f32;
+        let dt = 0.1_f32;
+        for _ in 0..3 {
+            smell_gpu.step(diffusion, decay, dt);
+            pheromone_gpu.step(diffusion, decay, dt);
+            smell_cpu.step(diffusion, decay, dt);
+            pheromone_cpu.step(diffusion, decay, dt);
+        }
+
+        let mut sensor =
+            SensorGatherGpu::with_context(&ctx, n, nf).expect("SensorGatherGpu init");
+        let eps = 4.0_f32;
+        let params = SensorParamsGpu {
+            hash_cell_size: cell_size,
+            world_half_x: world_half_xy[0],
+            world_half_y: world_half_xy[1],
+            world_half_z: 20.0,
+            field_res_x: field_resolution[0] as u32,
+            field_res_y: field_resolution[1] as u32,
+            field_res_z: field_resolution[2] as u32,
+            field_eps: eps,
+            field_world_half_x: field_world_half[0],
+            field_world_half_y: field_world_half[1],
+            field_world_half_z: field_world_half[2],
+            ..SensorParamsGpu::default()
+        };
+        let rows = sensor.compute(
+            &positions,
+            &eff_radii,
+            &vision_radii,
+            &food_positions,
+            &cell_hash,
+            &food_hash,
+            &smell_gpu,
+            &pheromone_gpu,
+            params,
+        );
+
+        let min_image = |d: f32, half: f32| -> f32 {
+            if d > half {
+                d - 2.0 * half
+            } else if d < -half {
+                d + 2.0 * half
+            } else {
+                d
+            }
+        };
+
+        for i in 0..n {
+            let pos_i = positions[i];
+            let vr2 = vision_radii[i] * vision_radii[i];
+
+            let mut best_cell_d2 = f32::INFINITY;
+            let mut best_cell_radius = -1.0_f32;
+            let mut count = 0u32;
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let dx = min_image(positions[j][0] - pos_i[0], world_half_xy[0]);
+                let dy = min_image(positions[j][1] - pos_i[1], world_half_xy[1]);
+                let dz = positions[j][2] - pos_i[2];
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 <= vr2 {
+                    count += 1;
+                    if d2 < best_cell_d2 {
+                        best_cell_d2 = d2;
+                        best_cell_radius = eff_radii[j];
+                    }
+                }
+            }
+
+            let mut best_food_d2 = f32::INFINITY;
+            let mut has_food = false;
+            for f in 0..nf {
+                let dx = min_image(food_positions[f][0] - pos_i[0], world_half_xy[0]);
+                let dy = min_image(food_positions[f][1] - pos_i[1], world_half_xy[1]);
+                let dz = food_positions[f][2] - pos_i[2];
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 <= vr2 && d2 < best_food_d2 {
+                    best_food_d2 = d2;
+                    has_food = true;
+                }
+            }
+
+            let row = &rows[i];
+            assert_eq!(
+                row.neighbors_in_vision, count,
+                "i={i} neighbor count mismatch"
+            );
+            assert_eq!(
+                row.nearest_cell.is_some(),
+                best_cell_radius >= 0.0,
+                "i={i} nearest_cell presence"
+            );
+            if let Some((_, r)) = row.nearest_cell {
+                assert!(
+                    (r - best_cell_radius).abs() < 1e-4,
+                    "i={i} radius cpu={best_cell_radius} gpu={r}"
+                );
+            }
+            assert_eq!(
+                row.nearest_food.is_some(),
+                has_food,
+                "i={i} nearest_food presence"
+            );
+
+            let cpu_smell_grad = smell_cpu.gradient_at(pos_i, eps);
+            let cpu_phero_grad = pheromone_cpu.gradient_at(pos_i, eps);
+            for axis in 0..3 {
+                assert!(
+                    (row.smell_grad[axis] - cpu_smell_grad[axis]).abs() < 1e-2,
+                    "i={i} smell_grad[{axis}] cpu={} gpu={}",
+                    cpu_smell_grad[axis],
+                    row.smell_grad[axis]
+                );
+                assert!(
+                    (row.pheromone_grad[axis] - cpu_phero_grad[axis]).abs() < 1e-2,
+                    "i={i} phero_grad[{axis}] cpu={} gpu={}",
+                    cpu_phero_grad[axis],
+                    row.pheromone_grad[axis]
+                );
+            }
+        }
     }
 
 
@@ -5375,7 +5633,8 @@ mod tests {
         let mut hash_gpu =
             SpatialHashGpu::with_context(&ctx, n, 64.0, [1000.0, 1000.0]).expect("SpatialHashGpu init");
         let mut field_gpu =
-            FieldGpu::with_context(&ctx, 16, [320.0, 320.0], 32).expect("FieldGpu init");
+            FieldGpu::with_context(&ctx, [16, 16, 4], [320.0, 320.0, 20.0], 32)
+                .expect("FieldGpu init");
         let mut stats_gpu = StatsGpu::with_context(&ctx, n).expect("StatsGpu init");
 
         let brains: Vec<Brain> = (0..n).map(|_| Brain::random(&mut rng)).collect();
@@ -5418,11 +5677,11 @@ mod tests {
         assert_eq!(offsets[GPU_HASH_NUM_BUCKETS] as usize, n);
 
         for (pos, _) in positions.iter().zip(0..n) {
-            field_gpu.add_source([pos[0], pos[1]], 1.0);
+            field_gpu.add_source(*pos, 1.0);
         }
         field_gpu.step(0.15, 0.3, 1.0 / 60.0);
         let grid = field_gpu.download();
-        assert_eq!(grid.len(), 16 * 16);
+        assert_eq!(grid.len(), 16 * 16 * 4);
 
         let stats = stats_gpu.compute(&positions, &velocities, &energies);
         assert!(stats.sum_energy > 0.0);

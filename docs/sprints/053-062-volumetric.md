@@ -320,13 +320,109 @@ plně 3D s 7-point Jacobi diffusion.
     SmellField 3D mismatch. Sprint 55 by mohl bucket part toroidal fixnout,
     ale field sample part stále nematch. Sprint 56 (FieldGpu 3D) re-enable.
 
-## Sprinty 56–62 — open-ended
+## Sprint 56 — GPU FieldGpu 3D + toroidal
 
-- **Sprint 56: GPU FieldGpu 3D + toroidal.** field_diffuse_3d.wgsl 7-point
-  stencil with xy wrap. Re-enable 2 ignored tests.
-- **Sprint 56: GPU FieldGpu 3D + toroidal.** field_diffuse_3d.wgsl 7-point
-  stencil with xy wrap.
-- **Sprint 57+:** 3D voxel rendering, ghost cell visual wrap.
-- **Sprint 58+:** progressive z expansion (z=30, z=50).
-- **Sprint 59+:** thermal stratification (temperature field z-gradient).
-- **Sprint 60+:** light field z-attenuation (photic vs aphotic zones).
+- **Cíl:** dokončit GPU field stack ze Sprintu 46/50 — přejít z 2D 5-point
+  stencilu na 3D 7-point stencil s xy toroidal wrap + z Neumann zero-flux.
+  Re-enable 2 testy (`field_gpu_diffusion_matches_cpu` +
+  `sensor_gather_gpu_matches_cpu`) které byly `#[ignore]` od Sprintu 53/54.
+
+  **Plán implementace:**
+
+  *Body 1 — `field_diffuse.wgsl` 3D rewrite:*
+  - `Params` struct `res_x/y/z` (per-axis), `cell_size_x/y/z`,
+    `world_half_x/y/z`. Pre-Sprint-56 byl `resolution: u32` + `world_half: f32`
+    pro symmetric 2D grid.
+  - `deposit` shader: 4 floats per source (`px, py, pz, amount`). xy modulo
+    wrap match `SmellField::idx_of`, z out-of-range → no-op.
+  - `diffuse` shader: workgroup_size(4,4,4). 7-point stencil
+    (`left+right+up+down+back+front - 6×center`). xy wrap (i_left = nx-1
+    if i==0, atd.) match `SmellField::step` Sprint 53/54 semantiku. z na
+    krajích fallback na center (Neumann zero-flux).
+
+  *Body 2 — Rust `FieldGpu` 3D API:*
+  - `resolution: [usize; 3]`, `world_half: [f32; 3]`. Konstruktor
+    (`new`, `with_context`, `with_device_inner`) přepsán; sources buffer
+    alokován s 4 floats per source. `add_source(pos: [f32; 3], amount)`.
+  - `step()` 3D dispatch (`wg_x = (res_x+3)/4`, atd.). `download()` vrací
+    `res_x * res_y * res_z` elements.
+  - `cell_size(axis)` helper.
+
+  *Body 3 — `sensor_gather.wgsl` 3D field sampling + toroidal broad-phase:*
+  - `SensorParams` rozšířen o `field_res_x/y/z`, `field_world_half_x/y/z`.
+    Pre-Sprint-56 byl `field_resolution: u32` + 2D `field_world_half_x/y`.
+  - Helpers: `bucket_id_wrapped` (Sprint 55 toroidal hash), `min_image_xy`
+    (Sprint 55), `sample_field_3d`, `gradient_at_3d` (3D central diff
+    along all axes).
+  - Cell + food broad-phase: ghost positions (`pos_i + offset * cs`) +
+    `bucket_id_wrapped` + min-image distance pro narrow-phase. Sprint 55
+    pattern (cell_neighbors / collision / predate).
+  - Output stride 13 → 15 (smell_grad.z + pheromone_grad.z přidány). Layout:
+    `[0..3]` food delta, `[3]` has_food, `[4..7]` cell delta, `[7]` cell radius,
+    `[8..11]` smell_grad, `[11..14]` pheromone_grad, `[14]` neighbor count.
+
+  *Body 4 — Rust `SensorGatherGpu` 3D:*
+  - `SensorParamsGpu` Rust struct match nový shader struct (3D field params,
+    16-byte aligned přes `_pad0`).
+  - `SensorRow.smell_grad` + `pheromone_grad` z `[f32; 2]` na `[f32; 3]`.
+    Match `BrainSensors` 3D semantiku ze Sprintu 53.
+  - Output buffer + readback alokované na `n * 15 * 4` bytes. `compute()`
+    extract loop reads stride 15.
+
+  *Body 5 — testy:*
+  - `field_gpu_diffusion_matches_cpu` re-enabled: 16×16×4 grid, 320×320×20
+    world_half, 16 sources, 6 step iterací s diffusion=0.15, decay=0.5,
+    dt=0.1. Compares full grid `cpu.grid_ref()` vs `gpu.download()` v ε
+    1e-3 absolute. `SmellField` získal `pub fn grid_ref()` accessor (test
+    needs direct grid).
+  - `sensor_gather_gpu_matches_cpu` re-enabled: 32 cells + 16 foods,
+    16×16×4 fields, 12 smell sources + 8 pheromone sources, 3 step iter.
+    Compares neighbor count, nearest cell radius, nearest food presence,
+    smell_grad + pheromone_grad (3 axes) vs CPU brute force s min-image
+    delta. Tolerance 1e-2 na gradient (atomic CAS drift).
+
+- **Konstanty:** žádné nové; FieldParams + SensorParams gain 3D fields.
+
+- **Výstup:**
+  - `shaders/field_diffuse.wgsl`: kompletní 3D rewrite (deposit + diffuse).
+  - `shaders/sensor_gather.wgsl`: 3D field helpers, toroidal broad-phase
+    (ghost positions + min_image_xy), output stride 15.
+  - `src/gpu.rs`: FieldGpu 3D, SensorParamsGpu rozšířen, SensorRow 3D
+    gradients, output stride 15. 2 testy re-enabled — vesměs **pass**.
+  - `src/lib.rs`: `SmellField::grid_ref()` accessor (test-only convenience).
+  - **73/73 testů pass + 0 ignored** (oba field/sensor gpu tests prošly).
+  - **Smoke headless seed=2 (CLI args fallback k defaultům):** 200 gen
+    completed bez panic, pop trajektorie 200 → 1000 (saturated) → 508 (gen
+    200). 442 ticks/s.
+
+- **Poznámky:**
+  - **Output stride bump 13 → 15:** binární kompat s pre-Sprint-56 caller
+    není zachována. Žádný in-tree caller mimo testy (SensorGatherGpu je
+    Sprint 50 standalone — nikoliv v `--gpu-full` nor renderer hot path),
+    takže žádný breakage produktu.
+  - **Neumann z-flux match CPU:** GPU diffuse shader fallback na center
+    pro k=0 a k=nz-1 odpovídá `SmellField::step` Sprint 53/54 semantiku.
+    7-point stencil v 3D s `diffusion < 1/6` je stable. `SMELL_DIFFUSION =
+    0.15` zůstává pod limitem.
+  - **Atomic CAS f32 drift:** GPU deposit používá CAS loop s `bitcast<u32>`
+    ↔ `bitcast<f32>` (Naga storage pointer restriction = inline CAS, no
+    function param). Pořadí přídavků není deterministické → ULP drift na
+    grid hodnotách. Tolerance 1e-3 absolute na `field_gpu_diffusion`,
+    1e-2 absolute na `sensor_gather` gradient (gradient přes 6 samples
+    zhoršuje drift 6×).
+  - **GPU field stack readiness:** Po Sprintu 56 GPU FieldGpu produkuje
+    bit-equivalent (modulo CAS drift) jako CPU SmellField. Sprint 57+
+    full GPU tick pipeline (smell + pheromone deposit + diffuse na GPU,
+    sensor gather na GPU) může nyní spojit FieldGpu + SensorGatherGpu +
+    BrainGpu + HebbianGpu + step + collision + predate v jednom unified
+    GPU loop. Pre-Sprint-56 byl FieldGpu blocking item.
+
+## Sprinty 57–62 — open-ended
+
+- **Sprint 57+:** unified GPU tick pipeline (FieldGpu deposit/diffuse +
+  SensorGatherGpu wired do `--gpu-full` headless a renderer GPU default
+  hot path; CPU SmellField fallback only).
+- **Sprint 58+:** 3D voxel rendering, ghost cell visual wrap.
+- **Sprint 59+:** progressive z expansion (z=30, z=50).
+- **Sprint 60+:** thermal stratification (temperature field z-gradient).
+- **Sprint 61+:** light field z-attenuation (photic vs aphotic zones).

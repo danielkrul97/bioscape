@@ -1419,6 +1419,10 @@ impl SmellField {
         self.idx_of(pos).map(|i| self.grid[i]).unwrap_or(0.0)
     }
 
+    pub fn grid_ref(&self) -> &[f32] {
+        &self.grid
+    }
+
     /// 3D central differences at `pos ± epsilon` along each axis. Returns
     /// `[d/dx, d/dy, d/dz]`. Out-of-bounds samples count as 0.
     pub fn gradient_at(&self, pos: [f32; 3], epsilon: f32) -> [f32; 3] {
@@ -2510,7 +2514,7 @@ mod tests {
     fn try_eat_isotropic_unchanged_for_unit_sphere() {
         // L=W=H=1, eat_factor=8 → ellipsoid degeneruje na sféru radius 8.
         // Backward-kompat se Sprint 40 sférickou eat-zónou.
-        let mut cell = Cell { energy: 50.0, ..base_cell() };
+        let cell = Cell { energy: 50.0, ..base_cell() };
         let inside = Food { position: [5.0, 0.0, 0.0], age_ticks: 0 };
         let outside = Food { position: [10.0, 0.0, 0.0], age_ticks: 0 };
         let lateral_inside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0 };
