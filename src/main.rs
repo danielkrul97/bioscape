@@ -263,10 +263,10 @@ fn main() {
             }),
             FrameTimeDiagnosticsPlugin::default(),
         ))
-        // Sprint 36: clear color matchnut s mid-richness green ground plane
-        // (world_map_image emituje zelený biome — viz `world_map_image`).
-        // Black margins kolem world plane se tak vizuálně rozpustí.
-        .insert_resource(ClearColor(Color::srgb(0.12, 0.42, 0.14)))
+        // Sprint 36: clear color matchnut s LOW richness color z `world_map_image`
+        // (poor zones jsou sytá zelená, rich zones bílá). Margins kolem world
+        // plane tak vizuálně splynou s chudými oblastmi mapy.
+        .insert_resource(ClearColor(Color::srgb(0.10, 0.42, 0.12)))
         .init_resource::<LineageMaterials>()
         .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
@@ -408,8 +408,7 @@ fn setup(
     let cell_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS).mesh().ico(2).unwrap());
     let food_mesh_handle = meshes.add(Sphere::new(FOOD_RADIUS).mesh().ico(1).unwrap());
     let food_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.95, 0.95, 0.85),
-        emissive: LinearRgba::new(0.4, 0.4, 0.3, 1.0),
+        base_color: Color::srgb(0.05, 0.05, 0.05),
         ..default()
     });
 
@@ -489,13 +488,18 @@ fn cell_rotation(yaw: f32, pitch: f32) -> Quat {
 fn world_map_image(map: &WorldMap) -> Image {
     let n = map.resolution;
     let mut data = Vec::with_capacity(n * n * 4);
+    // Lineární interpolace mezi LOW richness = sytá zelená a HIGH richness = bílá.
+    // Lerp(low, high, v) per kanál; clear color v `main` matchuje LOW.
+    let low = [0.10_f32, 0.42, 0.12]; // chudé oblasti (poor zone)
+    let high = [1.00_f32, 1.00, 1.00]; // bohaté oblasti (rich zone)
     for &v in map.field() {
-        let g = (v.clamp(0.0, 1.0) * 255.0) as u8;
-        // Bohaté oblasti = teplá zelená, chudé = tmavé. Alpha jednotná, finální
-        // alpha řízená Sprite.color.
-        data.push((g / 4).max(20));
+        let t = v.clamp(0.0, 1.0);
+        let r = ((low[0] + t * (high[0] - low[0])) * 255.0).clamp(0.0, 255.0) as u8;
+        let g = ((low[1] + t * (high[1] - low[1])) * 255.0).clamp(0.0, 255.0) as u8;
+        let b = ((low[2] + t * (high[2] - low[2])) * 255.0).clamp(0.0, 255.0) as u8;
+        data.push(r);
         data.push(g);
-        data.push((g / 3).max(20));
+        data.push(b);
         data.push(255);
     }
     Image::new(
