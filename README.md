@@ -13,27 +13,39 @@ Postavit otevřený systém, ve kterém se z primitivních agentů (něco jako b
 ## Architektura
 
 - **Jazyk:** Rust (CPU i GPU)
-- **Engine:** [Bevy 0.18](https://bevyengine.org) (ECS + 2D rendering přes wgpu), trimmed feature set bez `bevy_gilrs` a `audio` (žádné systémové `libudev-dev` / `libasound2-dev`)
+- **Engine:** [Bevy 0.18](https://bevyengine.org) (ECS + 3D rendering přes wgpu — orbit Camera3d, StandardMaterial, ellipsoid těla), trimmed feature set bez `bevy_gilrs` a `audio` (žádné systémové `libudev-dev` / `libasound2-dev`)
 - **Split kódu:**
-  - `src/lib.rs` — čistá simulační logika (`Cell`, `step()`, …) bez Bevy, pojede i headless
-  - `src/main.rs` — Bevy app, ECS svět + `Transform` synchronizace
+  - `src/lib.rs` — čistá simulační logika (`Cell`, `step()`, brain, world map, smell/pheromone fields …) bez Bevy. Single source of truth pro simulační konstanty + helpery (`populate_brain_inputs`, `pair_fertile`, `make_mating_child`).
+  - `src/main.rs` — Bevy app, ECS svět + `Transform` synchronizace, 3D renderer.
+  - `src/bin/headless.rs` — bezokenní harness pro batch experimenty (CSV log per generaci, deterministický seed).
 - **GPU compute:** opt-in feature `gpu` (přímý wgpu + bytemuck + pollster) pro vlastní kernely; Bevy už wgpu táhne pro rendering
 
 ## Spuštění
 
+**Renderer (3D viz):**
+
 ```bash
-# Default běh (debug, bez GPU compute kernelů)
-cargo run
+# Default běh
+cargo run --release
 
 # Rychlejší inkrementální iterace (dynamic linking Bevy)
 cargo run --features dev
 
 # S GPU compute kernely
 cargo run --features gpu
-
-# Release pro reálné experimenty
-cargo run --release
 ```
+
+Ovládání: **levé tlačítko + drag** = orbit, **střední tlačítko + drag** = pan, **kolečko** = zoom (orthographic scale), **WASD/šipky** = pan z klávesnice.
+
+**Headless (batch experimenty, CSV log):**
+
+```bash
+# Argumenty: <seed> <max_gens> <out.csv>
+cargo build --release --bin headless
+./target/release/headless 0 200 /tmp/run.csv
+```
+
+CSV obsahuje per-generaci stats: pop, lineages, body morphology, predation events, brain adoption metriky a další.
 
 ## Dokumentace
 
@@ -51,7 +63,9 @@ Rešerše vědeckého kontextu projektu (česky, srozumitelně i pro laika) je v
 
 ## Status
 
-Early stage. Architektura je rozhodnutá, simulační logika v `src/lib.rs` se rozjíždí.
+40+ sprintů. Plná 3D simulace: ellipsoid morfologie (length × width × height + spike), 3D pohyb (yaw + pitch), gravitace s vztlakem, predace s attack-gate, mating přes pheromone signaling, food clustering ve world map, hazard zóny, recurrent brain (20 sensory + 16 recurrent vstupů × 16 hidden × 9 výstupů, Elman feedback). Headless harness pro deterministické batch experimenty, 3D renderer s orbit kamerou.
+
+Detailní stav po sprintech: [`docs/sprints/`](docs/sprints/).
 
 ## Licence
 

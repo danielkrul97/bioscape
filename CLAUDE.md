@@ -4,7 +4,7 @@ Cílem výzkumného projektu Bioscape je vytvořit simulaci evoluce, abych pocho
 
 **Architektura:**
 
-- **Engine:** Bevy 0.18 (ECS, 2D rendering přes wgpu). `default-features = false` plus ručně vybraný feature set bez `bevy_gilrs` a `audio` — projekt nepotřebuje gamepad ani zvuk a tahle volba odstraňuje závislost na systémových `libudev-dev` / `libasound2-dev`.
+- **Engine:** Bevy 0.18 (ECS, 3D rendering přes wgpu — orbit Camera3d, StandardMaterial, sphere mesh + non-uniform scale pro ellipsoid těla). `default-features = false` plus ručně vybraný feature set bez `bevy_gilrs` a `audio` — projekt nepotřebuje gamepad ani zvuk a tahle volba odstraňuje závislost na systémových `libudev-dev` / `libasound2-dev`.
 - **Split kódu:**
   - `src/lib.rs` — čistá simulační logika (`Cell`, `step()`, `WorldMap`, …), bez Bevy. Drží taky všechny sdílené `pub const` sim parametry + `MUTATION_CONFIG` / `PHYSICS_CONFIG` — **single source of truth** pro renderer i headless. Nové tuneables, které ovlivňují simulaci, patří sem; renderer/headless-only knoby zůstávají ve svých binárkách.
   - `src/main.rs` — Bevy app, který drží svět v ECS a synchronizuje `Cell` stav s `Transform`em.
