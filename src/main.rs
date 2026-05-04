@@ -32,13 +32,21 @@ const GRID_CELL_SIZE: f32 = 100.0;
 const CAMERA_ZOOM_STEP: f32 = 0.1;
 // Sprint 35: z-osa aktivovaná, mírný 3D layer.
 const SIMULATION_HALF: [f32; 3] = [960.0, 540.0, 2.0];
-// Sprint 36: orbit Camera3d. State drží `OrbitCamera` resource — distance od
-// target, yaw/pitch v sim z-up frame. Default tilted view (pitch ≈ 55°)
-// ukazuje cells jako 3D body, ne ploché kola.
-const CAMERA_DISTANCE_INITIAL: f32 = 1800.0;
+// Sprint 36: orbit Camera3d s ORTHOGRAPHIC projection. Distance je fixní;
+// "zoom" modifikuje ortho scale (= world units per pixel), takže větší zoom
+// out neudělá black void kolem scény (na rozdíl od perspective). Cells stále
+// vypadají jako 3D body díky lighting + tilted angle, jen bez perspective
+// foreshortening.
+/// Fixní vzdálenost camera od target. Pro ortho neovlivňuje velikost cells,
+/// jen znear/zfar clipping plane positioning. 3000 dává dostatek depth bufferu.
+const CAMERA_OFFSET_DISTANCE: f32 = 3000.0;
 const CAMERA_PITCH_INITIAL: f32 = 0.95; // ~55° from xy plane
-const CAMERA_DISTANCE_MIN: f32 = 100.0;
-const CAMERA_DISTANCE_MAX: f32 = 8000.0;
+/// Ortho scale (Bevy `OrthographicProjection.scale`): 1 world unit = 1 / scale
+/// pixelů. Initial 1.2 dává mírný margin kolem world bounds (1920×1080 přesně
+/// padne při scale=1.0, +20 % je rezerva pro tilted view).
+const CAMERA_SCALE_INITIAL: f32 = 1.2;
+const CAMERA_SCALE_MIN: f32 = 0.2; // hluboký zoom in (~6× větší cells)
+const CAMERA_SCALE_MAX: f32 = 2.0; // limit zoom out — vždy dohlédne ke kraji world
 /// Pitch clamp tight near ±π/2 — `looking_at` s up vektorem +Z degeneruje při
 /// pohledu kolmo dolů. 0.05 rad ≈ 2.9° margin.
 const CAMERA_PITCH_MIN: f32 = 0.05;
@@ -184,15 +192,17 @@ struct FoodMaterial(Handle<StandardMaterial>);
 struct LineageMaterials(HashMap<u64, Handle<StandardMaterial>>);
 
 /// Sprint 36 orbit camera state. Camera obíhá kolem `target` ve sférických
-/// souřadnicích (yaw + pitch + distance). Yaw je rotace kolem world Z (sim
-/// vertical), pitch je elevace nad xy plochou (0 = horizon, π/2 = top-down).
-/// Camera Transform se přepočítá z těchto polí každý frame v `update_orbit_camera`.
+/// souřadnicích (yaw + pitch). Distance camera→target je fixní
+/// `CAMERA_OFFSET_DISTANCE`; "zoom" modifikuje `scale` (orthographic projection
+/// scale). Yaw = rotace kolem world Z, pitch = elevace nad xy plochou
+/// (0 = horizon, π/2 = top-down).
 #[derive(Resource, Debug, Clone, Copy)]
 struct OrbitCamera {
     target: Vec3,
     yaw: f32,
     pitch: f32,
-    distance: f32,
+    /// Orthographic scale (world units per pixel). Menší = zoom in.
+    scale: f32,
 }
 
 impl Default for OrbitCamera {
@@ -201,7 +211,7 @@ impl Default for OrbitCamera {
             target: Vec3::ZERO,
             yaw: 0.0,
             pitch: CAMERA_PITCH_INITIAL,
-            distance: CAMERA_DISTANCE_INITIAL,
+            scale: CAMERA_SCALE_INITIAL,
         }
     }
 }
@@ -213,7 +223,7 @@ impl OrbitCamera {
             -self.yaw.sin() * cos_p,
             -self.yaw.cos() * cos_p,
             self.pitch.sin(),
-        ) * self.distance;
+        ) * CAMERA_OFFSET_DISTANCE;
         let pos = self.target + offset;
         Transform::from_translation(pos).looking_at(self.target, Vec3::Z)
     }
@@ -326,14 +336,17 @@ fn setup(
     };
     commands.insert_resource(extent);
 
-    // Sprint 36: Camera3d s `IsDefaultUiCamera` markerem (UI overlay routes
-    // přes hlavní kameru, ne přes auto-spawned UI kameru bez render graph).
-    // Initial transform z OrbitCamera default — `update_orbit_camera_transform`
-    // ji přepisuje z OrbitCamera state každý frame.
+    // Sprint 36: Camera3d s orthographic projection — "scale" zoom feel bez
+    // perspective void okolo scény když user zoomne pryč. `IsDefaultUiCamera`
+    // marker říká bevy_ui_render ať použije tuto kameru pro UI.
     let initial_orbit = OrbitCamera::default();
     commands.spawn((
         Camera3d::default(),
         IsDefaultUiCamera,
+        Projection::Orthographic(OrthographicProjection {
+            scale: initial_orbit.scale,
+            ..OrthographicProjection::default_3d()
+        }),
         initial_orbit.transform(),
     ));
 
@@ -922,8 +935,9 @@ fn camera_orbit_input(
         (orbit.pitch + delta.y * ORBIT_SENSITIVITY).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX);
 }
 
-/// Sprint 36: mouse wheel zoom — adjustuje `OrbitCamera.distance`. Exponential
-/// step zachová stejný relativní zoom feel napříč rozsahem.
+/// Sprint 36: mouse wheel zoom — adjustuje orthographic scale. Scroll up =
+/// zoom in (menší scale = víc pixelů per world unit). Clamp brání zoom out
+/// pryč ze scény (nebyly by vidět hranice světa, jen black void).
 fn camera_zoom_input(mut wheel: MessageReader<MouseWheel>, mut orbit: ResMut<OrbitCamera>) {
     let mut scroll = 0.0_f32;
     for ev in wheel.read() {
@@ -936,8 +950,7 @@ fn camera_zoom_input(mut wheel: MessageReader<MouseWheel>, mut orbit: ResMut<Orb
         return;
     }
     let factor = (-scroll * CAMERA_ZOOM_STEP).exp();
-    orbit.distance =
-        (orbit.distance * factor).clamp(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
+    orbit.scale = (orbit.scale * factor).clamp(CAMERA_SCALE_MIN, CAMERA_SCALE_MAX);
 }
 
 /// Sprint 36: WASD/šipky pannují `OrbitCamera.target` v xy-plochy ve frame
@@ -964,7 +977,9 @@ fn camera_pan_input(
     if delta == Vec2::ZERO {
         return;
     }
-    let speed = orbit.distance * 0.5 * time.delta_secs();
+    // Pan rychlost ∝ scale — při zoom in pan jemně, při zoom out rychle.
+    // 800 world units/s při scale=1.0 = ~3 sec přejet šíři screenu.
+    let speed = orbit.scale * 800.0 * time.delta_secs();
     // Pan v rovině xy podle yaw orientace kamery: forward (do scény) je směr,
     // kterým camera kouká po xy projekci. Right = ⊥ k forwardu v xy.
     let cos_y = orbit.yaw.cos();
@@ -976,15 +991,18 @@ fn camera_pan_input(
     orbit.target.y += world_xy.y * speed;
 }
 
-/// Sprint 36: aplikuje OrbitCamera state na Camera3d Transform. Běží každý
-/// frame po input systemech, takže input změny se okamžitě projeví ve
-/// view matici.
+/// Sprint 36: aplikuje OrbitCamera state na Camera3d Transform a Projection
+/// scale. Běží každý frame po input systemech, takže input změny se okamžitě
+/// projeví ve view matici.
 fn update_orbit_camera_transform(
     orbit: Res<OrbitCamera>,
-    camera: Single<&mut Transform, With<Camera3d>>,
+    camera: Single<(&mut Transform, &mut Projection), With<Camera3d>>,
 ) {
-    let mut transform = camera.into_inner();
+    let (mut transform, mut projection) = camera.into_inner();
     *transform = orbit.transform();
+    if let Projection::Orthographic(ortho) = &mut *projection {
+        ortho.scale = orbit.scale;
+    }
 }
 
 fn log_clock_events(
