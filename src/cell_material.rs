@@ -30,8 +30,14 @@ impl Plugin for CellMaterialPlugin {
     }
 }
 
-pub fn pack_cell_tag(hue_deg: f32, alpha: f32) -> u32 {
+/// Tag layout:
+///   bits  0..7  = hue (0..255 → 0..360°)
+///   bits  8..15 = alpha (0..255 → 0..1)
+///   bits 16..23 = spike_norm (0..255 → 0..1, multiplied by MAX_SPIKE_LENGTH ×
+///                 CELL_RADIUS in shader for world-space tip extension)
+pub fn pack_cell_tag(hue_deg: f32, alpha: f32, spike_norm: f32) -> u32 {
     let h = (hue_deg.rem_euclid(360.0) * (255.0 / 360.0)).round() as u32 & 0xFF;
     let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32 & 0xFF;
-    h | (a << 8)
+    let s = (spike_norm.clamp(0.0, 1.0) * 255.0).round() as u32 & 0xFF;
+    h | (a << 8) | (s << 16)
 }

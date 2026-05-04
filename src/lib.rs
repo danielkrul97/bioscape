@@ -11,16 +11,36 @@ const HUE_RANGE: f32 = 360.0;
 const MIN_SPEED: f32 = 1.0;
 const MIN_VISION: f32 = 1.0;
 const MIN_TURN_RATE: f32 = 0.1;
-const MIN_BODY_SIZE: f32 = 0.3;
 pub const INITIAL_ENERGY: f32 = 100.0;
-// Brain inputs: 0=food_dx, 1=food_dy, 2=cell_dx, 3=cell_dy, 4=energy,
-// 5=speed, 6=rel_size, 7=smell_grad_x, 8=smell_grad_y, 9=heading_x,
-// 10=heading_y, 11=pheromone_grad_x, 12=pheromone_grad_y.
-pub const BRAIN_INPUTS: usize = 13;
+// Brain inputs: senzorické 0=food_dx, 1=food_dy, 2=cell_dx, 3=cell_dy,
+// 4=energy, 5=speed, 6=rel_size, 7=smell_grad_x, 8=smell_grad_y, 9=heading_x,
+// 10=heading_y, 11=pheromone_grad_x, 12=pheromone_grad_y, 13=local_density,
+// 14=damage. Sprint 33 přidává 3D rozšíření:
+// 15=food_dz, 16=cell_dz, 17=smell_grad_z, 18=heading_z, 19=pheromone_grad_z.
+// heading_x/y jsou nově xy projekce 3D forward vektoru (násobeno cos(pitch)),
+// heading_z = sin(pitch). Pro pitch=0 jsou identické s pre-Sprint-33 cos/sin
+// yaw — mozky natrénované v 2D zachovají chování při horizontálním letu.
+// Sprint 28 přidává recurrent kanál: indexy [BRAIN_INPUTS_SENSORY..BRAIN_INPUTS]
+// = previous tick `last_hidden` activations (Elman RNN). Genom drží sjednocený
+// `w1` matrix 28×8, mutace + Hebbian pracují bez rozlišení sensory vs recurrent.
+pub const BRAIN_INPUTS_SENSORY: usize = 20;
 pub const BRAIN_HIDDEN: usize = 8;
-// Brain outputs: 0=turn, 1=thrust, 2=pheromone modulation (positive = emit
-// more above baseline, costs energy).
-pub const BRAIN_OUTPUTS: usize = 3;
+/// Sprint 28: kolik dimenzí předchozího hidden state se feeduje zpátky jako
+/// input. = `BRAIN_HIDDEN` znamená 1:1 mapping (každý neuron má vlastní paměť
+/// slot). Menší než HIDDEN by exponoval jen subset hidden state; větší by
+/// vyžadoval delay buffer. 1:1 je nejjednodušší a kapacita stačí.
+pub const BRAIN_RECURRENT: usize = BRAIN_HIDDEN;
+/// Total brain input width = sensory + recurrent. Genom + forward pass +
+/// Hebbian + mutace pracují s touto velikostí transparentně.
+pub const BRAIN_INPUTS: usize = BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT;
+// Brain outputs: 0=turn (yaw rate), 1=thrust, 2=pheromone modulation
+// (positive = emit more above baseline, costs energy), 3=morph_length,
+// 4=morph_width, 5=morph_spike, 6=attack, 7=turn_pitch (Sprint 33),
+// 8=morph_height (Sprint 34, appended kvůli zachování existujících indexů).
+// Sprint 26 morph signals: signal × MORPH_RATE × dt přičteno k phenotype dim
+// každý tick, energy cost ∝ |delta|. Sprint 27 attack: gating signál pro
+// `predate` — bez aktivního output[6] > THRESHOLD se predace nestane.
+pub const BRAIN_OUTPUTS: usize = 9;
 /// Inicializační bias na thrust output bin v `Brain::random`. Bez něj má ~½
 /// random brainů thrust output blízko nuly (cell se sotva hýbe), což vytvářelo
 /// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce
@@ -30,6 +50,10 @@ pub const INNATE_THRUST_BIAS: f32 = 2.0;
 /// emisi pro reprodukci — bez biasu jen ~25 % párů projde threshold. S bias
 /// 1.0 většina random brainů emituje nad threshold v gen 0; selekce pak ladí.
 pub const INNATE_PHEROMONE_BIAS: f32 = 1.0;
+/// Inicializační bias na attack output (b2[6]). Sprint 27: predace je opt-in,
+/// ne default. Záměrně 0 — chceme měřit, jestli selekce attack chování objeví
+/// sama, nebo zůstane utlumený. Negative bias by ho aktivně potlačoval.
+pub const INNATE_ATTACK_BIAS: f32 = 0.0;
 
 // Shared sim parameters consumed by both the Bevy renderer (`src/main.rs`)
 // and the headless harness (`src/bin/headless.rs`). Single source of truth —
@@ -56,6 +80,17 @@ pub const BODY_COST_FACTOR: f32 = 0.8;
 pub const FOOD_VALUE: f32 = 20.0;
 pub const FOOD_SPAWN_RATE: usize = 5;
 pub const WORLD_UNITS_PER_FOOD: f32 = 2600.0;
+/// Sprint 31 spatial clustering: rejection sampling síla. Per uniformně
+/// vzorkovaný food candidate je pravděpodobnost zamítnutí
+/// `STRENGTH × (1 - richness)`. Při richness=1 (rich zone) nikdy nezamítá,
+/// při richness=0 (poor zone) zamítá s pravděpodobností STRENGTH. Sprint 21
+/// v1–v5 zkoušel plnou sílu (`1 × (1 - richness)`) → extinkce gen 70–110.
+/// 0.3 je kompromis: poor zone má 70 % šanci spawnu (vs. plná = 0 %), takže
+/// food není ostře oddělená do biomů, jen mírný gradient. Plus value modulace
+/// `WORLD_MAP_FOOD_FLOOR/AMP` jako safety net (i food v poor zone má hodnotu
+/// ~85 % baselinu). MAX_SPAWN_ATTEMPTS retry budget zajišťuje, že clustering
+/// nikdy úplně nezablokuje spawn.
+pub const FOOD_REJECTION_STRENGTH: f32 = 0.3;
 // Environmentální hazard layer: passive energy drain v "nebezpečných" zónách.
 // Zónová mapa jde z `WorldMap` noise — POSITIVNÍ korelace s food richness:
 // bohaté oblasti = nebezpečné (high reward, high risk), chudé = bezpečné.
@@ -65,6 +100,15 @@ pub const WORLD_UNITS_PER_FOOD: f32 = 2600.0;
 pub const HAZARD_DRAIN_PER_SEC: f32 = 0.5;
 pub const HAZARD_FLOOR: f32 = 0.0;
 pub const HAZARD_AMP: f32 = 1.0;
+
+/// Sprint 30 self-preservation: gain pro tanh(damage_accum × GAIN) brain input
+/// [14]. Damage_accum = nedobrovolný drain z minulého ticku (predation +
+/// hazard). Single predation hit (drain = `PREDATION_DRAIN_PER_TICK` = 3.0)
+/// → tanh(1.5) ≈ 0.90 (silný signál). Stabilní hazard ~0.008/tick → tanh ≈
+/// 0.004 (neviditelný — chronický hazard nemá být „damage event", spatial
+/// avoidance se vyvíjí přes selekční gradient na pozici, ne přes tento input).
+/// Multi-attacker pile-on saturuje k 1.0.
+pub const DAMAGE_NORMALIZATION_GAIN: f32 = 0.5;
 
 // Pheromone signaling layer. 2D scalar field jako SmellField, ale zdroje jsou
 // cells. Sprint 25: BASELINE = 0 (žádné free-rider, žádný predator exploit z
@@ -90,6 +134,35 @@ pub const REPRODUCE_THRESHOLD: f32 = 150.0;
 pub const SIZE_RATIO_THRESHOLD: f32 = 1.3;
 pub const PREDATION_DRAIN_PER_TICK: f32 = 3.0;
 pub const PREDATION_GAIN_PER_TICK: f32 = 1.5;
+/// Sprint 27: attacker.last_outputs[6].max(0) musí být > THRESHOLD aby se
+/// predate-on-contact spustila. Bez aktivního brain signálu jsou `cell × cell`
+/// kolize jen kolize — energy se nepřevádí. Mirroruje semantiku
+/// `MATING_PHEROMONE_THRESHOLD` (input → behaviorální gate).
+pub const ATTACK_THRESHOLD: f32 = 0.2;
+/// Cena udržování attack módu: COST × max(0, output[6]) za sekundu, paid each
+/// tick i když k predaci nedojde. Energie protiváhy "claws out". Bez ceny by
+/// selekce favorizovala vždy-zapnutý attack output.
+pub const ATTACK_COST_PER_SEC: f32 = 0.5;
+
+/// Sprint 29 quorum sensing: kolik viditelných sousedů saturuje `local_density`
+/// brain input (přes `tanh`). Kalibrováno na realistické počty: při typickém
+/// vision_radius=50 a pop=200 v 1920×1080 vidí cell náhodně ~0.8 sousedů.
+/// `DENSITY_NORM_COUNT=3` dává `tanh(0.8/3)≈0.26` (znatelný signál) a saturuje
+/// kolem ~3 visible cells (skutečný cluster). 10 by drželo input pod noise floor.
+pub const DENSITY_NORM_COUNT: f32 = 3.0;
+/// Sprint 29 selfish-herd: poloměr, ve kterém se počítají sousedé prey pro
+/// dilution. Záměrně **těsná** definice „v hejnu" — selfish-herd je o close
+/// contact, ne o všech v MATING_RADIUS. Při HERD_RADIUS=50 a pop=200 dává
+/// uniform distribuce ~0.76 sousedů, takže dilution při random pop = 1/(1+0.38)
+/// ≈ 0.93 (skoro žádný efekt). Skutečný cluster s ~5 close neighbors srazí gain
+/// na 1/(1+2.5)=0.29 — silný benefit pro shlukování bez plošného trestu.
+pub const HERD_RADIUS: f32 = 50.0;
+/// Sprint 29 predator-dilution faktor. `gain *= 1 / (1 + K × n_neighbors_prey)`.
+/// K=0.5 → 5 sousedů → gain padá na ~30 %, 10 sousedů → ~17 %. Direct mapping
+/// na Hamilton 1971 selfish-herd: bytí v hejnu snižuje atraktivitu cílů pro
+/// predátora. Drain z prey zůstává plný — utrpení obětí se nemění, mění se jen
+/// payoff útočníka.
+pub const DILUTION_K: f32 = 0.5;
 
 pub const CYCLE_GEN_PERIOD: u64 = 50;
 pub const CYCLE_AMPLITUDE: f32 = 0.15;
@@ -111,12 +184,63 @@ pub const WORLD_MAP_SEED: u64 = 1234;
 pub const WORLD_MAP_FOOD_FLOOR: f32 = 0.85;
 pub const WORLD_MAP_FOOD_AMP: f32 = 0.3;
 
+// Body morphology — Sprint 26. Tělo už není isotropní `body_size: f32`, ale
+// 2 osy v body frame: `body_length` (podél heading), `body_width` (kolmo) +
+// volitelný `spike_length` (frontální spike). Genom drží genetický template,
+// `Phenotype` na cell drží runtime-modifiable hodnotu (genotype/phenotype
+// split — runtime morph nemodifikuje gen, dítě dostane fresh phenotype z
+// rodičovského genomu). Cena: per-tick maintenance ∝ length×width + spike,
+// plus okamžitý cost ∝ rychlost morfingu.
+pub const MIN_BODY_LENGTH: f32 = 0.3;
+pub const MAX_BODY_LENGTH: f32 = 4.0;
+pub const MIN_BODY_WIDTH: f32 = 0.3;
+pub const MAX_BODY_WIDTH: f32 = 4.0;
+/// Sprint 34: 3-axis ellipsoid — třetí dimenze (vertikálně, ⊥ k length+width).
+pub const MIN_BODY_HEIGHT: f32 = 0.3;
+pub const MAX_BODY_HEIGHT: f32 = 4.0;
+pub const MIN_SPIKE_LENGTH: f32 = 0.0;
+pub const MAX_SPIKE_LENGTH: f32 = 2.0;
+/// Rychlost runtime morfingu — full brain output dává `MORPH_RATE` jednotek
+/// změny tvaru za sekundu. 0.02/s znamená full-range body morph trvá ~50 gen
+/// — pomalejší než životnost generace (~10s), takže morph je deliberátní akt
+/// přes mnoho generací, ne ad-hoc tick reakce. Initial runs s 0.5/0.1/0.05
+/// ukázaly "morph and starve": random brain biases (~0.5 stddev) × rychlý
+/// MORPH_RATE → cells rostly o 100 % ve 4 gen → 3× body maintenance kost
+/// dřív než selekce stihla optimalizovat brainy → extinkce.
+pub const MORPH_RATE: f32 = 0.02;
+/// Deadzone — pokud |signal| < threshold, morph se nepoužívá (žádná změna,
+/// žádný cost). Filtruje šum z random brain biases (mean 0, ~0.5 stddev),
+/// jen vědomě silné morph signály prochází. Threshold 0.7: prob(|tanh(N(0,1))|
+/// většího než 0.7) ≈ 0.38, ~62 % random buněk neumí morphovat. Trénovaný
+/// brain co chce morphovat dosáhne signálu blízko 1.0 → projde threshold.
+pub const MORPH_ACTIVATION_THRESHOLD: f32 = 0.7;
+/// Cena morfingu: `MORPH_COST_PER_DELTA × |Δ|` energie za faktická Δ tělesné
+/// dimenze (po clampu). Lineární.
+pub const MORPH_COST_PER_DELTA: f32 = 2.0;
+/// Maintenance cost frontálního spike per sekunda na jednotku spike_length.
+/// 0.3/s × 1.0 spike × 60 = 18/gen — srovnatelné s vision cost.
+pub const SPIKE_COST_PER_SEC: f32 = 0.3;
+/// Multiplier na `PREDATION_GAIN_PER_TICK` při frontálním spike hitu.
+/// Bonus = `PREDATION_GAIN × spike_length × SPIKE_PREDATION_BONUS`.
+/// 0.5: spike=1.0 dává +50 % predation gain, ne +100 % — méně dramatické,
+/// ponechá místo pro non-spike strategie.
+pub const SPIKE_PREDATION_BONUS: f32 = 0.5;
+/// Cosinus úhlu mezi attacker.heading a vektorem k oběti, nutný pro spike
+/// bonus. 0.7 ≈ 45° kužel — jen frontální zásahy.
+pub const SPIKE_DOT_THRESHOLD: f32 = 0.7;
+/// Pod tímto se spike nerenderuje (smoothness in viz, žádný flicker u
+/// minimálních hodnot z gaussian mutací).
+pub const SPIKE_RENDER_THRESHOLD: f32 = 0.05;
+
 pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_speed: 3.0,
     sigma_hue: 5.0,
     sigma_vision: 3.0,
     sigma_turn_rate: 0.3,
-    sigma_body_size: 0.05,
+    sigma_body_length: 0.05,
+    sigma_body_width: 0.05,
+    sigma_body_height: 0.05,
+    sigma_spike_length: 0.03,
     sigma_brain: 0.2,
 };
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
@@ -162,6 +286,9 @@ impl Brain {
         // Innate pheromone bias: Sprint 25 vyžaduje active emisi pro mating.
         // Bez biasu by se polovina random cells nemohla reprodukovat.
         b2[2] += INNATE_PHEROMONE_BIAS;
+        // Innate attack bias: Sprint 27 — default 0 (opt-in). Mění se přes
+        // konstantu, ne ad-hoc tady, ať se chování dá testovat A/B.
+        b2[6] += INNATE_ATTACK_BIAS;
         Self { w1, b1, w2, b2 }
     }
 
@@ -270,7 +397,10 @@ pub struct MutationConfig {
     pub sigma_hue: f32,
     pub sigma_vision: f32,
     pub sigma_turn_rate: f32,
-    pub sigma_body_size: f32,
+    pub sigma_body_length: f32,
+    pub sigma_body_width: f32,
+    pub sigma_body_height: f32,
+    pub sigma_spike_length: f32,
     pub sigma_brain: f32,
 }
 
@@ -280,18 +410,29 @@ pub struct Genome {
     pub color_hue: f32,
     pub vision_radius: f32,
     pub turn_rate: f32,
-    pub body_size: f32,
+    pub body_length: f32,
+    pub body_width: f32,
+    /// Sprint 34: 3-axis ellipsoid — vertikální rozměr.
+    pub body_height: f32,
+    pub spike_length: f32,
     pub brain: Brain,
 }
 
 impl Genome {
     pub fn random(rng: &mut impl Rng) -> Self {
+        // Default tělo je izotropní koule (length == width == height). Mutace
+        // mohou asymetrii vytvořit, ale jen pokud ji selekce odmění; gen 0
+        // nezavádí prior na ellipse fenotyp.
+        let body_size = rng.random_range(0.7..1.3);
         Self {
             max_speed: rng.random_range(30.0..90.0),
             color_hue: rng.random_range(0.0..HUE_RANGE),
             vision_radius: rng.random_range(20.0..80.0),
             turn_rate: rng.random_range(1.0..5.0),
-            body_size: rng.random_range(0.7..1.3),
+            body_length: body_size,
+            body_width: body_size,
+            body_height: body_size,
+            spike_length: rng.random_range(0.0..0.1),
             brain: Brain::random(rng),
         }
     }
@@ -302,7 +443,14 @@ impl Genome {
             color_hue: (self.color_hue + gaussian(rng) * cfg.sigma_hue).rem_euclid(HUE_RANGE),
             vision_radius: (self.vision_radius + gaussian(rng) * cfg.sigma_vision).max(MIN_VISION),
             turn_rate: (self.turn_rate + gaussian(rng) * cfg.sigma_turn_rate).max(MIN_TURN_RATE),
-            body_size: (self.body_size + gaussian(rng) * cfg.sigma_body_size).max(MIN_BODY_SIZE),
+            body_length: (self.body_length + gaussian(rng) * cfg.sigma_body_length)
+                .clamp(MIN_BODY_LENGTH, MAX_BODY_LENGTH),
+            body_width: (self.body_width + gaussian(rng) * cfg.sigma_body_width)
+                .clamp(MIN_BODY_WIDTH, MAX_BODY_WIDTH),
+            body_height: (self.body_height + gaussian(rng) * cfg.sigma_body_height)
+                .clamp(MIN_BODY_HEIGHT, MAX_BODY_HEIGHT),
+            spike_length: (self.spike_length + gaussian(rng) * cfg.sigma_spike_length)
+                .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH),
             brain: self.brain.mutate(rng, cfg.sigma_brain),
         }
     }
@@ -315,7 +463,10 @@ impl Genome {
             color_hue: if rng.random::<bool>() { a.color_hue } else { b.color_hue },
             vision_radius: if rng.random::<bool>() { a.vision_radius } else { b.vision_radius },
             turn_rate: if rng.random::<bool>() { a.turn_rate } else { b.turn_rate },
-            body_size: if rng.random::<bool>() { a.body_size } else { b.body_size },
+            body_length: if rng.random::<bool>() { a.body_length } else { b.body_length },
+            body_width: if rng.random::<bool>() { a.body_width } else { b.body_width },
+            body_height: if rng.random::<bool>() { a.body_height } else { b.body_height },
+            spike_length: if rng.random::<bool>() { a.spike_length } else { b.spike_length },
             brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
     }
@@ -341,15 +492,98 @@ pub struct PhysicsConfig {
     pub body_cost_factor: f32,
 }
 
+/// Runtime tělesný tvar buňky. Inicializuje se z `Genome` při spawnu /
+/// reprodukci (template) a může se měnit za běhu života přes `apply_morph`
+/// (řízeno brain output[3..6]). **Genotyp/fenotyp split**: runtime morph
+/// modifikuje `Phenotype`, ne `Genome`. Dítě dostane svůj fresh phenotype
+/// z rodičovského genomu — žádný Lamarckismus.
+#[derive(Debug, Clone, Copy)]
+pub struct Phenotype {
+    pub body_length: f32,
+    pub body_width: f32,
+    /// Sprint 34: vertikální rozměr ellipsoidu.
+    pub body_height: f32,
+    pub spike_length: f32,
+}
+
+impl Phenotype {
+    pub fn from_genome(genome: &Genome) -> Self {
+        Self {
+            body_length: genome.body_length,
+            body_width: genome.body_width,
+            body_height: genome.body_height,
+            spike_length: genome.spike_length,
+        }
+    }
+
+    /// Proxy pro circular-collision codepaths (eat radius, broad phase).
+    /// Sprint 34: aritmetický průměr 3 os; když length=width=height=s, dostane s
+    /// — backward compat s pre-Sprint-34 izotropním tělem.
+    pub fn effective_radius(&self) -> f32 {
+        (self.body_length + self.body_width + self.body_height) / 3.0
+    }
+
+    /// Sprint 34: 3D volume = length × width × height. Když length=width=height
+    /// =s, dostane s³. Pro pre-Sprint-34 srovnatelnost: tělo s body_height=1
+    /// dává area_pre × 1 = area_pre, tj. backward compat při height=1.
+    pub fn volume(&self) -> f32 {
+        self.body_length * self.body_width * self.body_height
+    }
+
+    /// Aplikuje 4 brain morph signály na dimenze tvaru. Signály pod
+    /// `MORPH_ACTIVATION_THRESHOLD` v absolutní hodnotě jsou deadzonovány
+    /// (no-op) — random brain noise neovlivní phenotype, jen deliberátní
+    /// signály z trénovaného brainu. Vrací sumu |Δ| napříč dimenzemi (po
+    /// clampu) pro výpočet morph cost.
+    pub fn apply_morph(&mut self, morph: [f32; 4], rate: f32, dt: f32) -> f32 {
+        let gate = |s: f32| -> f32 {
+            if s.abs() < MORPH_ACTIVATION_THRESHOLD {
+                0.0
+            } else {
+                s
+            }
+        };
+        let raw_dl = gate(morph[0]) * rate * dt;
+        let raw_dw = gate(morph[1]) * rate * dt;
+        let raw_dh = gate(morph[2]) * rate * dt;
+        let raw_ds = gate(morph[3]) * rate * dt;
+
+        let new_len = (self.body_length + raw_dl).clamp(MIN_BODY_LENGTH, MAX_BODY_LENGTH);
+        let new_wid = (self.body_width + raw_dw).clamp(MIN_BODY_WIDTH, MAX_BODY_WIDTH);
+        let new_hgt = (self.body_height + raw_dh).clamp(MIN_BODY_HEIGHT, MAX_BODY_HEIGHT);
+        let new_spk = (self.spike_length + raw_ds).clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
+
+        let actual_dl = (new_len - self.body_length).abs();
+        let actual_dw = (new_wid - self.body_width).abs();
+        let actual_dh = (new_hgt - self.body_height).abs();
+        let actual_ds = (new_spk - self.spike_length).abs();
+
+        self.body_length = new_len;
+        self.body_width = new_wid;
+        self.body_height = new_hgt;
+        self.spike_length = new_spk;
+
+        actual_dl + actual_dw + actual_dh + actual_ds
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Cell {
-    pub position: [f32; 2],
-    pub velocity: [f32; 2],
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    /// Yaw rate — rotace okolo vertikální osy. Brain output[0].
     pub angular_velocity: f32,
+    /// Sprint 33 pitch rate — rotace okolo horizontální osy kolmé k forwardu
+    /// v xy. Brain output[7]. Drag stejný jako u yawu.
+    pub pitch_velocity: f32,
     pub energy: f32,
     // Persists even when velocity hits zero — atan2(0, 0) would otherwise
     // collapse to 0 and bias evolution toward east-facing motion.
     pub heading: f32,
+    /// Sprint 33: pitch úhel, klampovaný do [-π/2, π/2]. Spolu s heading (yaw)
+    /// definuje forward unit vector: (cos(y)·cos(p), sin(y)·cos(p), sin(p)).
+    /// Roll vynechán — cells axially symetrické.
+    pub pitch: f32,
     // Lineage tracking — inherited from parent at reproduction (no mutation).
     // birth_gen records the generation when the lineage was created (initial
     // population: 0; new lineages from speciation events would bump it).
@@ -360,13 +594,19 @@ pub struct Cell {
     pub last_inputs: [f32; BRAIN_INPUTS],
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
+    /// Sprint 30: nedobrovolný energy drain akumulovaný v aktuálním ticku
+    /// (predation + hazard). Brain ho čte v dalším ticku jako input[14]
+    /// (damage signal), pak resetuje na 0. Voluntární cost se NEZAPISUJE
+    /// — cell sama drives ty náklady přes outputs, není to externí útok.
+    pub damage_accum: f32,
+    pub phenotype: Phenotype,
     pub genome: Genome,
 }
 
 impl Cell {
     pub fn random(
         rng: &mut impl Rng,
-        world_half: [f32; 2],
+        world_half: [f32; 3],
         lineage_id: u64,
         lineage_birth_gen: u64,
     ) -> Self {
@@ -377,25 +617,48 @@ impl Cell {
     pub fn from_genome(
         rng: &mut impl Rng,
         genome: Genome,
-        world_half: [f32; 2],
+        world_half: [f32; 3],
         lineage_id: u64,
         lineage_birth_gen: u64,
     ) -> Self {
         let direction = rng.random_range(0.0..TAU);
+        let phenotype = Phenotype::from_genome(&genome);
+        // Sprint 32 substrate: z-osa drží determinismus pre-3D semantiky.
+        // Když world_half[2] == 0 (Sprint 32 default), z=0 a žádný RNG draw —
+        // zachová bit-identical CSV trajektorii. Sprint 33+ unlockne motion +
+        // initial draw přes celou krabici.
+        let pos_z = if world_half[2] > 0.0 {
+            rng.random_range(-world_half[2]..world_half[2])
+        } else {
+            0.0
+        };
         Self {
             position: [
                 rng.random_range(-world_half[0]..world_half[0]),
                 rng.random_range(-world_half[1]..world_half[1]),
+                pos_z,
             ],
-            velocity: [direction.cos() * genome.max_speed, direction.sin() * genome.max_speed],
+            velocity: [
+                direction.cos() * genome.max_speed,
+                direction.sin() * genome.max_speed,
+                0.0,
+            ],
             angular_velocity: 0.0,
+            pitch_velocity: 0.0,
             energy: INITIAL_ENERGY,
             heading: direction,
+            // Sprint 33: cells startují horizontálně (pitch=0). Pohyb v z se
+            // vyvine přes brain output[7] = turn_pitch. Random initial pitch
+            // by zkonzumoval RNG draw a porušil pre-Sprint-33 reproducibility,
+            // pokud bychom chtěli A/B; horizontální start je clean baseline.
+            pitch: 0.0,
             lineage_id,
             lineage_birth_gen,
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
+            damage_accum: 0.0,
+            phenotype,
             genome,
         }
     }
@@ -404,55 +667,160 @@ impl Cell {
     /// quadratic drag on both, energy drains. Brain-applied forces should be
     /// integrated into velocity / angular_velocity *before* step (in
     /// `cells_brain_act`); step is purely passive integration + dissipation.
-    pub fn step(&mut self, dt: f32, world_half: [f32; 2], physics: &PhysicsConfig) {
-        // Position from current velocity (semi-implicit: drag applied after).
+    ///
+    /// Sprint 26 anisotropic drag: rozložím velocity na heading-aligned (par)
+    /// vs heading-perpendicular (perp) komponentu. Cross-section je v body
+    /// frame: forward motion „cítí" width (frontální), sideways motion cítí
+    /// length. Pro length=width=s drag přesně reprodukuje původní isotropní.
+    pub fn step(&mut self, dt: f32, world_half: [f32; 3], physics: &PhysicsConfig) {
         self.position[0] += self.velocity[0] * dt;
         self.position[1] += self.velocity[1] * dt;
+        self.position[2] += self.velocity[2] * dt;
         self.heading += self.angular_velocity * dt;
+        // Sprint 35: pitch range ±π/12 (=15°). Velmi konzervativní — Sprint 37
+        // ladí. Random brain pitch noise s tight range = nepatrný drift v z.
+        self.pitch = (self.pitch + self.pitch_velocity * dt).clamp(
+            -core::f32::consts::FRAC_PI_6 * 0.5,
+            core::f32::consts::FRAC_PI_6 * 0.5,
+        );
 
-        // Quadratic linear drag: dv = -DRAG · |v| · v · dt.
-        let v_mag = self.velocity[0].hypot(self.velocity[1]);
-        let drag_dt = physics.drag * v_mag * dt;
-        self.velocity[0] -= drag_dt * self.velocity[0];
-        self.velocity[1] -= drag_dt * self.velocity[1];
+        // Sprint 33: 3D anisotropic drag. Forward = (cos(y)·cos(p), sin(y)·cos(p),
+        // sin(p)). Velocity rozdělíme na along-forward a perpendicular-forward.
+        // Forward "cítí" width × length (cross-section frontu), perpendicular
+        // cítí length × width (boční cross-section). V Sprint 34 se přidá height
+        // do anisotropic split — zatím length/width proxy stačí.
+        let cos_y = self.heading.cos();
+        let sin_y = self.heading.sin();
+        let cos_p = self.pitch.cos();
+        let sin_p = self.pitch.sin();
+        let fx = cos_y * cos_p;
+        let fy = sin_y * cos_p;
+        let fz = sin_p;
+        let v_par = self.velocity[0] * fx + self.velocity[1] * fy + self.velocity[2] * fz;
+        let v_perp_x = self.velocity[0] - v_par * fx;
+        let v_perp_y = self.velocity[1] - v_par * fy;
+        let v_perp_z = self.velocity[2] - v_par * fz;
+        let v_perp_mag =
+            (v_perp_x * v_perp_x + v_perp_y * v_perp_y + v_perp_z * v_perp_z).sqrt();
+        let length = self.phenotype.body_length;
+        let width = self.phenotype.body_width;
+        let drag_par_factor = physics.drag * v_par.abs() * width * dt;
+        let drag_perp_factor = physics.drag * v_perp_mag * length * dt;
+        let new_v_par = v_par - drag_par_factor * v_par;
+        let new_v_perp_x = v_perp_x - drag_perp_factor * v_perp_x;
+        let new_v_perp_y = v_perp_y - drag_perp_factor * v_perp_y;
+        let new_v_perp_z = v_perp_z - drag_perp_factor * v_perp_z;
+        self.velocity[0] = new_v_par * fx + new_v_perp_x;
+        self.velocity[1] = new_v_par * fy + new_v_perp_y;
+        self.velocity[2] = new_v_par * fz + new_v_perp_z;
 
-        // Linear angular drag (multiplicative decay) — cheap, rotation slows
-        // exponentially. dω/dt = -ANGULAR_DRAG · ω.
-        self.angular_velocity *= (1.0 - physics.angular_drag * dt).max(0.0);
+        let drag_factor = (1.0 - physics.angular_drag * dt).max(0.0);
+        self.angular_velocity *= drag_factor;
+        self.pitch_velocity *= drag_factor;
 
-        // Energy: kinetic-motion proxy (v² · cost), rotational kinetic
-        // (MoI · ω² · cost ≈ body_size² · ω² · cost), vision, body². Linear
-        // distance-based cost is gone — fluid drag makes power ∝ v³ in
-        // strict physics, but v² is cheaper to balance and keeps the
-        // intuition (faster = more expensive).
-        self.energy -= v_mag * v_mag * physics.energy_cost_per_v_sq * dt;
-        let bs = self.genome.body_size;
+        // Energy: kinetic v², rotační ω² (yaw + pitch), vision, area-based
+        // maintenance, spike maintenance.
+        // Sprint 33: v² + ω² teď zahrnují 3D komponenty.
+        let v_mag_sq =
+            self.velocity[0].powi(2) + self.velocity[1].powi(2) + self.velocity[2].powi(2);
+        self.energy -= v_mag_sq * physics.energy_cost_per_v_sq * dt;
+        // Sprint 33: angular energy stále jen yaw (matches pre-Sprint-33).
+        // Pitch je „free" rotace pro Sprint 33 — random brain biases mají
+        // ~equal magnitude yaw + pitch outputs, takže započítání obou by
+        // zdvojnásobilo rotační drain a tlačilo random brainy do extinkce.
+        // Sprint 37 evaluuje, jestli pitch cost přidat (a v jaké váze).
         let av = self.angular_velocity;
-        self.energy -= bs * bs * av * av * physics.angular_energy_cost * dt;
+        let eff_r = self.phenotype.effective_radius();
+        self.energy -= eff_r * eff_r * av * av * physics.angular_energy_cost * dt;
         self.energy -= self.genome.vision_radius * physics.vision_cost_per_radius * dt;
-        self.energy -= bs * bs * physics.body_cost_factor * dt;
+        // Sprint 34: maintenance ∝ 3D volume = length×width×height. Pro
+        // height=1 (pre-Sprint-34 default) se redukuje na 2D area, takže
+        // pre-Sprint-34 cells s height=1 platí stejně jako dřív.
+        self.energy -= self.phenotype.volume() * physics.body_cost_factor * dt;
+        self.energy -= self.phenotype.spike_length * SPIKE_COST_PER_SEC * dt;
+        // Sprint 27 attack maintenance: brain v "claws out" módu platí, i když
+        // k predaci nedojde. Bez ceny by selekce favorizovala vždy-zapnutý
+        // attack output. Cost ∝ max(0, output[6]) — negativní output je
+        // "passive" a nestojí nic.
+        let attack_strength = self.last_outputs[6].max(0.0);
+        self.energy -= attack_strength * ATTACK_COST_PER_SEC * dt;
 
-        // Reflect off the world boundary so cells stay visible.
-        let mut bounced = false;
+        let mut bounced_xy = false;
         if self.position[0].abs() > world_half[0] {
             self.velocity[0] = -self.velocity[0];
             self.position[0] = self.position[0].clamp(-world_half[0], world_half[0]);
-            bounced = true;
+            bounced_xy = true;
         }
         if self.position[1].abs() > world_half[1] {
             self.velocity[1] = -self.velocity[1];
             self.position[1] = self.position[1].clamp(-world_half[1], world_half[1]);
-            bounced = true;
+            bounced_xy = true;
         }
-        if bounced {
+        // Sprint 32: z-bounce active jen když half_z > 0 (Sprint 33+); pro z=0
+        // locked režim je position[2]=0, abs() > 0.0 false → no-op, identické
+        // s pre-Sprint-32 chováním.
+        if world_half[2] > 0.0 && self.position[2].abs() > world_half[2] {
+            self.velocity[2] = -self.velocity[2];
+            self.position[2] = self.position[2].clamp(-world_half[2], world_half[2]);
+        }
+        if bounced_xy {
+            // Heading recompute z xy velocity. Pitch zůstává — bounce na
+            // xy zdi je horizontální event, neměl by smazat vertikální orientaci.
             self.heading = self.velocity[1].atan2(self.velocity[0]);
         }
+        // Sprint 33: bounce na strop/podlahu zachová yaw, ale obrátí vz —
+        // pitch dopočteme z dot(forward, up). atan2(vz, |v_xy|) by byl ideální
+        // ale velocity není zaručeně v body frame. Necháme pitch beze změny;
+        // brain musí reagovat na vertikální bounce sám.
+    }
+
+    /// Aplikuje runtime morph z brain outputs na phenotype + naúčtuje
+    /// energii za realizované Δ. Volá se mezi `brain_act` a `step`.
+    /// Sprint 34: morph teď řídí 4 dimenze (length, width, height, spike).
+    /// Mapování indexů: [3]=length, [4]=width, [8]=height (Sprint 34, append),
+    /// [5]=spike. Index [8] je za attack[6] a turn_pitch[7], které předtím
+    /// existovaly — nový height index zachoval stávající indexy beze změny.
+    pub fn apply_morph(&mut self, dt: f32) {
+        let morph = [
+            self.last_outputs[3],
+            self.last_outputs[4],
+            self.last_outputs[8],
+            self.last_outputs[5],
+        ];
+        let total_delta = self.phenotype.apply_morph(morph, MORPH_RATE, dt);
+        self.energy -= MORPH_COST_PER_DELTA * total_delta;
+    }
+
+    /// Bonus predation gain pokud má attacker spike a heading je zaměřený
+    /// na cíl (cosine > `SPIKE_DOT_THRESHOLD`). Vrací 0 jinak. Volá se z
+    /// predate cyklu v rendereru/headlessu nad rámec běžného size-ratio
+    /// gainu.
+    pub fn spike_bonus_against(&self, target_pos: [f32; 3]) -> f32 {
+        if self.phenotype.spike_length <= 0.0 {
+            return 0.0;
+        }
+        let dx = target_pos[0] - self.position[0];
+        let dy = target_pos[1] - self.position[1];
+        let dz = target_pos[2] - self.position[2];
+        let dist_sq = dx * dx + dy * dy + dz * dz;
+        if dist_sq < f32::EPSILON {
+            return 0.0;
+        }
+        let dist = dist_sq.sqrt();
+        // Sprint 33: full 3D forward unit vector (yaw + pitch).
+        let [fx, fy, fz] = forward_vector(self.heading, self.pitch);
+        let cos_angle = (dx * fx + dy * fy + dz * fz) / dist;
+        if cos_angle < SPIKE_DOT_THRESHOLD {
+            return 0.0;
+        }
+        PREDATION_GAIN_PER_TICK * self.phenotype.spike_length * SPIKE_PREDATION_BONUS
     }
 
     pub fn try_eat(&mut self, food: &Food, eat_radius: f32, food_value: f32) -> bool {
         let dx = self.position[0] - food.position[0];
         let dy = self.position[1] - food.position[1];
-        if dx * dx + dy * dy <= eat_radius * eat_radius {
+        let dz = self.position[2] - food.position[2];
+        if dx * dx + dy * dy + dz * dz <= eat_radius * eat_radius {
             self.energy += food_value;
             true
         } else {
@@ -463,18 +831,44 @@ impl Cell {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Food {
-    pub position: [f32; 2],
+    pub position: [f32; 3],
 }
 
 impl Food {
-    pub fn random(rng: &mut impl Rng, world_half: [f32; 2]) -> Self {
+    pub fn random(rng: &mut impl Rng, world_half: [f32; 3]) -> Self {
+        // Sprint 32: z-osa conditional pro deterministický CSV; world_half[2]=0
+        // → z=0 bez RNG draw.
+        let z = if world_half[2] > 0.0 {
+            rng.random_range(-world_half[2]..world_half[2])
+        } else {
+            0.0
+        };
         Self {
             position: [
                 rng.random_range(-world_half[0]..world_half[0]),
                 rng.random_range(-world_half[1]..world_half[1]),
+                z,
             ],
         }
     }
+}
+
+/// Sprint 33: 3D forward unit vector z yaw + pitch. Bez roll (cells axially
+/// symetrické). Pro pitch=0 redukuje na (cos(yaw), sin(yaw), 0) — backward
+/// kompat s pre-Sprint-33 2D heading semantikou.
+pub fn forward_vector(yaw: f32, pitch: f32) -> [f32; 3] {
+    let cos_p = pitch.cos();
+    [yaw.cos() * cos_p, yaw.sin() * cos_p, pitch.sin()]
+}
+
+/// Sprint 31: rejection test pro spatial food clustering. Vrací `true` =
+/// kandidát zamítnout (zkusit jinou pozici). Probability rejection =
+/// `FOOD_REJECTION_STRENGTH × (1 - richness)`. Volá se per uniformně
+/// vzorkovaný kandidát; spawn loop drží retry budget (`MAX_SPAWN_ATTEMPTS`),
+/// takže clustering jen ladí distribuci, neblokuje úplně.
+pub fn reject_food_for_richness(rng: &mut impl Rng, richness: f32) -> bool {
+    let r = richness.clamp(0.0, 1.0);
+    rng.random::<f32>() < FOOD_REJECTION_STRENGTH * (1.0 - r)
 }
 
 /// 2D scalar field with explicit-Jacobi diffusion and exponential decay.
@@ -719,7 +1113,10 @@ mod tests {
             color_hue: 0.0,
             vision_radius: 40.0,
             turn_rate: 2.5,
-            body_size: 1.0,
+            body_length: 1.0,
+            body_width: 1.0,
+            body_height: 1.0,
+            spike_length: 0.0,
             brain: dummy_brain(),
         }
     }
@@ -730,7 +1127,10 @@ mod tests {
             sigma_hue: 0.0,
             sigma_vision: 0.0,
             sigma_turn_rate: 0.0,
-            sigma_body_size: 0.0,
+            sigma_body_length: 0.0,
+            sigma_body_width: 0.0,
+            sigma_body_height: 0.0,
+            sigma_spike_length: 0.0,
             sigma_brain: 0.0,
         }
     }
@@ -743,7 +1143,10 @@ mod tests {
             color_hue: 120.0,
             vision_radius: 40.0,
             turn_rate: 2.5,
-            body_size: 1.1,
+            body_length: 1.1,
+            body_width: 0.9,
+            body_height: 1.0,
+            spike_length: 0.4,
             brain: Brain {
                 w1: [[1.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
                 b1: [0.3; BRAIN_HIDDEN],
@@ -756,7 +1159,9 @@ mod tests {
         assert_eq!(m.color_hue, 120.0);
         assert_eq!(m.vision_radius, 40.0);
         assert_eq!(m.turn_rate, 2.5);
-        assert_eq!(m.body_size, 1.1);
+        assert_eq!(m.body_length, 1.1);
+        assert_eq!(m.body_width, 0.9);
+        assert_eq!(m.spike_length, 0.4);
         assert_eq!(m.brain.w1, g.brain.w1);
         assert_eq!(m.brain.b1, g.brain.b1);
         assert_eq!(m.brain.w2, g.brain.w2);
@@ -772,7 +1177,10 @@ mod tests {
             sigma_hue: 1000.0,
             sigma_vision: 100.0,
             sigma_turn_rate: 100.0,
-            sigma_body_size: 10.0,
+            sigma_body_length: 10.0,
+            sigma_body_width: 10.0,
+            sigma_body_height: 10.0,
+            sigma_spike_length: 10.0,
             sigma_brain: 10.0,
         };
         for _ in 0..1000 {
@@ -781,7 +1189,9 @@ mod tests {
             assert!(m.color_hue >= 0.0 && m.color_hue < HUE_RANGE);
             assert!(m.vision_radius >= MIN_VISION);
             assert!(m.turn_rate >= MIN_TURN_RATE);
-            assert!(m.body_size >= MIN_BODY_SIZE);
+            assert!((MIN_BODY_LENGTH..=MAX_BODY_LENGTH).contains(&m.body_length));
+            assert!((MIN_BODY_WIDTH..=MAX_BODY_WIDTH).contains(&m.body_width));
+            assert!((MIN_SPIKE_LENGTH..=MAX_SPIKE_LENGTH).contains(&m.spike_length));
         }
     }
 
@@ -797,28 +1207,34 @@ mod tests {
     }
 
     fn base_cell() -> Cell {
+        let genome = dummy_genome();
+        let phenotype = Phenotype::from_genome(&genome);
         Cell {
-            position: [0.0, 0.0],
-            velocity: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
+            velocity: [0.0, 0.0, 0.0],
             angular_velocity: 0.0,
+            pitch_velocity: 0.0,
             energy: 100.0,
             heading: 0.0,
+            pitch: 0.0,
             lineage_id: 0,
             lineage_birth_gen: 0,
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
-            genome: dummy_genome(),
+            damage_accum: 0.0,
+            phenotype,
+            genome,
         }
     }
 
     #[test]
     fn step_drains_energy_from_motion_and_vision() {
         let mut cell = Cell {
-            velocity: [60.0, 0.0],
+            velocity: [60.0, 0.0, 0.0],
             ..base_cell()
         };
-        cell.step(1.0, [1000.0, 1000.0], &no_drag_physics(0.001, 0.05));
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.001, 0.05));
         // motion (v² model): 60² × 0.001 × 1.0 = 3.6 energy
         // vision: 40 × 0.05 × 1.0 = 2.0 energy
         // body: 0 (factor = 0)
@@ -830,11 +1246,11 @@ mod tests {
     #[test]
     fn step_bounce_recomputes_heading() {
         let mut cell = Cell {
-            position: [99.0, 0.0],
-            velocity: [60.0, 0.0],
+            position: [99.0, 0.0, 0.0],
+            velocity: [60.0, 0.0, 0.0],
             ..base_cell()
         };
-        cell.step(1.0, [100.0, 100.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [100.0, 100.0, 0.0], &no_drag_physics(0.0, 0.0));
         // velocity flipped to (-60, 0), heading should now be π.
         assert!((cell.heading - core::f32::consts::PI).abs() < 1e-4);
     }
@@ -845,7 +1261,7 @@ mod tests {
             heading: 1.5,
             ..base_cell()
         };
-        cell.step(1.0, [100.0, 100.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [100.0, 100.0, 0.0], &no_drag_physics(0.0, 0.0));
         // No movement, no bounce, no angular velocity, heading must persist.
         assert_eq!(cell.heading, 1.5);
     }
@@ -853,7 +1269,7 @@ mod tests {
     #[test]
     fn step_applies_quadratic_drag() {
         let mut cell = Cell {
-            velocity: [10.0, 0.0],
+            velocity: [10.0, 0.0, 0.0],
             ..base_cell()
         };
         let physics = PhysicsConfig {
@@ -864,7 +1280,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
         // |v| = 10, drag_dt = 0.01 × 10 × 1 = 0.1
         // velocity[0] -= 0.1 × 10 = 1.0 → final velocity[0] = 9.0
         assert!((cell.velocity[0] - 9.0).abs() < 1e-4, "got {}", cell.velocity[0]);
@@ -884,8 +1300,8 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0], &physics);
-        // body_size²(=1) × ω²(=4) × angular_cost(=0.05) × dt(=1) = 0.2 drained
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        // effective_radius²(=1) × ω²(=4) × angular_cost(=0.05) × dt(=1) = 0.2 drained
         assert!((cell.energy - 99.8).abs() < 1e-4, "got {}", cell.energy);
     }
 
@@ -905,7 +1321,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
         assert!((cell.energy - 100.0).abs() < 1e-4, "got {}", cell.energy);
     }
 
@@ -923,7 +1339,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
         // angular_velocity *= (1 − 0.5 × 1) = 0.5 → 0.5
         assert!((cell.angular_velocity - 0.5).abs() < 1e-4);
     }
@@ -934,7 +1350,7 @@ mod tests {
             energy: 50.0,
             ..base_cell()
         };
-        let food = Food { position: [5.0, 0.0] };
+        let food = Food { position: [5.0, 0.0, 0.0] };
         assert!(cell.try_eat(&food, 8.0, 20.0));
         assert_eq!(cell.energy, 70.0);
     }
@@ -945,7 +1361,7 @@ mod tests {
             energy: 50.0,
             ..base_cell()
         };
-        let food = Food { position: [20.0, 0.0] };
+        let food = Food { position: [20.0, 0.0, 0.0] };
         assert!(!cell.try_eat(&food, 8.0, 20.0));
         assert_eq!(cell.energy, 50.0);
     }
@@ -958,7 +1374,10 @@ mod tests {
             color_hue: 10.0,
             vision_radius: 20.0,
             turn_rate: 1.0,
-            body_size: 0.5,
+            body_length: 0.5,
+            body_width: 0.6,
+            body_height: 0.7,
+            spike_length: 0.0,
             brain: dummy_brain(),
         };
         let b = Genome {
@@ -966,17 +1385,21 @@ mod tests {
             color_hue: 200.0,
             vision_radius: 80.0,
             turn_rate: 5.0,
-            body_size: 1.5,
+            body_length: 1.5,
+            body_width: 1.4,
+            body_height: 1.3,
+            spike_length: 0.8,
             brain: dummy_brain(),
         };
-        // Run many crossovers, each gene must be one of the two parent values.
         for _ in 0..100 {
             let c = Genome::crossover(&a, &b, &mut rng);
             assert!(c.max_speed == 30.0 || c.max_speed == 90.0);
             assert!(c.color_hue == 10.0 || c.color_hue == 200.0);
             assert!(c.vision_radius == 20.0 || c.vision_radius == 80.0);
             assert!(c.turn_rate == 1.0 || c.turn_rate == 5.0);
-            assert!(c.body_size == 0.5 || c.body_size == 1.5);
+            assert!(c.body_length == 0.5 || c.body_length == 1.5);
+            assert!(c.body_width == 0.6 || c.body_width == 1.4);
+            assert!(c.spike_length == 0.0 || c.spike_length == 0.8);
         }
     }
 
@@ -1097,5 +1520,251 @@ mod tests {
         let outputs = brain.forward(&[0.0; BRAIN_INPUTS]);
         assert!((outputs[0] - 0.5_f32.tanh()).abs() < 1e-6);
         assert!((outputs[1] - (-0.5_f32).tanh()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn morph_zero_signal_does_not_change_phenotype() {
+        let mut phen = Phenotype {
+            body_length: 1.5,
+            body_width: 0.8,
+            body_height: 1.0,
+            spike_length: 0.3,
+        };
+        let delta = phen.apply_morph([0.0, 0.0, 0.0, 0.0], MORPH_RATE, 0.5);
+        assert_eq!(delta, 0.0);
+        assert_eq!(phen.body_length, 1.5);
+        assert_eq!(phen.body_width, 0.8);
+        assert_eq!(phen.body_height, 1.0);
+        assert_eq!(phen.spike_length, 0.3);
+    }
+
+    #[test]
+    fn morph_clamps_to_min_max_bounds() {
+        let mut phen = Phenotype {
+            body_length: MAX_BODY_LENGTH,
+            body_width: MIN_BODY_WIDTH,
+            body_height: MAX_BODY_HEIGHT,
+            spike_length: MAX_SPIKE_LENGTH,
+        };
+        // Strong positive signal on length, height & spike (already at max) → no change.
+        // Strong negative signal on width (already at min) → no change.
+        let delta = phen.apply_morph([1.0, -1.0, 1.0, 1.0], 100.0, 1.0);
+        assert_eq!(delta, 0.0);
+        assert_eq!(phen.body_length, MAX_BODY_LENGTH);
+        assert_eq!(phen.body_width, MIN_BODY_WIDTH);
+        assert_eq!(phen.body_height, MAX_BODY_HEIGHT);
+        assert_eq!(phen.spike_length, MAX_SPIKE_LENGTH);
+    }
+
+    #[test]
+    fn morph_returns_total_absolute_delta() {
+        let mut phen = Phenotype {
+            body_length: 1.0,
+            body_width: 1.0,
+            body_height: 1.0,
+            spike_length: 0.5,
+        };
+        // signal × rate × dt = 0.8 × 1.0 × 1.0 = 0.8 podél každé osy.
+        // Width clampuje na MIN_BODY_WIDTH (0.3), takže |Δ| pro width je
+        // 1.0 - 0.3 = 0.7. Total |Δ| = 0.8 (length) + 0.7 (width clamped)
+        // + 0.0 (height: signal=0) + 0.8 (spike) = 2.3.
+        let delta = phen.apply_morph([0.8, -0.8, 0.0, 0.8], 1.0, 1.0);
+        assert!((delta - 2.3).abs() < 1e-5, "got {}", delta);
+        assert!((phen.body_length - 1.8).abs() < 1e-5);
+        assert!((phen.body_width - MIN_BODY_WIDTH).abs() < 1e-5);
+        assert!((phen.spike_length - 1.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn morph_signal_below_threshold_is_deadzoned() {
+        let mut phen = Phenotype {
+            body_length: 1.0,
+            body_width: 1.0,
+            body_height: 1.0,
+            spike_length: 0.0,
+        };
+        // |signal| < threshold → no change (filters random brain noise).
+        let delta = phen.apply_morph(
+            [
+                MORPH_ACTIVATION_THRESHOLD - 0.01,
+                -MORPH_ACTIVATION_THRESHOLD + 0.01,
+                0.0,
+                0.0,
+            ],
+            1.0,
+            1.0,
+        );
+        assert_eq!(delta, 0.0);
+        assert_eq!(phen.body_length, 1.0);
+        assert_eq!(phen.body_width, 1.0);
+        assert_eq!(phen.spike_length, 0.0);
+    }
+
+    #[test]
+    fn cell_apply_morph_updates_phenotype_not_genome() {
+        // Genotype/phenotype split: runtime morph nesmí sahat na genome.
+        let mut cell = base_cell();
+        let original_genome_len = cell.genome.body_length;
+        cell.last_outputs[3] = 1.0; // morph_length signal
+        cell.apply_morph(1.0);
+        assert!(cell.phenotype.body_length > original_genome_len);
+        assert_eq!(cell.genome.body_length, original_genome_len);
+    }
+
+    #[test]
+    fn anisotropic_drag_slower_along_width_when_elongated() {
+        // Cell s length=2, width=1, heading=0, motion (10,0) (forward) vs (0,10)
+        // (sideways). Forward "cítí" width (=1) jako cross-section, sideways
+        // cítí length (=2). Sideways must therefore decay faster.
+        let physics = PhysicsConfig {
+            drag: 0.01,
+            angular_drag: 0.0,
+            energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.0,
+            vision_cost_per_radius: 0.0,
+            body_cost_factor: 0.0,
+        };
+        let make_cell = |vel: [f32; 3]| {
+            let mut c = base_cell();
+            c.phenotype = Phenotype {
+                body_length: 2.0,
+                body_width: 1.0,
+                body_height: 1.0,
+                spike_length: 0.0,
+            };
+            c.velocity = vel;
+            c
+        };
+        let mut forward = make_cell([10.0, 0.0, 0.0]);
+        let mut sideways = make_cell([0.0, 10.0, 0.0]);
+        forward.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        sideways.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        // |v| forward after step: 10 - drag·|v|·width·v = 10 - 0.01·10·1·10 = 9.0
+        // |v| sideways after step: 10 - 0.01·10·2·10 = 8.0
+        let v_forward = forward.velocity[0].hypot(forward.velocity[1]);
+        let v_sideways = sideways.velocity[0].hypot(sideways.velocity[1]);
+        assert!(v_forward > v_sideways, "forward {} should be > sideways {}", v_forward, v_sideways);
+        assert!((v_forward - 9.0).abs() < 1e-3, "forward got {}", v_forward);
+        assert!((v_sideways - 8.0).abs() < 1e-3, "sideways got {}", v_sideways);
+    }
+
+    #[test]
+    fn anisotropic_drag_isotropic_when_axes_equal() {
+        // Když length=width=1, anisotropic verze musí dát stejný výsledek jako
+        // původní isotropic (regression test pro `step_applies_quadratic_drag`).
+        let mut cell = base_cell();
+        cell.velocity = [10.0, 0.0, 0.0];
+        let physics = PhysicsConfig {
+            drag: 0.01,
+            angular_drag: 0.0,
+            energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.0,
+            vision_cost_per_radius: 0.0,
+            body_cost_factor: 0.0,
+        };
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        assert!((cell.velocity[0] - 9.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn spike_bonus_only_when_target_in_front_cone() {
+        let mut cell = base_cell();
+        cell.position = [0.0, 0.0, 0.0];
+        cell.heading = 0.0; // pointing +x
+        cell.phenotype.spike_length = 1.0;
+
+        // Target přímo vepředu — bonus se aplikuje.
+        let bonus_front = cell.spike_bonus_against([10.0, 0.0, 0.0]);
+        assert!(bonus_front > 0.0);
+
+        // Target za zády — bonus = 0.
+        let bonus_back = cell.spike_bonus_against([-10.0, 0.0, 0.0]);
+        assert_eq!(bonus_back, 0.0);
+
+        // Target přesně na boku — bonus = 0 (cosine = 0 < threshold 0.7).
+        let bonus_side = cell.spike_bonus_against([0.0, 10.0, 0.0]);
+        assert_eq!(bonus_side, 0.0);
+    }
+
+    #[test]
+    fn spike_bonus_zero_when_no_spike() {
+        let mut cell = base_cell();
+        cell.heading = 0.0;
+        cell.phenotype.spike_length = 0.0;
+        let bonus = cell.spike_bonus_against([10.0, 0.0, 0.0]);
+        assert_eq!(bonus, 0.0);
+    }
+
+    #[test]
+    fn food_rejection_never_rejects_at_max_richness() {
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..10_000 {
+            assert!(!reject_food_for_richness(&mut rng, 1.0));
+        }
+    }
+
+    #[test]
+    fn food_rejection_rate_at_min_richness_matches_strength() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let n = 100_000;
+        let rejected = (0..n)
+            .filter(|_| reject_food_for_richness(&mut rng, 0.0))
+            .count();
+        let observed = rejected as f32 / n as f32;
+        // Tolerance ±0.01 for sample noise on 100k draws (~3σ for p=0.3).
+        assert!(
+            (observed - FOOD_REJECTION_STRENGTH).abs() < 0.01,
+            "observed reject rate {} vs expected {}",
+            observed,
+            FOOD_REJECTION_STRENGTH
+        );
+    }
+
+    #[test]
+    fn step_3d_position_advances_with_z_velocity() {
+        // Sprint 32 sanity: z-složka pozice musí integrovat z velocity stejně
+        // jako x/y, takže Sprint 33+ má pevnou základnu.
+        let mut cell = base_cell();
+        cell.velocity = [0.0, 0.0, 5.0];
+        cell.step(1.0, [1000.0, 1000.0, 1000.0], &no_drag_physics(0.0, 0.0));
+        assert!(
+            (cell.position[2] - 5.0).abs() < 1e-4,
+            "expected z=5.0, got {}",
+            cell.position[2]
+        );
+    }
+
+    #[test]
+    fn z_locked_world_keeps_food_planar() {
+        // Sprint 32: world_half[2] = 0 znamená Food::random vrací z=0 a
+        // nespotřebovává RNG draw na z. Critical pro CSV identity.
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..1_000 {
+            let f = Food::random(&mut rng, [100.0, 100.0, 0.0]);
+            assert_eq!(f.position[2], 0.0);
+        }
+    }
+
+    #[test]
+    fn step_drains_energy_from_spike_maintenance() {
+        let mut cell = base_cell();
+        cell.phenotype.spike_length = 0.5;
+        let physics = PhysicsConfig {
+            drag: 0.0,
+            angular_drag: 0.0,
+            energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.0,
+            vision_cost_per_radius: 0.0,
+            body_cost_factor: 0.0,
+        };
+        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        // spike_length(=0.5) × SPIKE_COST_PER_SEC × dt(=1) = 0.15 drained
+        let expected_drain = 0.5 * SPIKE_COST_PER_SEC;
+        assert!(
+            (cell.energy - (100.0 - expected_drain)).abs() < 1e-4,
+            "got {}, expected {}",
+            cell.energy,
+            100.0 - expected_drain
+        );
     }
 }

@@ -1,14 +1,21 @@
-// Per-instance cell coloring without per-cell ColorMaterial.
+// Per-instance cell coloring + spike rendering without per-cell ColorMaterial.
 //
 // MeshTag (u32) carries:
 //   bits  0..7  = hue index (0..255 → 0..360°)
 //   bits  8..15 = alpha index (0..255 → 0..1)
+//   bits 16..23 = spike_norm (0..255 → 0..1, × MAX_SPIKE_WORLD_PX)
 //
 // All cells share one Material2d handle and one mesh handle, so Bevy bins them
 // into a single draw call. The tag travels with each instance through
 // Mesh2dUniform and is read in the vertex stage; the resulting RGBA is then
 // passed to fragment via a custom output, since the default VertexOutput does
 // not carry instance_index.
+//
+// Spike: vertex 1 of the teardrop (the +x tip) is extended in WORLD space along
+// the instance's local +x axis (heading direction) by
+// `spike_norm × MAX_SPIKE_WORLD_PX`. World-space extension makes the spike
+// length independent of body scale — a long-thin needle a a fat bulb dostávají
+// stejnou fyzickou délku spike, místo aby se měnila s anisotropic scale.
 
 #import bevy_sprite::{
     mesh2d_view_bindings::view,
@@ -19,8 +26,12 @@
 #import bevy_core_pipeline::tonemapping
 #endif
 
+// MAX_SPIKE_LENGTH (lib.rs) × CELL_RADIUS = 2.0 × 5.0 = 10.0 world units.
+const MAX_SPIKE_WORLD_PX: f32 = 10.0;
+
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
+    @builtin(vertex_index) vertex_index: u32,
     @location(0) position: vec3<f32>,
 };
 
@@ -48,15 +59,30 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> vec3<f32> {
 fn vertex(in: Vertex) -> VOut {
     var out: VOut;
     let world_from_local = mf::get_world_from_local(in.instance_index);
-    let world_pos = mf::mesh2d_position_local_to_world(
+    var world_pos = mf::mesh2d_position_local_to_world(
         world_from_local,
         vec4<f32>(in.position, 1.0),
     );
-    out.clip_position = mf::mesh2d_position_world_to_clip(world_pos);
 
     let tag = mf::get_tag(in.instance_index);
     let hue_byte   = f32(tag & 0xFFu);
     let alpha_byte = f32((tag >> 8u) & 0xFFu);
+    let spike_byte = f32((tag >> 16u) & 0xFFu);
+
+    // Vertex 1 = teardrop tip in +x in local frame. Add spike in world space
+    // along instance heading (= local +x axis after rotation, normalized to
+    // strip out scale).
+    if (in.vertex_index == 1u) {
+        let local_x_world = world_from_local[0].xyz;
+        let len = length(local_x_world);
+        if (len > 1e-5) {
+            let heading = local_x_world / len;
+            let spike_world_len = (spike_byte / 255.0) * MAX_SPIKE_WORLD_PX;
+            world_pos += vec4<f32>(heading * spike_world_len, 0.0);
+        }
+    }
+
+    out.clip_position = mf::mesh2d_position_world_to_clip(world_pos);
     let hue   = hue_byte * (360.0 / 255.0);
     let alpha = alpha_byte / 255.0;
     let rgb   = hsl_to_rgb(hue, 0.75, 0.55);
