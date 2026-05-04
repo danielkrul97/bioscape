@@ -80,6 +80,18 @@ pub const BODY_COST_FACTOR: f32 = 0.8;
 pub const FOOD_VALUE: f32 = 20.0;
 pub const FOOD_SPAWN_RATE: usize = 5;
 pub const WORLD_UNITS_PER_FOOD: f32 = 2600.0;
+
+/// Sprint 38: gravitační zrychlení (sim units / sec²) působící na vše s mass.
+/// Hodnota je effective gravity po vztlaku — reálná buňka v vodě má cca 5 %
+/// netto force kvůli density ratio 1.05/1.0. Ve volném prostoru by 9.81 m/s²
+/// dávalo nereálně rychlý sink; tady malé G + drag dá realistic sedimentation
+/// (cells s pitch=0 a žádným thrustem klesnou postupně k dnu).
+pub const GRAVITY: f32 = 5.0;
+/// Sprint 38: terminal sink rate pro food (food nemá velocity field, pohybuje
+/// se konstantní rychlostí dolů). Pomalejší než cells (které mohou plavat),
+/// takže food drift k dnu = postupný „benthic deposit". 8 units/sec ~ 4 sec
+/// průchod celé z-vrstvy (z=2).
+pub const FOOD_SINK_RATE: f32 = 8.0;
 /// Sprint 31 spatial clustering: rejection sampling síla. Per uniformně
 /// vzorkovaný food candidate je pravděpodobnost zamítnutí
 /// `STRENGTH × (1 - richness)`. Při richness=1 (rich zone) nikdy nezamítá,
@@ -677,6 +689,11 @@ impl Cell {
         self.position[1] += self.velocity[1] * dt;
         self.position[2] += self.velocity[2] * dt;
         self.heading += self.angular_velocity * dt;
+        // Sprint 38: gravity působí pouze pokud je z-volume aktivní. Aplikuje
+        // se před drag aby drag mohl balancovat → terminal velocity.
+        if world_half[2] > 0.0 {
+            self.velocity[2] -= GRAVITY * dt;
+        }
         // Sprint 35: pitch range ±π/12 (=15°). Velmi konzervativní — Sprint 37
         // ladí. Random brain pitch noise s tight range = nepatrný drift v z.
         self.pitch = (self.pitch + self.pitch_velocity * dt).clamp(
@@ -850,6 +867,15 @@ impl Food {
                 z,
             ],
         }
+    }
+
+    /// Sprint 38: aplikuje gravitační drift food (sink). Pouze pokud je
+    /// z-volume aktivní; jinak no-op (Sprint 32 z=0 setup).
+    pub fn apply_gravity(&mut self, dt: f32, world_half_z: f32) {
+        if world_half_z <= 0.0 {
+            return;
+        }
+        self.position[2] = (self.position[2] - FOOD_SINK_RATE * dt).max(-world_half_z);
     }
 }
 

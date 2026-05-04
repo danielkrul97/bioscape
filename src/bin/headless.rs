@@ -131,6 +131,7 @@ impl World {
         self.emit_pheromones(dt);
         self.apply_morph(dt);
         self.step(dt);
+        self.apply_food_gravity(dt);
         self.apply_hazards(dt);
         self.resolve_collisions();
         self.predate();
@@ -321,6 +322,12 @@ impl World {
     fn step(&mut self, dt: f32) {
         for cell in &mut self.cells {
             cell.step(dt, WORLD_HALF, &PHYSICS_CONFIG);
+        }
+    }
+
+    fn apply_food_gravity(&mut self, dt: f32) {
+        for food in &mut self.foods {
+            food.apply_gravity(dt, WORLD_HALF[2]);
         }
     }
 

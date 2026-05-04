@@ -292,6 +292,7 @@ fn main() {
                 emit_pheromones,
                 apply_cell_morph,
                 step_cells,
+                apply_food_gravity,
                 apply_environmental_hazards,
                 rebuild_cell_grid,
                 resolve_cell_collisions,
@@ -570,6 +571,21 @@ fn step_cells(
     let half = extent.as_array();
     for mut cell in &mut cells {
         cell.0.step(dt, half, &PHYSICS_CONFIG);
+    }
+}
+
+/// Sprint 38: gravity drift na food. Aktualizuje Food.position[2] + sync
+/// Transform.translation.z aby viditelně klesalo k dnu.
+fn apply_food_gravity(
+    time: Res<Time>,
+    extent: Res<WorldExtent>,
+    mut foods: Query<(&mut FoodEntity, &mut Transform)>,
+) {
+    let dt = time.delta_secs();
+    let half_z = extent.as_array()[2];
+    for (mut food, mut transform) in &mut foods {
+        food.0.apply_gravity(dt, half_z);
+        transform.translation.z = food.0.position[2];
     }
 }
 
