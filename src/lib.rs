@@ -1830,6 +1830,14 @@ pub fn make_mating_child(
     // pointu mezi „cells occasionally bond" a „persistent multi-cell
     // organisms" — children rostou bond network místo aby ho jen redukovaly
     // skrz death (Sprint 67.1 + 69 ukázaly net formed-broken < 0).
+    //
+    // Sprint 79 audit: jitter může produkovat raw pozici mírně mimo world
+    // bounds (max |Δ| = CLUSTER_SPAWN_RADIUS = 8 v xy, 2.4 v z). Následný
+    // step() pre-tick aplikuje apply_world_bounce → toroidal xy wrap +
+    // z reflective clamp. Jeden tick mezi spawn a step může grid lookup
+    // vidět out-of-bounds pozici; for_each_in_radius_toroidal interně
+    // používá min_image_delta, takže lookup je correct. No bug, just
+    // race-tick edge case — accepted.
     let cluster_parent =
         pick_cluster_parent(parent_a, parent_b, child_genome.adhesion_type);
     let pos = match cluster_parent {
@@ -2869,7 +2877,10 @@ mod tests {
         // Innate thrust bias musí dělat to, k čemu existuje: random buňky
         // mají ze startu thrust output kladný v průměru, takže se hýbou
         // dopředu místo zacyklení v rozporu mezi turn a thrust.
-        let mut rng = rand::rng();
+        // Sprint 79: seeded RNG (pre-S57 era používalo `rand::rng()` thread-local
+        // → flaky napříč CI, ~5 % run failures kdyby gaussian sampling ojediněle
+        // posunul mean pod 0.3). Fixed seed dělá test deterministický.
+        let mut rng = StdRng::seed_from_u64(42);
         let n = 200;
         let zero_inputs = [0.0_f32; BRAIN_INPUTS];
         let mut sum = 0.0_f64;

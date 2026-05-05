@@ -473,16 +473,75 @@ hunt damage vs bond maintenance.
     - Renderer screencast / visual proof.
     - Photic stratification, GPU collision, anisotropic collision.
 
-## Sprinty 79–82 — open-ended
+## Sprint 79 — bug hunting (audit + flaky test fix)
 
-- **Sprint 79 (priorita):** renderer screencast + HUD bond stats.
+- **Cíl:** post-Sprint-78 breakthrough audit. Velký kus kódu připadl
+  za 5 sprintů (S73-S78), žádné regresion testy mimo CSV smoke.
+  Sprint 79 je quality pause: clippy, code review nedávných změn,
+  determinism check, renderer parity, edge case audit.
+
+- **Audit findings (žádné kritické bugy):**
+  - **clippy: 33+ warnings** (stylistic), žádný real bug. Většina
+    `manual_div_ceil`, `manual_flatten`, `for_loop_over_single_element`.
+    Ne-blocking, kandidáti pro `cargo clippy --fix` v jiném sprintu.
+  - **Sprint 78 food share kód OK** — žádný off-by-one, žádný
+    double-apply. `partner_idx != cell_idx` defensive check je redundant
+    (bonds nikdy self-loop) ale neshkodí.
+  - **Bond cleanup OK** — dangling refs (cell zemřel, partner má bond)
+    se prunují v `resolve_collisions` next tick (lib.rs:1214 +
+    main.rs:2265).
+  - **Renderer / headless parity OK** — všechny S69-S78 mechaniky
+    (gizmos, bond defense, food share, hunters, MAX_SPEED cap) wired
+    v obou binárkách identically.
+  - **Determinism OK** — same seed → byte-identical CSV (verified
+    `diff /tmp/det_a.csv /tmp/det_b.csv` exit 0 pro 30-gen run).
+  - **`INNATE_BOND_BIAS` na b2[9] only** ✓ — žádný leak do jiných
+    outputů. Crossover + mutate pak normálně tweakují, jak měl.
+  - **Cluster spawn jitter (Sprint 70):** může produkovat raw position
+    mírně mimo world bounds (max ±8 v xy, ±2.4 v z). Race-tick edge
+    case — next-step `apply_world_bounce` to bounce/wrapne. Žádný
+    crash, žádný NaN. Accepted edge case (komentován v lib).
+
+- **Fix: flaky test `random_brain_average_thrust_is_positive`:**
+  - Pre-Sprint-79 používal `rand::rng()` (thread-local, neseeded) →
+    ~5 % CI failure rate (Sprint 63 doc to noted, ale nebylo opraveno).
+    Test sampluje 200 random brains a ověřuje, že průměr thrust > 0.3
+    a >75 % je positive. S unseed RNG ojediněle drift.
+  - Sprint 79: `rand::rng()` → `StdRng::seed_from_u64(42)`. Test
+    deterministický, **95/95 pass** poprvé bez flake.
+
+- **Konstanty:** žádné nové.
+
+- **Výstup:**
+  - `src/lib.rs`: 1-line test seed change + 6-line audit comment
+    v `make_mating_child`. Žádný behavior change v sim logice.
+  - **Test suite: 95/95 pass** (deterministicky).
+
+- **Závěr:** Codebase v dobrém stavu. Žádné kritické bugy nalezeny.
+  Sprint 78 breakthrough drží. Připraveno na Sprint 80 pokračování
+  (HUD overlay, screencast, photic/thermal stratification, atd.).
+
+- **Poznámky:**
+  - **Audit framework nastavený** — clippy + tests + determinism
+    diff + grep audit recipes by se měly opakovat každých 5-10 sprintů
+    jako quality pause.
+  - **Co Sprint 79 NEŘEŠÍ (Sprint 80+):**
+    - clippy auto-fixes (estetické warnings, low-priority).
+    - HUD overlay v rendereru s tissue stats.
+    - Screencast.
+    - Photic / thermal stratification.
+
+## Sprinty 80–82 — open-ended
+
+- **Sprint 80 (priorita):** renderer screencast + HUD bond stats.
   Konečně vidět tissue regime pohledem.
-- **Sprint 79+:** Cluster reproduction (Sprint 70 retry with S78
+- **Sprint 80+:** Cluster reproduction (Sprint 70 retry with S78
   baseline) — offspring spawnou uvnitř parent clusteru.
-- **Sprint 79+:** `BOND_FOOD_SHARE_FRAC` sweep (0.1, 0.5, 0.7) —
+- **Sprint 80+:** `BOND_FOOD_SHARE_FRAC` sweep (0.1, 0.5, 0.7) —
   najít balance ne-trivialní cluster vs nezávislé cells.
-- **Sprint 79+:** Photic stratification (z-gradient light field +
+- **Sprint 80+:** Photic stratification (z-gradient light field +
   photoreceptor sensor input) — niche separation by depth.
-- **Sprint 79+:** Thermal stratification (z-gradient temperature).
-- **Sprint 79+:** GPU collision shader, anisotropic collision.
-- **Sprint 79+:** Spatial autocorrelation adhesion_type clustering metric.
+- **Sprint 80+:** Thermal stratification (z-gradient temperature).
+- **Sprint 80+:** GPU collision shader, anisotropic collision.
+- **Sprint 80+:** Spatial autocorrelation adhesion_type clustering metric.
+- **Sprint 80+:** Clippy auto-fixes pass (estetické cleanup).
