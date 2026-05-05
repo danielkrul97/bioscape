@@ -264,7 +264,13 @@ pub const WORLD_MAP_FOOD_AMP: f32 = 0.3;
 // plus okamžitý cost ∝ rychlost morfingu.
 pub const MIN_BODY_LENGTH: f32 = 0.3;
 pub const MAX_BODY_LENGTH: f32 = 4.0;
-pub const MIN_BODY_WIDTH: f32 = 0.3;
+/// Sprint 77: 0.3 → 0.8. Sprint 73-76 1000-gen smokes ukázaly konzistentní
+/// konvergenci k asp = length/width = 12 (1D needles), které fyzicky
+/// neclusterují s 2+ bondy. Cap MIN_BODY_WIDTH na 0.8 limituje asp_max =
+/// 4.0/0.8 = 5.0, takže streamlining race nezavře cluster path. Tradeoff:
+/// cells přijdou o jedno z hlavních energy efficiency variables (smaller
+/// cross-section drag), ale tissue regime by měl být sustainable.
+pub const MIN_BODY_WIDTH: f32 = 0.8;
 pub const MAX_BODY_WIDTH: f32 = 4.0;
 /// Sprint 34: 3-axis ellipsoid — třetí dimenze (vertikálně, ⊥ k length+width).
 pub const MIN_BODY_HEIGHT: f32 = 0.3;
@@ -2942,11 +2948,11 @@ mod tests {
             shell_thickness: 0.0,
         };
         // signal × rate × dt = 0.8 × 1.0 × 1.0 = 0.8 podél každé osy.
-        // Width clampuje na MIN_BODY_WIDTH (0.3), takže |Δ| pro width je
-        // 1.0 - 0.3 = 0.7. Total |Δ| = 0.8 (length) + 0.7 (width clamped)
-        // + 0.0 (height: signal=0) + 0.8 (spike) = 2.3.
+        // Width clampuje na MIN_BODY_WIDTH (0.8 post-Sprint-77), takže |Δ|
+        // pro width je 1.0 - 0.8 = 0.2. Total |Δ| = 0.8 (length) + 0.2
+        // (width clamped) + 0.0 (height: signal=0) + 0.8 (spike) = 1.8.
         let delta = phen.apply_morph([0.8, -0.8, 0.0, 0.8], 1.0, 1.0);
-        assert!((delta - 2.3).abs() < 1e-5, "got {}", delta);
+        assert!((delta - 1.8).abs() < 1e-5, "got {}", delta);
         assert!((phen.body_length - 1.8).abs() < 1e-5);
         assert!((phen.body_width - MIN_BODY_WIDTH).abs() < 1e-5);
         assert!((phen.spike_length - 1.3).abs() < 1e-5);

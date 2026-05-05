@@ -322,15 +322,74 @@ hunt damage vs bond maintenance.
     - Asp=12 needle attractor (real bottleneck pro tissue stability).
     - Cluster food share, persistent hunter chase, HUD.
 
-## Sprinty 77–82 — open-ended
+## Sprint 77 — `MIN_BODY_WIDTH` 0.3 → 0.8 (cap asp ~5)
 
-- **Sprint 77 (priorita):** `MIN_BODY_WIDTH` + `MIN_BODY_HEIGHT` 0.3 → 0.8
-  → cap asp ~5. Hypotéza: bez needle phenotype cells si zachovají
-  cluster-friendly body shape, immune_frac sustained > 0.05 do gen 500+.
-- **Sprint 77+:** Cluster food share — bonded cells sdílejí % eaten
-  food s partnery. Direct fitness reward.
-- **Sprint 77+:** Hunter persistent target chase logic.
-- **Sprint 77+:** HUD overlay s real-time bond stats.
-- **Sprint 77+:** Photic / thermal stratification.
-- **Sprint 77+:** GPU collision shader, anisotropic collision.
-- **Sprint 77+:** Spatial autocorrelation adhesion_type clustering metric.
+- **Cíl:** zlomit asp=12 needle attractor (Sprint 76 diagnóza). Hypotéza:
+  cap asp na 5 přes MIN_BODY_WIDTH bump → cells si zachovají roundish
+  body → cluster path zůstává geometricky viable napříč generací.
+
+- **Konstanty:**
+  - `MIN_BODY_WIDTH` 0.3 → 0.8 (asp_max = 4.0/0.8 = 5.0)
+  - Test `morph_returns_total_absolute_delta` updated (delta 2.3 → 1.8
+    kvůli novému clamp).
+
+- **Výstup:**
+  - `src/lib.rs`: 1 const update + 1 test fix.
+  - **Test suite: 95/95 pass.**
+  - **Long-run smoke seed=0, 1000 gen, default world, CPU:**
+    - Wall-clock 613.8 s = **978 ticks/s** (S76 861, +14 % — smaller
+      cells = lower compute cost). Final pop 398.
+    - **Asp cap funguje** ✓: max asp = 4.885 @ gen 847 (vs S76's 12.73).
+    - **Bond density LOWER vs Sprint 76:**
+
+      | Gen | spd | asp | mBond | hunt_atks | immune_frac |
+      |-----|-----|------|-------|-----------|-------------|
+      | 3   | ~75 | ~1.0 | ~0.10 | ~5500 | **0.027 (peak)** |
+      | 35  | ~110 | ~1.4 | **0.178 (peak)** | ~3500 | ~0.020 |
+      | 49  | 151 | 1.6  | 0.061 | 2671 | 0.002 |
+      | 99  | 182 | 3.9  | 0.015 | 2494 | 0.002 |
+      | 199 | 191 | 4.7  | 0.000 | 2349 | 0 |
+      | 999 | 193 | 4.7  | 0.000 | 2313 | 0 |
+    - Peak `mBond=0.178` (S76: 0.210, **−15 %**).
+    - Peak `immune_frac=0.027` (S76: 0.034, **−21 %**).
+
+- **Závěr — hypotéza falsifikována:**
+  - **Cap funguje mechanicky** (asp pinned 4.7 < cap 5.0), ale **nepomáhá
+    bondingu**. Cluster path stále crashed po gen 200.
+  - **Real bottleneck není body shape, ale fitness reward.** I s
+    cluster-friendly bodies cells nedostávají dost benefitu z bondingu;
+    selekce stále favorizuje solo path.
+  - **Side effect: pop crash 575 → 398** (–31 %). Cells se širší body
+    mají větší volume → vyšší maintenance + drag, méně cells přežívá
+    do reprodukce.
+  - **Cap zůstává v kódu** — prevence regrese k extrém asp je biologicky
+    obhájitelná, ale není to wow effect.
+
+- **Implikace pro Sprint 78+:**
+  - **Cluster food share = direct fitness reward.** Pokud bonded cell eats
+    food, share x % energy s bonded partners. Vytváří **explicit positive
+    selection signal** pro bondování — bonded cells dostanou víc energie
+    na osobu (multiplicative), což překlopí ekonomiku.
+  - Implementace touch eat_food fáze v lib + headless + main. Větší scope
+    než parameter tweaky, ale fundamentálnější.
+
+- **Poznámky:**
+  - **Wall-clock fastest yet** (978 ticks/s) — menší cells, menší volume,
+    levnější collision detection.
+  - **Asp pinned at 4.7 (just under cap 5)** — selekce pořád tlačí k
+    streamline, jen je teď bounded. Streamlining-as-attractor je
+    independent na bonding mechanic.
+  - **Co Sprint 77 NEŘEŠÍ (Sprint 78+):**
+    - Direct fitness reward pro bonding (cluster food share).
+    - Hunter persistent chase, HUD, photic/thermal.
+
+## Sprinty 78–82 — open-ended
+
+- **Sprint 78 (priorita):** Cluster food share — bonded cells sdílejí
+  % eaten food (např. 30 % per bond) s partnery. Direct positive
+  selection pressure. Touch eat_food v lib + headless + main.
+- **Sprint 78+:** Hunter persistent target chase logic.
+- **Sprint 78+:** HUD overlay s real-time bond stats.
+- **Sprint 78+:** Photic / thermal stratification.
+- **Sprint 78+:** GPU collision shader, anisotropic collision.
+- **Sprint 78+:** Spatial autocorrelation adhesion_type clustering metric.
