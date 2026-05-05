@@ -678,11 +678,17 @@ fn setup(
     // hunters spawnou na náhodné pozice; constant pop, žádný respawn.
     // Sprint 88: bumped emissive na red glow s HDR > 1.0 hodnoty — Bloom catches
     // hunter jako menacing red beacon viditelný z dálky.
+    // Sprint 88.4: pure-red emissive (zero green/blue). Reinhard tonemapper
+    // má dokumentované „lots of hue shifting" v brights — předchozí
+    // LinearRgba(2.5, 0.2, 0.1) se posouvalo směrem k oranžové. Pure red
+    // (3.5, 0.0, 0.0) zůstává nezpochybnitelně červené i pod tonemap +
+    // bloom redistribution. Brighter base 0.4 → 0.85 aby hunter byl viditelně
+    // červený i bez bloom kontribuce (např. v post-process toggle off).
     let hunter_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS * 4.0).mesh().ico(2).unwrap());
     let hunter_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.4, 0.05, 0.05),
+        base_color: Color::srgb(0.85, 0.05, 0.05),
         perceptual_roughness: 0.4,
-        emissive: LinearRgba::new(2.5, 0.2, 0.1, 1.0),
+        emissive: LinearRgba::new(3.5, 0.0, 0.0, 1.0),
         ..default()
     });
     let mut hunter_rng = rand::rng();
