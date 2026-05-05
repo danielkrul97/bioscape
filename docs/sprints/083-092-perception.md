@@ -915,7 +915,76 @@ sebou, kterou cells mohou flank-uniknout.
     output[9] threshold. Cluster grows pomalu; gradient defense reward
     není guaranteed selekční tah pokud bond formation cost dominates.
 
-## Sprinty 93+ — open-ended
+## Sprint 93 — hunter economy retune + diet diagnostics
+
+- **Cíl:** Sprint 92 exposure scaling redukoval avg hunter damage gain →
+  hunter pop kolapsoval k 1 do gen 20 (vs S90 cap 50). Sprint 93 tunes:
+  bump `HUNTER_ENERGY_PER_DAMAGE 6.0 → 12.0` (kompenzace partial defense),
+  širší init `carnivore_score [0, 0.3] → [0, 0.5]` (immediate niche pro
+  hunter carrion eaters), 2 nové CSV columns (`carnivore_avg`, `exposure_avg`)
+  pro diet + defense diagnostics.
+
+- **Mechanismus:**
+  - `HUNTER_ENERGY_PER_DAMAGE`: `12.0 × avg exposure 0.85 ≈ 10.2 effective`
+    (~1.7× pre-S92 baseline 6.0 × 1.0).
+  - `Genome::random.carnivore_score`: range `[0.0, 0.5]` — half populace
+    je smíšený fenotyp s aspoň částečnou capacity pro hunter carrion.
+  - `carnivore_avg`: mean `genome.carnivore_score` přes alive cells.
+  - `exposure_avg`: mean `cell_exposure(n_bonds())` přes cells. 1.0 = all
+    solo, < 1.0 = clustering aktivní.
+
+- **Smoke seed=0 60 gen — predator-prey equilibrium restored:**
+
+  | gen | cells | hunters | atk/gen | carnivore_avg | exposure_avg |
+  |-----|-------|---------|---------|---------------|--------------|
+  | 0   | 200   | 12      | 0       | 0.257         | 1.000        |
+  | 10  | 610   | 15      | 375     | 0.125         | 0.954        |
+  | 30  | 579   | 15      | 512     | 0.072         | 0.973        |
+  | 50  | 539   | **50**  | 2985    | 0.050         | 0.984        |
+  | 60  | 483   | 50      | 3098    | 0.039         | 0.988        |
+
+  - **Hunters reach MAX_POP cap** v gen 40-50 (parita s S90 v3 baseline).
+    Predator-prey equilibrium funguje stejně dobře jako pre-S92.
+  - **Diet drift toward herbivore** (0.257 → 0.039) — selection signal
+    active. Plant food je plentiful, hunter carrion vzácné → cells
+    specializují k plant digestion. Multi-trophic mechanismus identifikoval
+    dominant food source správně.
+  - **Exposure stays ~1.0** — cells nedosahují clustering pressures.
+    Edge-vulnerability gradient teoreticky aktivní ale prakticky se neuplatní
+    při průměrných n_bonds < 0.1. **Sprint 94+ bude potřebovat tlak na
+    bond formation** (lower formation cost, higher reward, nebo coordinated
+    multi-cell selection event).
+
+- **Determinismus:** Sprint 93 = nový baseline. Initial carnivore_score
+  range bump posune RNG sequence; HUNTER_ENERGY_PER_DAMAGE změna
+  trajectory hunter dynamics.
+
+- **Test suite:** 136/136 pass. Test `carnivore_score_in_genome_random_initial_range`
+  aktualizován na nový range [0, 0.5].
+
+- **CSV:** 62 → 64 sloupců. Header + extinction-row updated.
+
+- **Výstup:**
+  - `src/lib.rs`: `HUNTER_ENERGY_PER_DAMAGE 6.0 → 12.0`, `Genome::random
+    carnivore_score range [0,0.3] → [0,0.5]`, test range update.
+  - `src/bin/headless.rs`: `carnivore_avg + exposure_avg` v `write_stats`,
+    CSV header + extinction-row + writeln rozšířen.
+
+- **Co Sprint 93 NEŘEŠÍ (S94+):**
+  - **Bond formation incentive** — cells stále nedosahují cluster pressure.
+    Možnosti: lower `BOND_FORMATION_COST`, higher `INNATE_BOND_BIAS`,
+    structural break (bond-only food sharing, larger cluster reproduction
+    bonus).
+  - **Visual food kind differentiation** — všechny food kinds mají same
+    green material.
+  - **Multi-trophic active utilization** — diet drift toward homogeneous
+    herbivore. Aby carnivore niche přežil, hunter carrion by musel být
+    častější (víc hunter deaths) nebo hodnotnější (`HUNTER_CARRION_FOOD_VALUE
+    50 → 100`).
+  - **Predator brain efficiency** — random brain wastes energy on chase
+    paths; Sprint 94+ Hebbian na hunter brain pomohlo.
+
+## Sprinty 94+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud

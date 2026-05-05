@@ -731,11 +731,14 @@ pub const HUNTER_BODY_COST: f32 = 0.5;
 /// Hunter „claws out" continuously — lze trade-off-it nižší damage = nižší
 /// upkeep, vhodné pro low-energy survivors.
 pub const HUNTER_ATTACK_UPKEEP: f32 = 0.02;
-/// Energy gain per damage dealt (proportional). Pokud ENERGY_PER_DAMAGE = 1.0
-/// a damage_per_tick = 8, single tick attack na cell vrací 8 energy. Při 60Hz
-/// a HUNTER_ATTACK_RADIUS contact, hunter může drainovat ~480 energy/sec
-/// ze single prey — fast kills sustain reprodukci.
-pub const HUNTER_ENERGY_PER_DAMAGE: f32 = 6.0;
+/// Energy gain per damage dealt (proportional). Sprint 89 v3 = 6.0.
+/// Sprint 93: 6.0 → 12.0 — kompenzace S92 exposure scaling (cells s 1-3
+/// bondy mají reduced damage = reduced gain). Pre-S93 smoke gen 20 ukázal
+/// hunter pop kolaps k 1 (cumulative net negative energy). 12.0 × avg
+/// exposure ~0.85 ≈ 10.2 effective gain ≈ 1.7× pre-S92 6.0 × 1.0 = 6.0,
+/// kompenzace partial defense + příležitost pro carnivore-niche cells
+/// dostat z hunter carrion.
+pub const HUNTER_ENERGY_PER_DAMAGE: f32 = 12.0;
 /// Carrion drops při hunter death. Mirror cell death (Sprint 27 carrion).
 /// 2× value default — hunter větší než cell, víc biomasy.
 pub const HUNTER_CARRION_DROP: usize = 2;
@@ -1756,10 +1759,12 @@ impl Genome {
             // RNG draw je breaking change pro Sprint 86 baseline (BRAIN_INPUTS
             // shape change už CSV reproducibility ztratila).
             thermal_optimum: rng.random_range(MIN_THERMAL_OPTIMUM..MAX_THERMAL_OPTIMUM),
-            // Sprint 92: bias toward herbivore (range [0, 0.3]) — cold start
-            // potřebuje plant food digestion. Selekce může driftovat carnivore
-            // pokud hunter carrion availability vytvoří nutritional opportunity.
-            carnivore_score: rng.random_range(0.0..0.3),
+            // Sprint 92: bias toward herbivore (range [0, 0.3]) — cold start.
+            // Sprint 93: range [0, 0.5] — wider initial spread aby existoval
+            // immediate niche pro carnivore-leaning cells na hunter carrion
+            // drop sites. Bez tohoto je multi-trophic food chain dormant
+            // dokud sigma drift nedotlačí > 0.5 (mnoho gens).
+            carnivore_score: rng.random_range(0.0..0.5),
             brain: Brain::random(rng),
         }
     }
@@ -3917,8 +3922,8 @@ mod tests {
         for _ in 0..100 {
             let g = Genome::random(&mut rng);
             assert!(
-                (0.0..0.3).contains(&g.carnivore_score),
-                "carnivore_score {} out of init range [0, 0.3]",
+                (0.0..0.5).contains(&g.carnivore_score),
+                "carnivore_score {} out of init range [0, 0.5]",
                 g.carnivore_score
             );
         }

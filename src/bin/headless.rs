@@ -2112,15 +2112,15 @@ const EDGE_FRAC_THRESHOLD: f32 = 0.9;
 fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let n = world.cells.len();
     if n == 0 {
-        // 62 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
+        // 64 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
         // + 3 birth/death + 1 atk_emit 0 + predation + 6 brain/density 0 + 2
         // bonds + 6 bond/adhesion 0 + 2 hunter + 1 immune_frac 0 +
         // 3 cell_state 0 (Sprint 80) + 2 vision_fov 0 (Sprint 83) +
         // 1 thermal 0 (Sprint 85) + 2 thermal_optimum 0 (Sprint 87) +
-        // 7 hunter genome 0 (Sprint 89).
+        // 7 hunter genome 0 (Sprint 89) + 2 diet/exposure 0 (Sprint 93).
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2205,6 +2205,16 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let mut h_fov_sum = 0.0_f64;
     let mut h_dmg_sum = 0.0_f64;
     let mut h_size_sum = 0.0_f64;
+    // Sprint 93: per-cell diet + defense diagnostics.
+    let mut carnivore_sum = 0.0_f64;
+    let mut exposure_sum = 0.0_f64;
+    for c in &world.cells {
+        carnivore_sum += c.genome.carnivore_score as f64;
+        exposure_sum += bioscape::cell_exposure(c.n_bonds()) as f64;
+    }
+    let cell_count = world.cells.len();
+    let carnivore_m = if cell_count > 0 { carnivore_sum / cell_count as f64 } else { 0.0 };
+    let exposure_m = if cell_count > 0 { exposure_sum / cell_count as f64 } else { 0.0 };
     let n_hunters = world.hunters.len();
     if n_hunters > 0 {
         for h in &world.hunters {
@@ -2430,7 +2440,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let immune_f = immune_cells as f64 / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -2501,6 +2511,9 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         h_fov_m,
         h_dmg_m,
         h_size_m,
+        // Sprint 93 diet + defense diagnostics.
+        carnivore_m,
+        exposure_m,
     )
 }
 
@@ -2703,7 +2716,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();
