@@ -771,6 +771,19 @@ impl World {
             shell_cost_per_sec: SHELL_COST_PER_SEC,
             attack_cost_per_sec: ATTACK_COST_PER_SEC,
             pitch_clamp: core::f32::consts::FRAC_PI_6 * 0.5,
+            thermal_top: bioscape::THERMAL_TOP,
+            thermal_bottom: bioscape::THERMAL_BOTTOM,
+            thermal_q10: bioscape::THERMAL_Q10,
+            thermal_ref_temp: bioscape::THERMAL_REF_TEMP,
+            // Sprint 86: per-tick phase fractions, pre-computed na CPU aby
+            // shader nemusel řešit u64 modulo + f32 cast.
+            thermal_diurnal_amp: bioscape::THERMAL_DIURNAL_AMP,
+            thermal_seasonal_amp: bioscape::THERMAL_SEASONAL_AMP,
+            thermal_diurnal_phase: (self.clock.tick % bioscape::THERMAL_DIURNAL_PERIOD_TICKS)
+                as f32
+                / bioscape::THERMAL_DIURNAL_PERIOD_TICKS as f32,
+            thermal_seasonal_phase: (self.clock.generation % CYCLE_GEN_PERIOD) as f32
+                / CYCLE_GEN_PERIOD as f32,
         };
         gpu.step.dispatch_with_cells(&gpu.cells, n, step_params);
 
@@ -843,16 +856,25 @@ impl World {
                 let pos = cell.position;
                 let vision_r = cell.genome.vision_radius;
                 let vr2 = vision_r * vision_r;
+                // Sprint 83: cone filter — viz `gather` v main.rs.
+                let fov = cell.genome.vision_fov;
+                let skip_cone = fov >= bioscape::MAX_VISION_FOV;
+                let cos_fov = fov.cos();
+                let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
 
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
                 food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, ()| {
                     let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if d2 <= vr2 && d2 < best_food_d2 {
-                        best_food_d2 = d2;
-                        best_food = Some(d);
+                    if d2 > vr2 || d2 >= best_food_d2 {
+                        return;
                     }
+                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                        return;
+                    }
+                    best_food_d2 = d2;
+                    best_food = Some(d);
                 });
 
                 let mut best_cell: Option<([f32; 3], f32)> = None;
@@ -864,12 +886,16 @@ impl World {
                     }
                     let d = bioscape::min_image_delta(pos, op, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if d2 <= vr2 {
-                        neighbors_in_vision += 1;
-                        if d2 < best_cell_d2 {
-                            best_cell_d2 = d2;
-                            best_cell = Some((d, oradius));
-                        }
+                    if d2 > vr2 {
+                        return;
+                    }
+                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                        return;
+                    }
+                    neighbors_in_vision += 1;
+                    if d2 < best_cell_d2 {
+                        best_cell_d2 = d2;
+                        best_cell = Some((d, oradius));
                     }
                 });
 
@@ -945,16 +971,25 @@ impl World {
                 let pos = cell.position;
                 let vision_r = cell.genome.vision_radius;
                 let vr2 = vision_r * vision_r;
+                // Sprint 83: cone filter — viz `gather` v main.rs.
+                let fov = cell.genome.vision_fov;
+                let skip_cone = fov >= bioscape::MAX_VISION_FOV;
+                let cos_fov = fov.cos();
+                let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
 
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
                 food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, ()| {
                     let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if d2 <= vr2 && d2 < best_food_d2 {
-                        best_food_d2 = d2;
-                        best_food = Some(d);
+                    if d2 > vr2 || d2 >= best_food_d2 {
+                        return;
                     }
+                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                        return;
+                    }
+                    best_food_d2 = d2;
+                    best_food = Some(d);
                 });
 
                 let mut best_cell: Option<([f32; 3], f32)> = None;
@@ -966,12 +1001,16 @@ impl World {
                     }
                     let d = bioscape::min_image_delta(pos, op, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if d2 <= vr2 {
-                        neighbors_in_vision += 1;
-                        if d2 < best_cell_d2 {
-                            best_cell_d2 = d2;
-                            best_cell = Some((d, oradius));
-                        }
+                    if d2 > vr2 {
+                        return;
+                    }
+                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                        return;
+                    }
+                    neighbors_in_vision += 1;
+                    if d2 < best_cell_d2 {
+                        best_cell_d2 = d2;
+                        best_cell = Some((d, oradius));
                     }
                 });
 
@@ -1010,8 +1049,10 @@ impl World {
         }
         // Sprint 57: stejně jako apply_morph, ~16 us sekvenčně vs ~30 us
         // paralelně — work per cell je příliš malý pro rayon. Sekvenční win.
+        let tick = self.clock.tick;
+        let gen = self.clock.generation;
         for cell in &mut self.cells {
-            cell.step(dt, WORLD_HALF, &PHYSICS_CONFIG);
+            cell.step(dt, WORLD_HALF, tick, gen, &PHYSICS_CONFIG);
         }
     }
 
@@ -1491,7 +1532,12 @@ impl World {
         let cells_ref = &self.cells;
         let mut attacks: Vec<(usize, f32)> = Vec::new();
         for hunter in &mut self.hunters {
-            let target_idx = nearest_attackable_cell(hunter.position, cells_ref, WORLD_HALF);
+            let target_idx = nearest_attackable_cell(
+                hunter.position,
+                hunter.velocity,
+                cells_ref,
+                WORLD_HALF,
+            );
             let target_pos = target_idx.map(|i| cells_ref[i].position);
             hunter.step(target_pos, rng, dt, WORLD_HALF);
             if let Some(i) = target_idx {
@@ -1909,13 +1955,14 @@ const EDGE_FRAC_THRESHOLD: f32 = 0.9;
 fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let n = world.cells.len();
     if n == 0 {
-        // 50 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
+        // 53 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
         // + 3 birth/death + 1 atk_emit 0 + predation + 6 brain/density 0 + 2
         // bonds + 6 bond/adhesion 0 + 2 hunter + 1 immune_frac 0 +
-        // 3 cell_state 0 (Sprint 80).
+        // 3 cell_state 0 (Sprint 80) + 2 vision_fov 0 (Sprint 83) +
+        // 1 thermal 0 (Sprint 85).
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -1977,6 +2024,14 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let mut state_sum = 0.0_f64;
     let mut state_sumsq = 0.0_f64;
     let mut altruist_count = 0_u64;
+    // Sprint 83: per-gen FOV diagnostika. Init populace = π (full sphere);
+    // pokles avg + růst dev = aktivní selekce na užší kužel.
+    let mut fov_sum = 0.0_f64;
+    let mut fov_sumsq = 0.0_f64;
+    // Sprint 85: thermal niche metric. Mean temperature na cell pozicích —
+    // posun směrem k THERMAL_BOTTOM (~4) = populace migrovala ke dnu (cold,
+    // pomalý metabolism), posun k THERMAL_TOP (~30) = surface dwellers.
+    let mut temp_sum = 0.0_f64;
     let current_gen = world.clock.generation;
     for c in &world.cells {
         let s = c.genome.max_speed as f64;
@@ -1996,6 +2051,18 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         asp_sum += aspect;
         asp_sumsq += aspect * aspect;
         spk_sum += spk;
+        let fov = c.genome.vision_fov as f64;
+        fov_sum += fov;
+        fov_sumsq += fov * fov;
+        // Sprint 86: temperature includes diurnal + seasonal cycles. Snapshot
+        // se bere v aktuálním clock state — temp_avg pak odráží environmental
+        // teplotu cells **v okamžiku end-of-gen**, ne time-averaged.
+        temp_sum += bioscape::temperature_at_z(
+            c.position[2],
+            WORLD_HALF,
+            world.clock.tick,
+            world.clock.generation,
+        ) as f64;
         if spk > spk_max {
             spk_max = spk;
         }
@@ -2119,6 +2186,11 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let state_m = state_sum / nf;
     let state_d = ((state_sumsq / nf) - state_m * state_m).max(0.0).sqrt();
     let altruist_frac = altruist_count as f64 / nf;
+    // Sprint 83 vision_fov stats.
+    let fov_m = fov_sum / nf;
+    let fov_d = ((fov_sumsq / nf) - fov_m * fov_m).max(0.0).sqrt();
+    // Sprint 85 thermal niche — mean teplota.
+    let temp_m = temp_sum / nf;
     // Sprint 29 spatial clustering metric: mean nearest-neighbor distance.
     // Sprint 43: grid lookup s expanding radius. Začni na GRID_CELL_SIZE (=64),
     // pokud nikdo není, double až po WORLD diagonal — typický nn dist je < 50,
@@ -2163,7 +2235,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let immune_f = immune_cells as f64 / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2}",
         world.clock.generation,
         n,
         spd_m,
@@ -2218,6 +2290,11 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         state_m,
         state_d,
         altruist_frac,
+        // Sprint 83 vision_fov diagnostics.
+        fov_m,
+        fov_d,
+        // Sprint 85 thermal niche.
+        temp_m,
     )
 }
 
@@ -2407,7 +2484,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();

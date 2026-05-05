@@ -689,7 +689,9 @@ fn adhesion_material(
         return h.clone();
     }
     let hue = idx as f32 * (360.0 / 8.0);
-    let color = Color::hsl(hue, 0.85, 0.55);
+    // Sprint 85: saturation 0.85 → 1.0 — sytější body color, ostřejší
+    // adhesion-type rozlišení proti bílému ClearColoru.
+    let color = Color::hsl(hue, 1.0, 0.55);
     let handle = materials.add(StandardMaterial {
         base_color: color,
         perceptual_roughness: 0.6,
@@ -843,12 +845,15 @@ fn advance_clock(
 fn step_cells(
     time: Res<Time>,
     extent: Res<WorldExtent>,
+    clock: Res<Clock>,
     mut cells: Query<&mut CellEntity>,
 ) {
     let dt = time.delta_secs();
     let half = extent.as_array();
+    let tick = clock.0.tick;
+    let gen = clock.0.generation;
     for mut cell in &mut cells {
-        cell.0.step(dt, half, &PHYSICS_CONFIG);
+        cell.0.step(dt, half, tick, gen, &PHYSICS_CONFIG);
     }
 }
 
@@ -1060,15 +1065,26 @@ fn cells_brain_act(
         let pos = cell.position;
         let vision_r = cell.genome.vision_radius;
         let vr2 = vision_r * vision_r;
+        // Sprint 83: precomputed cone parametry. `skip_cone` short-circuit pro
+        // full-sphere FOV (cos(π) ≈ −1, jakýkoliv kandidát uvnitř radia by
+        // procházel) — vyhne se per-callback sqrt.
+        let fov = cell.genome.vision_fov;
+        let skip_cone = fov >= bioscape::MAX_VISION_FOV;
+        let cos_fov = fov.cos();
+        let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
         let mut nearest_food: Option<[f32; 3]> = None;
         let mut best_food_d2 = f32::MAX;
         food_grid.0.for_each_in_radius_toroidal(pos, vision_r, SIMULATION_HALF, |_, fp, _| {
             let d = bioscape::min_image_delta(pos, fp, SIMULATION_HALF);
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-            if d2 <= vr2 && d2 < best_food_d2 {
-                best_food_d2 = d2;
-                nearest_food = Some(d);
+            if d2 > vr2 || d2 >= best_food_d2 {
+                return;
             }
+            if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                return;
+            }
+            best_food_d2 = d2;
+            nearest_food = Some(d);
         });
         let mut nearest_cell: Option<([f32; 3], f32)> = None;
         let mut best_cell_d2 = f32::MAX;
@@ -1081,12 +1097,16 @@ fn cells_brain_act(
                 }
                 let d = bioscape::min_image_delta(pos, other_pos, SIMULATION_HALF);
                 let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                if d2 <= vr2 {
-                    neighbors_in_vision += 1;
-                    if d2 < best_cell_d2 {
-                        best_cell_d2 = d2;
-                        nearest_cell = Some((d, other_radius));
-                    }
+                if d2 > vr2 {
+                    return;
+                }
+                if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                    return;
+                }
+                neighbors_in_vision += 1;
+                if d2 < best_cell_d2 {
+                    best_cell_d2 = d2;
+                    nearest_cell = Some((d, other_radius));
                 }
             });
         let pos_xyz = [pos[0], pos[1], pos[2]];
@@ -1438,7 +1458,7 @@ fn step_hunters(
     let mut attacks: Vec<(Entity, f32)> = Vec::new();
     for mut h in &mut hunters {
         let target_idx =
-            nearest_attackable_cell(h.0.position, &cells_only, SIMULATION_HALF);
+            nearest_attackable_cell(h.0.position, h.0.velocity, &cells_only, SIMULATION_HALF);
         let target_pos = target_idx.map(|i| cells_only[i].position);
         h.0.step(target_pos, &mut rng, dt, SIMULATION_HALF);
         if let Some(i) = target_idx {
@@ -1490,7 +1510,8 @@ fn draw_bond_gizmos(
     for cell in &cells {
         let start = Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]);
         let hue = adhesion_hue(cell.0.genome.adhesion_type);
-        let color = Color::hsl(hue, 0.85, 0.65);
+        // Sprint 85: saturation 0.85 → 1.0, match s body color v adhesion_material.
+        let color = Color::hsl(hue, 1.0, 0.65);
         for bond in cell.0.bonds.iter().flatten() {
             let Some(end) = id_to_pos.get(&bond.other_cell_id) else {
                 continue;

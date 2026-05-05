@@ -26,6 +26,14 @@ struct StepParams {
     shell_cost_per_sec: f32,
     attack_cost_per_sec: f32,
     pitch_clamp: f32,
+    thermal_top: f32,
+    thermal_bottom: f32,
+    thermal_q10: f32,
+    thermal_ref_temp: f32,
+    thermal_diurnal_amp: f32,
+    thermal_seasonal_amp: f32,
+    thermal_diurnal_phase: f32,
+    thermal_seasonal_phase: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: StepParams;
@@ -101,19 +109,36 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     pitch_vel = pitch_vel * ang_drag_factor;
 
     // apply_energy_costs
+    // Sprint 85: thermal stratification — z-gradient teplota × Q10 metabolism
+    // multiplikátor na all drains. Mirror CPU `temperature_at_z` +
+    // `metabolism_factor`. Při world_half_z = 0 fallback na ref temp = 1.0×.
+    // Sprint 86: time-varying — seasonal uniform shift (per gen) + diurnal
+    // surface-weighted oscilace (per tick). Phases pre-computed CPU-side.
+    let TAU = 6.28318530717958647692;
+    var temp = params.thermal_ref_temp;
+    if (params.world_half_z > 0.0) {
+        var norm = (pos.z / params.world_half_z + 1.0) * 0.5;
+        norm = clamp(norm, 0.0, 1.0);
+        let base = params.thermal_bottom + (params.thermal_top - params.thermal_bottom) * norm;
+        let seasonal_offset = params.thermal_seasonal_amp * sin(TAU * params.thermal_seasonal_phase);
+        let diurnal_offset = params.thermal_diurnal_amp * norm * sin(TAU * params.thermal_diurnal_phase);
+        temp = base + seasonal_offset + diurnal_offset;
+    }
+    let metabolism = pow(params.thermal_q10, (temp - params.thermal_ref_temp) / 10.0);
+    let dt_eff = params.dt * metabolism;
     let v_mag_sq = dot(vel, vel);
-    energy = energy - v_mag_sq * params.energy_cost_per_v_sq * params.dt;
+    energy = energy - v_mag_sq * params.energy_cost_per_v_sq * dt_eff;
     let eff_r = (body_l + body_w + body_h) / 3.0;
-    energy = energy - eff_r * eff_r * ang_vel * ang_vel * params.angular_energy_cost * params.dt;
-    energy = energy - vision * params.vision_cost_per_radius * params.dt;
+    energy = energy - eff_r * eff_r * ang_vel * ang_vel * params.angular_energy_cost * dt_eff;
+    energy = energy - vision * params.vision_cost_per_radius * dt_eff;
     let age_sec = f32(ages[i]) / params.fixed_timestep_hz;
     let aging_factor = 1.0 + params.age_decay_per_sec * age_sec;
     let volume = body_l * body_w * body_h;
-    energy = energy - volume * params.body_cost_factor * aging_factor * params.dt;
-    energy = energy - spike * params.spike_cost_per_sec * params.dt;
-    energy = energy - shell * params.shell_cost_per_sec * params.dt;
+    energy = energy - volume * params.body_cost_factor * aging_factor * dt_eff;
+    energy = energy - spike * params.spike_cost_per_sec * dt_eff;
+    energy = energy - shell * params.shell_cost_per_sec * dt_eff;
     let attack_strength = max(attack, 0.0);
-    energy = energy - attack_strength * params.attack_cost_per_sec * params.dt;
+    energy = energy - attack_strength * params.attack_cost_per_sec * dt_eff;
 
     // Sprint 54: toroidal xy wrap (cylinder topology), z bounce. Matches
     // CPU `Cell::apply_world_bounce` Sprint 54 semantiku.

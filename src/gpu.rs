@@ -3187,6 +3187,22 @@ pub struct StepParamsGpu {
     pub shell_cost_per_sec: f32,
     pub attack_cost_per_sec: f32,
     pub pitch_clamp: f32,
+    /// Sprint 85: thermal stratification params. Mirror constanty z `lib.rs`
+    /// (THERMAL_TOP/BOTTOM/Q10/REF_TEMP). Compute z-gradient temperature →
+    /// Q10 metabolism multiplikátor → škálování všech drains.
+    pub thermal_top: f32,
+    pub thermal_bottom: f32,
+    pub thermal_q10: f32,
+    pub thermal_ref_temp: f32,
+    /// Sprint 86: time-varying thermal — diurnal (per-tick, surface-weighted)
+    /// + seasonal (per-generation, uniform shift). Periody jsou pre-computed
+    /// jako f32 reciprocals aby shader nemusel dělit u32.
+    pub thermal_diurnal_amp: f32,
+    pub thermal_seasonal_amp: f32,
+    /// Phase fraction (tick mod period) / period, [0, 1) — caller už spočítal
+    /// aby se vyhnulo u64 → f32 cast precision loss pro long runs.
+    pub thermal_diurnal_phase: f32,
+    pub thermal_seasonal_phase: f32,
 }
 
 pub struct StepGpu {
@@ -6211,7 +6227,8 @@ mod tests {
         use crate::{
             Cell, AGE_DECAY_PER_SEC, ANGULAR_DRAG, ANGULAR_ENERGY_COST, ATTACK_COST_PER_SEC,
             BODY_COST_FACTOR, DRAG_COEFFICIENT, ENERGY_COST_PER_V_SQ, FIXED_TIMESTEP_HZ, GRAVITY,
-            PHYSICS_CONFIG, SHELL_COST_PER_SEC, SPIKE_COST_PER_SEC, VISION_COST_PER_RADIUS,
+            PHYSICS_CONFIG, SHELL_COST_PER_SEC, SPIKE_COST_PER_SEC, THERMAL_BOTTOM, THERMAL_Q10,
+            THERMAL_REF_TEMP, THERMAL_TOP, VISION_COST_PER_RADIUS,
         };
         let mut rng = StdRng::seed_from_u64(43);
         let n = 64;
@@ -6282,6 +6299,16 @@ mod tests {
             shell_cost_per_sec: SHELL_COST_PER_SEC,
             attack_cost_per_sec: ATTACK_COST_PER_SEC,
             pitch_clamp: core::f32::consts::FRAC_PI_6 * 0.5,
+            thermal_top: THERMAL_TOP,
+            thermal_bottom: THERMAL_BOTTOM,
+            thermal_q10: THERMAL_Q10,
+            thermal_ref_temp: THERMAL_REF_TEMP,
+            // Sprint 86: tick=0, gen=0 → phases = 0 → sin(0) = 0 → no
+            // seasonal/diurnal offset (matches CPU step(.., 0, 0, ..)).
+            thermal_diurnal_amp: crate::THERMAL_DIURNAL_AMP,
+            thermal_seasonal_amp: crate::THERMAL_SEASONAL_AMP,
+            thermal_diurnal_phase: 0.0,
+            thermal_seasonal_phase: 0.0,
             ..StepParamsGpu::default()
         };
         let res = gpu.compute(
@@ -6290,7 +6317,7 @@ mod tests {
         );
 
         for c in cells.iter_mut() {
-            c.step(dt, world_half, &PHYSICS_CONFIG);
+            c.step(dt, world_half, 0, 0, &PHYSICS_CONFIG);
         }
 
         for i in 0..n {

@@ -164,7 +164,7 @@ fn bench_cell_step(c: &mut Criterion) {
             let mut local = cells.clone();
             b.iter(|| {
                 for c in local.iter_mut() {
-                    c.step(1.0 / 60.0, WORLD_HALF, physics);
+                    c.step(1.0 / 60.0, WORLD_HALF, 0, 0, physics);
                 }
             });
         });

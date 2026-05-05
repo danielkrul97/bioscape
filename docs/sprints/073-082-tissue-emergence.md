@@ -622,17 +622,76 @@ hunt damage vs bond maintenance.
     - Photic / thermal stratification.
     - GPU / anisotropic collision.
 
-## Sprinty 81–82 — open-ended
+## Sprint 82 — `vision_fov` gen (pure infra, full-sphere baseline)
 
-- **Sprint 81+:** renderer screencast + HUD bond/state stats (z S80
-  odsunuto).
-- **Sprint 81+:** Cluster reproduction (Sprint 70 retry with S78
-  baseline) — offspring spawnou uvnitř parent clusteru.
-- **Sprint 81+:** `BOND_FOOD_SHARE_FRAC` sweep (0.1, 0.5, 0.7) —
-  najít balance ne-trivialní cluster vs nezávislé cells.
-- **Sprint 81+:** Photic stratification (z-gradient light field +
-  photoreceptor sensor input) — niche separation by depth.
-- **Sprint 81+:** Thermal stratification (z-gradient temperature).
-- **Sprint 81+:** GPU collision shader, anisotropic collision.
-- **Sprint 81+:** Spatial autocorrelation adhesion_type clustering metric.
-- **Sprint 81+:** Clippy auto-fixes pass (estetické cleanup).
+- **Cíl:** zavést genovou infrastrukturu pro směrový FOV. Pre-Sprint-82
+  bylo vidění čistě sférické (4π str) — sensor gather používal
+  `for_each_in_radius_toroidal` bez úhlového filtru. Sprint 82 přidává
+  per-cell `vision_fov` half-angle gen + cost faktor, který škáluje
+  vision drain podle pokrývaného solid angle. **Zatím žádný cone filter
+  v sensor gather** (Sprint 83) a **žádný drift** (`sigma_vision_fov = 0`
+  v `MUTATION_CONFIG`); cells startují s `INITIAL_VISION_FOV = π` (full
+  sphere) → `vision_fov_factor(π) = 1.0` → energy cost identický
+  s pre-Sprint-82. Motivace: bez gen+cost infrastructure by cone filter
+  byl pure detriment a evoluce by ho nikdy nenarrowila — tato decoupling
+  fáze drží stable baseline pro CSV diff a dovolí Sprint 83 zaměřit se
+  jen na sensor gather změny.
+
+- **Mechanismus:**
+  - Konstanty (`src/lib.rs`): `MIN_VISION_FOV = π/12` (~17°),
+    `MAX_VISION_FOV = π` (full sphere), `INITIAL_VISION_FOV = π`.
+  - Helper `vision_fov_factor(theta) = (1 − cos θ) / 2` ∈ [0,1] —
+    full sphere → 1, narrow → 0. Solid angle kuželu = 2π(1−cos θ),
+    normalizováno na 4π (full sphere).
+  - `Genome::vision_fov: f32` field (serde default = `INITIAL_VISION_FOV`
+    pro backward-compat deserialize starších save files, kdyby existovaly).
+  - `MutationConfig::sigma_vision_fov: f32` — gaussian sigma. Default
+    `MUTATION_CONFIG` = 0.0 (drift dormant).
+  - `Genome::random` set `vision_fov: INITIAL_VISION_FOV` bez RNG draw
+    (žádný shift v initial population sekvenci).
+  - `Genome::mutate` short-circuit pattern (Sprint 80 add_neuron_rate
+    konvence): při `sigma_vision_fov = 0` se gaussian draw přeskočí, jinak
+    drift + clamp `[MIN_VISION_FOV, MAX_VISION_FOV]`.
+  - `Genome::crossover` short-circuit při shodě hodnot: pokud `a.vision_fov
+    == b.vision_fov` (S82 default — všichni mají INITIAL_VISION_FOV), bool
+    draw se přeskočí. Po Sprint 83+ aktivaci sigma divergují hodnoty →
+    bool draw se zapne.
+  - `Cell::apply_energy_costs` násobí vision drain `vision_fov_factor`:
+    `energy -= vision_radius × VISION_COST_PER_RADIUS × fov_factor × dt`.
+    Při fov = π je factor = 1.0 → multiplication 1.0 je f32-exact (žádné
+    rounding) → drain identický s pre-Sprint-82.
+
+- **Determinismus:** Sprint 82 baseline je **byte-identical s pre-Sprint-82
+  CSV** díky short-circuit pattern. RNG draws se aktivují až s
+  `sigma_vision_fov > 0` (Sprint 83). Cone filter v sensor gather se
+  uplatní až v Sprint 83; Sprint 82 sensor gather drží `skip_cone = true`
+  pro full-sphere FOV (no-op pro fov ≥ MAX_VISION_FOV).
+
+- **Test suite:** 110/110 pass (106 baseline + 4 nové: `vision_fov_factor_endpoints`,
+  `vision_fov_narrows_energy_cost`, `vision_fov_dormant_preserves_rng_sequence`,
+  `vision_fov_crossover_skips_rng_when_equal`). Poslední dva jsou
+  reproducibility guards: ověřují, že short-circuit ušetří přesně 2 u32
+  draws v mutate (gaussian) a 1 bool draw v crossover. `mutation_keeps_genes_in_valid_ranges`
+  rozšířen o range check `[MIN_VISION_FOV, MAX_VISION_FOV]`.
+  `crossover_picks_genes_from_either_parent` rozšířen o `vision_fov`
+  assertion. `cargo check --bins --benches` clean.
+
+- **Výstup:**
+  - `src/lib.rs`: 3 nové konstanty (`MIN_VISION_FOV`, `MAX_VISION_FOV`,
+    `INITIAL_VISION_FOV`), `vision_fov_factor` helper, `vision_fov` field
+    na `Genome`, `sigma_vision_fov` field na `MutationConfig`,
+    `apply_energy_costs` násobí fov_factor, `default_vision_fov` serde
+    helper, 6 míst v testech aktualizováno (dummy/zero helpery + literály).
+
+- **Co Sprint 82 NEŘEŠÍ (S83+):**
+  - Cone filter v sensor gather (`main.rs` + `headless.rs`) — Sprint 83.
+  - Hunter směrový FOV — Sprint 84.
+  - Aktivace `sigma_vision_fov > 0` v `MUTATION_CONFIG` — čeká na Sprint
+    83+ aby měla evoluce informační tlak (bez filteru je úzký FOV pure
+    win → degenerace na MIN_VISION_FOV).
+  - CSV column pro `vision_fov_avg` — zatím konstanta π, dump nemá
+    diagnostic value. Přidat až s aktivním driftem.
+
+Decade 73-82 uzavřena. Decade 83+ pokračuje v `083-092-perception.md` —
+směrový FOV (cells + hunter), photic/thermal stratification, sensor
+specializace.

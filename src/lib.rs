@@ -26,6 +26,18 @@ const MIN_SPEED: f32 = 1.0;
 /// dovoluje fluktuace v rámci capu.
 pub const MAX_SPEED: f32 = 200.0;
 const MIN_VISION: f32 = 1.0;
+/// Sprint 82: minimum half-angle směrového FOV (radiány). Pod ~17° je vidění
+/// degenerované — buňka skoro nic neuvidí, nemá smysl evolvovat dál.
+pub const MIN_VISION_FOV: f32 = core::f32::consts::PI / 12.0;
+/// Sprint 82: maximum half-angle FOV = π = full sphere (4π str solid angle).
+/// `vision_fov_factor(π) = 1.0` → energy cost identický s pre-Sprint-82
+/// omnidirectional vision; výchozí hodnota při Genome::random.
+pub const MAX_VISION_FOV: f32 = core::f32::consts::PI;
+/// Sprint 82: initial vision_fov při Genome::random = full sphere baseline.
+/// Cone filter v sensor gather je no-op pro fov ≥ π (cos π = −1, dot vždy ≥ −1).
+/// Selekční tlak (cost ∝ fov_factor) může FOV zúžit, pokud info-loss < energy
+/// savings; v Sprint 82 je `sigma_vision_fov = 0` → gen drift dormant.
+pub const INITIAL_VISION_FOV: f32 = core::f32::consts::PI;
 const MIN_TURN_RATE: f32 = 0.1;
 pub const INITIAL_ENERGY: f32 = 100.0;
 // Brain inputs: senzorické 0=food_dx, 1=food_dy, 2=cell_dx, 3=cell_dy,
@@ -160,6 +172,38 @@ pub const COLLISION_RESTITUTION: f32 = 0.0;
 /// takže food drift k dnu = postupný „benthic deposit". 8 units/sec ~ 4 sec
 /// průchod celé z-vrstvy (z=2).
 pub const FOOD_SINK_RATE: f32 = 8.0;
+
+// Thermal stratification (Sprint 85). Lineární z-gradient: warm at top, cold
+// at bottom (oceán-like). Coupling přes Q10 multiplikátor na all per-tick
+// drains v `apply_energy_costs`. Niche separation emergne behaviorálně —
+// cells co plavou dolů platí míň energie ale nemají žádnou další výhodu;
+// selekce hledá optimum food-density × thermal-cost. Žádný temperature
+// field grid — funkce z stačí.
+/// Maximum teploty (z = +world_half[2], hladina). Sim units, ne reálné °C.
+pub const THERMAL_TOP: f32 = 30.0;
+/// Minimum teploty (z = −world_half[2], dno). Sim units.
+pub const THERMAL_BOTTOM: f32 = 4.0;
+/// Q10 koeficient — biologické rychlosti přibližně 2× per +10 sim-units
+/// teploty. Standard biology Q10 ~ 2-3 (enzyme kinetics, metabolic rate).
+pub const THERMAL_Q10: f32 = 2.0;
+/// Referenční teplota — při T = THERMAL_REF_TEMP je `metabolism_factor = 1.0`,
+/// drain identický s pre-Sprint-85. Volena uprostřed [BOTTOM, TOP] aby
+/// průměrná cell drain ~ pre-Sprint-85 (ratio top:ref:bottom ≈ 2.46:1:0.41).
+pub const THERMAL_REF_TEMP: f32 = 17.0;
+/// Sprint 86: peak diurnal amplitude na hladině. Surface temperature osciluje
+/// `THERMAL_TOP ± THERMAL_DIURNAL_AMP` v rámci 1 day = `TICKS_PER_GENERATION`
+/// ticks (10 s real-time). Hloubka oscilace klesá lineárně k 0 na `THERMAL_BOTTOM`
+/// (= mirror reálné termokliny: deep water buffered proti solárnímu cyklu).
+pub const THERMAL_DIURNAL_AMP: f32 = 5.0;
+/// Sprint 86: full diurnal cycle = 1 generation = 600 ticks = 10 s real-time.
+/// Cells with ~1 gen lifespan experience exactly one day. Krátší period =
+/// flicker, delší = cells málokdy zažijí přechod.
+pub const THERMAL_DIURNAL_PERIOD_TICKS: u64 = TICKS_PER_GENERATION;
+/// Sprint 86: peak seasonal amplitude (uniform shift všech depth). Period =
+/// `CYCLE_GEN_PERIOD` (50 gen) — sdílený s food density cyklem, takže warm
+/// season = abundant food (summer), cold season = scarce food (winter).
+/// Coupling vytváří přírodní seasonal niche shift.
+pub const THERMAL_SEASONAL_AMP: f32 = 4.0;
 /// Sprint 31 spatial clustering: rejection sampling síla. Per uniformně
 /// vzorkovaný food candidate je pravděpodobnost zamítnutí
 /// `STRENGTH × (1 - richness)`. Při richness=1 (rich zone) nikdy nezamítá,
@@ -578,6 +622,16 @@ pub const HUNTER_IDLE_DRIFT: f32 = 30.0;
 /// 2-bond cluster je „pair / triad" minimum — pořád proto-multicelular,
 /// ale dosažitelný pro elongated body shapes (line of pairs).
 pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 2;
+/// Sprint 84: hunter směrový FOV half-angle (rad). π/3 = 60° → 120° cone.
+/// Predátoři klasicky mají frontal eyes; cells mohou flank-uniknout do blind
+/// spotu. Pevná konstanta (Hunter nemá genom), ne pod selekcí.
+pub const HUNTER_VISION_FOV: f32 = core::f32::consts::PI / 3.0;
+/// Sprint 84: minimum speed² pro aktivní směrový vision. Pod threshold má
+/// hunter velocity ~ 0 → není definovaný forward → fallback na omnidirectional
+/// (idle hunter „spins around" hledá target). Threshold je sub-tick noise
+/// (1 unit/s² ≪ HUNTER_IDLE_DRIFT² = 900); reálně cone aktivní vždy v lovu
+/// nebo i drift, jen ne při startovním idle 0-vector.
+pub const HUNTER_FORWARD_SPEED_THRESHOLD_SQ: f32 = 1.0;
 
 /// Sprint 71: non-evolving environmental predator. Pohybuje se pseudo-AI
 /// (seek nejbližší cell ∈ vision range, jinak random drift). Atakuje cells
@@ -683,20 +737,47 @@ impl Hunter {
 /// nejbližší **z attackable** cells, ne nejbližší absolutně — Hunter nepronásleduje
 /// imune clustery (skill: cluster je viditelný, ale ne lovitelný; Hunter musí
 /// najít solo cell). Toroidal-aware přes `min_image_delta`.
+///
+/// Sprint 84: směrový FOV. `hunter_velocity` určuje forward; cells mimo
+/// `HUNTER_VISION_FOV` kuželu nejsou viditelné. Idle hunter (velocity² <
+/// `HUNTER_FORWARD_SPEED_THRESHOLD_SQ`) má fallback na omni — bez toho by
+/// hunter zaseknutý v 0-velocity stavu nikdy nenašel target.
 pub fn nearest_attackable_cell(
     hunter_pos: [f32; 3],
+    hunter_velocity: [f32; 3],
     cells: &[Cell],
     world_half: [f32; 3],
 ) -> Option<usize> {
     let vision_r2 = HUNTER_VISION_RADIUS * HUNTER_VISION_RADIUS;
+    let cos_fov = HUNTER_VISION_FOV.cos();
+    let speed_sq = hunter_velocity[0] * hunter_velocity[0]
+        + hunter_velocity[1] * hunter_velocity[1]
+        + hunter_velocity[2] * hunter_velocity[2];
+    let cone_active = speed_sq > HUNTER_FORWARD_SPEED_THRESHOLD_SQ;
+    let forward = if cone_active {
+        let inv = 1.0 / speed_sq.sqrt();
+        [
+            hunter_velocity[0] * inv,
+            hunter_velocity[1] * inv,
+            hunter_velocity[2] * inv,
+        ]
+    } else {
+        [0.0; 3]
+    };
     let mut best: Option<(usize, f32)> = None;
     for (i, c) in cells.iter().enumerate() {
         if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
             continue;
         }
-        let d = min_image_delta(c.position, hunter_pos, world_half);
+        // Sprint 84: vector from hunter to cell (= c.position − hunter_pos).
+        // Pre-Sprint-84 byl `d` drženo jako hunter_pos − c.position (jen pro d²
+        // distance, kde znaménko nehraje); cone filter potřebuje směr.
+        let d = min_image_delta(hunter_pos, c.position, world_half);
         let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
         if d2 >= vision_r2 {
+            continue;
+        }
+        if cone_active && !fov_cone_accept(d, d2, forward, cos_fov) {
             continue;
         }
         match best {
@@ -729,6 +810,12 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // local `MutationConfig { add_neuron_rate: 0.05, ..MUTATION_CONFIG }`
     // v experimentech.
     add_neuron_rate: 0.0,
+    // Sprint 82: FOV gen dormant — Sprint 82 je pure infra (gen + cost factor).
+    // Sprint 83: 0.0 → 0.05 — modest drift jako sigma_bond_stiffness (0.3 / 10
+    // = 3 % range, sigma_vision_fov 0.05 / 2.88 ≈ 1.7 % FOV range per gen).
+    // Pomalejší než tělesné geny aby evoluce stihla najít optimum bez random
+    // walku do MIN_VISION_FOV.
+    sigma_vision_fov: 0.05,
 };
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     drag: DRAG_COEFFICIENT,
@@ -1052,6 +1139,13 @@ pub struct MutationConfig {
     /// B byte-identical trajectory). Tuning sweep příští sprint zkusí 0.02,
     /// 0.05, 0.1.
     pub add_neuron_rate: f32,
+    /// Sprint 82: gaussian sigma pro `vision_fov` mutaci. `MUTATION_CONFIG`
+    /// default = 0 (Sprint 82 pure-infra, FOV gen dormant). Sprint 83+ FOV
+    /// aktivuje a tuning experimenty mohou nastavit nenulový drift. Při
+    /// drift na MIN_VISION_FOV cells ztrácejí cells/food awareness, ale
+    /// platí minimální vision cost — selekční trade-off vstoupí v platnost
+    /// až s aktivním cone filterem.
+    pub sigma_vision_fov: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1077,7 +1171,17 @@ pub struct Genome {
     /// Sprint 68: per-cell spring damping contribution. Stejná semantika jako
     /// bond_stiffness — pair-mean uložený do Bond.
     pub bond_damping: f32,
+    /// Sprint 82: půl-úhel kuželu směrového FOV kolem `forward_vector` (rad).
+    /// Range `[MIN_VISION_FOV, MAX_VISION_FOV]`. Init = `INITIAL_VISION_FOV`
+    /// (= π = full sphere). Sprint 83+ aktivuje cone filter v sensor gather;
+    /// energy cost už v Sprint 82 škáluje s `vision_fov_factor(theta)`.
+    #[serde(default = "default_vision_fov")]
+    pub vision_fov: f32,
     pub brain: Brain,
+}
+
+fn default_vision_fov() -> f32 {
+    INITIAL_VISION_FOV
 }
 
 impl Genome {
@@ -1106,6 +1210,10 @@ impl Genome {
             // drift pak rozhrnou rozsah.
             bond_stiffness: rng.random_range(BOND_STIFFNESS * 0.5..BOND_STIFFNESS * 1.5),
             bond_damping: rng.random_range(BOND_DAMPING * 0.5..BOND_DAMPING * 1.5),
+            // Sprint 82: full-sphere baseline, žádný RNG draw — initial population
+            // kompletně omnidirectional. Cost faktor = 1.0, behavior matches
+            // pre-Sprint-82 baseline až do prvního sigma_vision_fov > 0 sprintu.
+            vision_fov: INITIAL_VISION_FOV,
             brain: Brain::random(rng),
         }
     }
@@ -1147,6 +1255,16 @@ impl Genome {
                 .clamp(MIN_BOND_STIFFNESS, MAX_BOND_STIFFNESS),
             bond_damping: (self.bond_damping + gaussian(rng) * cfg.sigma_bond_damping)
                 .clamp(MIN_BOND_DAMPING, MAX_BOND_DAMPING),
+            // Sprint 82: short-circuit pattern jako Sprint 80 add_neuron_rate —
+            // při `sigma_vision_fov = 0` se gaussian draw přeskočí, RNG sekvence
+            // zůstává byte-identical s pre-Sprint-82. Při sigma > 0 (Sprint 83+)
+            // je drift aktivní a CSV se rozejde od toho sprintu (expected).
+            vision_fov: if cfg.sigma_vision_fov > 0.0 {
+                (self.vision_fov + gaussian(rng) * cfg.sigma_vision_fov)
+                    .clamp(MIN_VISION_FOV, MAX_VISION_FOV)
+            } else {
+                self.vision_fov
+            },
             brain: {
                 let mut b = self.brain.mutate(rng, cfg.sigma_brain);
                 // Sprint 80 Sprint C: structural mutace. Default rate=0.0 →
@@ -1180,6 +1298,18 @@ impl Genome {
             adhesion_type: if rng.random::<bool>() { a.adhesion_type } else { b.adhesion_type },
             bond_stiffness: if rng.random::<bool>() { a.bond_stiffness } else { b.bond_stiffness },
             bond_damping: if rng.random::<bool>() { a.bond_damping } else { b.bond_damping },
+            // Sprint 82: short-circuit při shodě hodnot — pokud `sigma_vision_fov
+            // = 0` (S82 default), všechny cells drží INITIAL_VISION_FOV a RNG
+            // bool draw se vyhne, takže pre-Sprint-82 CSV zůstává reprodukovatelný.
+            // Po Sprint 83+ aktivaci sigmy budou hodnoty divergovat → bool draw
+            // se zapne a CSV se rozejde (expected v behavior-change sprintu).
+            vision_fov: if a.vision_fov == b.vision_fov {
+                a.vision_fov
+            } else if rng.random::<bool>() {
+                a.vision_fov
+            } else {
+                b.vision_fov
+            },
             brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
     }
@@ -1462,7 +1592,14 @@ impl Cell {
     /// vs heading-perpendicular (perp) komponentu. Cross-section je v body
     /// frame: forward motion „cítí" width (frontální), sideways motion cítí
     /// length. Pro length=width=s drag přesně reprodukuje původní isotropní.
-    pub fn step(&mut self, dt: f32, world_half: [f32; 3], physics: &PhysicsConfig) {
+    pub fn step(
+        &mut self,
+        dt: f32,
+        world_half: [f32; 3],
+        tick: u64,
+        generation: u64,
+        physics: &PhysicsConfig,
+    ) {
         // Sprint 42: aging + cooldown decrement na začátku ticku, aby
         // apply_energy_costs viděl current age v ramp formuli.
         self.age = self.age.saturating_add(1);
@@ -1472,7 +1609,9 @@ impl Cell {
         self.integrate_kinematics(dt, world_half);
         self.apply_anisotropic_drag(dt, physics);
         self.apply_angular_drag(dt, physics);
-        self.apply_energy_costs(dt, physics);
+        // Sprint 86: tick + generation propagace pro time-varying thermal
+        // (diurnal + seasonal cykly v `temperature_at_z`).
+        self.apply_energy_costs(dt, world_half, tick, generation, physics);
         self.apply_world_bounce(world_half);
         self.update_cell_state(dt);
     }
@@ -1551,27 +1690,54 @@ impl Cell {
     /// Sprint 40: per-tick energy costs. v², rotational (yaw only — Sprint 33
     /// note: pitch je „free" rotace, jinak by random brainy ztrácely 2× rotační
     /// drain), vision, body volume maintenance, spike, attack-mode upkeep.
-    fn apply_energy_costs(&mut self, dt: f32, physics: &PhysicsConfig) {
+    ///
+    /// Sprint 85: všechny drains škálují `metabolism_factor(T)` kde T je
+    /// teplota na cell pozici. Warm cells (z = +half) drain ~2.46× rychleji
+    /// než REF, cold cells (z = -half) drain ~0.41×. Niche separation by
+    /// depth — selekce favorizuje cells co najdou energy-optimal z-vrstvu.
+    /// Při `world_half[2] = 0` (pre-3D baseline) vrací temperature_at_z
+    /// REF_TEMP → metabolism = 1.0 → drain backward-compat.
+    fn apply_energy_costs(
+        &mut self,
+        dt: f32,
+        world_half: [f32; 3],
+        tick: u64,
+        generation: u64,
+        physics: &PhysicsConfig,
+    ) {
+        let metabolism = metabolism_factor(temperature_at_z(
+            self.position[2],
+            world_half,
+            tick,
+            generation,
+        ));
+        let dt_eff = dt * metabolism;
         // Sprint 33: v_mag_sq zahrnuje 3D (vz != 0 v Sprint 35+).
         let v_mag_sq =
             self.velocity[0].powi(2) + self.velocity[1].powi(2) + self.velocity[2].powi(2);
-        self.energy -= v_mag_sq * physics.energy_cost_per_v_sq * dt;
+        self.energy -= v_mag_sq * physics.energy_cost_per_v_sq * dt_eff;
         let av = self.angular_velocity;
         let eff_r = self.phenotype.effective_radius();
-        self.energy -= eff_r * eff_r * av * av * physics.angular_energy_cost * dt;
-        self.energy -= self.genome.vision_radius * physics.vision_cost_per_radius * dt;
+        self.energy -= eff_r * eff_r * av * av * physics.angular_energy_cost * dt_eff;
+        // Sprint 82: cost ∝ radius × fov_factor. Full sphere (fov = π) → factor
+        // 1.0 → identický s pre-Sprint-82. Užší kužel platí míň, ale Sprint 83
+        // aktivuje cone filter v sensor gather → trade-off info-loss vs energy.
+        let fov_factor = vision_fov_factor(self.genome.vision_fov);
+        self.energy -=
+            self.genome.vision_radius * physics.vision_cost_per_radius * fov_factor * dt_eff;
         // Sprint 34: maintenance ∝ 3D volume = length×width×height.
         // Sprint 42: aging ramp — starší cells platí postupně víc per volume unit.
         let age_sec = self.age as f32 / FIXED_TIMESTEP_HZ;
         let aging_factor = 1.0 + AGE_DECAY_PER_SEC * age_sec;
-        self.energy -= self.phenotype.volume() * physics.body_cost_factor * aging_factor * dt;
-        self.energy -= self.phenotype.spike_length * SPIKE_COST_PER_SEC * dt;
+        self.energy -=
+            self.phenotype.volume() * physics.body_cost_factor * aging_factor * dt_eff;
+        self.energy -= self.phenotype.spike_length * SPIKE_COST_PER_SEC * dt_eff;
         // Sprint 41: shell maintenance — defensive armor stojí víc než spike,
         // protože pokrývá celý povrch.
-        self.energy -= self.phenotype.shell_thickness * SHELL_COST_PER_SEC * dt;
+        self.energy -= self.phenotype.shell_thickness * SHELL_COST_PER_SEC * dt_eff;
         // Sprint 27 attack maintenance: cost ∝ max(0, output[6]).
         let attack_strength = self.last_outputs[6].max(0.0);
-        self.energy -= attack_strength * ATTACK_COST_PER_SEC * dt;
+        self.energy -= attack_strength * ATTACK_COST_PER_SEC * dt_eff;
     }
 
     /// Sprint 54: xy modulo wrap (toroidal cylinder topology), z bounce.
@@ -1783,6 +1949,92 @@ impl Food {
 pub fn forward_vector(yaw: f32, pitch: f32) -> [f32; 3] {
     let cos_p = pitch.cos();
     [yaw.cos() * cos_p, yaw.sin() * cos_p, pitch.sin()]
+}
+
+/// Sprint 82: cost faktor pro směrový FOV. `theta` = half-angle kuželu kolem
+/// `forward_vector`. Solid angle kuželu = 2π(1 − cos θ); normalizováno na
+/// [0,1] (full sphere → 1, narrow → 0). Použité jako multiplikátor pro
+/// `vision_radius × VISION_COST_PER_RADIUS` v `apply_energy_costs` — užší
+/// kužel platí menší vision drain, ale ztrácí informace v slepém úhlu.
+#[inline]
+pub fn vision_fov_factor(theta: f32) -> f32 {
+    let t = theta.clamp(0.0, MAX_VISION_FOV);
+    (1.0 - t.cos()) * 0.5
+}
+
+/// Sprint 85: lineární z-gradient teploty. Warm at top (`world_half[2]`),
+/// cold at bottom (`-world_half[2]`). Pro `world_half[2] == 0` (Sprint 32
+/// pre-3D baseline) vrací `THERMAL_REF_TEMP` → `metabolism_factor = 1.0` →
+/// drain backward-compat s pre-Sprint-85.
+///
+/// Sprint 86: time-varying. `tick` parametr aplikuje diurnal oscilaci
+/// (surface-weighted, hloubka neoscilluje), `generation` parametr aplikuje
+/// uniform seasonal shift (synchronní s food density cyklem). Při
+/// `tick = 0, generation = 0` jsou oba sin(0) = 0 → identical s pre-S86.
+#[inline]
+pub fn temperature_at_z(z: f32, world_half: [f32; 3], tick: u64, generation: u64) -> f32 {
+    if world_half[2] <= 0.0 {
+        return THERMAL_REF_TEMP;
+    }
+    let normalized = ((z / world_half[2]) + 1.0) * 0.5;
+    let normalized = normalized.clamp(0.0, 1.0);
+    let base = THERMAL_BOTTOM + (THERMAL_TOP - THERMAL_BOTTOM) * normalized;
+    // Sprint 86: seasonal — uniform shift, period = CYCLE_GEN_PERIOD (50 gen).
+    // Modulo gen drží phase v [0, 1) bez f32 precision ztráty pro long runs.
+    let seasonal_phase =
+        (generation % CYCLE_GEN_PERIOD) as f32 / CYCLE_GEN_PERIOD as f32;
+    let seasonal_offset = THERMAL_SEASONAL_AMP * (TAU * seasonal_phase).sin();
+    // Sprint 86: diurnal — surface-weighted (× normalized), period 1 day =
+    // THERMAL_DIURNAL_PERIOD_TICKS. Bottom (normalized = 0) → no oscillation;
+    // surface (normalized = 1) → full AMP.
+    let diurnal_phase =
+        (tick % THERMAL_DIURNAL_PERIOD_TICKS) as f32 / THERMAL_DIURNAL_PERIOD_TICKS as f32;
+    let diurnal_offset =
+        THERMAL_DIURNAL_AMP * normalized * (TAU * diurnal_phase).sin();
+    base + seasonal_offset + diurnal_offset
+}
+
+/// Sprint 85: Q10 metabolism multiplikátor. `Q10^((T − T_REF) / 10)`.
+/// `T = THERMAL_REF_TEMP` → 1.0 (no-op, identický s pre-Sprint-85).
+/// `T = THERMAL_TOP = 30` (REF + 13) → 2^1.3 ≈ 2.46 (warm cells drain rychleji).
+/// `T = THERMAL_BOTTOM = 4` (REF − 13) → 2^−1.3 ≈ 0.41 (cold cells drain pomaleji).
+#[inline]
+pub fn metabolism_factor(temp: f32) -> f32 {
+    THERMAL_Q10.powf((temp - THERMAL_REF_TEMP) / 10.0)
+}
+
+/// Sprint 83: per-cell cone test pro sensor gather. Vrací `true` pokud
+/// kandidát ve směru `delta` (od cell k targetu) leží uvnitř FOV kuželu
+/// kolem `forward`. `cos_fov_threshold` = `cos(vision_fov)` precomputed
+/// jednou per cell; volání je hot-path uvnitř `for_each_in_radius_toroidal`.
+/// `d2` je `delta · delta` (už spočítáno pro radius test); umožňuje výpočet
+/// `|delta|` pomocí jediného sqrt.
+///
+/// Degenerate case `|delta| ≈ 0` (target přímo na cell pozici) vrací `true`
+/// — cell vidí self-overlap region nezávisle na orientaci.
+///
+/// Pro `cos_fov_threshold = -1.0` (full sphere FOV) by formálně všechny
+/// kandidáti procházely; caller však typicky short-circuituje přes
+/// `vision_fov >= MAX_VISION_FOV` flag, takže tato funkce se ani nevolá.
+#[inline]
+pub fn fov_cone_accept(
+    delta: [f32; 3],
+    d2: f32,
+    forward: [f32; 3],
+    cos_fov_threshold: f32,
+) -> bool {
+    if d2 < 1e-12 {
+        return true;
+    }
+    let dot = delta[0] * forward[0] + delta[1] * forward[1] + delta[2] * forward[2];
+    // Místo `dot / |delta| >= threshold` porovnáváme bez dělení:
+    //   threshold > 0: dot > 0 AND dot² >= threshold² × d²
+    //   threshold ≤ 0: dot ≥ threshold × |delta|  → potřebujem sqrt
+    // Protože threshold pochází z `cos(vision_fov)` ∈ [cos(π/12), 1] = [0.97, 1] pro
+    // typické úzké FOV, plus krátkodobě může jít pod 0 při hemisphere+ FOV během
+    // evoluce, používáme jednotnou cestu se sqrt — jednoznačné a numericky stable.
+    let mag = d2.sqrt();
+    dot >= cos_fov_threshold * mag
 }
 
 /// Sprint 41: orthonormální body frame z (yaw, pitch). `fwd` je `forward_vector`,
@@ -2667,6 +2919,7 @@ mod tests {
             adhesion_type: 0,
             bond_stiffness: BOND_STIFFNESS,
             bond_damping: BOND_DAMPING,
+            vision_fov: INITIAL_VISION_FOV,
             brain: dummy_brain(),
         }
     }
@@ -2687,6 +2940,7 @@ mod tests {
             sigma_bond_stiffness: 0.0,
             sigma_bond_damping: 0.0,
             add_neuron_rate: 0.0,
+            sigma_vision_fov: 0.0,
         }
     }
 
@@ -2706,6 +2960,7 @@ mod tests {
             adhesion_type: 0,
             bond_stiffness: BOND_STIFFNESS,
             bond_damping: BOND_DAMPING,
+            vision_fov: INITIAL_VISION_FOV,
             brain: Brain {
                 hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
                 w1: [[1.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
@@ -2747,6 +3002,7 @@ mod tests {
             sigma_bond_stiffness: 100.0,
             sigma_bond_damping: 10.0,
             add_neuron_rate: 0.0,
+            sigma_vision_fov: 10.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -2758,7 +3014,213 @@ mod tests {
             assert!((MIN_BODY_LENGTH..=MAX_BODY_LENGTH).contains(&m.body_length));
             assert!((MIN_BODY_WIDTH..=MAX_BODY_WIDTH).contains(&m.body_width));
             assert!((MIN_SPIKE_LENGTH..=MAX_SPIKE_LENGTH).contains(&m.spike_length));
+            assert!((MIN_VISION_FOV..=MAX_VISION_FOV).contains(&m.vision_fov));
         }
+    }
+
+    #[test]
+    fn vision_fov_dormant_preserves_rng_sequence() {
+        // Sprint 82 reproducibility guard: při `sigma_vision_fov = 0`
+        // (S82 default) musí mutate přeskočit gaussian draw pro FOV gen,
+        // jinak Sprint 82 baseline rozejde s pre-Sprint-82 CSV. Verifikuje
+        // shodu RNG stavu mezi dormant cestou (krátkou) a aktivní cestou
+        // (sigma > 0) po injekci přesně 2 u32 draws (gaussian = 2 u32).
+        let mut rng_zero = StdRng::seed_from_u64(0xC0FFEE);
+        let mut rng_active = StdRng::seed_from_u64(0xC0FFEE);
+        let cfg_zero = MutationConfig {
+            sigma_vision_fov: 0.0,
+            ..MUTATION_CONFIG
+        };
+        let cfg_active = MutationConfig {
+            sigma_vision_fov: 0.05,
+            ..MUTATION_CONFIG
+        };
+        let g = dummy_genome();
+        let _ = g.mutate(&mut rng_zero, &cfg_zero);
+        let _ = g.mutate(&mut rng_active, &cfg_active);
+        let _: u32 = rng_zero.random();
+        let _: u32 = rng_zero.random();
+        let next_zero: u32 = rng_zero.random();
+        let next_active: u32 = rng_active.random();
+        assert_eq!(
+            next_zero, next_active,
+            "sigma_vision_fov = 0 musí ušetřit přesně 2 u32 RNG draws (gaussian); \
+             jinak Sprint 82 nezachová pre-S82 reproducibility"
+        );
+    }
+
+    #[test]
+    fn vision_fov_crossover_skips_rng_when_equal() {
+        // Sprint 82 reproducibility guard: pokud oba parents mají identické
+        // vision_fov (což je pravda v initial pop kde všichni = INITIAL_VISION_FOV),
+        // crossover musí přeskočit bool draw. Verifikuje shodu RNG stavu mezi
+        // equal-values cestou (krátkou) a different-values cestou (s draw)
+        // po injekci 1 bool draw.
+        let mut rng_eq = StdRng::seed_from_u64(0xBEEF);
+        let mut rng_diff = StdRng::seed_from_u64(0xBEEF);
+        let mut a = dummy_genome();
+        let mut b = dummy_genome();
+        a.vision_fov = INITIAL_VISION_FOV;
+        b.vision_fov = INITIAL_VISION_FOV;
+        let _ = Genome::crossover(&a, &b, &mut rng_eq);
+        b.vision_fov = MIN_VISION_FOV;
+        let _ = Genome::crossover(&a, &b, &mut rng_diff);
+        let _ = rng_eq.random::<bool>();
+        let next_eq: u32 = rng_eq.random();
+        let next_diff: u32 = rng_diff.random();
+        assert_eq!(
+            next_eq, next_diff,
+            "crossover s a.vision_fov == b.vision_fov musí ušetřit přesně 1 bool draw"
+        );
+    }
+
+    #[test]
+    fn temperature_at_z_endpoints() {
+        let half = [960.0, 540.0, 50.0];
+        // Sprint 86: tick=0, gen=0 → seasonal sin(0)=0, diurnal sin(0)=0,
+        // takže static gradient endpoints zůstávají identické s pre-Sprint-86.
+        // Top z = +half → THERMAL_TOP.
+        assert!((temperature_at_z(50.0, half, 0, 0) - THERMAL_TOP).abs() < 1e-4);
+        // Bottom z = -half → THERMAL_BOTTOM.
+        assert!((temperature_at_z(-50.0, half, 0, 0) - THERMAL_BOTTOM).abs() < 1e-4);
+        // Mid z = 0 → exact midpoint.
+        let mid = (THERMAL_TOP + THERMAL_BOTTOM) * 0.5;
+        assert!((temperature_at_z(0.0, half, 0, 0) - mid).abs() < 1e-4);
+        // Out-of-bounds z → clamp na endpoints.
+        assert!((temperature_at_z(1000.0, half, 0, 0) - THERMAL_TOP).abs() < 1e-4);
+        assert!((temperature_at_z(-1000.0, half, 0, 0) - THERMAL_BOTTOM).abs() < 1e-4);
+        // world_half[2] = 0 (pre-3D baseline) → ref temp fallback (no-op pro
+        // metabolism). Důležité pro backward-compat pre-Sprint-33 testů.
+        let flat = [960.0, 540.0, 0.0];
+        assert!((temperature_at_z(0.0, flat, 0, 0) - THERMAL_REF_TEMP).abs() < 1e-4);
+    }
+
+    #[test]
+    fn metabolism_factor_q10_ratio() {
+        // Q10 = 2.0 → biologické rychlosti přesně 2× per +10 sim-units T.
+        let m_ref = metabolism_factor(THERMAL_REF_TEMP);
+        assert!((m_ref - 1.0).abs() < 1e-4, "ref temp musí dát factor 1.0");
+        let m_plus_10 = metabolism_factor(THERMAL_REF_TEMP + 10.0);
+        assert!(
+            (m_plus_10 - THERMAL_Q10).abs() < 1e-4,
+            "+10 musí dát Q10 (= 2.0), got {m_plus_10}"
+        );
+        let m_minus_10 = metabolism_factor(THERMAL_REF_TEMP - 10.0);
+        assert!(
+            (m_minus_10 - 1.0 / THERMAL_Q10).abs() < 1e-4,
+            "-10 musí dát 1/Q10 (= 0.5), got {m_minus_10}"
+        );
+        // Endpoints by měly dát ratio top:bottom = Q10^((TOP-BOT)/10)
+        let m_top = metabolism_factor(THERMAL_TOP);
+        let m_bot = metabolism_factor(THERMAL_BOTTOM);
+        let expected_ratio = THERMAL_Q10.powf((THERMAL_TOP - THERMAL_BOTTOM) / 10.0);
+        assert!(
+            ((m_top / m_bot) - expected_ratio).abs() < 1e-3,
+            "top/bottom ratio {} vs expected {}",
+            m_top / m_bot,
+            expected_ratio
+        );
+    }
+
+    #[test]
+    fn apply_energy_costs_scales_with_temperature() {
+        // Sprint 85: cell na warm depth (z = +half) drain rychleji než cell na
+        // cold depth (z = -half). Při shodné velocity / body / vision platí
+        // ratio drain = metabolism(top) / metabolism(bottom) ≈ 2.46 / 0.41 ≈ 6×.
+        let half = [1000.0, 1000.0, 50.0];
+        let physics = no_drag_physics(0.001, 0.0);
+        let mut warm = base_cell();
+        warm.position = [0.0, 0.0, 50.0]; // top → warmest
+        warm.velocity = [60.0, 0.0, 0.0];
+        let mut cold = base_cell();
+        cold.position = [0.0, 0.0, -50.0]; // bottom → coldest
+        cold.velocity = [60.0, 0.0, 0.0];
+        warm.step(1.0, half, 0, 0, &physics);
+        cold.step(1.0, half, 0, 0, &physics);
+        let warm_drain = 100.0 - warm.energy;
+        let cold_drain = 100.0 - cold.energy;
+        let ratio = warm_drain / cold_drain;
+        let expected = metabolism_factor(THERMAL_TOP) / metabolism_factor(THERMAL_BOTTOM);
+        assert!(
+            (ratio - expected).abs() < 0.05,
+            "warm/cold drain ratio {ratio} ≠ expected {expected}"
+        );
+    }
+
+    #[test]
+    fn vision_fov_factor_endpoints() {
+        // Full sphere (theta = π) → solid angle = 4π str → factor = 1.0.
+        assert!((vision_fov_factor(MAX_VISION_FOV) - 1.0).abs() < 1e-6);
+        // Hemisphere (theta = π/2) → solid angle = 2π str → factor = 0.5.
+        let half = vision_fov_factor(core::f32::consts::PI * 0.5);
+        assert!((half - 0.5).abs() < 1e-6, "got {half}");
+        // Narrow cone (theta = 0) → factor = 0.
+        assert!(vision_fov_factor(0.0).abs() < 1e-6);
+        // Clamp: above π saturates na 1.0 (kdyby někdo poslal 2π omylem).
+        assert!((vision_fov_factor(core::f32::consts::PI * 2.0) - 1.0).abs() < 1e-6);
+        // Monotonic mezi krajními body.
+        let q = vision_fov_factor(core::f32::consts::PI * 0.25);
+        assert!(q > 0.0 && q < 0.5);
+    }
+
+    #[test]
+    fn fov_cone_accept_basic_directions() {
+        let fwd = [1.0_f32, 0.0, 0.0];
+        // Quarter-circle FOV: half-angle = π/4 → cos = ~0.707.
+        let cos_q = (core::f32::consts::PI * 0.25).cos();
+        // Target přímo vpředu — vždy uvnitř.
+        let front = [10.0_f32, 0.0, 0.0];
+        assert!(fov_cone_accept(front, 100.0, fwd, cos_q));
+        // Target přímo vpravo (90° offset) — mimo π/4 kuželu.
+        let side = [0.0_f32, 10.0, 0.0];
+        assert!(!fov_cone_accept(side, 100.0, fwd, cos_q));
+        // Target přímo vzadu — mimo.
+        let back = [-10.0_f32, 0.0, 0.0];
+        assert!(!fov_cone_accept(back, 100.0, fwd, cos_q));
+        // Hemisphere FOV (cos = 0) — front + side accepted, back rejected.
+        let cos_h = 0.0_f32;
+        assert!(fov_cone_accept(front, 100.0, fwd, cos_h));
+        // Side je přesně na hranici (dot = 0 = cos_h) → accept.
+        assert!(fov_cone_accept(side, 100.0, fwd, cos_h));
+        assert!(!fov_cone_accept(back, 100.0, fwd, cos_h));
+        // Degenerate target na cell pozici — vždy accept.
+        assert!(fov_cone_accept([0.0, 0.0, 0.0], 0.0, fwd, cos_q));
+        // Full sphere (cos = -1) — vše accept včetně back.
+        assert!(fov_cone_accept(back, 100.0, fwd, -1.0));
+    }
+
+    #[test]
+    fn fov_cone_works_in_3d() {
+        // Heading podél +X, cell s pitch +π/4 → forward má kladnou Z komponentu.
+        // Test, že target nahoře-vpředu projde, target dole-vpředu padne ven
+        // u úzkého kuželu.
+        let fwd = forward_vector(0.0, core::f32::consts::PI * 0.25);
+        let cos_q = (core::f32::consts::PI * 0.25).cos();
+        let up_front = [10.0_f32, 0.0, 10.0];
+        let down_front = [10.0_f32, 0.0, -10.0];
+        let d2 = 200.0;
+        assert!(fov_cone_accept(up_front, d2, fwd, cos_q));
+        assert!(!fov_cone_accept(down_front, d2, fwd, cos_q));
+    }
+
+    #[test]
+    fn vision_fov_narrows_energy_cost() {
+        // Sprint 82: užší FOV → menší cost. Hemisphere (factor 0.5) drained
+        // přesně poloviční energy než full sphere (factor 1.0) při stejném
+        // vision_radius a stejném dt.
+        let mut wide = base_cell();
+        wide.genome.vision_fov = MAX_VISION_FOV;
+        let mut narrow = base_cell();
+        narrow.genome.vision_fov = core::f32::consts::PI * 0.5;
+        let physics = no_drag_physics(0.0, 0.05);
+        wide.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
+        narrow.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
+        let wide_drain = 100.0 - wide.energy;
+        let narrow_drain = 100.0 - narrow.energy;
+        // Vision part: wide = 40 × 0.05 × 1.0 = 2.0, narrow = 40 × 0.05 × 0.5 = 1.0.
+        // Ostatní drain (body, motion, …) je 0 v no_drag_physics.
+        assert!((wide_drain - 2.0).abs() < 1e-4, "wide drain {wide_drain}");
+        assert!((narrow_drain - 1.0).abs() < 1e-4, "narrow drain {narrow_drain}");
     }
 
     fn no_drag_physics(cost_per_v_sq: f32, vision_cost: f32) -> PhysicsConfig {
@@ -2805,7 +3267,7 @@ mod tests {
             velocity: [60.0, 0.0, 0.0],
             ..base_cell()
         };
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.001, 0.05));
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &no_drag_physics(0.001, 0.05));
         // motion (v² model): 60² × 0.001 × 1.0 = 3.6 energy
         // vision: 40 × 0.05 × 1.0 = 2.0 energy
         // body: 0 (factor = 0)
@@ -2825,7 +3287,7 @@ mod tests {
             heading: 0.0,
             ..base_cell()
         };
-        cell.step(1.0, [100.0, 100.0, 0.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [100.0, 100.0, 0.0], 0, 0, &no_drag_physics(0.0, 0.0));
         assert!(
             (cell.position[0] - (-41.0)).abs() < 1e-3,
             "expected pos.x ≈ -41 after wrap, got {}",
@@ -2843,7 +3305,7 @@ mod tests {
             heading: 1.5,
             ..base_cell()
         };
-        cell.step(1.0, [100.0, 100.0, 0.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [100.0, 100.0, 0.0], 0, 0, &no_drag_physics(0.0, 0.0));
         // No movement, no bounce, no angular velocity, heading must persist.
         assert_eq!(cell.heading, 1.5);
     }
@@ -2862,7 +3324,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // |v| = 10, drag_dt = 0.01 × 10 × 1 = 0.1
         // velocity[0] -= 0.1 × 10 = 1.0 → final velocity[0] = 9.0
         assert!((cell.velocity[0] - 9.0).abs() < 1e-4, "got {}", cell.velocity[0]);
@@ -2882,7 +3344,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // effective_radius²(=1) × ω²(=4) × angular_cost(=0.05) × dt(=1) = 0.2 drained
         assert!((cell.energy - 99.8).abs() < 1e-4, "got {}", cell.energy);
     }
@@ -2903,7 +3365,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         assert!((cell.energy - 100.0).abs() < 1e-4, "got {}", cell.energy);
     }
 
@@ -2921,7 +3383,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // angular_velocity *= (1 − 0.5 × 1) = 0.5 → 0.5
         assert!((cell.angular_velocity - 0.5).abs() < 1e-4);
     }
@@ -2964,6 +3426,7 @@ mod tests {
             adhesion_type: 1,
             bond_stiffness: 2.0,
             bond_damping: 0.3,
+            vision_fov: MIN_VISION_FOV,
             brain: dummy_brain(),
         };
         let b = Genome {
@@ -2979,6 +3442,7 @@ mod tests {
             adhesion_type: 5,
             bond_stiffness: 8.0,
             bond_damping: 1.0,
+            vision_fov: MAX_VISION_FOV,
             brain: dummy_brain(),
         };
         for _ in 0..100 {
@@ -2990,6 +3454,7 @@ mod tests {
             assert!(c.body_length == 0.5 || c.body_length == 1.5);
             assert!(c.body_width == 0.6 || c.body_width == 1.4);
             assert!(c.spike_length == 0.0 || c.spike_length == 0.8);
+            assert!(c.vision_fov == MIN_VISION_FOV || c.vision_fov == MAX_VISION_FOV);
         }
     }
 
@@ -3289,6 +3754,7 @@ mod tests {
             sigma_bond_stiffness: 0.0,
             sigma_bond_damping: 0.0,
             add_neuron_rate: 1.0,
+            sigma_vision_fov: 0.0,
         };
         let mut current = g;
         // Iteruj N >= (BRAIN_HIDDEN - DEFAULT). Po naplnění capu se další
@@ -3476,7 +3942,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         assert!((cell.velocity[0] - 9.0).abs() < 1e-4);
     }
 
@@ -3540,7 +4006,7 @@ mod tests {
         // jako x/y, takže Sprint 33+ má pevnou základnu.
         let mut cell = base_cell();
         cell.velocity = [0.0, 0.0, 5.0];
-        cell.step(1.0, [1000.0, 1000.0, 1000.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [1000.0, 1000.0, 1000.0], 0, 0, &no_drag_physics(0.0, 0.0));
         assert!(
             (cell.position[2] - 5.0).abs() < 1e-4,
             "expected z=5.0, got {}",
@@ -3571,7 +4037,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // spike_length(=0.5) × SPIKE_COST_PER_SEC × dt(=1) = 0.15 drained
         let expected_drain = 0.5 * SPIKE_COST_PER_SEC;
         assert!(
@@ -3706,7 +4172,7 @@ mod tests {
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
         };
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         let expected_drain = 1.0 * SHELL_COST_PER_SEC;
         assert!(
             (cell.energy - (100.0 - expected_drain)).abs() < 1e-4,
@@ -3735,6 +4201,7 @@ mod tests {
             sigma_bond_stiffness: 0.0,
             sigma_bond_damping: 0.0,
             add_neuron_rate: 0.0,
+            sigma_vision_fov: 0.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -3782,9 +4249,9 @@ mod tests {
     fn step_increments_age() {
         let mut cell = base_cell();
         assert_eq!(cell.age, 0);
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &no_drag_physics(0.0, 0.0));
         assert_eq!(cell.age, 1);
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &no_drag_physics(0.0, 0.0));
         assert_eq!(cell.age, 2);
     }
 
@@ -3792,7 +4259,7 @@ mod tests {
     fn cooldown_decrements_per_step() {
         let mut cell = base_cell();
         cell.reproduce_cooldown_ticks = 5;
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &no_drag_physics(0.0, 0.0));
         assert_eq!(cell.reproduce_cooldown_ticks, 4);
     }
 
@@ -3800,7 +4267,7 @@ mod tests {
     fn cooldown_does_not_underflow() {
         let mut cell = base_cell();
         cell.reproduce_cooldown_ticks = 0;
-        cell.step(1.0, [1000.0, 1000.0, 0.0], &no_drag_physics(0.0, 0.0));
+        cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &no_drag_physics(0.0, 0.0));
         assert_eq!(cell.reproduce_cooldown_ticks, 0);
     }
 
@@ -4240,7 +4707,8 @@ mod tests {
         c1.position = [50.0, 0.0, 0.0];
         cells.push(c1);
         let hunter_pos = [0.0, 0.0, 0.0];
-        let pick = nearest_attackable_cell(hunter_pos, &cells, half);
+        // Sprint 84: idle hunter (velocity 0) → cone filter disabled, omni.
+        let pick = nearest_attackable_cell(hunter_pos, [0.0; 3], &cells, half);
         assert_eq!(pick, Some(1));
     }
 
@@ -4266,7 +4734,7 @@ mod tests {
         let mut c1 = Cell::random(&mut rng, half, 1, 0, 1);
         c1.position = [60.0, 0.0, 0.0];
         cells.push(c1);
-        let pick = nearest_attackable_cell([0.0, 0.0, 0.0], &cells, half);
+        let pick = nearest_attackable_cell([0.0, 0.0, 0.0], [0.0; 3], &cells, half);
         assert_eq!(pick, Some(1));
     }
 
@@ -4286,7 +4754,48 @@ mod tests {
             });
         }
         let cells = vec![c];
-        assert!(nearest_attackable_cell([0.0, 0.0, 0.0], &cells, half).is_none());
+        assert!(nearest_attackable_cell([0.0, 0.0, 0.0], [0.0; 3], &cells, half).is_none());
+    }
+
+    #[test]
+    fn hunter_cone_filters_blind_spot() {
+        // Sprint 84: hunter pohybující se +X má forward = +X. Target přímo
+        // vzadu (-X) je v blind spotu pro 60° half-angle FOV.
+        let mut rng = StdRng::seed_from_u64(84);
+        let half = [960.0, 540.0, 50.0];
+        let mut behind = Cell::random(&mut rng, half, 0, 0, 0);
+        behind.position = [-50.0, 0.0, 0.0];
+        let cells = vec![behind];
+        let hunter_pos = [0.0, 0.0, 0.0];
+        let hunter_vel = [50.0, 0.0, 0.0]; // forward = +X (speed_sq = 2500 > threshold)
+        // Cone aktivní, target vzadu → None.
+        assert!(nearest_attackable_cell(hunter_pos, hunter_vel, &cells, half).is_none());
+        // Idle hunter (velocity 0) → cone disabled → target nalezen.
+        assert!(nearest_attackable_cell(hunter_pos, [0.0; 3], &cells, half).is_some());
+    }
+
+    #[test]
+    fn hunter_cone_sees_front_target() {
+        // Hunter pohybující se +X, target přímo vpředu — uvnitř cone.
+        let mut rng = StdRng::seed_from_u64(85);
+        let half = [960.0, 540.0, 50.0];
+        let mut front = Cell::random(&mut rng, half, 0, 0, 0);
+        front.position = [50.0, 0.0, 0.0];
+        let cells = vec![front];
+        let pick = nearest_attackable_cell([0.0, 0.0, 0.0], [50.0, 0.0, 0.0], &cells, half);
+        assert_eq!(pick, Some(0));
+    }
+
+    #[test]
+    fn hunter_cone_filters_flank_target() {
+        // Target přímo vpravo (90° offset) — mimo 60° cone.
+        let mut rng = StdRng::seed_from_u64(86);
+        let half = [960.0, 540.0, 50.0];
+        let mut side = Cell::random(&mut rng, half, 0, 0, 0);
+        side.position = [0.0, 50.0, 0.0];
+        let cells = vec![side];
+        let pick = nearest_attackable_cell([0.0, 0.0, 0.0], [50.0, 0.0, 0.0], &cells, half);
+        assert!(pick.is_none());
     }
 
     #[test]
