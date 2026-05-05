@@ -438,13 +438,15 @@ pub fn bond_defense_factor(n_bonds: u32) -> f32 {
 // Tím dává sim persistent pressure na ≥3-bond clusters = exact tipping point
 // pro tissue formation.
 
-/// Cílový počet hunterů ve světě. 3 = sparse (low density, ~1 per
-/// 1.5M units²), takže celkový pressure je „rare but lethal" namísto
-/// „constant grind".
-pub const HUNTER_TARGET_COUNT: usize = 3;
+/// Cílový počet hunterů ve světě. Sprint 71 měl 3 = příliš sparse
+/// (escape-by-speed cells našly free corridors). Sprint 72: 8 hunterů
+/// pokrývá víc paths, solo cell má kratší survival window.
+pub const HUNTER_TARGET_COUNT: usize = 8;
 /// Vision range Hunteru — vidí cells v této vzdálenosti, aktivně k nim
-/// míří. Mimo range = random walk.
-pub const HUNTER_VISION_RADIUS: f32 = 120.0;
+/// míří. Mimo range = random walk. Sprint 72 zvětšen 120 → 200 (větší
+/// než MATING_RADIUS=200, takže hunters detekují cells dřív než stihnou
+/// utéct přes broad-phase fail).
+pub const HUNTER_VISION_RADIUS: f32 = 200.0;
 /// Attack range — Hunter dealuje damage cells uvnitř této vzdálenosti.
 /// Menší než vision, takže Hunter musí se sblížit (cells mají šanci utéct).
 pub const HUNTER_ATTACK_RADIUS: f32 = 18.0;
@@ -452,11 +454,12 @@ pub const HUNTER_ATTACK_RADIUS: f32 = 18.0;
 /// jako energy loss + damage_accum (brain damage signal). Lineární per tick,
 /// no spike bonus (Hunter je sám bez evolved phenotype).
 pub const HUNTER_DAMAGE_PER_TICK: f32 = 4.0;
-/// Hunter top speed — mírně nad typical evolved cell max_speed (~150-200
-/// post-Sprint-70). Cells s extreme-speed phenotype (asp 12+ pure swimmers)
-/// můžou Hunteru utéct, takže predace je „skill-gated" — cells se musí
-/// reálně vyhýbat, ne jen být fast.
-pub const HUNTER_MAX_SPEED: f32 = 220.0;
+/// Hunter top speed. Sprint 71 měl 220 — cells dotáhly průměr na 218 a
+/// outrun se ukázal jako viable escape route (asp 12.6 pure speedy cells).
+/// Sprint 72: 300, nad teoretický cell max_speed cap. Cells nemůžou outrun
+/// jen rychlostí — cluster path (≥3 bondy = immunity) musí být dominantní
+/// úniková strategie.
+pub const HUNTER_MAX_SPEED: f32 = 300.0;
 /// Acceleration coefficient. Hunter nemá brain, jen target-seeking velocity
 /// adjustment. dt × ACC × (target_dir - current_dir) škáluje na max_speed.
 pub const HUNTER_ACC: f32 = 80.0;

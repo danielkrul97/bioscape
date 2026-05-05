@@ -1131,4 +1131,85 @@ dilution, food share) + horizontální layers (thermal/light fields).
     - Spatial clustering of hunters (currently random walk; could implement
       „pack" behavior pro extra pressure).
 
-## Sprinty 72 — open-ended
+## Sprint 72 — hunter tuning + 1000-gen verification
+
+- **Cíl:** zlomit Sprint 71 outrun-equilibrium tím, že hunter dostane natolik
+  rychlost / vision / counts, že cells nebudou moct utíkat — cluster path
+  (≥3 bondy = immunity) musí být dominantní strategie. Plus 1000-gen smoke
+  ověří, jestli druhořádová selekce na bondování přijde s delším časem.
+
+  **Plán:** parameter-only změna v lib.rs. Žádný structural / API code change.
+
+- **Konstanty:**
+  - `HUNTER_MAX_SPEED`: 220 → **300** (předpoklad: nad cell.max_speed cap).
+  - `HUNTER_TARGET_COUNT`: 3 → **8** (víc paths blokovaných).
+  - `HUNTER_VISION_RADIUS`: 120 → **200** (větší než MATING_RADIUS).
+
+- **Výstup:**
+  - `src/lib.rs`: 3 const updates + comments.
+  - **Test suite: 95/95 pass** (parameter-only change, žádné nové testy).
+  - **Long-run smoke seed=0, 1000 gen, default world, CPU:**
+    - Wall-clock 868.9 s = **691 ticks/s**. Hunt phase 29 µs/tick avg
+      (timed!() wired do dump). Final pop 390.
+    - **Hunt pressure persists end-to-end**, jako Sprint 71 ✓.
+      Hunt attacks: peak 4148 @ gen 3 (early panic) → stable ~1000-1100/gen
+      napříč gen 500-1000. Hunters nikdy nevyhynuli.
+    - **Cells outran HUNTER_MAX_SPEED=300:**
+
+      | Gen | spd_avg | asp | mBond | hunt_atks | immune_frac |
+      |-----|---------|------|-------|-----------|-------------|
+      | 49  | 148 | 3.5 | 0.039 | 1523 | 0 |
+      | 99  | 172 | 7.5 | 0.012 | 1964 | 0 |
+      | 199 | 209 | 11.6 | 0.000 | 1701 | 0 |
+      | 499 | **307** | 12.7 | 0.000 | 968 | 0 |
+      | **999** | **337 (= 1.12× hunter)** | 12.4 | 0.000 | 1109 | **0** |
+    - Peak `mean_bond_count = 0.045` @ gen 50 (NIŽŠÍ než Sprint 71 0.051).
+    - Peak `immune_frac = 0.001` (essentially zero — proto-tissue NEDOSAŽEN).
+
+- **Závěr — fundamentální problém s arms race:**
+  - **Cells evolovaly `genome.max_speed` přes hunter cap**, protože v lib.rs
+    je jen `MIN_SPEED=1.0` floor, **žádný horní cap**. Mutation drift
+    (sigma_speed=3.0) přes 1000 gen + selekce na escape produkovala
+    spd_avg 344 @ gen 991. Hunter MAX_SPEED=300 byl nevýznamný.
+  - **Bonding krátce vzplanul (gen 50: mBond=0.045) a pak crashl**, protože
+    selekce našla výhodnější escape route (rychlost) než cluster (immunity).
+    Speedy cells dostávaly hunt damage jen krátce pri sblížení; cluster
+    cells by stále musely investovat do bond cost + adhesion overhead.
+  - **Tipping point je strukturálně nedosažitelný bez cell-speed cap.**
+    Jakmile cells můžou eskalovat speed bez bound, outrun je vždycky
+    levnější než cluster. Sprint 73 musí přidat `MAX_SPEED` constant
+    (např. 200, mírně pod Sprint 71 baseline 218) plus `clamp` v
+    `Genome::mutate`. To by udělalo speed strop a teprve pak by bonding
+    byl jediná zbylá obrana.
+
+- **Implikace pro Sprint 73+:**
+  - **Strukturální fix: `MAX_SPEED` cap** v lib.rs + `Genome::mutate`
+    `clamp(MIN_SPEED, MAX_SPEED)`. Hodnota 200 (mírně pod 218 Sprint 71
+    baseline) by udělala HUNTER_MAX_SPEED=300 reálně neutekatelný.
+  - **Alternative: zostřit `ENERGY_COST_PER_V_SQ`.** Aktuálně 0.0008 dává
+    při v=337 cca 91 energy/s drain. Cells přežijí. Pokud bumpneme
+    cost na 0.0030 (~4×), drain by byl 340/s — energeticky nemyslitelné.
+    Ale tato změna je global (ovlivní brain motion economy), takže risk
+    of unintended consequences. Hard cap je čistší.
+  - **Dlouhý smoke ukázal svou hodnotu:** Sprint 71 250-gen ukázal mBond
+    peak 0.051 @ gen 149; Sprint 72 1000-gen ukázal že to byl jen
+    transient peak — cluster path NIKDY nestabilizoval. Bez 1000-gen
+    runu by Sprint 72 vypadal jako částečný úspěch.
+
+- **Poznámky:**
+  - **Hunt phase wall-time 29 µs/tick = 0.0058 µs per cell-Hunter pair**
+    (8 hunters × 600 cells = 4800 pairs/tick). Negligible vs eat_food
+    (799 µs) nebo brain_act (691 µs). Hunters scale freely; Sprint 73 by
+    mohl mít 16-32 hunters bez perf hit.
+  - **CSV opravě fungovala** — empty-row format má 47 fields, populated
+    row taky 47, parsing s awk čistý.
+  - **Sprint 72 je poslední decade-end sprint** v `063-072-scaleup.md`.
+    Sprint 73+ patří do nového souboru `073-082-<slug>.md`. Slug podle
+    dominantního tématu next decade — pravděpodobně „selection-bounds"
+    nebo „tissue-emergence" podle toho, kam Sprint 73 míří.
+  - **Co Sprint 72 NEŘEŠÍ (Sprint 73+):**
+    - Cell `MAX_SPEED` cap + clamp v Genome::mutate (kritický fix).
+    - HUD overlay s real-time bond / hunter / immune_frac stats.
+    - Long-long run (5000+ gen) post-cap k ověření, že cluster path
+      finally dominuje.
+    - Anizotropic cell collision, GPU collision, photic stratification.
