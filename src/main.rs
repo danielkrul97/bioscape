@@ -478,7 +478,11 @@ fn setup(
     commands.spawn((
         Camera3d::default(),
         Hdr,
-        Tonemapping::TonyMcMapface,
+        // Sprint 88.2: TonyMcMapface → AcesFitted. Tony je explicitly „boring,
+        // does not increase contrast or saturation"; ACES má dramatic hue
+        // shifting + increased contrast + brights desaturate. Pro biologické
+        // cells s sytými hue (8 distinct adhesion types) je ACES výrazně lepší.
+        Tonemapping::AcesFitted,
         Bloom::NATURAL,
         DistanceFog {
             color: Color::srgb(0.08, 0.18, 0.30),
@@ -501,8 +505,11 @@ fn setup(
     // 6000 + ambient 600 produkovaly blackout scene. HDR + bloom kombinaci nutno
     // krmit dostatkem světla aby base scene byla viditelná, ne jen emissive
     // bloom highlights.
+    // Sprint 88.2: ambient méně blue (0.6 → 0.85) — silně modré ambient
+    // multiplikuje s cell hue a desaturuje warm colors (red/orange/yellow
+    // adhesion types). Subtler tint zachová cell color identity.
     commands.spawn(AmbientLight {
-        color: Color::srgb(0.6, 0.75, 1.0),
+        color: Color::srgb(0.85, 0.92, 1.0),
         brightness: 1500.0,
         ..default()
     });
@@ -719,17 +726,18 @@ fn adhesion_material(
     let hue = idx as f32 * (360.0 / 8.0);
     // Sprint 85: saturation 0.85 → 1.0 — sytější body color.
     // Sprint 88: emissive ∝ hue color. Pod HDR + Bloom cells „bioluminescent".
-    // Sprint 88.1: lightness 0.45 → 0.55 (back to S85 brightness), emissive
-    // multiplier 0.8 → 0.6 — méně agresivní glow, primárně viditelnost base.
-    let color = Color::hsl(hue, 1.0, 0.55);
-    let emissive_color = Color::hsl(hue, 1.0, 0.45);
+    // Sprint 88.2: lightness 0.55 → 0.50 (deeper saturated feel), emissive
+    // multiplier 0.6 → 1.0 — emissive dominuje base color, hue se nepere
+    // s ambient tintem. Pod ACES tonemapper se cells stanou skutečně sytí.
+    let color = Color::hsl(hue, 1.0, 0.50);
+    let emissive_color = Color::hsl(hue, 1.0, 0.50);
     let emissive_linear = emissive_color.to_linear();
     let handle = materials.add(StandardMaterial {
         base_color: color,
         emissive: LinearRgba::new(
-            emissive_linear.red * 0.6,
-            emissive_linear.green * 0.6,
-            emissive_linear.blue * 0.6,
+            emissive_linear.red * 1.0,
+            emissive_linear.green * 1.0,
+            emissive_linear.blue * 1.0,
             1.0,
         ),
         perceptual_roughness: 0.5,
