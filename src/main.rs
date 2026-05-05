@@ -25,22 +25,24 @@ const DIAG_SYNC_TRANSFORMS: DiagnosticPath = DiagnosticPath::const_new("sim/sync
 const DIAG_TICKS_PER_FRAME: DiagnosticPath = DiagnosticPath::const_new("sim/ticks_per_frame");
 const DIAG_RENDER_OVERHEAD: DiagnosticPath = DiagnosticPath::const_new("sim/render_overhead_ms");
 use bioscape::{
-    adhesion_velocity_delta, bond_velocity_delta, reject_food_for_richness, Bond, Cell, Food,
-    Phenotype, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
-    ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD, BOND_FORMATION_COST, BOND_FORM_THRESHOLD,
-    BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC, BOND_REST_LENGTH_SLACK, BRAIN_INPUTS,
-    CARRION_FOOD_COUNT, CELL_RADIUS, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
-    DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
-    HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
+    adhesion_velocity_delta, bond_velocity_delta, nearest_attackable_cell,
+    reject_food_for_richness, Bond, Cell, Food, Hunter, Phenotype, SimClock, SmellField,
+    SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR, ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
+    BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
+    BOND_REST_LENGTH_SLACK, BRAIN_INPUTS, CARRION_FOOD_COUNT, CELL_RADIUS,
+    CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS,
+    FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH, HAZARD_AMP,
+    HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, HUNTER_ATTACK_RADIUS,
+    HUNTER_DAMAGE_PER_TICK, HUNTER_TARGET_COUNT, INITIAL_CELLS, LEARNING_RATE,
     MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH,
     MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
     PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
-    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
-    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z, SMELL_PER_FOOD,
-    SMELL_SAMPLE_EPSILON, THERMAL_NOISE, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES,
-    WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES,
-    WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
+    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
+    SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, THERMAL_NOISE, TICKS_PER_GENERATION,
+    WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
+    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 #[cfg(feature = "gpu")]
 use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu};
@@ -244,6 +246,21 @@ struct FoodMesh(Handle<Mesh>);
 #[derive(Resource)]
 struct FoodMaterial(Handle<StandardMaterial>);
 
+/// Sprint 71: shared mesh + material pro Hunter entities. Single resource —
+/// všichni hunters vypadají stejně, žádný cache potřeba. Resources drží
+/// handles při životě (Assets refcount); fields se přímo nečtou.
+#[derive(Resource)]
+#[allow(dead_code)]
+struct HunterMesh(Handle<Mesh>);
+
+#[derive(Resource)]
+#[allow(dead_code)]
+struct HunterMaterial(Handle<StandardMaterial>);
+
+/// Sprint 71: ECS component wrapping `Hunter` data pro renderer hot loop.
+#[derive(Component)]
+struct HunterEntity(Hunter);
+
 /// Sprint 36: per-lineage material cache. Lineage hue → handle do
 /// `Assets<StandardMaterial>`. Bevy automaticky deduplikuje stejné materialy
 /// na renderer instances draw call.
@@ -387,6 +404,7 @@ fn main() {
                     rebuild_cell_grid,
                     resolve_cell_collisions,
                     cell_predates_on_neighbor,
+                    step_hunters,
                     cell_eats_food,
                     spawn_food,
                     cell_reproduces_on_threshold,
@@ -407,6 +425,7 @@ fn main() {
                 camera_pan_input,
                 update_orbit_camera_transform,
                 sync_transforms,
+                sync_hunter_transforms,
                 draw_bond_gizmos,
                 log_clock_events,
                 toggle_stats_overlay,
@@ -617,6 +636,29 @@ fn setup(
     commands.insert_resource(CellMesh(cell_mesh_handle));
     commands.insert_resource(FoodMesh(food_mesh_handle));
     commands.insert_resource(FoodMaterial(food_material));
+
+    // Sprint 71: macropredator setup. Hunter mesh = větší sphere (4× CELL_RADIUS),
+    // tmavě červený material — visually distinct od cells. HUNTER_TARGET_COUNT
+    // hunters spawnou na náhodné pozice; constant pop, žádný respawn.
+    let hunter_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS * 4.0).mesh().ico(2).unwrap());
+    let hunter_material = materials.add(StandardMaterial {
+        base_color: Color::hsl(0.0, 0.7, 0.30),
+        perceptual_roughness: 0.4,
+        emissive: Color::hsl(0.0, 0.6, 0.15).into(),
+        ..default()
+    });
+    let mut hunter_rng = rand::rng();
+    for i in 0..HUNTER_TARGET_COUNT {
+        let h = Hunter::random(&mut hunter_rng, half, i as u64);
+        commands.spawn((
+            HunterEntity(h),
+            Mesh3d(hunter_mesh_handle.clone()),
+            MeshMaterial3d(hunter_material.clone()),
+            Transform::from_xyz(h.position[0], h.position[1], h.position[2]),
+        ));
+    }
+    commands.insert_resource(HunterMesh(hunter_mesh_handle));
+    commands.insert_resource(HunterMaterial(hunter_material));
     commands.insert_resource(SmellResource(SmellField::new(
         [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
         half,
@@ -1332,6 +1374,58 @@ fn sync_transforms(
         }
     }
     diag.add_measurement(&DIAG_SYNC_TRANSFORMS, || t.elapsed().as_secs_f64() * 1000.0);
+}
+
+/// Sprint 71: macropredator step + attack. Per Hunter: nearest_attackable_cell
+/// (vision range, n_bonds < threshold), pohni se k němu, attack pokud v dosahu.
+/// Two-pass kvůli borrow checkeru: pass 1 sbírá (entity, damage) během
+/// `&mut HunterEntity` iterace, pass 2 mutuje cells po uvolnění hunter borrow.
+fn step_hunters(
+    mut hunters: Query<&mut HunterEntity>,
+    mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    fixed_time: Res<Time<Fixed>>,
+) {
+    let dt = fixed_time.delta_secs();
+    // Snapshot cells (Cell je Copy → cheap clone). Indexovaný pro
+    // `nearest_attackable_cell` lookup.
+    let cell_snapshot: Vec<(Entity, Cell)> =
+        cells.iter().map(|(e, c)| (e, c.0)).collect();
+    let cells_only: Vec<Cell> = cell_snapshot.iter().map(|(_, c)| *c).collect();
+    let attack_r2 = HUNTER_ATTACK_RADIUS * HUNTER_ATTACK_RADIUS;
+    let mut rng = rand::rng();
+    let mut attacks: Vec<(Entity, f32)> = Vec::new();
+    for mut h in &mut hunters {
+        let target_idx =
+            nearest_attackable_cell(h.0.position, &cells_only, SIMULATION_HALF);
+        let target_pos = target_idx.map(|i| cells_only[i].position);
+        h.0.step(target_pos, &mut rng, dt, SIMULATION_HALF);
+        if let Some(i) = target_idx {
+            let d = bioscape::min_image_delta(
+                h.0.position,
+                cells_only[i].position,
+                SIMULATION_HALF,
+            );
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if d2 < attack_r2 {
+                attacks.push((cell_snapshot[i].0, HUNTER_DAMAGE_PER_TICK * dt));
+            }
+        }
+    }
+    for (entity, damage) in attacks {
+        if let Ok((_, mut cell)) = cells.get_mut(entity) {
+            cell.0.energy -= damage;
+            cell.0.damage_accum += damage;
+        }
+    }
+}
+
+/// Sprint 71: sync Hunter.position → Transform pro renderer. Hunter mesh
+/// se nerotuje (sphere — žádná orientace), takže Transform se updatuje jen
+/// translation. Mesh scale je fixed v setup, neměnné per-tick.
+fn sync_hunter_transforms(mut hunters: Query<(&HunterEntity, &mut Transform)>) {
+    for (h, mut transform) in &mut hunters {
+        transform.translation = Vec3::new(h.0.position[0], h.0.position[1], h.0.position[2]);
+    }
 }
 
 /// Sprint 69: render persistent spring bonds jako gizmo lines. Hue podle

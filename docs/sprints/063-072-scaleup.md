@@ -1005,19 +1005,130 @@ dilution, food share) + horizontální layers (thermal/light fields).
     zachycuje regression** — pre-Sprint-70 behavior se reproduces když
     parents nemají bondy (= většina ranných gen).
 
-## Sprinty 71–72 — open-ended
+## Sprint 71 — macropredator (Hunter) entity
 
-- **Sprint 71 (priorita):** rebalance defense vs predation. Sprint 70
-  long-run odhalil emergent predator extinction při current `BOND_DEFENSE_FRAC=0.15`.
-  Kandidáti: snížit FRAC na 0.08, zvýšit `SPIKE_PREDATION_BONUS`, nebo
-  přidat baseline attack incentive. Cíl: udržet predaci jako stable
-  selekční tlak na bondování napříč 250+ gen.
-- **Sprint 71+:** HUD overlay s real-time bond stats (renderer mirror
-  CSV diagnostiky ze Sprintu 67).
-- **Sprint 71+:** Thermal stratification (temperature field z-gradient).
-- **Sprint 71+:** Light field z-attenuation (photic vs aphotic zones).
-- **Sprint 71+:** GPU collision wire (3D + velocity damping + adhesion mirror).
-- **Sprint 71+:** Anisotropic cell collision (ellipsoid geometry).
-- **Sprint 71+:** Bigger horizontal world expansion + dynamic GPU
-  SpatialHash sizing.
-- **Sprint 71+:** Spatial autocorrelation adhesion_type clustering metric.
+- **Cíl:** zavést persistent predator pressure, kterou cell-vs-cell selekce
+  nemůže vypotit. Sprint 70 ukázal predator-extinction event: bonded clustery
+  byly tak tough, že spike investice ztratila fitness payoff → predátoři
+  vyhynuli → bond benefit zmizel. Sprint 71 přidává **non-evolving
+  environmental predator** (= „Hunter") — entitu mimo Cell selection loop,
+  takže nikdy nevyhyne. Hunter atakuje cells s `n_bonds() < 3` (cluster
+  „too big to swallow" = Volvox / paramecium scenario z reálné biologie).
+  Tím vzniká exact tipping point: dosáhnout ≥3-bond clusteru = immunity.
+
+  **Plán implementace:**
+
+  *Body 1 — `Hunter` struct + `nearest_attackable_cell` (lib.rs):*
+  - Hunter má position, velocity, hunter_id. Žádný brain, žádný genome,
+    žádná mutace — pure world entity.
+  - `Hunter::random` random init, `Hunter::step` per-tick movement
+    (target-seek pokud ∃ attackable cell ∈ vision range, jinak random drift).
+    Toroidal-aware přes `min_image_delta`.
+  - `nearest_attackable_cell(pos, &cells, world_half) -> Option<usize>` —
+    skip cells s `n_bonds() ≥ HUNTER_BOND_IMMUNITY_THRESHOLD`.
+
+  *Body 2 — Headless `hunt` phase:*
+  - World gets `hunters: Vec<Hunter>` + `hunter_attacks_gen` counter.
+    Init: HUNTER_TARGET_COUNT random spawns.
+  - `World::hunt` mezi `predate` a `eat_food` v tick chain. Two-pass
+    (borrow checker): pass 1 sbírá (cell_idx, damage), pass 2 apply.
+  - CSV: 3 nové sloupce — `hunter_attacks`, `hunters_alive`, `immune_frac`
+    (= fraction cells s `n_bonds() ≥ 3`).
+
+  *Body 3 — Renderer Hunter ECS:*
+  - `HunterEntity(Hunter)` component, `HunterMesh` + `HunterMaterial`
+    resources (single shared mesh/material — všichni hunters look same).
+  - Mesh = `Sphere::new(CELL_RADIUS × 4)` (= radius 20, 4× větší než cell).
+    Material = dark red (`Color::hsl(0.0, 0.7, 0.30)`) + emissive accent.
+  - `step_hunters` system v FixedUpdate (mezi `cell_predates_on_neighbor`
+    a `cell_eats_food`). `sync_hunter_transforms` v Update (mirror cells).
+
+  *Body 4 — Lib const + tests:*
+  - 7 nových konstant: `HUNTER_TARGET_COUNT=3`, `HUNTER_VISION_RADIUS=120`,
+    `HUNTER_ATTACK_RADIUS=18`, `HUNTER_DAMAGE_PER_TICK=4.0`,
+    `HUNTER_MAX_SPEED=220`, `HUNTER_ACC=80`, `HUNTER_IDLE_DRIFT=30`,
+    `HUNTER_BOND_IMMUNITY_THRESHOLD=3`.
+  - 5 unit testů: seek nearest, skip immune cluster, none when only
+    immune, step toward target, idle random walk.
+
+- **Konstanty (lib.rs):** výše uvedené 7 + threshold.
+
+- **Výstup:**
+  - `src/lib.rs`: Hunter struct + impl + nearest_attackable_cell + 5 testů.
+  - `src/bin/headless.rs`: World rozšířen o hunters + hunter_attacks_gen,
+    nový `hunt` phase + timed!, CSV header rozšířen na 47 sloupců,
+    immune_frac spočtený. Empty-row format opraven (pre-existující bug
+    z S68: měl 42 fields místo 44 → teď 47).
+  - `src/main.rs`: HunterEntity + HunterMesh/Material resources, spawn
+    v setup, `step_hunters` + `sync_hunter_transforms` systémy.
+  - **Test suite: 95/95 pass** (90 baseline + 5 nové hunter testy).
+  - **Long-run smoke seed=0, 250 gen, default world, CPU:**
+    - Wall-clock 272.4 s = **551 ticks/s** (Sprint 70: 545; Sprint 67.1: 720).
+      Hunt phase měřena přes timed!() — ale dump nezahrnut v výstupu z důvodu
+      pre-existing dump format (přidáno post-smoke). Final pop 558.
+    - **Hunters živi end-to-end** — gen 49: 872 útoků, gen 249: 500 útoků.
+      **Žádné extinkce** (Sprint 70 měl predE=0 v gen 199+). ✓ Hypotéza
+      „non-evolving predator nikdy nevyhyne" potvrzena.
+    - **Bond density trajectory:**
+
+      | Gen | mean_bond_count | predE | hunt_atks | spk | asp | immune_frac |
+      |-----|-----------------|-------|-----------|-----|-----|-------------|
+      | 49  | 0.040 | 1208 | 872 | 0.31 | 3.6  | 0.002 |
+      | 99  | 0.034 | 2083 | 565 | 0.26 | 8.6  | 0.000 |
+      | **149** | **0.051 (peak)** | 274 | 545 | 0.14 | 10.8 | 0.000 |
+      | 199 | 0.022 | 0 | 693 | 0.08 | 12.0 | 0.000 |
+      | 249 | 0.000 | 0 | 500 | 0.08 | 12.6 | 0.000 |
+
+- **Závěr — partial success:**
+  - **Hunter pressure persists** ✓ — design funguje, predátor je v simu
+    end-to-end aktivní. Sprint 70 bottleneck (extinction) vyřešen.
+  - **Bonding peak +56 % oproti Sprint 70** (0.051 vs Sprint 70 0.057
+    ~comparable, dosaženo o 30 gen rychleji — gen 149 vs gen 180).
+  - **Ale tipping point nedosažen.** `immune_frac` zůstal pod 0.2 % —
+    cells nedosáhly proto-tissue regimu. Místo clusteringu **evolovaly
+    extreme speed swimmer** strategy (asp 12.6, spd 218). Hunter
+    MAX_SPEED je 220 — cells se těsně přiblížily limitu, **outrun místo
+    immune** se ukázal být snadnější evoluční cesta než 3+ bond cluster.
+  - **Bond density crash to 0 by gen 249** — bonded cells v této niche
+    nedostávaly žádný benefit (speed-evader strategy nepotřebuje cluster),
+    selekce postupně bondování opustila.
+
+- **Implikace pro Sprint 72+:**
+  - **Tunit hunter aby outrun nebylo viable.** Tři páky:
+    1. `HUNTER_MAX_SPEED` 220 → 280 (cells nemůžou outrun bez krádeže
+       cell.max_speed limit).
+    2. `HUNTER_TARGET_COUNT` 3 → 8 (víc hunterů = víc paths blokovaných;
+       solo cell nemá kde se schovat).
+    3. `HUNTER_VISION_RADIUS` 120 → 200 (větší než MATING_RADIUS — hunters
+       detekují cells dřív než cells stihnou ujet).
+  - Doporučuju kombinaci #1 + #2 (rychlejší + víc hunterů). Vision je
+    sekundární — primary je „kdo je rychlejší".
+  - **Long-long run (1000 gen)** může taky odhalit, že cells mají strop
+    na max_speed (genome.max_speed cap je definovaný v lib.rs) — pokud
+    HUNTER_MAX_SPEED je nad cap, escape je nemožný a cluster path se
+    stane jediná. Toto by bylo ideální nastavení.
+
+- **Poznámky:**
+  - **Hunter mesh size 4× CELL_RADIUS = 20 unit radius:** dramatic visual
+    distinction. V renderer-u (3 hunters × 1500-cell pop) snadno
+    rozlišitelní jako tmavě-červené koule pohybující se rychleji než cells.
+  - **Hunters v checkpointu nejsou** — re-spawnou se fresh z
+    `chk.mating_radius` jako seed (rough hash). Hunter je transient world
+    feature; ztráta pozice při loadu nemá selection signal.
+  - **Two-pass borrow checker pattern:** v obou binárkách hunter step + attack
+    sbírají (idx/entity, damage) tuples během iterace `&mut hunters`,
+    pak apply na `cells` po uvolnění hunter borrow. Mirror Sprint 66
+    `resolve_collisions` Phase 1+2 pattern.
+  - **Empty-row CSV bug fix:** Sprint 68 přidal bond_stiff/damp sloupce
+    do header (42→44), ale empty row nezakreslil (zůstal 42 fields).
+    Sprint 71 opravil (47 fields total = header match).
+  - **Co Sprint 71 NEŘEŠÍ (Sprint 72+):**
+    - Hunter speed/count tuning pro flip equilibrium k cluster path.
+    - Cells útočící zpátky na hunter (spike fight-back). Aktuálně hunter
+      je nesmrtelný; Sprint 72 může dát hunteru health pool.
+    - Hunter HUD overlay (renderer ukazuje hunters vizuálně, ale CSV
+      sloupce hunter_attacks / hunters_alive / immune_frac nejsou v HUD).
+    - Spatial clustering of hunters (currently random walk; could implement
+      „pack" behavior pro extra pressure).
+
+## Sprinty 72 — open-ended

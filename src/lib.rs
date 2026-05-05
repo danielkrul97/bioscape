@@ -428,6 +428,175 @@ pub fn bond_defense_factor(n_bonds: u32) -> f32 {
     1.0 - BOND_DEFENSE_FRAC * capped
 }
 
+// ─── Sprint 71: macropredator (Hunter) ────────────────────────────────────────
+// Sprint 70 long-run odhalil emergent predator-extinction event: cell-vs-cell
+// predace zkolapsovala, jakmile byly bonded clustery dostatečně tough. Sprint
+// 71 zavádí non-evolving environmental predátora („Hunter") který běží mimo
+// Cell selection loop — nikdy nevyhyne, protože není pod evolučním tlakem.
+// Hunters atakují solo / lightly-bonded cells; cells s ≥3 bondy jsou immune
+// (cluster „too big to swallow" — Volvox/paramecium scenario z reálné biologie).
+// Tím dává sim persistent pressure na ≥3-bond clusters = exact tipping point
+// pro tissue formation.
+
+/// Cílový počet hunterů ve světě. 3 = sparse (low density, ~1 per
+/// 1.5M units²), takže celkový pressure je „rare but lethal" namísto
+/// „constant grind".
+pub const HUNTER_TARGET_COUNT: usize = 3;
+/// Vision range Hunteru — vidí cells v této vzdálenosti, aktivně k nim
+/// míří. Mimo range = random walk.
+pub const HUNTER_VISION_RADIUS: f32 = 120.0;
+/// Attack range — Hunter dealuje damage cells uvnitř této vzdálenosti.
+/// Menší než vision, takže Hunter musí se sblížit (cells mají šanci utéct).
+pub const HUNTER_ATTACK_RADIUS: f32 = 18.0;
+/// Damage per tick, který Hunter působí cells v attack range. Aplikuje se
+/// jako energy loss + damage_accum (brain damage signal). Lineární per tick,
+/// no spike bonus (Hunter je sám bez evolved phenotype).
+pub const HUNTER_DAMAGE_PER_TICK: f32 = 4.0;
+/// Hunter top speed — mírně nad typical evolved cell max_speed (~150-200
+/// post-Sprint-70). Cells s extreme-speed phenotype (asp 12+ pure swimmers)
+/// můžou Hunteru utéct, takže predace je „skill-gated" — cells se musí
+/// reálně vyhýbat, ne jen být fast.
+pub const HUNTER_MAX_SPEED: f32 = 220.0;
+/// Acceleration coefficient. Hunter nemá brain, jen target-seeking velocity
+/// adjustment. dt × ACC × (target_dir - current_dir) škáluje na max_speed.
+pub const HUNTER_ACC: f32 = 80.0;
+/// Hunter random-walk noise při idle (no cell ve vision). Pomaly drift,
+/// brzy najde cell + zacílí.
+pub const HUNTER_IDLE_DRIFT: f32 = 30.0;
+/// Bond count threshold pro immunity. Cells s ≥ tomuto počtu bondů Hunter
+/// nemůže atakovat — cluster je „too big to swallow". 3 = exact tipping
+/// point; minimum bond network size pro „proto-tissue" v této simu.
+pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 3;
+
+/// Sprint 71: non-evolving environmental predator. Pohybuje se pseudo-AI
+/// (seek nejbližší cell ∈ vision range, jinak random drift). Atakuje cells
+/// s `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD` v attack range. Žádný
+/// genome, žádný brain, žádná smrt — Hunter je world feature, ne entity
+/// pod selekcí.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Hunter {
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    /// Stable identifier (procedural, monotonic při init). Nepoužívá se pro
+    /// bond resolution — Hunter ≠ Cell.
+    pub hunter_id: u64,
+}
+
+impl Hunter {
+    /// Random init pozice + zero velocity. World-half určuje rozsah.
+    pub fn random(rng: &mut impl Rng, world_half: [f32; 3], hunter_id: u64) -> Self {
+        Self {
+            position: [
+                rng.random_range(-world_half[0]..world_half[0]),
+                rng.random_range(-world_half[1]..world_half[1]),
+                rng.random_range(-world_half[2]..world_half[2]),
+            ],
+            velocity: [0.0; 3],
+            hunter_id,
+        }
+    }
+
+    /// Per-tick movement integration: target-seek pokud je cell ve vision
+    /// range, jinak random drift. `target_pos` je `Some(pos)` z helperu
+    /// `nearest_attackable_cell` (caller). World wrap (toroidal xy) aplikován
+    /// stejně jako Cell::apply_world_bounce.
+    pub fn step(
+        &mut self,
+        target_pos: Option<[f32; 3]>,
+        rng: &mut impl Rng,
+        dt: f32,
+        world_half: [f32; 3],
+    ) {
+        // Seek nebo random drift.
+        let desired = match target_pos {
+            Some(t) => {
+                // Min-image vector self→target (toroidal aware). `min_image_delta(a, b)`
+                // vrací `b - a`, takže `(self_pos, t)` dá `t - self_pos`.
+                let d = min_image_delta(self.position, t, world_half);
+                let mag = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                if mag > 1e-6 {
+                    let inv = HUNTER_MAX_SPEED / mag;
+                    [d[0] * inv, d[1] * inv, d[2] * inv]
+                } else {
+                    [0.0; 3]
+                }
+            }
+            None => [
+                rng.random_range(-HUNTER_IDLE_DRIFT..HUNTER_IDLE_DRIFT),
+                rng.random_range(-HUNTER_IDLE_DRIFT..HUNTER_IDLE_DRIFT),
+                rng.random_range(-HUNTER_IDLE_DRIFT * 0.3..HUNTER_IDLE_DRIFT * 0.3),
+            ],
+        };
+        // Steer velocity → desired s rate-limited acc. HUNTER_ACC = max
+        // change v jednotkách/s; dt-scaled cap brání over-shoot při velkých dt.
+        let max_delta = HUNTER_ACC * dt;
+        for i in 0..3 {
+            let want = desired[i] - self.velocity[i];
+            self.velocity[i] += want.clamp(-max_delta, max_delta);
+        }
+        // Clamp speed.
+        let speed_sq = self.velocity[0] * self.velocity[0]
+            + self.velocity[1] * self.velocity[1]
+            + self.velocity[2] * self.velocity[2];
+        let max_sq = HUNTER_MAX_SPEED * HUNTER_MAX_SPEED;
+        if speed_sq > max_sq {
+            let scale = HUNTER_MAX_SPEED / speed_sq.sqrt();
+            self.velocity[0] *= scale;
+            self.velocity[1] *= scale;
+            self.velocity[2] *= scale;
+        }
+        // Integrate position.
+        self.position[0] += self.velocity[0] * dt;
+        self.position[1] += self.velocity[1] * dt;
+        self.position[2] += self.velocity[2] * dt;
+        // Toroidal wrap xy, z bounce (mirror Cell::apply_world_bounce).
+        let wx = 2.0 * world_half[0];
+        let wy = 2.0 * world_half[1];
+        if self.position[0] >= world_half[0] || self.position[0] < -world_half[0] {
+            let p = self.position[0] + world_half[0];
+            self.position[0] = p - (p / wx).floor() * wx - world_half[0];
+        }
+        if self.position[1] >= world_half[1] || self.position[1] < -world_half[1] {
+            let p = self.position[1] + world_half[1];
+            self.position[1] = p - (p / wy).floor() * wy - world_half[1];
+        }
+        if world_half[2] > 0.0 && self.position[2].abs() > world_half[2] {
+            self.velocity[2] = -self.velocity[2];
+            self.position[2] = self.position[2].clamp(-world_half[2], world_half[2]);
+        }
+    }
+}
+
+/// Sprint 71: vrací `Some(cell_index)` nejbližší attackable cell ∈ vision
+/// range. „Attackable" = `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD`. Vrací
+/// nejbližší **z attackable** cells, ne nejbližší absolutně — Hunter nepronásleduje
+/// imune clustery (skill: cluster je viditelný, ale ne lovitelný; Hunter musí
+/// najít solo cell). Toroidal-aware přes `min_image_delta`.
+pub fn nearest_attackable_cell(
+    hunter_pos: [f32; 3],
+    cells: &[Cell],
+    world_half: [f32; 3],
+) -> Option<usize> {
+    let vision_r2 = HUNTER_VISION_RADIUS * HUNTER_VISION_RADIUS;
+    let mut best: Option<(usize, f32)> = None;
+    for (i, c) in cells.iter().enumerate() {
+        if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
+            continue;
+        }
+        let d = min_image_delta(c.position, hunter_pos, world_half);
+        let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if d2 >= vision_r2 {
+            continue;
+        }
+        match best {
+            None => best = Some((i, d2)),
+            Some((_, bd2)) if d2 < bd2 => best = Some((i, d2)),
+            _ => {}
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_speed: 3.0,
     sigma_hue: 5.0,
@@ -3581,6 +3750,103 @@ mod tests {
             "child spawn pozice měla být midpoint (0, 0), got {:?}",
             child.position
         );
+    }
+
+    #[test]
+    fn hunter_seeks_nearest_attackable_cell() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let half = [960.0, 540.0, 50.0];
+        let mut cells: Vec<Cell> = Vec::new();
+        // Cell 0 daleko (>vision), cell 1 blízko + bez bondů.
+        let mut c0 = Cell::random(&mut rng, half, 0, 0, 0);
+        c0.position = [500.0, 500.0, 0.0];
+        cells.push(c0);
+        let mut c1 = Cell::random(&mut rng, half, 1, 0, 1);
+        c1.position = [50.0, 0.0, 0.0];
+        cells.push(c1);
+        let hunter_pos = [0.0, 0.0, 0.0];
+        let pick = nearest_attackable_cell(hunter_pos, &cells, half);
+        assert_eq!(pick, Some(1));
+    }
+
+    #[test]
+    fn hunter_skips_immune_cluster_cells() {
+        let mut rng = StdRng::seed_from_u64(12);
+        let half = [960.0, 540.0, 50.0];
+        let mut cells: Vec<Cell> = Vec::new();
+        // Cell 0 nejbližší ale immune (3 bondy).
+        let mut c0 = Cell::random(&mut rng, half, 0, 0, 0);
+        c0.position = [10.0, 0.0, 0.0];
+        for slot in 0..3 {
+            c0.bonds[slot] = Some(Bond {
+                other_cell_id: 100 + slot as u64,
+                rest_length: 5.0,
+                stiffness: BOND_STIFFNESS,
+                damping: 0.6,
+                age_ticks: 0,
+            });
+        }
+        cells.push(c0);
+        // Cell 1 dál ale solo → attackable.
+        let mut c1 = Cell::random(&mut rng, half, 1, 0, 1);
+        c1.position = [60.0, 0.0, 0.0];
+        cells.push(c1);
+        let pick = nearest_attackable_cell([0.0, 0.0, 0.0], &cells, half);
+        assert_eq!(pick, Some(1));
+    }
+
+    #[test]
+    fn hunter_returns_none_when_only_immune_in_range() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let half = [960.0, 540.0, 50.0];
+        let mut c = Cell::random(&mut rng, half, 0, 0, 0);
+        c.position = [10.0, 0.0, 0.0];
+        for slot in 0..3 {
+            c.bonds[slot] = Some(Bond {
+                other_cell_id: 100 + slot as u64,
+                rest_length: 5.0,
+                stiffness: BOND_STIFFNESS,
+                damping: 0.6,
+                age_ticks: 0,
+            });
+        }
+        let cells = vec![c];
+        assert!(nearest_attackable_cell([0.0, 0.0, 0.0], &cells, half).is_none());
+    }
+
+    #[test]
+    fn hunter_step_moves_toward_target() {
+        let mut rng = StdRng::seed_from_u64(14);
+        let half = [960.0, 540.0, 50.0];
+        let mut h = Hunter {
+            position: [0.0, 0.0, 0.0],
+            velocity: [0.0, 0.0, 0.0],
+            hunter_id: 0,
+        };
+        let target = [100.0, 0.0, 0.0];
+        // Krok 1: velocity začne přibližovat k +x (toward target).
+        h.step(Some(target), &mut rng, 1.0 / 60.0, half);
+        assert!(h.velocity[0] > 0.0, "expected +x velocity, got {:?}", h.velocity);
+        assert!(h.position[0] > 0.0, "expected +x position, got {:?}", h.position);
+    }
+
+    #[test]
+    fn hunter_step_random_walks_when_no_target() {
+        let mut rng = StdRng::seed_from_u64(15);
+        let half = [960.0, 540.0, 50.0];
+        let mut h = Hunter {
+            position: [0.0, 0.0, 0.0],
+            velocity: [0.0, 0.0, 0.0],
+            hunter_id: 0,
+        };
+        // Bez targetu se velocity nenuluje (idle drift).
+        for _ in 0..30 {
+            h.step(None, &mut rng, 1.0 / 60.0, half);
+        }
+        let speed_sq = h.velocity[0] * h.velocity[0]
+            + h.velocity[1] * h.velocity[1]
+            + h.velocity[2] * h.velocity[2];
+        assert!(speed_sq > 1e-3, "idle drift should produce nonzero velocity, got {:?}", h.velocity);
     }
 
     #[test]

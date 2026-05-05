@@ -7,22 +7,24 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    adhesion_velocity_delta, bond_velocity_delta, reject_food_for_richness, Bond, Cell, Food,
-    SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR, ATTACK_THRESHOLD,
-    BOND_BREAK_THRESHOLD, BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS,
-    BOND_MAINTENANCE_PER_SEC, BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT,
-    CELL_RADIUS, COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
-    DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
-    GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS,
-    LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS,
-    MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
-    PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
-    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
-    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
-    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z, SMELL_PER_FOOD,
-    SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z,
-    WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED,
-    WORLD_UNITS_PER_FOOD,
+    adhesion_velocity_delta, bond_velocity_delta, nearest_attackable_cell,
+    reject_food_for_richness, Bond, Cell, Food, Hunter, SimClock, SmellField, SpatialGrid,
+    WorldMap, ADHESION_RANGE_FACTOR, ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
+    BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
+    BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
+    COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
+    DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE,
+    GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
+    HERD_RADIUS, HUNTER_ATTACK_RADIUS, HUNTER_DAMAGE_PER_TICK, HUNTER_TARGET_COUNT,
+    INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
+    MATING_RADIUS, MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
+    PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON,
+    PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
+    SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES,
+    WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES,
+    WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 #[cfg(feature = "gpu")]
 use bioscape::{
@@ -108,6 +110,7 @@ struct PhaseTimings {
     apply_hazards: f64,
     resolve_collisions: f64,
     predate: f64,
+    hunt: f64,
     eat_food: f64,
     spawn_food: f64,
     reproduce: f64,
@@ -152,6 +155,12 @@ struct World {
     bonds_formed_gen: u64,
     /// Sprint 66 diagnostic — počet bondů přervaných v aktuální generaci.
     bonds_broken_gen: u64,
+    /// Sprint 71: macropredator entities (Hunter). Constant population
+    /// `HUNTER_TARGET_COUNT`, žádná evolution / reproduction / respawn.
+    /// Pohybuje se nezávisle na Cell loop; útočí na cells `n_bonds() < threshold`.
+    hunters: Vec<Hunter>,
+    /// Sprint 71 diagnostic — počet hunter útoků v aktuální generaci.
+    hunter_attacks_gen: u64,
     mating_radius: f32,
     // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
     // může nastavit výš (potřeba pro bench při N > 1000).
@@ -261,6 +270,11 @@ impl World {
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
+            // Sprint 71: spawn HUNTER_TARGET_COUNT hunterů na náhodné pozice.
+            hunters: (0..HUNTER_TARGET_COUNT)
+                .map(|i| Hunter::random(rng, WORLD_HALF, i as u64))
+                .collect(),
+            hunter_attacks_gen: 0,
             mating_radius,
             max_population,
             bench_timings: PhaseTimings::default(),
@@ -351,6 +365,16 @@ impl World {
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
+            // Sprint 71: hunters nejsou v checkpointu — re-spawnou se fresh.
+            // Hunter je transient world entity, ne pod selekcí, takže ztráta
+            // pozic při loadu nemá selection signal.
+            hunters: {
+                let mut rng = StdRng::seed_from_u64(chk.mating_radius as u64);
+                (0..HUNTER_TARGET_COUNT)
+                    .map(|i| Hunter::random(&mut rng, WORLD_HALF, i as u64))
+                    .collect()
+            },
+            hunter_attacks_gen: 0,
             mating_radius: chk.mating_radius,
             max_population: chk.max_population,
             bench_timings: PhaseTimings::default(),
@@ -389,6 +413,7 @@ impl World {
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
         timed!(predate, self.predate());
+        timed!(hunt, self.hunt(rng, dt));
         timed!(eat_food, self.eat_food());
         timed!(spawn_food, self.spawn_food(rng));
         timed!(reproduce, self.reproduce(rng));
@@ -1452,6 +1477,43 @@ impl World {
         }
     }
 
+    /// Sprint 71: macropredator phase. Per Hunter: najdi nejbližší attackable
+    /// cell (vision range, n_bonds < threshold), pohni se k němu, pokud je
+    /// v attack range → action damage. Pokud nikdo není attackable (clustery
+    /// dominují, nebo cells utekly), random drift. Hunters sami nemají brain
+    /// ani genome — selekce běží jen na cells, ne na hunters.
+    ///
+    /// Two-pass kvůli borrow checkeru: pass 1 sbírá (cell_idx, damage) do
+    /// scratch Vec během iterace `&mut self.hunters`, pass 2 apply mutace na
+    /// `self.cells` po uvolnění hunter borrow.
+    fn hunt(&mut self, rng: &mut impl Rng, dt: f32) {
+        let attack_r2 = HUNTER_ATTACK_RADIUS * HUNTER_ATTACK_RADIUS;
+        let cells_ref = &self.cells;
+        let mut attacks: Vec<(usize, f32)> = Vec::new();
+        for hunter in &mut self.hunters {
+            let target_idx = nearest_attackable_cell(hunter.position, cells_ref, WORLD_HALF);
+            let target_pos = target_idx.map(|i| cells_ref[i].position);
+            hunter.step(target_pos, rng, dt, WORLD_HALF);
+            if let Some(i) = target_idx {
+                let d = bioscape::min_image_delta(
+                    hunter.position,
+                    cells_ref[i].position,
+                    WORLD_HALF,
+                );
+                let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                if d2 < attack_r2 {
+                    attacks.push((i, HUNTER_DAMAGE_PER_TICK * dt));
+                }
+            }
+        }
+        self.hunter_attacks_gen += attacks.len() as u64;
+        for (i, damage) in attacks {
+            let cell = &mut self.cells[i];
+            cell.energy -= damage;
+            cell.damage_accum += damage;
+        }
+    }
+
     fn eat_food(&mut self) {
         // Sprint 43: food_grid lookup místo full sweep.
         // Sprint 57: 3-pass paralelizace. Pass 1 paralelně vybere candidate
@@ -1805,9 +1867,12 @@ const EDGE_FRAC_THRESHOLD: f32 = 0.9;
 fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let n = world.cells.len();
     if n == 0 {
+        // 47 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
+        // + 3 birth/death + 1 atk_emit 0 + predation + 6 brain/density 0 + 2
+        // bonds + 6 bond/adhesion 0 + 2 hunter + 1 immune_frac 0.
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,{},{},0,0,0,0,0,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -1817,6 +1882,8 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
             world.predation_events_gen,
             world.bonds_formed_gen,
             world.bonds_broken_gen,
+            world.hunter_attacks_gen,
+            world.hunters.len(),
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -1850,6 +1917,9 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let mut bond_signal_sum = 0.0_f64;
     let mut total_bonds = 0_u64;
     let mut bonded_cells = 0_u64;
+    // Sprint 71: cells s ≥ HUNTER_BOND_IMMUNITY_THRESHOLD bondů — immune
+    // proti hunteru. Pop-level metric pro „kolik populace dosáhlo proto-tissue".
+    let mut immune_cells = 0_u64;
     let mut adhesion_hist = [0_u64; bioscape::ADHESION_TYPE_COUNT as usize];
     // Sprint 68: gene-level diagnostics — mean of bond_stiffness / bond_damping
     // přes celou populaci. Porovnáním s initial draw centerem (BOND_STIFFNESS=4.0,
@@ -1926,6 +1996,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         total_bonds += cell_bonds;
         if cell_bonds > 0 {
             bonded_cells += 1;
+        }
+        // Sprint 71: hunter-immune cells (≥3 bondy → cluster „too big to swallow").
+        if cell_bonds >= bioscape::HUNTER_BOND_IMMUNITY_THRESHOLD as u64 {
+            immune_cells += 1;
         }
         let t_idx = (c.genome.adhesion_type as usize) % adhesion_hist.len();
         adhesion_hist[t_idx] += 1;
@@ -2024,9 +2098,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     } else {
         0.0
     };
+    let immune_f = immune_cells as f64 / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -2073,6 +2148,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // Sprint 68 gene means.
         bond_stiff_m,
         bond_damp_m,
+        // Sprint 71 hunter diagnostics.
+        world.hunter_attacks_gen,
+        world.hunters.len(),
+        immune_f,
     )
 }
 
@@ -2262,7 +2341,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();
@@ -2325,6 +2404,7 @@ fn main() {
                 dump("apply_hazards", t.apply_hazards);
                 dump("resolve_collisions", t.resolve_collisions);
                 dump("predate", t.predate);
+                dump("hunt", t.hunt);
                 dump("eat_food", t.eat_food);
                 dump("spawn_food", t.spawn_food);
                 dump("reproduce", t.reproduce);
@@ -2338,6 +2418,8 @@ fn main() {
             // Sprint 66: bond formation/break per-gen counters.
             world.bonds_formed_gen = 0;
             world.bonds_broken_gen = 0;
+            // Sprint 71: hunter attack counter.
+            world.hunter_attacks_gen = 0;
         }
         if world.cells.is_empty() {
             eprintln!("extinction at gen {}", world.clock.generation);
