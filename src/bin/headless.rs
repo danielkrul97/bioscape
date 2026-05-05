@@ -845,6 +845,8 @@ impl World {
         let food_grid = &self.food_grid;
         let smell = &self.smell;
         let pheromone = &self.pheromone;
+        let tick = self.clock.tick;
+        let gen = self.clock.generation;
 
         // Phase 1: par_iter_mut nad cells — sensor gather, populate inputs,
         // apply_shell_absorb. Vrací inputs[N] pro GPU dispatch.
@@ -902,12 +904,15 @@ impl World {
                 let pos_xyz = [pos[0], pos[1], pos[2]];
                 let smell_grad = smell.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
                 let pheromone_grad = pheromone.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+                let temperature_local =
+                    bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
                 let sensors = bioscape::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
                     neighbors_in_vision,
                     smell_grad,
                     pheromone_grad,
+                    temperature_local,
                 };
                 cell.apply_shell_absorb(dt);
                 bioscape::populate_brain_inputs(cell, &sensors, vision_r)
@@ -963,6 +968,8 @@ impl World {
         let food_grid = &self.food_grid;
         let smell = &self.smell;
         let pheromone = &self.pheromone;
+        let tick = self.clock.tick;
+        let gen = self.clock.generation;
 
         self.cells
             .par_iter_mut()
@@ -1017,12 +1024,15 @@ impl World {
                 let pos_xyz = [pos[0], pos[1], pos[2]];
                 let smell_grad = smell.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
                 let pheromone_grad = pheromone.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+                let temperature_local =
+                    bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
                 let sensors = bioscape::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
                     neighbors_in_vision,
                     smell_grad,
                     pheromone_grad,
+                    temperature_local,
                 };
 
                 cell.apply_shell_absorb(dt);
@@ -1955,14 +1965,14 @@ const EDGE_FRAC_THRESHOLD: f32 = 0.9;
 fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let n = world.cells.len();
     if n == 0 {
-        // 53 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
+        // 55 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
         // + 3 birth/death + 1 atk_emit 0 + predation + 6 brain/density 0 + 2
         // bonds + 6 bond/adhesion 0 + 2 hunter + 1 immune_frac 0 +
         // 3 cell_state 0 (Sprint 80) + 2 vision_fov 0 (Sprint 83) +
-        // 1 thermal 0 (Sprint 85).
+        // 1 thermal 0 (Sprint 85) + 2 thermal_optimum 0 (Sprint 87).
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2032,6 +2042,12 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     // posun směrem k THERMAL_BOTTOM (~4) = populace migrovala ke dnu (cold,
     // pomalý metabolism), posun k THERMAL_TOP (~30) = surface dwellers.
     let mut temp_sum = 0.0_f64;
+    // Sprint 87: thermal_optimum gen statistics. Mean + std → speciation
+    // ukazuje, jak se populace rozčlenila mezi cold-prefer / warm-prefer
+    // fenotypy. Gen 0 mean ≈ (BOTTOM+TOP)/2 = 17 (uniform init), std ≈ 7.5
+    // (uniform sigma).
+    let mut topt_sum = 0.0_f64;
+    let mut topt_sumsq = 0.0_f64;
     let current_gen = world.clock.generation;
     for c in &world.cells {
         let s = c.genome.max_speed as f64;
@@ -2063,6 +2079,9 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
             world.clock.tick,
             world.clock.generation,
         ) as f64;
+        let topt = c.genome.thermal_optimum as f64;
+        topt_sum += topt;
+        topt_sumsq += topt * topt;
         if spk > spk_max {
             spk_max = spk;
         }
@@ -2191,6 +2210,9 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let fov_d = ((fov_sumsq / nf) - fov_m * fov_m).max(0.0).sqrt();
     // Sprint 85 thermal niche — mean teplota.
     let temp_m = temp_sum / nf;
+    // Sprint 87 thermal_optimum gen.
+    let topt_m = topt_sum / nf;
+    let topt_d = ((topt_sumsq / nf) - topt_m * topt_m).max(0.0).sqrt();
     // Sprint 29 spatial clustering metric: mean nearest-neighbor distance.
     // Sprint 43: grid lookup s expanding radius. Začni na GRID_CELL_SIZE (=64),
     // pokud nikdo není, double až po WORLD diagonal — typický nn dist je < 50,
@@ -2235,7 +2257,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let immune_f = immune_cells as f64 / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -2295,6 +2317,9 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         fov_d,
         // Sprint 85 thermal niche.
         temp_m,
+        // Sprint 87 thermal_optimum gen.
+        topt_m,
+        topt_d,
     )
 }
 
@@ -2484,7 +2509,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();

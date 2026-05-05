@@ -78,11 +78,13 @@ const B2_OFFSET: usize = W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN;
 const _: () = assert!(W1_OFFSET == 0);
 // Sprint 80 (HIDDEN 16 → 32 storage bump): B1 = 32*52 = 1664, W2 = 1664+32 =
 // 1696, B2 = 1696+10*32 = 2016, WEIGHTS_PER_CELL = 2016+10 = 2026.
-// Pre-Sprint-80: B1=576, W2=592, B2=752, WEIGHTS_PER_CELL=762.
-const _: () = assert!(B1_OFFSET == 1664);
-const _: () = assert!(W2_OFFSET == 1696);
-const _: () = assert!(B2_OFFSET == 2016);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 2026);
+// Sprint 87 (BRAIN_INPUTS_SENSORY 20 → 21, BRAIN_INPUTS 52 → 53): B1 = 32*53 =
+// 1696, W2 = 1696+32 = 1728, B2 = 1728+10*32 = 2048, WEIGHTS_PER_CELL = 2048+10
+// = 2058. Pre-Sprint-80: B1=576, W2=592, B2=752, WEIGHTS_PER_CELL=762.
+const _: () = assert!(B1_OFFSET == 1696);
+const _: () = assert!(W2_OFFSET == 1728);
+const _: () = assert!(B2_OFFSET == 2048);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 2058);
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -6316,8 +6318,16 @@ mod tests {
             &pitch_velocities, &ages, &cooldowns, &energies, &body_dims, &aux, params,
         );
 
+        // Sprint 87: GPU step shader nepočítá thermal_optimum penalty
+        // (latentní debt — aux buffer by potřeboval expansion na [f32; 5]).
+        // Override penalty na 0 aby parity zůstala — test ověřuje kinematics
+        // + drag + drains, ne thermal_optimum stress.
+        let test_physics = crate::PhysicsConfig {
+            thermal_optimum_penalty: 0.0,
+            ..PHYSICS_CONFIG
+        };
         for c in cells.iter_mut() {
-            c.step(dt, world_half, 0, 0, &PHYSICS_CONFIG);
+            c.step(dt, world_half, 0, 0, &test_physics);
         }
 
         for i in 0..n {

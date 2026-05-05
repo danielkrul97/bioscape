@@ -305,7 +305,119 @@ sebou, kterou cells mohou flank-uniknout.
   - Climate trend (monotonic warming) — open-ended evolution stress test.
   - Per-cell `thermal_optimum` gen.
 
-## Sprinty 87+ — open-ended
+## Sprint 87 — thermal awareness (sensor input + optimum gene)
+
+- **Cíl:** dát buňkám "thermometer" — pre-Sprint-87 cells žily v thermal
+  prostředí ale neměly k němu sensory access. Selekce probíhala pomalu
+  čistě behaviorálně přes diferenciální energy drain (= „survive longer
+  in cold zones"). Sprint 87 přidává (1) per-cell `temperature_local`
+  brain input — cells "vidí" svou aktuální teplotu, mohou na ni reagovat
+  v rámci života; (2) per-cell `thermal_optimum` gen — preferovaná
+  teplota, drain kvadraticky penalizuje deviation. Společně tvoří
+  thermal niche framework: brain učí "kde mě bolí", genom evolvuje
+  "kde se cítím dobře".
+
+- **Mechanismus:**
+  - **Konstanty (`src/lib.rs`):** `MIN_THERMAL_OPTIMUM = THERMAL_BOTTOM`
+    (4), `MAX_THERMAL_OPTIMUM = THERMAL_TOP` (30), `THERMAL_OPTIMUM_PENALTY
+    = 1.0` (peak penalty/sec při |dev|/13 = 1.0, comparable s body cost).
+  - **Genome:** `thermal_optimum: f32` ∈ [4, 30]. Init populace uniform
+    random across range → speciation potential. Mutate gaussian s
+    `sigma_thermal_optimum = 0.5` (~1.9 % range/gen) + clamp. Crossover
+    standard bool draw.
+  - **PhysicsConfig:** `thermal_optimum_penalty: f32` (default = const
+    1.0). Tests + GPU parity override na 0.0 pro disable.
+  - **Penalty drain (`apply_energy_costs`):** `((temp − optimum) / 13)² ×
+    penalty × dt`. Independent of metabolism (thermal stress = extra
+    cost, ne reduced enzyme rate). Cell s matching optimum platí 0;
+    extreme deviation ~1.0/sec.
+  - **Brain input slot 20:** `tanh((temp − REF) / 10)` ∈ [-1, +1]. Q10-
+    aware škálování — REF→0, TOP→+0.86, BOTTOM→−0.86. Diurnal/seasonal
+    swings mohou krátkodobě saturovat k ±1.
+  - **`BRAIN_INPUTS_SENSORY: 20 → 21`**, `BRAIN_INPUTS: 52 → 53`. Breaking
+    change — w1 matice resize, all brain weights re-randomized při
+    `Genome::random`.
+  - **`BrainSensors`:** + field `temperature_local: f32` (caller spočítá
+    z pos[2] + clock).
+
+- **Sensor gather (CPU):** main.rs `cells_brain_act` přebírá `Res<Clock>`,
+  počítá `temperature_at_z(pos[2], world_half, tick, gen)` per cell před
+  `populate_brain_inputs`. Headless `brain_act` + `brain_act_gpu` Phase 1
+  capture `self.clock.tick/generation` před par_iter, computes per cell.
+
+- **GPU shader updates:**
+  - `brain_forward.wgsl` + `hebbian.wgsl`: hardcoded constants update
+    (`BRAIN_INPUTS = 53u`, B1_OFFSET=1696u, W2_OFFSET=1728u, B2_OFFSET=2048u,
+    `WEIGHTS_PER_CELL = 2058u`). Compile-time asserts v `gpu.rs` updated.
+  - **`step.wgsl` thermal_optimum penalty: latentní debt** — aux buffer
+    `[f32; 4]` by potřeboval expand na `[f32; 5]` pro per-cell optimum.
+    Out-of-scope. Parity test (`step_gpu_matches_cpu`) override `physics.thermal_optimum_penalty
+    = 0.0` aby se vyhne CPU↔GPU drift.
+  - **`populate_inputs.wgsl` slot 20: latentní debt** — GPU shader nemá
+    positions binding (12 bindings cap), nemůže spočítat thermal. Init
+    loop zeroes all inputs, takže slot 20 = 0 v `--gpu-full` mode. Cells
+    v `--gpu-full` mají thermal weights v brain (slot 20 column existuje),
+    ale input vždy 0 → effectively zero contribution. Default headless
+    (CPU-only) je unaffected.
+
+- **CSV diagnostika (`headless.rs`):** přidány 2 sloupce `topt_avg`, `topt_dev`
+  (53 → 55 total). Speciation tracking: gen 0 bude wide (uniform init,
+  std ~7.5), narrowing přes selection.
+
+- **Smoke (seed=0, 60 gen):**
+  - Gen 0: `topt_avg=17.66`, `topt_dev=7.66` (uniform random init).
+  - Gen 30: `topt_avg=16.80`, `topt_dev=4.17` (selection narrows).
+  - Gen 60: `topt_avg=14.91`, `topt_dev=2.51` — population convergence
+    k stabilizing-selection optimum mírně pod REF=17. **Bez bimodální
+    speciace** (cold-prefer × warm-prefer split): seasonal cycle homogenizes
+    populace — extrémní optima umírají v opačné půlce roku, mid-range
+    survives. Přesně očekávaný outcome ve well-mixed environment bez
+    barrier proti migraci.
+  - `temp_avg` paralelně sleduje seasonal cycle (gen 35-40 winter trough
+    6.0, gen 60 recovery 10.8).
+  - `fov_avg` 3.14 → 2.86 (FOV evolution unchanged).
+  - Pop stabilní (200 → 521).
+
+- **Determinismus:** Sprint 87 = nový baseline kvůli BRAIN_INPUTS shape
+  change (52 → 53) — `Brain::random` produces different weights per
+  identical seed. Tato breaking change ekonomicky nevyhnutelná pro nový
+  sensory slot. Žádné nové RNG draws v `apply_energy_costs` (deterministic
+  Q10 + penalty math).
+
+- **Test suite:** 124/124 pass (121 z S86 + 3 nové: `thermal_optimum_random_in_range`,
+  `apply_energy_costs_thermal_stress_quadratic`,
+  `populate_brain_inputs_writes_temperature_slot`). `mutation_keeps_genes_in_valid_ranges`
+  + `crossover_picks_genes_from_either_parent` rozšířeny. GPU parity test
+  passuje s thermal_optimum_penalty=0 override.
+
+- **Výstup:**
+  - `src/lib.rs`: 3 nové konstanty, BRAIN_INPUTS_SENSORY 20→21,
+    `thermal_optimum` field na Genome, `sigma_thermal_optimum` na MutationConfig,
+    `thermal_optimum_penalty` na PhysicsConfig, `temperature_local` na
+    BrainSensors, populate_brain_inputs slot 20, apply_energy_costs penalty,
+    3 nové tests, 6 literal callsites updated.
+  - `src/main.rs`: `cells_brain_act` přebírá `Res<Clock>`, propaguje tick/gen
+    do gather closure, vytváří `temperature_local` per cell.
+  - `src/bin/headless.rs`: 2 sensor gather sites (CPU + GPU Phase 1)
+    capture self.clock.tick/gen, vytváří `temperature_local`. CSV header
+    + extinction-row + writeln rozšířen o `topt_avg`/`topt_dev`.
+  - `src/gpu.rs`: BRAIN offsety asserts updated (1696/1728/2048/2058),
+    parity test override `thermal_optimum_penalty = 0`.
+  - `shaders/brain_forward.wgsl`, `shaders/hebbian.wgsl`: BRAIN_INPUTS=53u
+    + offsets update.
+  - `benches/headless_phases.rs`: BrainSensors literal +temperature_local field.
+
+- **Co Sprint 87 NEŘEŠÍ (S88+):**
+  - GPU step.wgsl thermal_optimum penalty (latentní debt, aux buffer
+    expansion).
+  - GPU populate_inputs.wgsl slot 20 (latentní debt, positions binding).
+  - Spatial barrier (z-discontinuity) proti homogenizaci. Bez něj
+    seasonal cycle drives populace k mid-temp optimum místo speciace.
+  - Photic stratification (light gradient + photoreceptor sensor).
+  - Brain output „active gaze".
+  - Multiple eyes.
+
+## Sprinty 88+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud

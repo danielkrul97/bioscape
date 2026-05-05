@@ -4,10 +4,10 @@
 // Vstupy (binding 1): N × BRAIN_INPUTS f32, AoS po cells.
 // Váhy (binding 2): N × WEIGHTS_PER_CELL f32, AoS po cells. Per-cell layout
 // (Sprint 80 storage bump HIDDEN 16→32):
-//   [0..1664)    w1 row-major (HIDDEN rows × INPUTS cols)
-//   [1664..1696) b1
-//   [1696..2016) w2 row-major (OUTPUTS rows × HIDDEN cols)
-//   [2016..2026) b2
+//   [0..1696)    w1 row-major (HIDDEN rows × INPUTS cols)
+//   [1696..1728) b1
+//   [1728..2048) w2 row-major (OUTPUTS rows × HIDDEN cols)
+//   [2048..2058) b2
 // Hidden (binding 3): N × BRAIN_HIDDEN f32, write-back.
 // Outputs (binding 4): N × BRAIN_OUTPUTS f32, write-back.
 // Per-cell active hidden count (`Brain.hidden_n`) je pro shader IRRELEVANT —
@@ -15,14 +15,14 @@
 // hidden / output. Pre-Sprint-80 cells (hidden_n=16) produkují identický
 // výstup pre a post bump.
 
-const BRAIN_INPUTS: u32 = 52u;       // 20 sensory + 32 recurrent (= BRAIN_HIDDEN)
+const BRAIN_INPUTS: u32 = 53u;       // Sprint 87: 21 sensory + 32 recurrent (slot 20 = thermal_local)
 const BRAIN_HIDDEN: u32 = 32u;       // Sprint 80: 16 → 32 storage cap
 const BRAIN_OUTPUTS: u32 = 10u;      // Sprint 66: +1 (bond signal output[9])
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 1664u;        // BRAIN_HIDDEN * BRAIN_INPUTS = 32*52
-const W2_OFFSET: u32 = 1696u;        // B1 + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 2016u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN = 1696+10*32
-const WEIGHTS_PER_CELL: u32 = 2026u; // B2 + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 1696u;        // Sprint 87: BRAIN_HIDDEN * BRAIN_INPUTS = 32*53
+const W2_OFFSET: u32 = 1728u;        // B1 + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 2048u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN = 1728+10*32
+const WEIGHTS_PER_CELL: u32 = 2058u; // B2 + BRAIN_OUTPUTS
 
 struct Params {
     num_cells: u32,

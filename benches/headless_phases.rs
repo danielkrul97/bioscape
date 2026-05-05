@@ -180,6 +180,7 @@ fn bench_populate_brain_inputs(c: &mut Criterion) {
         neighbors_in_vision: 5,
         smell_grad: [0.1, -0.2, 0.05],
         pheromone_grad: [0.0, 0.1, -0.05],
+        temperature_local: 17.0,
     };
     for n in [1000usize] {
         group.throughput(Throughput::Elements(n as u64));

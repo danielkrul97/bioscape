@@ -51,7 +51,11 @@ pub const INITIAL_ENERGY: f32 = 100.0;
 // Sprint 28 přidává recurrent kanál: indexy [BRAIN_INPUTS_SENSORY..BRAIN_INPUTS]
 // = previous tick `last_hidden` activations (Elman RNN). Genom drží sjednocený
 // `w1` matrix 28×8, mutace + Hebbian pracují bez rozlišení sensory vs recurrent.
-pub const BRAIN_INPUTS_SENSORY: usize = 20;
+// Sprint 87: 20 → 21 — slot 20 = `temperature_local`. Brain inputs šířka
+// shiftne 52 → 53 (sensory + recurrent). Breaking change pre-S87 baseline:
+// w1 matice resize, GPU shader hardcoded constants update (brain_forward.wgsl,
+// hebbian.wgsl), all brain weights re-randomized při Genome::random.
+pub const BRAIN_INPUTS_SENSORY: usize = 21;
 // Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
 // hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
 // w1 z 28×8=224 na 36×16=576 weights (2.6×).
@@ -204,6 +208,19 @@ pub const THERMAL_DIURNAL_PERIOD_TICKS: u64 = TICKS_PER_GENERATION;
 /// season = abundant food (summer), cold season = scarce food (winter).
 /// Coupling vytváří přírodní seasonal niche shift.
 pub const THERMAL_SEASONAL_AMP: f32 = 4.0;
+/// Sprint 87: range pro per-cell `thermal_optimum` gen. Init populace draws
+/// uniform across [MIN, MAX] = [BOTTOM, TOP] → speciace mezi cold-prefer
+/// a warm-prefer fenotypy. Range matches static gradient endpoints — cells
+/// nemůžou preferovat teplotu mimo dostupný z-rozsah.
+pub const MIN_THERMAL_OPTIMUM: f32 = THERMAL_BOTTOM;
+pub const MAX_THERMAL_OPTIMUM: f32 = THERMAL_TOP;
+/// Sprint 87: peak penalty rate při |dev|/13 = 1.0 (= max single-direction
+/// deviation v [BOTTOM, TOP] od optima blízko opačného konce). Quadratic
+/// penalty: `((temp - opt) / 13.0)² × PENALTY × dt`. Při PENALTY = 1.0:
+/// extreme-deviation cell platí ~1.0 energy/sec navíc — comparable s body
+/// maintenance cost. Independentní od metabolism factor (thermal stress je
+/// extra cost, ne reduction enzymové aktivity).
+pub const THERMAL_OPTIMUM_PENALTY: f32 = 1.0;
 /// Sprint 31 spatial clustering: rejection sampling síla. Per uniformně
 /// vzorkovaný food candidate je pravděpodobnost zamítnutí
 /// `STRENGTH × (1 - richness)`. Při richness=1 (rich zone) nikdy nezamítá,
@@ -816,6 +833,10 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // Pomalejší než tělesné geny aby evoluce stihla najít optimum bez random
     // walku do MIN_VISION_FOV.
     sigma_vision_fov: 0.05,
+    // Sprint 87: thermal_optimum drift. 0.5 sim-units / gen ≈ 1.9 % range
+    // (range = 26 sim-units = TOP - BOTTOM). Pomalý drift aby selekce stihla
+    // tlumit speciaci do depth-coupled niche, ne random walk.
+    sigma_thermal_optimum: 0.5,
 };
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     drag: DRAG_COEFFICIENT,
@@ -824,6 +845,7 @@ pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     angular_energy_cost: ANGULAR_ENERGY_COST,
     vision_cost_per_radius: VISION_COST_PER_RADIUS,
     body_cost_factor: BODY_COST_FACTOR,
+    thermal_optimum_penalty: THERMAL_OPTIMUM_PENALTY,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1146,6 +1168,10 @@ pub struct MutationConfig {
     /// platí minimální vision cost — selekční trade-off vstoupí v platnost
     /// až s aktivním cone filterem.
     pub sigma_vision_fov: f32,
+    /// Sprint 87: gaussian sigma pro `thermal_optimum` mutaci. ~0.5 sim-units
+    /// (~1.9 % range per gen) — pomalý drift relative k init populace
+    /// uniform ∈ [BOTTOM, TOP], nechává selekci tlumit speciaci.
+    pub sigma_thermal_optimum: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1177,7 +1203,17 @@ pub struct Genome {
     /// energy cost už v Sprint 82 škáluje s `vision_fov_factor(theta)`.
     #[serde(default = "default_vision_fov")]
     pub vision_fov: f32,
+    /// Sprint 87: per-cell preferovaná teplota (sim units, range
+    /// `[MIN_THERMAL_OPTIMUM, MAX_THERMAL_OPTIMUM]`). Cell platí kvadratický
+    /// penalty drain za |temp − optimum|. Init populace random uniform
+    /// across range → speciace mezi cold-prefer / warm-prefer fenotypy.
+    #[serde(default = "default_thermal_optimum")]
+    pub thermal_optimum: f32,
     pub brain: Brain,
+}
+
+fn default_thermal_optimum() -> f32 {
+    THERMAL_REF_TEMP
 }
 
 fn default_vision_fov() -> f32 {
@@ -1214,6 +1250,10 @@ impl Genome {
             // kompletně omnidirectional. Cost faktor = 1.0, behavior matches
             // pre-Sprint-82 baseline až do prvního sigma_vision_fov > 0 sprintu.
             vision_fov: INITIAL_VISION_FOV,
+            // Sprint 87: random uniform across [BOTTOM, TOP] — initial speciace.
+            // RNG draw je breaking change pro Sprint 86 baseline (BRAIN_INPUTS
+            // shape change už CSV reproducibility ztratila).
+            thermal_optimum: rng.random_range(MIN_THERMAL_OPTIMUM..MAX_THERMAL_OPTIMUM),
             brain: Brain::random(rng),
         }
     }
@@ -1265,6 +1305,14 @@ impl Genome {
             } else {
                 self.vision_fov
             },
+            // Sprint 87: stejný short-circuit pattern. Při sigma=0 mutace
+            // přeskočí gaussian draw → cell drží initial uniform draw.
+            thermal_optimum: if cfg.sigma_thermal_optimum > 0.0 {
+                (self.thermal_optimum + gaussian(rng) * cfg.sigma_thermal_optimum)
+                    .clamp(MIN_THERMAL_OPTIMUM, MAX_THERMAL_OPTIMUM)
+            } else {
+                self.thermal_optimum
+            },
             brain: {
                 let mut b = self.brain.mutate(rng, cfg.sigma_brain);
                 // Sprint 80 Sprint C: structural mutace. Default rate=0.0 →
@@ -1310,6 +1358,14 @@ impl Genome {
             } else {
                 b.vision_fov
             },
+            // Sprint 87: standard bool crossover. Init populace má unikátní
+            // optima (uniform random per cell) → values divergují hned od
+            // gen 0, bool draw aktivní vždy.
+            thermal_optimum: if rng.random::<bool>() {
+                a.thermal_optimum
+            } else {
+                b.thermal_optimum
+            },
             brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
     }
@@ -1333,6 +1389,11 @@ pub struct PhysicsConfig {
     pub angular_energy_cost: f32,
     pub vision_cost_per_radius: f32,
     pub body_cost_factor: f32,
+    /// Sprint 87: drain rate koeficient pro thermal_optimum penalty.
+    /// `dev² × penalty × dt` kde dev = (temp − optimum) / 13.0 (normalized
+    /// half-range). Default 1.0; tests mohou override 0.0 pro disable
+    /// (např. `step_gpu_matches_cpu` parita — GPU shader nepočítá penalty).
+    pub thermal_optimum_penalty: f32,
 }
 
 /// Runtime tělesný tvar buňky. Inicializuje se z `Genome` při spawnu /
@@ -1705,12 +1766,8 @@ impl Cell {
         generation: u64,
         physics: &PhysicsConfig,
     ) {
-        let metabolism = metabolism_factor(temperature_at_z(
-            self.position[2],
-            world_half,
-            tick,
-            generation,
-        ));
+        let temp = temperature_at_z(self.position[2], world_half, tick, generation);
+        let metabolism = metabolism_factor(temp);
         let dt_eff = dt * metabolism;
         // Sprint 33: v_mag_sq zahrnuje 3D (vz != 0 v Sprint 35+).
         let v_mag_sq =
@@ -1738,6 +1795,11 @@ impl Cell {
         // Sprint 27 attack maintenance: cost ∝ max(0, output[6]).
         let attack_strength = self.last_outputs[6].max(0.0);
         self.energy -= attack_strength * ATTACK_COST_PER_SEC * dt_eff;
+        // Sprint 87: thermal stress penalty. Quadratic na deviation od optima,
+        // independent metabolism (tepelný stres = extra cost, ne reduced rate).
+        // `dt`, ne `dt_eff` — penalty není Q10-modulated.
+        let dev = (temp - self.genome.thermal_optimum) / 13.0;
+        self.energy -= dev * dev * physics.thermal_optimum_penalty * dt;
     }
 
     /// Sprint 54: xy modulo wrap (toroidal cylinder topology), z bounce.
@@ -2094,6 +2156,11 @@ pub struct BrainSensors {
     pub neighbors_in_vision: u32,
     pub smell_grad: [f32; 3],
     pub pheromone_grad: [f32; 3],
+    /// Sprint 87: aktuální teplota na cell pozici (sim units, ne normalized).
+    /// Caller spočítá `temperature_at_z(pos[2], world_half, tick, gen)`.
+    /// `populate_brain_inputs` normalizuje přes `tanh((T − REF) / 10)` →
+    /// brain input [-1, 1] (Q10-aware škálování).
+    pub temperature_local: f32,
 }
 
 /// Sprint 40: jediný source of truth pro brain inputs layout. Pre-refactor byl
@@ -2143,6 +2210,11 @@ pub fn populate_brain_inputs(
     inputs[13] = (sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
     inputs[14] = (cell.damage_accum * DAMAGE_NORMALIZATION_GAIN).tanh();
     cell.damage_accum = 0.0;
+    // Sprint 87: thermal awareness, slot 20. Q10-aware tanh normalizace —
+    // (T - REF) / 10 dává tanh(±1.3) ≈ ±0.86 na endpoints [BOTTOM, TOP],
+    // tanh(0) = 0 na ref. Diurnal/seasonal posuny mohou krátkodobě saturovat
+    // k ±1, což je akceptovatelná oversaturace pro brain signal.
+    inputs[20] = ((sensors.temperature_local - THERMAL_REF_TEMP) / 10.0).tanh();
     inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
         .copy_from_slice(&cell.last_hidden[..BRAIN_RECURRENT]);
     inputs
@@ -2920,6 +2992,7 @@ mod tests {
             bond_stiffness: BOND_STIFFNESS,
             bond_damping: BOND_DAMPING,
             vision_fov: INITIAL_VISION_FOV,
+            thermal_optimum: THERMAL_REF_TEMP,
             brain: dummy_brain(),
         }
     }
@@ -2941,6 +3014,7 @@ mod tests {
             sigma_bond_damping: 0.0,
             add_neuron_rate: 0.0,
             sigma_vision_fov: 0.0,
+            sigma_thermal_optimum: 0.0,
         }
     }
 
@@ -2961,6 +3035,7 @@ mod tests {
             bond_stiffness: BOND_STIFFNESS,
             bond_damping: BOND_DAMPING,
             vision_fov: INITIAL_VISION_FOV,
+            thermal_optimum: THERMAL_REF_TEMP,
             brain: Brain {
                 hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
                 w1: [[1.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
@@ -3003,6 +3078,7 @@ mod tests {
             sigma_bond_damping: 10.0,
             add_neuron_rate: 0.0,
             sigma_vision_fov: 10.0,
+            sigma_thermal_optimum: 100.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -3015,6 +3091,7 @@ mod tests {
             assert!((MIN_BODY_WIDTH..=MAX_BODY_WIDTH).contains(&m.body_width));
             assert!((MIN_SPIKE_LENGTH..=MAX_SPIKE_LENGTH).contains(&m.spike_length));
             assert!((MIN_VISION_FOV..=MAX_VISION_FOV).contains(&m.vision_fov));
+            assert!((MIN_THERMAL_OPTIMUM..=MAX_THERMAL_OPTIMUM).contains(&m.thermal_optimum));
         }
     }
 
@@ -3209,6 +3286,106 @@ mod tests {
     }
 
     #[test]
+    fn thermal_optimum_random_in_range() {
+        // Sprint 87: Genome::random by měl init thermal_optimum uniform v range.
+        let mut rng = StdRng::seed_from_u64(0x7E0);
+        for _ in 0..100 {
+            let g = Genome::random(&mut rng);
+            assert!(
+                (MIN_THERMAL_OPTIMUM..=MAX_THERMAL_OPTIMUM).contains(&g.thermal_optimum),
+                "optimum {} out of range",
+                g.thermal_optimum
+            );
+        }
+    }
+
+    #[test]
+    fn apply_energy_costs_thermal_stress_quadratic() {
+        // Sprint 87: penalty kvadratický v |temp - optimum|. Cell s optimum
+        // matching local temp platí 0 penalty; cell s extreme deviation platí
+        // PENALTY × (dev/13)². Compare 3 cells: matched, half-deviation,
+        // extreme.
+        let half = [1000.0, 1000.0, 50.0];
+        let physics = PhysicsConfig {
+            drag: 0.0,
+            angular_drag: 0.0,
+            energy_cost_per_v_sq: 0.0,
+            angular_energy_cost: 0.0,
+            vision_cost_per_radius: 0.0,
+            body_cost_factor: 0.0,
+            thermal_optimum_penalty: 1.0,
+        };
+        // Cell at z=0 → temp = REF = 17. Optimum = 17 → no penalty.
+        let mut matched = base_cell();
+        matched.position = [0.0, 0.0, 0.0];
+        matched.genome.thermal_optimum = THERMAL_REF_TEMP;
+        matched.step(1.0, half, 0, 0, &physics);
+        let matched_drain = 100.0 - matched.energy;
+        assert!(matched_drain.abs() < 0.01, "matched drain {matched_drain}");
+        // Cell at z=0 (temp=17), optimum=4 (= BOTTOM, dev=13). penalty/sec =
+        // (13/13)² × 1.0 = 1.0.
+        let mut extreme = base_cell();
+        extreme.position = [0.0, 0.0, 0.0];
+        extreme.genome.thermal_optimum = MIN_THERMAL_OPTIMUM;
+        extreme.step(1.0, half, 0, 0, &physics);
+        let extreme_drain = 100.0 - extreme.energy;
+        assert!(
+            (extreme_drain - 1.0).abs() < 0.01,
+            "extreme drain {extreme_drain}"
+        );
+        // Cell at z=0, optimum = 17 + 6.5 = 23.5 (= half-deviation). penalty/sec
+        // = (6.5/13)² × 1.0 = 0.25.
+        let mut half_dev = base_cell();
+        half_dev.position = [0.0, 0.0, 0.0];
+        half_dev.genome.thermal_optimum = THERMAL_REF_TEMP + 6.5;
+        half_dev.step(1.0, half, 0, 0, &physics);
+        let half_dev_drain = 100.0 - half_dev.energy;
+        assert!(
+            (half_dev_drain - 0.25).abs() < 0.01,
+            "half-dev drain {half_dev_drain}"
+        );
+    }
+
+    #[test]
+    fn populate_brain_inputs_writes_temperature_slot() {
+        // Sprint 87: slot 20 = tanh((temp - REF) / 10).
+        let mut cell = base_cell();
+        let sensors = BrainSensors {
+            nearest_food: None,
+            nearest_cell: None,
+            neighbors_in_vision: 0,
+            smell_grad: [0.0; 3],
+            pheromone_grad: [0.0; 3],
+            temperature_local: THERMAL_REF_TEMP, // exact REF → tanh(0) = 0
+        };
+        let inputs = populate_brain_inputs(&mut cell, &sensors, 50.0);
+        assert!((inputs[20] - 0.0).abs() < 1e-4, "REF should be 0, got {}", inputs[20]);
+        // Test top temp.
+        let sensors_top = BrainSensors {
+            temperature_local: THERMAL_TOP,
+            ..sensors
+        };
+        let inputs_top = populate_brain_inputs(&mut cell, &sensors_top, 50.0);
+        // tanh(13/10) = tanh(1.3) ≈ 0.86
+        assert!(
+            (inputs_top[20] - 1.3_f32.tanh()).abs() < 1e-4,
+            "TOP got {}",
+            inputs_top[20]
+        );
+        // Test bottom temp.
+        let sensors_bot = BrainSensors {
+            temperature_local: THERMAL_BOTTOM,
+            ..sensors
+        };
+        let inputs_bot = populate_brain_inputs(&mut cell, &sensors_bot, 50.0);
+        assert!(
+            (inputs_bot[20] - (-1.3_f32).tanh()).abs() < 1e-4,
+            "BOTTOM got {}",
+            inputs_bot[20]
+        );
+    }
+
+    #[test]
     fn vision_fov_factor_endpoints() {
         // Full sphere (theta = π) → solid angle = 4π str → factor = 1.0.
         assert!((vision_fov_factor(MAX_VISION_FOV) - 1.0).abs() < 1e-6);
@@ -3292,6 +3469,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: vision_cost,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         }
     }
 
@@ -3384,6 +3562,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         };
         cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // |v| = 10, drag_dt = 0.01 × 10 × 1 = 0.1
@@ -3404,6 +3583,7 @@ mod tests {
             angular_energy_cost: 0.05,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         };
         cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // effective_radius²(=1) × ω²(=4) × angular_cost(=0.05) × dt(=1) = 0.2 drained
@@ -3425,6 +3605,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         };
         cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         assert!((cell.energy - 100.0).abs() < 1e-4, "got {}", cell.energy);
@@ -3443,6 +3624,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         };
         cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // angular_velocity *= (1 − 0.5 × 1) = 0.5 → 0.5
@@ -3488,6 +3670,7 @@ mod tests {
             bond_stiffness: 2.0,
             bond_damping: 0.3,
             vision_fov: MIN_VISION_FOV,
+            thermal_optimum: MIN_THERMAL_OPTIMUM,
             brain: dummy_brain(),
         };
         let b = Genome {
@@ -3504,6 +3687,7 @@ mod tests {
             bond_stiffness: 8.0,
             bond_damping: 1.0,
             vision_fov: MAX_VISION_FOV,
+            thermal_optimum: MAX_THERMAL_OPTIMUM,
             brain: dummy_brain(),
         };
         for _ in 0..100 {
@@ -3516,6 +3700,10 @@ mod tests {
             assert!(c.body_width == 0.6 || c.body_width == 1.4);
             assert!(c.spike_length == 0.0 || c.spike_length == 0.8);
             assert!(c.vision_fov == MIN_VISION_FOV || c.vision_fov == MAX_VISION_FOV);
+            assert!(
+                c.thermal_optimum == MIN_THERMAL_OPTIMUM
+                    || c.thermal_optimum == MAX_THERMAL_OPTIMUM
+            );
         }
     }
 
@@ -3816,6 +4004,7 @@ mod tests {
             sigma_bond_damping: 0.0,
             add_neuron_rate: 1.0,
             sigma_vision_fov: 0.0,
+            sigma_thermal_optimum: 0.0,
         };
         let mut current = g;
         // Iteruj N >= (BRAIN_HIDDEN - DEFAULT). Po naplnění capu se další
@@ -3963,6 +4152,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         };
         let make_cell = |vel: [f32; 3]| {
             let mut c = base_cell();
@@ -4002,6 +4192,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         };
         cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         assert!((cell.velocity[0] - 9.0).abs() < 1e-4);
@@ -4097,6 +4288,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         };
         cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // spike_length(=0.5) × SPIKE_COST_PER_SEC × dt(=1) = 0.15 drained
@@ -4232,6 +4424,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 0.0,
+            thermal_optimum_penalty: 0.0,
         };
         cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         let expected_drain = 1.0 * SHELL_COST_PER_SEC;
@@ -4263,6 +4456,7 @@ mod tests {
             sigma_bond_damping: 0.0,
             add_neuron_rate: 0.0,
             sigma_vision_fov: 0.0,
+            sigma_thermal_optimum: 0.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -4283,6 +4477,7 @@ mod tests {
             angular_energy_cost: 0.0,
             vision_cost_per_radius: 0.0,
             body_cost_factor: 1.0,
+            thermal_optimum_penalty: 0.0,
         };
         // Cell at age 0 → factor 1.0, drain = volume = 1.
         let mut young = base_cell();

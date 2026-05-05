@@ -1051,6 +1051,7 @@ fn cells_brain_act(
     smell: Res<SmellResource>,
     pheromone: Res<PheromoneResource>,
     slot_map: Res<CellSlotMap>,
+    clock: Res<Clock>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut diag: Diagnostics,
@@ -1058,6 +1059,11 @@ fn cells_brain_act(
     let _t_total = Instant::now();
     let dt = time.delta_secs();
     diag.add_measurement(&DIAG_CELL_COUNT, || cells.iter().count() as f64);
+
+    // Sprint 87: clock pro thermal_local sensor. Capture u64 mimo closure aby
+    // kopie šly do Bevy threadu bez dalšího `Clock` borrow.
+    let tick = clock.0.tick;
+    let gen = clock.0.generation;
 
     // Sprint 52: helper closure pro per-cell sensor gather + populate_brain_inputs.
     // Reused jak v CPU tak GPU path. Takes &mut Cell + Entity, vrací inputs[36].
@@ -1112,12 +1118,14 @@ fn cells_brain_act(
         let pos_xyz = [pos[0], pos[1], pos[2]];
         let smell_grad = smell.0.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
         let pheromone_grad = pheromone.0.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+        let temperature_local = bioscape::temperature_at_z(pos[2], SIMULATION_HALF, tick, gen);
         let sensors = bioscape::BrainSensors {
             nearest_food,
             nearest_cell,
             neighbors_in_vision,
             smell_grad,
             pheromone_grad,
+            temperature_local,
         };
         cell.apply_shell_absorb(dt);
         bioscape::populate_brain_inputs(cell, &sensors, vision_r)
