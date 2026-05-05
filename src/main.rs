@@ -6,10 +6,11 @@ use bevy::diagnostic::{
 };
 use bevy::image::Image;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
-use bevy::pbr::{DistanceFog, FogFalloff};
+use bevy::pbr::{DistanceFog, ExtendedMaterial, FogFalloff, MaterialExtension};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat};
+use bevy::shader::ShaderRef;
 use bevy::render::view::Hdr;
 use std::time::Instant;
 
@@ -95,6 +96,49 @@ const CAMERA_PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
 /// Mouse drag → orbit angle delta. Tuned pro 1080p screen — full screen drag
 /// = ~π rotace.
 const ORBIT_SENSITIVITY: f32 = 0.005;
+
+/// Sprint 91: shader asset path pro `BioMaterialExt`. Loaded přes AssetServer
+/// při startu, hot-reload v dev mode.
+const BIO_SHADER_PATH: &str = "shaders/bio_material.wgsl";
+
+/// Sprint 91: shader-side struct GPU layout. `ShaderType` derive zajistí
+/// 16-byte alignment + matching layout s WGSL `BioParams`. `Reflect` je
+/// požadován protože owner `BioMaterialExt` taky derivuje Reflect.
+#[derive(ShaderType, Reflect, Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct BioParams {
+    pub pattern_kind: u32,
+    pub scale: f32,
+    pub intensity: f32,
+    pub _pad: f32,
+}
+
+/// Sprint 91: procedurální texture extension nad `StandardMaterial`. Single
+/// shader handles obě cell + hunter — `pattern_kind` field switchne mezi
+/// jelly membrane (0) a chitinous scales (1). Voronoi noise s world_normal
+/// jako texture coordinate → texture rotates s mesh.
+///
+/// Single `#[uniform(100)]` field s ShaderType-derived struct → AsBindGroup
+/// generuje 1 binding s celým struct uvnitř. (Multi-field same-binding by
+/// vyžadovalo bindless mode nebo specific webgl2 cfg.)
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+pub struct BioMaterialExt {
+    #[uniform(100)]
+    pub params: BioParams,
+}
+
+impl MaterialExtension for BioMaterialExt {
+    fn fragment_shader() -> ShaderRef {
+        BIO_SHADER_PATH.into()
+    }
+    fn deferred_fragment_shader() -> ShaderRef {
+        BIO_SHADER_PATH.into()
+    }
+}
+
+/// Sprint 91: alias pro extended material handle type. `MaterialPlugin`
+/// musí být registrován pro tento typ aby Bevy renderoval s naším shaderem.
+type BioMaterial = ExtendedMaterial<StandardMaterial, BioMaterialExt>;
 
 #[derive(Component)]
 struct CellEntity(Cell);
@@ -270,7 +314,7 @@ struct HunterMesh(Handle<Mesh>);
 
 #[derive(Resource)]
 #[allow(dead_code)]
-struct HunterMaterial(Handle<StandardMaterial>);
+struct HunterMaterial(Handle<BioMaterial>);
 
 /// Sprint 71: ECS component wrapping `Hunter` data pro renderer hot loop.
 #[derive(Component)]
@@ -287,7 +331,7 @@ struct HunterEntity(Hunter);
 /// užitečný pro fyzickou separaci, ale přebíjel adhesion clustering. Lineage
 /// info zůstává v HUD + CSV `lineages` count.
 #[derive(Resource, Default)]
-struct AdhesionMaterials([Option<Handle<StandardMaterial>>; 8]);
+struct AdhesionMaterials([Option<Handle<BioMaterial>>; 8]);
 
 /// Sprint 36 orbit camera state. Camera obíhá kolem `target` ve sférických
 /// souřadnicích (yaw + pitch). Distance camera→target je fixní
@@ -364,6 +408,10 @@ fn main() {
         }),
         ..default()
     }));
+    // Sprint 91: registrace ExtendedMaterial<StandardMaterial, BioMaterialExt>
+    // pipeline. Bez toho by Bevy nevěděl, jak rendrovat naše custom material
+    // (asset by se loadnul ale shader by se nezkompiloval).
+    app.add_plugins(MaterialPlugin::<BioMaterial>::default());
 
     if want_diag {
         app.add_plugins((
@@ -472,6 +520,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut bio_materials: ResMut<Assets<BioMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut adhesion_materials: ResMut<AdhesionMaterials>,
     mut window: Single<&mut Window>,
@@ -602,7 +651,7 @@ fn setup(
         let cell = Cell::random(&mut rng, half, i as u64, 0, i as u64);
         let mat = adhesion_material(
             &mut adhesion_materials,
-            &mut materials,
+            &mut bio_materials,
             cell.genome.adhesion_type,
         );
         let entity = commands
@@ -708,11 +757,23 @@ fn setup(
     // bloom redistribution. Brighter base 0.4 → 0.85 aby hunter byl viditelně
     // červený i bez bloom kontribuce (např. v post-process toggle off).
     let hunter_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS * 4.0).mesh().ico(2).unwrap());
-    let hunter_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.85, 0.05, 0.05),
-        perceptual_roughness: 0.4,
-        emissive: LinearRgba::new(3.5, 0.0, 0.0, 1.0),
-        ..default()
+    // Sprint 91: hunter ExtendedMaterial s chitinous-scales pattern (kind=1).
+    // Scale 14 = denser scales than cells; intensity 1.0.
+    let hunter_material = bio_materials.add(BioMaterial {
+        base: StandardMaterial {
+            base_color: Color::srgb(0.85, 0.05, 0.05),
+            perceptual_roughness: 0.4,
+            emissive: LinearRgba::new(3.5, 0.0, 0.0, 1.0),
+            ..default()
+        },
+        extension: BioMaterialExt {
+            params: BioParams {
+                pattern_kind: 1,
+                scale: 14.0,
+                intensity: 1.0,
+                _pad: 0.0,
+            },
+        },
     });
     // Sprint 89: každý hunter dostává random genome + lineage. Initial
     // population spawnuje se tady; Sprint 89+ lifecycle (death/reproduce)
@@ -750,9 +811,9 @@ fn setup(
 /// těla + barva bond lines = jednolitý vizuální chunk.
 fn adhesion_material(
     cache: &mut AdhesionMaterials,
-    materials: &mut Assets<StandardMaterial>,
+    bio_materials: &mut Assets<BioMaterial>,
     adhesion_type: u8,
-) -> Handle<StandardMaterial> {
+) -> Handle<BioMaterial> {
     let idx = (adhesion_type as usize) % 8;
     if let Some(h) = &cache.0[idx] {
         return h.clone();
@@ -760,22 +821,31 @@ fn adhesion_material(
     let hue = idx as f32 * (360.0 / 8.0);
     // Sprint 85: saturation 0.85 → 1.0 — sytější body color.
     // Sprint 88: emissive ∝ hue color. Pod HDR + Bloom cells „bioluminescent".
-    // Sprint 88.2: lightness 0.55 → 0.50 (deeper saturated feel), emissive
-    // multiplier 0.6 → 1.0 — emissive dominuje base color, hue se nepere
-    // s ambient tintem. Pod ACES tonemapper se cells stanou skutečně sytí.
+    // Sprint 91: ExtendedMaterial s pattern_kind=0 (jelly membrane). Voronoi
+    // procedural shader moduluje base_color + emissive na povrchu mesh.
     let color = Color::hsl(hue, 1.0, 0.50);
     let emissive_color = Color::hsl(hue, 1.0, 0.50);
     let emissive_linear = emissive_color.to_linear();
-    let handle = materials.add(StandardMaterial {
-        base_color: color,
-        emissive: LinearRgba::new(
-            emissive_linear.red * 1.0,
-            emissive_linear.green * 1.0,
-            emissive_linear.blue * 1.0,
-            1.0,
-        ),
-        perceptual_roughness: 0.5,
-        ..default()
+    let handle = bio_materials.add(BioMaterial {
+        base: StandardMaterial {
+            base_color: color,
+            emissive: LinearRgba::new(
+                emissive_linear.red,
+                emissive_linear.green,
+                emissive_linear.blue,
+                1.0,
+            ),
+            perceptual_roughness: 0.5,
+            ..default()
+        },
+        extension: BioMaterialExt {
+            params: BioParams {
+                pattern_kind: 0,
+                scale: 6.0,
+                intensity: 1.0,
+                _pad: 0.0,
+            },
+        },
     });
     cache.0[idx] = Some(handle.clone());
     handle
@@ -2081,7 +2151,7 @@ fn cell_reproduces_on_threshold(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     cell_mesh: Res<CellMesh>,
     mut adhesion_materials: ResMut<AdhesionMaterials>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut bio_materials: ResMut<Assets<BioMaterial>>,
     mut slot_map: ResMut<CellSlotMap>,
     mut next_cell_id: ResMut<NextCellId>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
@@ -2143,7 +2213,7 @@ fn cell_reproduces_on_threshold(
     for cell in to_spawn {
         let mat = adhesion_material(
             &mut adhesion_materials,
-            &mut materials,
+            &mut bio_materials,
             cell.genome.adhesion_type,
         );
         let entity = commands

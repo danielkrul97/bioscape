@@ -725,7 +725,86 @@ sebou, kterou cells mohou flank-uniknout.
   - **Higher MAX_POP** — 50 cap je tight, evolution stagnates rychle.
     Vyšší cap (100-200) by dovolil delší selekční signal před equilibrium.
 
-## Sprinty 91+ — open-ended
+## Sprint 91 — procedural bio-textures (cell + hunter)
+
+- **Cíl:** Sprint 88 atmospheric pass dal HDR + bloom + fog. Sprint 91 přidává
+  „sexy" surface detail — Voronoi-based procedural pattern přes `ExtendedMaterial<StandardMaterial,
+  BioMaterialExt>`. Single shader handles obě cell + hunter, parametrizováno
+  `pattern_kind` uniformem.
+
+- **Mechanismus:**
+  - **Shader (`assets/shaders/bio_material.wgsl`):** PBR pipeline reuse —
+    fragment override calls `pbr_input_from_standard_material`, then modifies
+    `pbr_input.material.{base_color, emissive, perceptual_roughness, metallic}`,
+    then calls `apply_pbr_lighting + main_pass_post_lighting_processing`.
+    Procedural coord = `world_normal × scale` (texture rotates s mesh, ne
+    drift při motion). 3D Voronoi (3-loop neighbor scan) → F1, F2 distances
+    → `edge = smoothstep(0.0, 0.2, F2 - F1)` (peaks na cell borders).
+  - **Pattern_kind 0 (CELL — jelly membrane):** bright Voronoi edges
+    (membrane web), dim cores (cytoplasm). Emissive boost +250% na edges →
+    bioluminescent border glow pod bloom. Roughness 0.3 (smooth) v core,
+    0.7 (rougher) na edges.
+  - **Pattern_kind 1 (HUNTER — chitinous scales):** inverse — dark edges
+    (between scales), bright centers (scale plates). Partial metallic 0.4
+    na edges → reflective armor look. Higher emissive na centers (2.5×).
+  - **Rust Material (`main.rs`):**
+    - `BioMaterialExt` struct s 4 uniforms na binding 100 (pattern_kind,
+      scale, intensity, _pad). `Asset + AsBindGroup + Reflect + Default`.
+    - `MaterialExtension` trait impl — `fragment_shader()` + `deferred_fragment_shader()`
+      vrátí `BIO_SHADER_PATH = "shaders/bio_material.wgsl"`.
+    - Type alias `BioMaterial = ExtendedMaterial<StandardMaterial, BioMaterialExt>`.
+    - `MaterialPlugin::<BioMaterial>::default()` registrován v App builderu.
+  - **Resource type changes:**
+    - `AdhesionMaterials([Option<Handle<StandardMaterial>>; 8])` → `Handle<BioMaterial>`.
+    - `HunterMaterial(Handle<StandardMaterial>)` → `Handle<BioMaterial>`.
+    - `setup` system + `cell_reproduces_on_threshold` přebírají `ResMut<Assets<BioMaterial>>`
+      navíc. `adhesion_material` function vrací `Handle<BioMaterial>`.
+  - **Shader scale tuning:** cell scale=6 (medium voronoi tiles na povrchu
+    sphere — viditelné membrane segments), hunter scale=14 (denser scales
+    pro chitinous look).
+
+- **Determinismus:** Pure visual change — žádný sim impact. Headless mode
+  (no renderer) unaffected. CSV/test suite preserved.
+
+- **Test suite:** 132/132 pass — žádná sim regression. `cargo check --bins
+  --benches` clean.
+
+- **NETESTOVÁNO vizuálně** — implementační agent nemá GUI access. User akce:
+  `cargo run --features dev` a vizuální ověření. Pokud:
+  - Shader compile error: Bevy 0.18 PBR shader naming conventions se mohly
+    změnit oproti starší verzi. Check `bevy_pbr-0.18.1/src/render/pbr_fragment.wgsl`
+    pro správné import paths.
+  - Pattern příliš noisy: snížit `scale` (cell 6 → 4, hunter 14 → 10).
+  - Pattern invisible: zvýšit `scale` nebo `intensity`.
+  - Edge brightness wrong: tweak `mix(0.4, 1.4, edge)` ranges v shaderu.
+  - Hunter scales vypadají flat: bump `metallic` mix range.
+  - Black artifacts: některé mesh edges nemají world_normal interpolated
+    správně — `Sphere::ico(2)` má 162 verts, hrubé na denser pattern; bump
+    `ico(3)` (642 verts) by pomohl.
+
+- **Výstup:**
+  - `assets/shaders/bio_material.wgsl`: nový procedural shader (~80 řádků,
+    Voronoi + PBR moduulace).
+  - `src/main.rs`: imports (ExtendedMaterial, MaterialExtension, AsBindGroup,
+    ShaderRef), `BioMaterialExt` struct, `BioMaterial` type alias,
+    `MaterialPlugin` registration, `AdhesionMaterials` + `HunterMaterial`
+    type changes, `setup` + `cell_reproduces_on_threshold` system signatures
+    (+ `ResMut<Assets<BioMaterial>>`), `adhesion_material` function rewrite,
+    hunter material spawn rewrite.
+
+- **Co Sprint 91 NEŘEŠÍ (S92+):**
+  - **Time-animated patterns** — current shader je statický (žádný `time`
+    uniform). Dodal by pulsing/breathing effect. Vyžaduje globals binding.
+  - **Per-cell pattern variation** — všechny cells s adhesion_type X mají
+    identický pattern. Mohly by mít unique seed (cell_id) přes vertex
+    instance attributes.
+  - **Subsurface scattering** — translucent jelly look (Bevy 0.18 má
+    `StandardMaterial.subsurface_intensity`).
+  - **Animated UV warp** — vertex shader manipulace pro pulsing.
+  - **Energy-modulated emissive** — material reacts to cell.energy (low =
+    dim, high = bright pulse). Vyžaduje per-instance uniform updates.
+
+## Sprinty 92+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud
