@@ -3,20 +3,22 @@
 // rule. CPU equivalent v lib.rs Brain::hebbian_update.
 //
 // Layout brain weights musí matchnout `lib::gpu::BRAIN_WEIGHTS_PER_CELL`
-// packing (Sprint 44 brain_forward.wgsl). Sprint 66 OUTPUTS=10:
-//   [0..576)   w1 row-major (HIDDEN × INPUTS)
-//   [576..592) b1
-//   [592..752) w2 row-major (OUTPUTS × HIDDEN) — 10*16 = 160
-//   [752..762) b2
+// packing (Sprint 44 brain_forward.wgsl). Sprint 80 storage bump HIDDEN 16→32:
+//   [0..1664)    w1 row-major (HIDDEN × INPUTS)
+//   [1664..1696) b1
+//   [1696..2016) w2 row-major (OUTPUTS × HIDDEN) — 10*32 = 320
+//   [2016..2026) b2
+// Dead zone neurons (hidden_n..BRAIN_HIDDEN) bezpečně self-bound: mají
+// last_hidden = 0, takže `lr × h_val × x = 0`, weights nemodifikují.
 
-const BRAIN_INPUTS: u32 = 36u;
-const BRAIN_HIDDEN: u32 = 16u;
+const BRAIN_INPUTS: u32 = 52u;
+const BRAIN_HIDDEN: u32 = 32u;
 const BRAIN_OUTPUTS: u32 = 10u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 576u;
-const W2_OFFSET: u32 = 592u;
-const B2_OFFSET: u32 = 752u;
-const WEIGHTS_PER_CELL: u32 = 762u;
+const B1_OFFSET: u32 = 1664u;
+const W2_OFFSET: u32 = 1696u;
+const B2_OFFSET: u32 = 2016u;
+const WEIGHTS_PER_CELL: u32 = 2026u;
 
 struct HebbianParams {
     num_cells: u32,

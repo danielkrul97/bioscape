@@ -531,17 +531,108 @@ hunt damage vs bond maintenance.
     - Screencast.
     - Photic / thermal stratification.
 
-## Sprinty 80–82 — open-ended
+## Sprint 80 — bistabilní cell-state (epigenetic-like memory)
 
-- **Sprint 80 (priorita):** renderer screencast + HUD bond stats.
-  Konečně vidět tissue regime pohledem.
-- **Sprint 80+:** Cluster reproduction (Sprint 70 retry with S78
+- **Cíl:** zavést per-cell bistabilní fenotypovou paměť, která se dědí
+  s šumem mimo genom. Inspirace Levin-style „cells as small computational
+  units with state" + klasický biological toggle switch (Gardner/Collins
+  2000). Po S78 tissue breakthrough je další přirozený krok diferenciace
+  rolí *uvnitř* clusteru — bez další mutace genomu, jen přes stabilní
+  per-cell state. MVP coupling: state moduluje food share fraction →
+  „donor" vs „free-rider" emergují uvnitř bonded clusteru.
+
+- **Mechanismus:**
+  - `Cell.cell_state: f32` v [0,1], init = 0.5 ± `CELL_STATE_INIT_KICK` (0.05).
+  - Per-tick update v `step()`:
+    `s' = s + K·(s − 0.5)·dt + bias·n_bonds·dt`, clamp [0,1].
+  - `K = CELL_STATE_FEEDBACK_K = 0.5` — pozitivní feedback okolo 0.5
+    (nestabilní fixed point) → dva stabilní attractory ~0 (selfish), ~1
+    (altruist).
+  - `bias = CELL_STATE_BOND_BIAS = 0.04` — env drive od `n_bonds()`,
+    konzistentně tlačí tissue cells k altruist.
+  - Dědičnost v `make_mating_child`: child = mid-parent + uniform
+    šum σ = `CELL_STATE_INHERIT_NOISE` (0.05). Žádný gen → fenotypová
+    paměť přes generace.
+  - Coupling: food share `*= donor_state` v obou binárkách. Selfish
+    donor (state≈0) prakticky nesdílí; altruist donor (state≈1) plný
+    30 % share. Energy-conservation neutral (free reward, jako v S78).
+
+- **Konstanty (`src/lib.rs`):**
+  - `CELL_STATE_FEEDBACK_K = 0.5`
+  - `CELL_STATE_BOND_BIAS = 0.04`
+  - `CELL_STATE_INHERIT_NOISE = 0.05`
+  - `CELL_STATE_INIT_KICK = 0.05`
+
+- **Renderer:** nový gizmo `draw_cell_state_gizmos` — vertikální line
+  nad každým cellem, blue (selfish) → red (altruist) lerp v sRGB.
+  Per-cell `StandardMaterial` rebind by byl drahý (1 alloc/tick/cell);
+  gizmo je free.
+
+- **Headless CSV:** přidány 3 sloupce `state_avg`, `state_dev`,
+  `altruist_frac` (cells s state > 0.6). Nyní 50 sloupců (47 + 3).
+
+- **Smoke (seed=0, 30 gen):**
+  - Gen 0: state_avg=0.501, std=0.027, altruist_frac=0.000 (initial
+    tight distribuce ~0.5).
+  - Gen 1-19: bimodální split — std skočí na ~0.48, altruist_frac
+    oscilluje 0.30-0.45. Feedback funguje, oba attractory aktivní.
+  - Gen 20-30: pop-level drift k altruist (state_avg 0.54 → 0.87).
+    n_bonds bias + food-share advantage → altruist lineages out-compete
+    selfish v post-S78 tissue regime. **Ne lock-in chyba — očekávaná
+    selekce, šum (σ=0.05) drží malou selfish menšinu.**
+
+- **Determinismus:** seed=0, 30 gen → byte-identical CSV ze 2 nezávislých
+  runů (`diff /tmp/det_a.csv /tmp/det_b.csv` exit 0). RNG draws appended
+  na konci `from_genome` a `make_mating_child` — pre-S80 draw order
+  zachován, takže Sprint 80 baseline je nový (konzistentní), ale
+  pre-Sprint-80 reprodukovat nelze — odpovídá konvenci „nový sprint =
+  nový baseline".
+
+- **Test suite:** 106/106 pass. Clippy: 45 warnings (stylistic, baseline
+  S79 noise + 0 nových errors).
+
+- **Výstup:**
+  - `src/lib.rs`: `cell_state` field na `Cell`, 4 nové konstanty,
+    `update_cell_state()` v `step()`, dědičnost v `make_mating_child`,
+    init kick v `from_genome`, `cell_state: 0.5` v `base_cell()` test
+    helperu.
+  - `src/main.rs`: food share kapitán capture + `donor_state` násobení,
+    `draw_cell_state_gizmos` system + registrace.
+  - `src/bin/headless.rs`: stejný coupling, CSV header + 3 nové
+    sloupce + extinction-row 0s.
+  - `docs/sprints/073-082-tissue-emergence.md`: tento entry.
+
+- **Závěr:** Bistabilní cell-state funguje, dynamika je čistá (bimodální
+  v early gens, attractor-driven divergence). Sprint 81+ může to dál
+  rozšířit (víc bistabilních scalarů → cell-type repertoire, či coupling
+  na adhesion bias), nebo se vrátit k odsunutému screencast / HUD plánu.
+
+- **Poznámky:**
+  - **Sprint 80 nahradil původní plán „renderer screencast + HUD bond
+    stats"** — ten se odsouvá na S81+. Důvod: bistable cell-state má
+    větší science payoff (Levin framing, fenotypová paměť), screencast
+    je obsahový (vidět existující), ne mechanika.
+  - **Co Sprint 80 NEŘEŠÍ (S81+):**
+    - Renderer screencast / HUD overlay (obnovený plán).
+    - Multi-scalar bistable network (víc cell types).
+    - Coupling state na adhesion bias / thrust efficiency (alternativní
+      coupling kandidáti).
+    - Cluster reproduction (S70 retry).
+    - `BOND_FOOD_SHARE_FRAC` × `cell_state` interaction sweep.
+    - Photic / thermal stratification.
+    - GPU / anisotropic collision.
+
+## Sprinty 81–82 — open-ended
+
+- **Sprint 81+:** renderer screencast + HUD bond/state stats (z S80
+  odsunuto).
+- **Sprint 81+:** Cluster reproduction (Sprint 70 retry with S78
   baseline) — offspring spawnou uvnitř parent clusteru.
-- **Sprint 80+:** `BOND_FOOD_SHARE_FRAC` sweep (0.1, 0.5, 0.7) —
+- **Sprint 81+:** `BOND_FOOD_SHARE_FRAC` sweep (0.1, 0.5, 0.7) —
   najít balance ne-trivialní cluster vs nezávislé cells.
-- **Sprint 80+:** Photic stratification (z-gradient light field +
+- **Sprint 81+:** Photic stratification (z-gradient light field +
   photoreceptor sensor input) — niche separation by depth.
-- **Sprint 80+:** Thermal stratification (z-gradient temperature).
-- **Sprint 80+:** GPU collision shader, anisotropic collision.
-- **Sprint 80+:** Spatial autocorrelation adhesion_type clustering metric.
-- **Sprint 80+:** Clippy auto-fixes pass (estetické cleanup).
+- **Sprint 81+:** Thermal stratification (z-gradient temperature).
+- **Sprint 81+:** GPU collision shader, anisotropic collision.
+- **Sprint 81+:** Spatial autocorrelation adhesion_type clustering metric.
+- **Sprint 81+:** Clippy auto-fixes pass (estetické cleanup).

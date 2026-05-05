@@ -40,10 +40,30 @@ pub const INITIAL_ENERGY: f32 = 100.0;
 // = previous tick `last_hidden` activations (Elman RNN). Genom drží sjednocený
 // `w1` matrix 28×8, mutace + Hebbian pracují bez rozlišení sensory vs recurrent.
 pub const BRAIN_INPUTS_SENSORY: usize = 20;
-// Sprint 39 patch: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs
-// → 8 hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
-// w1 z 28×8=224 na 36×16=576 weights (2.6×), brain hot-loop ~2× pomalejší.
-pub const BRAIN_HIDDEN: usize = 16;
+// Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
+// hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
+// w1 z 28×8=224 na 36×16=576 weights (2.6×).
+// Sprint 80 (decade NEAT): 16 → 32 jako *storage cap*. Aktivní hidden count je
+// per-cell v `Brain.hidden_n`; default spawn = `BRAIN_HIDDEN_DEFAULT` = 16.
+// Storage 32 dává prostor pro structural mutace (add_neuron) bez Brain struct
+// resize. Dead zone (rows hidden_n..BRAIN_HIDDEN) je zero-initialized a
+// nepřispívá do forward passu (zero × x = 0).
+// Memory: brain.w1 z 16×36 = 576 floats na 32×52 = 1664 (2.9×).
+// Per cell brain footprint ~8 KB; 2500 cells = ~20 MB total. Acceptable.
+pub const BRAIN_HIDDEN: usize = 32;
+/// Initial active hidden count při spawn. Cell s `hidden_n = BRAIN_HIDDEN_DEFAULT`
+/// reprodukuje pre-Sprint-80 behavior byte-identical (dead zone weights = 0,
+/// nepřispívá). Structural mutace později rozhojnou na ≤ `BRAIN_HIDDEN`.
+pub const BRAIN_HIDDEN_DEFAULT: usize = 16;
+/// Floor pro budoucí remove_neuron mutaci. Pod 4 neurony brain nedělá nic
+/// užitečného (sensory→hidden kompresor potřebuje minimum kapacity).
+pub const BRAIN_HIDDEN_MIN: usize = 4;
+/// Sprint 80 Sprint C: gaussian sigma pro inicializaci nových neuronů v
+/// `Brain::add_neuron`. Menší než `sigma_brain` (0.2) — NEAT-style minimal
+/// disruption: nový neuron startuje s near-zero kontribucí k outputům, takže
+/// add_neuron sám o sobě neporouchá existující funkční mozek. Selekce ho
+/// pak buď posílí (subsequent weight mutace), nebo nechá v latentní formě.
+pub const ADD_NEURON_SIGMA: f32 = 0.1;
 /// Sprint 28: kolik dimenzí předchozího hidden state se feeduje zpátky jako
 /// input. = `BRAIN_HIDDEN` znamená 1:1 mapping (každý neuron má vlastní paměť
 /// slot). Menší než HIDDEN by exponoval jen subset hidden state; větší by
@@ -264,33 +284,44 @@ pub const WORLD_MAP_FOOD_AMP: f32 = 0.3;
 // plus okamžitý cost ∝ rychlost morfingu.
 pub const MIN_BODY_LENGTH: f32 = 0.3;
 pub const MAX_BODY_LENGTH: f32 = 4.0;
-/// Sprint 77: 0.3 → 0.8. Sprint 73-76 1000-gen smokes ukázaly konzistentní
-/// konvergenci k asp = length/width = 12 (1D needles), které fyzicky
-/// neclusterují s 2+ bondy. Cap MIN_BODY_WIDTH na 0.8 limituje asp_max =
-/// 4.0/0.8 = 5.0, takže streamlining race nezavře cluster path. Tradeoff:
-/// cells přijdou o jedno z hlavních energy efficiency variables (smaller
-/// cross-section drag), ale tissue regime by měl být sustainable.
+/// Sprint 77: 0.3 → 0.8 — preventivní hack před Sprintem 78. Sprint 73-76
+/// smokes ukázaly konvergenci k asp=12 needles, které fyzicky neclusterují.
+/// Sprint 80 attempt-1: 0.8 → 0.3 → tissue collapse (asp 14, mBond 0 do gen 250).
+/// Sprint 80 final: revert na 0.8.
 pub const MIN_BODY_WIDTH: f32 = 0.8;
 pub const MAX_BODY_WIDTH: f32 = 4.0;
 /// Sprint 34: 3-axis ellipsoid — třetí dimenze (vertikálně, ⊥ k length+width).
 pub const MIN_BODY_HEIGHT: f32 = 0.3;
+/// Sprint 80 attempt-2: MAX_BODY_* 4 → 6 (s MIN_BODY_WIDTH=0.8 zpět). Smoke
+/// 500 gen ukázal nový pancake attractor — cells konvergovaly k len=5.8 ×
+/// wid=5.9 × hgt=0.32 (flat disc), volume ~11 vs S78 ~4.4. mBond collapsed
+/// na 0 do gen 50. Wide+flat outcompete clustered cells na food intake area.
+/// Sprint 80 final: revert na 4.0.
 pub const MAX_BODY_HEIGHT: f32 = 4.0;
 pub const MIN_SPIKE_LENGTH: f32 = 0.0;
 pub const MAX_SPIKE_LENGTH: f32 = 2.0;
 /// Rychlost runtime morfingu — full brain output dává `MORPH_RATE` jednotek
-/// změny tvaru za sekundu. 0.02/s znamená full-range body morph trvá ~50 gen
-/// — pomalejší než životnost generace (~10s), takže morph je deliberátní akt
-/// přes mnoho generací, ne ad-hoc tick reakce. Initial runs s 0.5/0.1/0.05
-/// ukázaly "morph and starve": random brain biases (~0.5 stddev) × rychlý
-/// MORPH_RATE → cells rostly o 100 % ve 4 gen → 3× body maintenance kost
-/// dřív než selekce stihla optimalizovat brainy → extinkce.
-pub const MORPH_RATE: f32 = 0.02;
+/// změny tvaru za sekundu.
+/// Sprint 26: 0.02/s = full-range body morph ~50 gen, pomalejší než životnost
+/// generace → morph je víc evoluční než behaviorální parametr. Initial runs
+/// s 0.5/0.1/0.05 ukázaly "morph and starve" (random brain biasy × rychlý
+/// MORPH_RATE → 3× body maintenance dřív než selekce optimalizuje → extinkce).
+/// Sprint 80: 0.02 → 0.05 (2.5× rychlejší). Po S78 stable tissue regime má
+/// populace zdravé brainy a "morph and starve" risk je nižší. Cells dostávají
+/// in-life shape adaptaci jako reálný behavioral lever — např. roztáhnout
+/// tělo pri lovu, smrštit při útěku. MORPH_COST_PER_DELTA=2.0 zůstává jako
+/// energy circuit-breaker.
+pub const MORPH_RATE: f32 = 0.05;
 /// Deadzone — pokud |signal| < threshold, morph se nepoužívá (žádná změna,
 /// žádný cost). Filtruje šum z random brain biases (mean 0, ~0.5 stddev),
-/// jen vědomě silné morph signály prochází. Threshold 0.7: prob(|tanh(N(0,1))|
-/// většího než 0.7) ≈ 0.38, ~62 % random buněk neumí morphovat. Trénovaný
-/// brain co chce morphovat dosáhne signálu blízko 1.0 → projde threshold.
-pub const MORPH_ACTIVATION_THRESHOLD: f32 = 0.7;
+/// jen vědomě silné morph signály prochází.
+/// Sprint 26: threshold 0.7 → prob(|tanh(N(0,1))| > 0.7) ≈ 0.38, ~62 % random
+/// buněk neumí morphovat. Sprint 80: 0.7 → 0.3 → ~76 % signálů projde. Brain
+/// driven shape control je teď reálný (S78 baseline brainy nejsou random).
+/// Trénovaný brain pořád dosahuje silných signálů 1.0; uvolnění gating dává
+/// víc behavioral expression bez "extinct"-level rizika (MORPH_RATE × dt ×
+/// raw_signal je bound, COST_PER_DELTA absorbuje).
+pub const MORPH_ACTIVATION_THRESHOLD: f32 = 0.3;
 /// Cena morfingu: `MORPH_COST_PER_DELTA × |Δ|` energie za faktická Δ tělesné
 /// dimenze (po clampu). Lineární.
 pub const MORPH_COST_PER_DELTA: f32 = 2.0;
@@ -435,6 +466,35 @@ pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.05;
 /// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál
 /// pro bonding — fitness payoff přímo, ne přes hunter immunity proxy.
 pub const BOND_FOOD_SHARE_FRAC: f32 = 0.3;
+
+// ─── Sprint 80: bistabilní cell-state (epigenetic-like memory) ──────────────
+// Per-cell continuous scalar [0,1] s pozitivním feedbackem okolo 0.5 →
+// dva stabilní attractory (≈0 = "selfish", ≈1 = "altruist"). State není v
+// genomu — dědí se z parenta s šumem, takže lineages můžou rozvinout
+// fenotypovou paměť napříč generacemi bez DNA změny. Driver pro switch
+// je `n_bonds()` (cell hluboko v clusteru = víc bondů = push k altruist
+// attractoru). Coupling: `cell_state` modulates BOND_FOOD_SHARE_FRAC →
+// uvnitř clusteru emergují role „donor" vs „free-rider".
+
+/// Pozitivní feedback rate. `s' += K × (s − 0.5) × dt`. Při K=0.5 a dt~0.05
+/// (1 tick = 1/20 s) per-tick deflexe je ~0.025 × (s−0.5) — pomalý, ale
+/// jistý posun k attractorům, jakmile cell vystoupí z neutrální zóny.
+pub const CELL_STATE_FEEDBACK_K: f32 = 0.5;
+/// Per-bond enviromentální drive. `s' += BOND_BIAS × n_bonds × dt`. n_bonds=4
+/// (typický tissue cell) přidá 0.04 × 0.05 = 0.002 per tick směrem k 1.0.
+/// Slabší než feedback, aby pure feedback nevytlačoval cells z 0-attractoru
+/// jen proto, že krátce mají bond — bias musí konzistentně tlačit přes víc
+/// ticků, než si feedback převezme režii.
+pub const CELL_STATE_BOND_BIAS: f32 = 0.04;
+/// σ pro Gaussian-like noise při dědění (uniform [-σ, σ] approx). Mating
+/// child dostane `(parent_a.state + parent_b.state)/2 + uniform(±σ)`.
+/// 0.05 = jeden „skok" za ~10 generací průměrně přes attractor boundary
+/// — rare flip, ale ne lock-in.
+pub const CELL_STATE_INHERIT_NOISE: f32 = 0.05;
+/// Initial population kick okolo 0.5, aby cells nestartovaly přesně na
+/// nestabilním fixed pointu (jinak by feedback nikdy nezačal — symetrie).
+pub const CELL_STATE_INIT_KICK: f32 = 0.05;
+
 /// Sprint 70: jitter radius pro cluster-aware reproduction. Když má parent
 /// bondy a child se má spawn-it blízko něj (uvnitř bond network), použije
 /// se random offset v ±tomto rangi. 8.0 = 0.8× pair_radius pro typical
@@ -665,6 +725,10 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // má slabý signál, větší sigma by způsobil random walk).
     sigma_bond_stiffness: 0.3,
     sigma_bond_damping: 0.05,
+    // Sprint 80 Sprint C: structural mutation off by default. Zapnutí přes
+    // local `MutationConfig { add_neuron_rate: 0.05, ..MUTATION_CONFIG }`
+    // v experimentech.
+    add_neuron_rate: 0.0,
 };
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     drag: DRAG_COEFFICIENT,
@@ -677,12 +741,23 @@ pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Brain {
+    /// Sprint 80: active hidden neuron count (≤ BRAIN_HIDDEN storage). Default
+    /// = BRAIN_HIDDEN_DEFAULT. forward/mutate/crossover/hebbian iterují jen
+    /// [0..hidden_n]; dead zone (hidden_n..BRAIN_HIDDEN) drží 0 a do výpočtu
+    /// nepřispívá. Strukturální mutace (add/remove neuron) přijdou v dalších
+    /// sprintech a budou tuhle hodnotu měnit.
+    #[serde(default = "default_hidden_n")]
+    pub hidden_n: u32,
     #[serde(with = "serde_arrays_w1")]
     pub w1: [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN],
     pub b1: [f32; BRAIN_HIDDEN],
     #[serde(with = "serde_arrays_w2")]
     pub w2: [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
     pub b2: [f32; BRAIN_OUTPUTS],
+}
+
+fn default_hidden_n() -> u32 {
+    BRAIN_HIDDEN_DEFAULT as u32
 }
 
 // Sprint 48: serde 1 has native const-generic support pro `[T; N]` ale
@@ -760,19 +835,40 @@ mod serde_arr_inputs {
 
 impl Brain {
     pub fn random(rng: &mut impl Rng) -> Self {
+        Self::random_with_hidden(rng, BRAIN_HIDDEN_DEFAULT as u32)
+    }
+
+    /// Sprint 80: variable-size random init. `hidden_n` aktivních neuronů,
+    /// zbytek storage (BRAIN_HIDDEN..) zero-initialized a do forward passu
+    /// nepřispívá. RNG draws happen only for active region — same seed s
+    /// hidden_n=BRAIN_HIDDEN_DEFAULT reprodukuje pre-Sprint-80 sekvenci.
+    pub fn random_with_hidden(rng: &mut impl Rng, hidden_n: u32) -> Self {
+        debug_assert!(
+            (hidden_n as usize) >= BRAIN_HIDDEN_MIN
+                && (hidden_n as usize) <= BRAIN_HIDDEN,
+            "hidden_n {} out of [{}, {}]",
+            hidden_n,
+            BRAIN_HIDDEN_MIN,
+            BRAIN_HIDDEN
+        );
+        let h_n = hidden_n as usize;
+        // Sprint 80 (storage bump): active input width je sensory + hidden_n,
+        // ne celá BRAIN_INPUTS storage. Pro default h_n=16: 20+16 = 36, match
+        // Sprint A pre-bump RNG sekvence byte-identical.
+        let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
         let mut w1 = [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN];
         let mut b1 = [0.0; BRAIN_HIDDEN];
         let mut w2 = [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS];
         let mut b2 = [0.0; BRAIN_OUTPUTS];
-        for (row, bias) in w1.iter_mut().zip(b1.iter_mut()) {
-            for w in row.iter_mut() {
-                *w = gaussian(rng);
+        for i in 0..h_n {
+            for j in 0..active_inputs {
+                w1[i][j] = gaussian(rng);
             }
-            *bias = gaussian(rng);
+            b1[i] = gaussian(rng);
         }
         for (row, bias) in w2.iter_mut().zip(b2.iter_mut()) {
-            for w in row.iter_mut() {
-                *w = gaussian(rng);
+            for j in 0..h_n {
+                row[j] = gaussian(rng);
             }
             *bias = gaussian(rng);
         }
@@ -789,7 +885,7 @@ impl Brain {
         b2[6] += INNATE_ATTACK_BIAS;
         // Sprint 66 bond signal bias — opt-in jako attack.
         b2[9] += INNATE_BOND_BIAS;
-        Self { w1, b1, w2, b2 }
+        Self { hidden_n, w1, b1, w2, b2 }
     }
 
     pub fn forward(&self, inputs: &[f32; BRAIN_INPUTS]) -> [f32; BRAIN_OUTPUTS] {
@@ -802,19 +898,20 @@ impl Brain {
         &self,
         inputs: &[f32; BRAIN_INPUTS],
     ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
+        let h_n = self.hidden_n as usize;
         let mut hidden = [0.0_f32; BRAIN_HIDDEN];
-        for ((h, row), &bias) in hidden.iter_mut().zip(self.w1.iter()).zip(self.b1.iter()) {
-            let mut sum = bias;
-            for (&w, &x) in row.iter().zip(inputs.iter()) {
+        for i in 0..h_n {
+            let mut sum = self.b1[i];
+            for (&w, &x) in self.w1[i].iter().zip(inputs.iter()) {
                 sum += w * x;
             }
-            *h = sum.tanh();
+            hidden[i] = sum.tanh();
         }
         let mut out = [0.0_f32; BRAIN_OUTPUTS];
         for ((o, row), &bias) in out.iter_mut().zip(self.w2.iter()).zip(self.b2.iter()) {
             let mut sum = bias;
-            for (&w, &h) in row.iter().zip(hidden.iter()) {
-                sum += w * h;
+            for j in 0..h_n {
+                sum += row[j] * hidden[j];
             }
             *o = sum.tanh();
         }
@@ -834,17 +931,17 @@ impl Brain {
         learning_rate: f32,
     ) {
         let lr = learning_rate * reward;
-        for (out_h, &h) in self.w1.iter_mut().zip(last_hidden.iter()) {
-            for (w, &x) in out_h.iter_mut().zip(last_inputs.iter()) {
+        let h_n = self.hidden_n as usize;
+        for i in 0..h_n {
+            let h = last_hidden[i];
+            for (w, &x) in self.w1[i].iter_mut().zip(last_inputs.iter()) {
                 *w += lr * h * x;
             }
-        }
-        for (b, &h) in self.b1.iter_mut().zip(last_hidden.iter()) {
-            *b += lr * h;
+            self.b1[i] += lr * h;
         }
         for (out_o, &o) in self.w2.iter_mut().zip(last_outputs.iter()) {
-            for (w, &h) in out_o.iter_mut().zip(last_hidden.iter()) {
-                *w += lr * o * h;
+            for j in 0..h_n {
+                out_o[j] += lr * o * last_hidden[j];
             }
         }
         for (b, &o) in self.b2.iter_mut().zip(last_outputs.iter()) {
@@ -854,28 +951,69 @@ impl Brain {
 
     pub fn mutate(&self, rng: &mut impl Rng, sigma: f32) -> Self {
         let mut out = *self;
-        for (row, bias) in out.w1.iter_mut().zip(out.b1.iter_mut()) {
-            for w in row.iter_mut() {
-                *w += gaussian(rng) * sigma;
+        let h_n = self.hidden_n as usize;
+        let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
+        for i in 0..h_n {
+            for j in 0..active_inputs {
+                out.w1[i][j] += gaussian(rng) * sigma;
             }
-            *bias += gaussian(rng) * sigma;
+            out.b1[i] += gaussian(rng) * sigma;
         }
         for (row, bias) in out.w2.iter_mut().zip(out.b2.iter_mut()) {
-            for w in row.iter_mut() {
-                *w += gaussian(rng) * sigma;
+            for j in 0..h_n {
+                row[j] += gaussian(rng) * sigma;
             }
             *bias += gaussian(rng) * sigma;
         }
         out
     }
 
+    /// Sprint 80 Sprint C: structural mutation — přidá jeden hidden neuron.
+    /// Vrací `true` pokud se neuron přidal, `false` pokud cap (`hidden_n ==
+    /// BRAIN_HIDDEN`) nebo `BRAIN_HIDDEN_MIN` violation prevented.
+    ///
+    /// **Init logic (NEAT-style minimal disruption):**
+    /// - `w1[new_idx][0..active_inputs]` = gaussian × sigma (small, drift)
+    /// - `b1[new_idx]` = gaussian × sigma
+    /// - `w2[*][new_idx]` = gaussian × sigma (output contribution starts small)
+    /// - Existing neurons NETKNUTÉ (jejich w1[i][20+new_idx] zůstává 0 = no
+    ///   incoming connection from new recurrent slot; selekce + future
+    ///   weight mutace mohou prokopnout, pokud má smysl).
+    ///
+    /// `active_inputs = BRAIN_INPUTS_SENSORY + (hidden_n+1)` zahrnuje vlastní
+    /// recurrent slot nového neuronu (= připojení k své vlastní paměti).
+    pub fn add_neuron(&mut self, rng: &mut impl Rng, sigma: f32) -> bool {
+        let new_idx = self.hidden_n as usize;
+        if new_idx >= BRAIN_HIDDEN {
+            return false;
+        }
+        let active_inputs = BRAIN_INPUTS_SENSORY + new_idx + 1;
+        for j in 0..active_inputs {
+            self.w1[new_idx][j] = gaussian(rng) * sigma;
+        }
+        self.b1[new_idx] = gaussian(rng) * sigma;
+        for o in 0..BRAIN_OUTPUTS {
+            self.w2[o][new_idx] = gaussian(rng) * sigma;
+        }
+        self.hidden_n += 1;
+        true
+    }
+
     /// Per-row uniform crossover. Each hidden neuron's `w1` row + `b1`
     /// scalar comes from one parent (50/50); same for output neurons. Per-row
     /// rather than per-weight preserves coordinated patterns within a single
-    /// neuron's receptive field.
+    /// neuron's receptive field. Sprint 80: vyžaduje shodný `hidden_n` u
+    /// obou rodičů — topology-aware crossover (mismatched hidden_n) přijde
+    /// až s další structural mutací (Sprint D+).
     pub fn crossover(a: &Brain, b: &Brain, rng: &mut impl Rng) -> Brain {
+        assert_eq!(
+            a.hidden_n, b.hidden_n,
+            "Brain::crossover requires matching hidden_n (got {} vs {})",
+            a.hidden_n, b.hidden_n
+        );
         let mut out = *a;
-        for i in 0..BRAIN_HIDDEN {
+        let h_n = a.hidden_n as usize;
+        for i in 0..h_n {
             if rng.random::<bool>() {
                 out.w1[i] = b.w1[i];
                 out.b1[i] = b.b1[i];
@@ -909,6 +1047,11 @@ pub struct MutationConfig {
     pub sigma_bond_stiffness: f32,
     /// Sprint 68: gaussian sigma pro bond_damping gen.
     pub sigma_bond_damping: f32,
+    /// Sprint 80 Sprint C: pravděpodobnost `add_neuron` structural mutace
+    /// per dítě. 0.0 = topology evoluce vypnutá (default; zachovává Sprint
+    /// B byte-identical trajectory). Tuning sweep příští sprint zkusí 0.02,
+    /// 0.05, 0.1.
+    pub add_neuron_rate: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1004,7 +1147,20 @@ impl Genome {
                 .clamp(MIN_BOND_STIFFNESS, MAX_BOND_STIFFNESS),
             bond_damping: (self.bond_damping + gaussian(rng) * cfg.sigma_bond_damping)
                 .clamp(MIN_BOND_DAMPING, MAX_BOND_DAMPING),
-            brain: self.brain.mutate(rng, cfg.sigma_brain),
+            brain: {
+                let mut b = self.brain.mutate(rng, cfg.sigma_brain);
+                // Sprint 80 Sprint C: structural mutace. Default rate=0.0 →
+                // bool draw probíhá ale add_neuron se nikdy nevolá → žádný
+                // RNG drift vůči Sprint B baseline (jeden extra `rng.random::<f32>()`
+                // by trajectory shiftnul). Branchnu na rate>0 abych draw vůbec
+                // nepřípravil v default scenáři.
+                if cfg.add_neuron_rate > 0.0
+                    && rng.random::<f32>() < cfg.add_neuron_rate
+                {
+                    b.add_neuron(rng, ADD_NEURON_SIGMA);
+                }
+                b
+            },
         }
     }
 
@@ -1209,6 +1365,12 @@ pub struct Cell {
     /// Sprint 66: persistent spring bonds. Fixní array `Option<Bond>` aby Cell
     /// zůstal `Copy` a žádný heap alloc per cell. Empty slots = `None`.
     pub bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
+    /// Sprint 80: bistabilní cell-state [0,1]. Není v genomu — dědí se z
+    /// parenta s šumem, takže slouží jako fenotypová paměť napříč generacemi.
+    /// Pozitivní feedback okolo 0.5 + bias od `n_bonds()` produkuje dva
+    /// stabilní attractory: ~0 (selfish) a ~1 (altruist). Reguluje food share
+    /// frakci uvnitř bonded clusteru.
+    pub cell_state: f32,
     pub phenotype: Phenotype,
     pub genome: Genome,
 }
@@ -1281,6 +1443,11 @@ impl Cell {
             reproduce_cooldown_ticks: 0,
             cell_id,
             bonds: [None; MAX_BONDS_PER_CELL],
+            // Sprint 80: kick okolo 0.5 (nestabilní fixed point feedback),
+            // aby cells nezamrzly přesně v neutrální zóně. Append na konci
+            // RNG sekvence — pre-Sprint-80 draws (direction, pos_z, pos_x,
+            // pos_y) zůstávají v identickém pořadí, jen za nimi je 1 nový.
+            cell_state: 0.5 + rng.random_range(-CELL_STATE_INIT_KICK..CELL_STATE_INIT_KICK),
             phenotype,
             genome,
         }
@@ -1307,6 +1474,25 @@ impl Cell {
         self.apply_angular_drag(dt, physics);
         self.apply_energy_costs(dt, physics);
         self.apply_world_bounce(world_half);
+        self.update_cell_state(dt);
+    }
+
+    /// Sprint 80: bistabilní cell-state dynamika. Pure deterministic (no RNG)
+    /// — RNG by zde rozbil seed reproducibility step()u. Šum vstupuje jen
+    /// při dědičnosti v `make_mating_child`.
+    ///
+    /// Update rule:
+    ///   s' = s + K · (s − 0.5) · dt + bias · n_bonds · dt
+    ///
+    /// Pozitivní feedback `(s − 0.5)` táhne stav od nestabilního fixed
+    /// pointu k 0 nebo 1 podle aktuální orientace. `n_bonds` bias konzistentně
+    /// tlačí cells s víc bondy směrem k altruist attractoru — tissue cells
+    /// commitnou k altruismu, solo cells driftují k selfish.
+    fn update_cell_state(&mut self, dt: f32) {
+        let n_bonds = self.n_bonds() as f32;
+        let feedback = CELL_STATE_FEEDBACK_K * (self.cell_state - 0.5) * dt;
+        let env_drive = CELL_STATE_BOND_BIAS * n_bonds * dt;
+        self.cell_state = (self.cell_state + feedback + env_drive).clamp(0.0, 1.0);
     }
 
     /// Sprint 40: čistý integrate (position += v · dt, heading + pitch),
@@ -1875,6 +2061,15 @@ pub fn make_mating_child(
         // Sprint 66: child startuje bez bondů (čistý slate). Bondy se vytvoří
         // podle vlastního chování dítěte, neinheritují se po rodičích.
         bonds: [None; MAX_BONDS_PER_CELL],
+        // Sprint 80: cell_state se DĚDÍ (mid-parent + uniform noise σ ≈
+        // CELL_STATE_INHERIT_NOISE), na rozdíl od bondů. Tím vzniká
+        // fenotypová paměť přes generace bez genetické změny — lineage
+        // může držet altruist nebo selfish režim, dokud noise / drift
+        // attractor nepřevrátí. Append na konci struct literálu zachovává
+        // pre-Sprint-80 RNG draw order.
+        cell_state: ((parent_a.cell_state + parent_b.cell_state) * 0.5
+            + rng.random_range(-CELL_STATE_INHERIT_NOISE..CELL_STATE_INHERIT_NOISE))
+            .clamp(0.0, 1.0),
         phenotype: child_phenotype,
         genome: child_genome,
     }
@@ -2450,6 +2645,7 @@ mod tests {
 
     fn dummy_brain() -> Brain {
         Brain {
+            hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
             w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
             b1: [0.0; BRAIN_HIDDEN],
             w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
@@ -2490,6 +2686,7 @@ mod tests {
             adhesion_flip_rate: 0.0,
             sigma_bond_stiffness: 0.0,
             sigma_bond_damping: 0.0,
+            add_neuron_rate: 0.0,
         }
     }
 
@@ -2510,6 +2707,7 @@ mod tests {
             bond_stiffness: BOND_STIFFNESS,
             bond_damping: BOND_DAMPING,
             brain: Brain {
+                hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
                 w1: [[1.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
                 b1: [0.3; BRAIN_HIDDEN],
                 w2: [[1.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
@@ -2548,6 +2746,7 @@ mod tests {
             adhesion_flip_rate: 0.5,
             sigma_bond_stiffness: 100.0,
             sigma_bond_damping: 10.0,
+            add_neuron_rate: 0.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -2594,6 +2793,7 @@ mod tests {
             reproduce_cooldown_ticks: 0,
             cell_id: 0,
             bonds: [None; MAX_BONDS_PER_CELL],
+            cell_state: 0.5,
             phenotype,
             genome,
         }
@@ -2814,8 +3014,8 @@ mod tests {
     #[test]
     fn hebbian_update_reinforces_when_reward_positive() {
         let mut brain = dummy_brain();
-        // hidden = [1.0; 8], output = [1.0; 2], reward = 1.0, lr = 0.1
-        // Δb1[i] = 0.1 × 1.0 × hidden[i] = 0.1
+        // hidden = [1.0; hidden_n], output = [1.0; OUT], reward = 1.0, lr = 0.1
+        // Δb1[i] = 0.1 × 1.0 × hidden[i] = 0.1 pro i < hidden_n; 0 jinak
         // Δb2[i] = 0.1 × 1.0 × output[i] = 0.1
         brain.hebbian_update(
             &[0.0; BRAIN_INPUTS],
@@ -2824,8 +3024,13 @@ mod tests {
             1.0,
             0.1,
         );
-        for &b in &brain.b1 {
-            assert!((b - 0.1).abs() < 1e-5, "b1 got {}", b);
+        // Sprint 80: hebbian bounded by hidden_n. Dead zone b1 stays at init (0).
+        let h_n = brain.hidden_n as usize;
+        for &b in &brain.b1[..h_n] {
+            assert!((b - 0.1).abs() < 1e-5, "active b1 got {}", b);
+        }
+        for &b in &brain.b1[h_n..] {
+            assert_eq!(b, 0.0, "dead-zone b1 must stay 0");
         }
         for &b in &brain.b2 {
             assert!((b - 0.1).abs() < 1e-5, "b2 got {}", b);
@@ -2911,6 +3116,7 @@ mod tests {
         b2[0] = 0.5;
         b2[1] = -0.5;
         let brain = Brain {
+            hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
             w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
             b1: [0.7; BRAIN_HIDDEN],
             w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
@@ -2919,6 +3125,210 @@ mod tests {
         let outputs = brain.forward(&[0.0; BRAIN_INPUTS]);
         assert!((outputs[0] - 0.5_f32.tanh()).abs() < 1e-6);
         assert!((outputs[1] - (-0.5_f32).tanh()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn brain_random_sets_default_hidden_n() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let b = Brain::random(&mut rng);
+        assert_eq!(b.hidden_n as usize, BRAIN_HIDDEN_DEFAULT);
+    }
+
+    #[test]
+    fn brain_random_with_hidden_zeros_dead_zone() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let h_n: u32 = 8;
+        assert!((h_n as usize) < BRAIN_HIDDEN, "test assumes h_n < storage");
+        let b = Brain::random_with_hidden(&mut rng, h_n);
+        assert_eq!(b.hidden_n, h_n);
+        // Dead zone w1[h_n..] / b1[h_n..] / w2[*][h_n..] must stay 0 — random
+        // initialization touched only active region.
+        for i in (h_n as usize)..BRAIN_HIDDEN {
+            assert_eq!(b.b1[i], 0.0, "b1[{}] should be 0", i);
+            for &w in b.w1[i].iter() {
+                assert_eq!(w, 0.0, "w1[{}][..] should be 0", i);
+            }
+        }
+        for o in 0..BRAIN_OUTPUTS {
+            for j in (h_n as usize)..BRAIN_HIDDEN {
+                assert_eq!(b.w2[o][j], 0.0, "w2[{}][{}] should be 0", o, j);
+            }
+        }
+    }
+
+    #[test]
+    fn brain_mutate_preserves_hidden_n_and_dead_zone() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let h_n: u32 = 6;
+        let parent = Brain::random_with_hidden(&mut rng, h_n);
+        let child = parent.mutate(&mut rng, 0.5);
+        assert_eq!(child.hidden_n, h_n, "hidden_n must survive mutation");
+        // Dead zone untouched (no gaussian draws applied to inactive rows).
+        for i in (h_n as usize)..BRAIN_HIDDEN {
+            assert_eq!(child.b1[i], parent.b1[i]);
+            assert_eq!(child.w1[i], parent.w1[i]);
+        }
+        for o in 0..BRAIN_OUTPUTS {
+            for j in (h_n as usize)..BRAIN_HIDDEN {
+                assert_eq!(child.w2[o][j], parent.w2[o][j]);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "matching hidden_n")]
+    fn brain_crossover_panics_on_mismatched_hidden_n() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let a = Brain::random_with_hidden(&mut rng, 8);
+        let b = Brain::random_with_hidden(&mut rng, 12);
+        let _ = Brain::crossover(&a, &b, &mut rng);
+    }
+
+    #[test]
+    fn brain_storage_cap_above_default_with_room_for_growth() {
+        // Sprint 80 (storage bump): BRAIN_HIDDEN je storage cap, default je
+        // initial active. Rozdíl = headroom pro structural mutace.
+        assert!(
+            BRAIN_HIDDEN > BRAIN_HIDDEN_DEFAULT,
+            "BRAIN_HIDDEN ({}) must be > BRAIN_HIDDEN_DEFAULT ({}) to leave room for add_neuron",
+            BRAIN_HIDDEN,
+            BRAIN_HIDDEN_DEFAULT
+        );
+        assert!(
+            BRAIN_HIDDEN >= BRAIN_HIDDEN_DEFAULT + 8,
+            "headroom < 8 neurons: structural mutace bude rychle narážet na cap"
+        );
+    }
+
+    #[test]
+    fn add_neuron_increments_hidden_n() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let mut b = Brain::random_with_hidden(&mut rng, BRAIN_HIDDEN_DEFAULT as u32);
+        let h_before = b.hidden_n;
+        let added = b.add_neuron(&mut rng, ADD_NEURON_SIGMA);
+        assert!(added);
+        assert_eq!(b.hidden_n, h_before + 1);
+    }
+
+    #[test]
+    fn add_neuron_returns_false_at_storage_cap() {
+        let mut rng = StdRng::seed_from_u64(33);
+        let mut b = Brain::random_with_hidden(&mut rng, BRAIN_HIDDEN as u32);
+        assert_eq!(b.hidden_n as usize, BRAIN_HIDDEN);
+        let added = b.add_neuron(&mut rng, ADD_NEURON_SIGMA);
+        assert!(!added, "add_neuron at cap must return false");
+        assert_eq!(b.hidden_n as usize, BRAIN_HIDDEN, "cap respected");
+    }
+
+    #[test]
+    fn add_neuron_initializes_active_region_only() {
+        let mut rng = StdRng::seed_from_u64(37);
+        let mut b = Brain::random_with_hidden(&mut rng, BRAIN_HIDDEN_DEFAULT as u32);
+        let new_idx = b.hidden_n as usize;
+        let active_inputs = BRAIN_INPUTS_SENSORY + new_idx + 1;
+        let _ = b.add_neuron(&mut rng, ADD_NEURON_SIGMA);
+        // New neuron's row [new_idx] active part [0..active_inputs] should be
+        // gaussian-initialized (some non-zero values expected). Dead-zone of
+        // that same row [active_inputs..BRAIN_INPUTS] should remain 0.
+        let any_active_nonzero = b.w1[new_idx][..active_inputs]
+            .iter()
+            .any(|&w| w != 0.0);
+        assert!(any_active_nonzero, "new neuron active w1 row all-zero");
+        for &w in &b.w1[new_idx][active_inputs..] {
+            assert_eq!(w, 0.0, "new neuron dead-cols must stay 0");
+        }
+    }
+
+    #[test]
+    fn add_neuron_preserves_existing_neurons() {
+        let mut rng = StdRng::seed_from_u64(41);
+        let mut b = Brain::random_with_hidden(&mut rng, BRAIN_HIDDEN_DEFAULT as u32);
+        let snapshot_w1: Vec<_> = b.w1[..BRAIN_HIDDEN_DEFAULT].to_vec();
+        let snapshot_b1 = b.b1;
+        let snapshot_b2 = b.b2;
+        // Snapshot w2 active cols only — dead col at new_idx will get populated.
+        let snapshot_w2_active: Vec<Vec<f32>> = b
+            .w2
+            .iter()
+            .map(|row| row[..BRAIN_HIDDEN_DEFAULT].to_vec())
+            .collect();
+        let _ = b.add_neuron(&mut rng, ADD_NEURON_SIGMA);
+        // Existing neurons (rows 0..BRAIN_HIDDEN_DEFAULT) untouched.
+        for (i, expected) in snapshot_w1.iter().enumerate() {
+            assert_eq!(&b.w1[i], expected, "w1[{}] should be unchanged", i);
+        }
+        for i in 0..BRAIN_HIDDEN_DEFAULT {
+            assert_eq!(b.b1[i], snapshot_b1[i], "b1[{}] should be unchanged", i);
+        }
+        // b2 unchanged (no contribution from add_neuron).
+        assert_eq!(b.b2, snapshot_b2);
+        // w2 active cols (existing neurons' connections) unchanged.
+        for o in 0..BRAIN_OUTPUTS {
+            for h in 0..BRAIN_HIDDEN_DEFAULT {
+                assert_eq!(b.w2[o][h], snapshot_w2_active[o][h]);
+            }
+        }
+    }
+
+    #[test]
+    fn genome_mutate_with_rate_one_grows_brain_to_cap() {
+        let mut rng = StdRng::seed_from_u64(43);
+        let g = dummy_genome();
+        let cfg = MutationConfig {
+            sigma_speed: 0.0,
+            sigma_hue: 0.0,
+            sigma_vision: 0.0,
+            sigma_turn_rate: 0.0,
+            sigma_body_length: 0.0,
+            sigma_body_width: 0.0,
+            sigma_body_height: 0.0,
+            sigma_spike_length: 0.0,
+            sigma_shell: 0.0,
+            sigma_brain: 0.0,
+            adhesion_flip_rate: 0.0,
+            sigma_bond_stiffness: 0.0,
+            sigma_bond_damping: 0.0,
+            add_neuron_rate: 1.0,
+        };
+        let mut current = g;
+        // Iteruj N >= (BRAIN_HIDDEN - DEFAULT). Po naplnění capu se další
+        // add_neuron volá, ale vrací false → hidden_n se nezvyšuje.
+        for _ in 0..(BRAIN_HIDDEN - BRAIN_HIDDEN_DEFAULT + 4) {
+            current = current.mutate(&mut rng, &cfg);
+        }
+        assert_eq!(
+            current.brain.hidden_n as usize,
+            BRAIN_HIDDEN,
+            "brain musí dosáhnout cap (BRAIN_HIDDEN={}) ale hidden_n={}",
+            BRAIN_HIDDEN,
+            current.brain.hidden_n
+        );
+    }
+
+    #[test]
+    fn brain_hidden_n_above_default_forward_uses_padded_storage() {
+        // Sprint B: brain s hidden_n > BRAIN_HIDDEN_DEFAULT používá rozšířený
+        // storage. Forward output musí brát v potaz nové aktivní neurony.
+        let h_n: u32 = (BRAIN_HIDDEN_DEFAULT as u32) + 4;
+        assert!(
+            (h_n as usize) <= BRAIN_HIDDEN,
+            "test config: h_n {} must be ≤ BRAIN_HIDDEN {}",
+            h_n,
+            BRAIN_HIDDEN
+        );
+        let mut rng = StdRng::seed_from_u64(17);
+        let brain_default = Brain::random_with_hidden(&mut rng, BRAIN_HIDDEN_DEFAULT as u32);
+        let brain_extended = Brain::random_with_hidden(&mut rng, h_n);
+        let inputs = [0.5_f32; BRAIN_INPUTS];
+        let out_default = brain_default.forward(&inputs);
+        let out_extended = brain_extended.forward(&inputs);
+        // Two different brains with non-overlapping random init should produce
+        // different outputs. Sanity check že padded storage není no-op.
+        let any_diff = out_default
+            .iter()
+            .zip(out_extended.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(any_diff, "extended hidden_n produced identical output");
     }
 
     #[test]
@@ -2967,9 +3377,9 @@ mod tests {
             shell_thickness: 0.0,
         };
         // signal × rate × dt = 0.8 × 1.0 × 1.0 = 0.8 podél každé osy.
-        // Width clampuje na MIN_BODY_WIDTH (0.8 post-Sprint-77), takže |Δ|
-        // pro width je 1.0 - 0.8 = 0.2. Total |Δ| = 0.8 (length) + 0.2
-        // (width clamped) + 0.0 (height: signal=0) + 0.8 (spike) = 1.8.
+        // Width clampuje na MIN_BODY_WIDTH (0.8), takže |Δ| pro width je
+        // 1.0 - 0.8 = 0.2. Total |Δ| = 0.8 (length) + 0.2 (width clamped)
+        // + 0.0 (height: signal=0) + 0.8 (spike) = 1.8.
         let delta = phen.apply_morph([0.8, -0.8, 0.0, 0.8], 1.0, 1.0);
         assert!((delta - 1.8).abs() < 1e-5, "got {}", delta);
         assert!((phen.body_length - 1.8).abs() < 1e-5);
@@ -3324,6 +3734,7 @@ mod tests {
             adhesion_flip_rate: 0.0,
             sigma_bond_stiffness: 0.0,
             sigma_bond_damping: 0.0,
+            add_neuron_rate: 0.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);

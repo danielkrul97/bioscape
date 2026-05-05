@@ -2,22 +2,27 @@
 // Layout musí matchnout `lib::gpu::BRAIN_WEIGHTS_PER_CELL` packing v Rustu.
 //
 // Vstupy (binding 1): N × BRAIN_INPUTS f32, AoS po cells.
-// Váhy (binding 2): N × WEIGHTS_PER_CELL f32, AoS po cells. Per-cell:
-//   [0..576)   w1 row-major (HIDDEN rows × INPUTS cols)
-//   [576..592) b1
-//   [592..752) w2 row-major (OUTPUTS rows × HIDDEN cols) — Sprint 66 OUTPUTS=10
-//   [752..762) b2 — Sprint 66 OUTPUTS=10
+// Váhy (binding 2): N × WEIGHTS_PER_CELL f32, AoS po cells. Per-cell layout
+// (Sprint 80 storage bump HIDDEN 16→32):
+//   [0..1664)    w1 row-major (HIDDEN rows × INPUTS cols)
+//   [1664..1696) b1
+//   [1696..2016) w2 row-major (OUTPUTS rows × HIDDEN cols)
+//   [2016..2026) b2
 // Hidden (binding 3): N × BRAIN_HIDDEN f32, write-back.
 // Outputs (binding 4): N × BRAIN_OUTPUTS f32, write-back.
+// Per-cell active hidden count (`Brain.hidden_n`) je pro shader IRRELEVANT —
+// dead zone weights jsou zero (CPU-side init), tedy zero contribution k
+// hidden / output. Pre-Sprint-80 cells (hidden_n=16) produkují identický
+// výstup pre a post bump.
 
-const BRAIN_INPUTS: u32 = 36u;
-const BRAIN_HIDDEN: u32 = 16u;
-const BRAIN_OUTPUTS: u32 = 10u; // Sprint 66: +1 (bond signal output[9])
+const BRAIN_INPUTS: u32 = 52u;       // 20 sensory + 32 recurrent (= BRAIN_HIDDEN)
+const BRAIN_HIDDEN: u32 = 32u;       // Sprint 80: 16 → 32 storage cap
+const BRAIN_OUTPUTS: u32 = 10u;      // Sprint 66: +1 (bond signal output[9])
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 576u;        // BRAIN_HIDDEN * BRAIN_INPUTS
-const W2_OFFSET: u32 = 592u;        // B1 + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 752u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN (10*16)
-const WEIGHTS_PER_CELL: u32 = 762u; // B2 + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 1664u;        // BRAIN_HIDDEN * BRAIN_INPUTS = 32*52
+const W2_OFFSET: u32 = 1696u;        // B1 + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 2016u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN = 1696+10*32
+const WEIGHTS_PER_CELL: u32 = 2026u; // B2 + BRAIN_OUTPUTS
 
 struct Params {
     num_cells: u32,
@@ -44,7 +49,7 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h_off = cell * BRAIN_HIDDEN;
     let o_off = cell * BRAIN_OUTPUTS;
 
-    var hid: array<f32, 16>;
+    var hid: array<f32, 32>;
     for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
         var sum: f32 = weights[w_off + B1_OFFSET + h];
         for (var i: u32 = 0u; i < BRAIN_INPUTS; i = i + 1u) {

@@ -427,6 +427,7 @@ fn main() {
                 sync_transforms,
                 sync_hunter_transforms,
                 draw_bond_gizmos,
+                draw_cell_state_gizmos,
                 log_clock_events,
                 toggle_stats_overlay,
                 toggle_world_map_overlay,
@@ -721,8 +722,8 @@ fn world_map_image(map: &WorldMap) -> Image {
     let nz = map.resolution[2];
     let z_slice = nz / 2;
     let mut data = Vec::with_capacity(nx * ny * 4);
-    let low = [0.10_f32, 0.42, 0.12];
-    let high = [1.00_f32, 1.00, 1.00];
+    let low = [0.55_f32, 0.55, 0.55];
+    let high = [0.92_f32, 0.92, 0.92];
     let field = map.field();
     let plane = nx * ny;
     for j in 0..ny {
@@ -1324,9 +1325,10 @@ fn cell_eats_food(
                 continue;
             }
             eaten.insert(*food_e);
-            let bonds_copy = if let Ok((_, mut cell)) = cells.get_mut(*entity) {
+            let (bonds_copy, donor_state) = if let Ok((_, mut cell)) = cells.get_mut(*entity) {
                 cell.0.energy += *value;
                 let copy = cell.0.bonds;
+                let state = cell.0.cell_state;
                 if use_gpu_hebbian {
                     if let Some(slot) = slot_map.slot_of(*entity) {
                         if slot < rewards.len() {
@@ -1345,13 +1347,16 @@ fn cell_eats_food(
                         LEARNING_RATE,
                     );
                 }
-                copy
+                (copy, state)
             } else {
                 continue;
             };
             // Sprint 78: share s bonded partnery (free reward, no
             // conservation — modeluje tissue cooperation).
-            let share_value = *value * bioscape::BOND_FOOD_SHARE_FRAC;
+            // Sprint 80: donor's cell_state moduluje fraction. State≈0
+            // (selfish) → ~0% share; state≈1 (altruist) → plný 30% share.
+            // Tím vzniká uvnitř clusteru divergence rolí bez genetické změny.
+            let share_value = *value * bioscape::BOND_FOOD_SHARE_FRAC * donor_state;
             if share_value > 0.0 {
                 for bond_opt in bonds_copy.iter() {
                     if let Some(bond) = bond_opt {
@@ -1502,6 +1507,27 @@ fn draw_bond_gizmos(
             }
             gizmos.line(start, *end, color);
         }
+    }
+}
+
+/// Sprint 80: vertical marker per cell colored by `cell_state`. Modrá =
+/// selfish (state≈0), červená = altruist (state≈1). Per-cell StandardMaterial
+/// rebind by byl drahý (každý tick allocate handle), gizmo line je free.
+fn draw_cell_state_gizmos(
+    cells: Query<&CellEntity, Without<Dying>>,
+    mut gizmos: Gizmos,
+) {
+    for cell in &cells {
+        let s = cell.0.cell_state.clamp(0.0, 1.0);
+        let pos = Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]);
+        // Marker výška: 1.5× max body axis nad cell, viditelné nezávisle
+        // na velikosti těla.
+        let h = cell.0.phenotype.max_axis() * 1.5 + 1.0;
+        let top = pos + Vec3::new(0.0, 0.0, h);
+        // Lerp blue → red v sRGB. Mezistav kolem 0.5 = magenta = vidíme,
+        // jak cells přecházejí přes attractor boundary.
+        let color = Color::srgb(s, 0.05, 1.0 - s);
+        gizmos.line(pos, top, color);
     }
 }
 

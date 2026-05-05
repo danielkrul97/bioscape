@@ -1607,12 +1607,16 @@ impl World {
                 }
                 self.eaten_scratch[*food_idx] = true;
                 let bonds_copy;
+                let donor_state;
                 {
                     let cell = &mut self.cells[cell_idx];
                     cell.energy += *value;
                     bonds_copy = cell.bonds;
+                    donor_state = cell.cell_state;
                 }
-                let share_value = *value * bioscape::BOND_FOOD_SHARE_FRAC;
+                // Sprint 80: donor's cell_state modulates share fraction.
+                // State≈0 (selfish) → ~0%; state≈1 (altruist) → plný 30%.
+                let share_value = *value * bioscape::BOND_FOOD_SHARE_FRAC * donor_state;
                 if share_value > 0.0 {
                     for bond_opt in bonds_copy.iter() {
                         if let Some(bond) = bond_opt {
@@ -1905,12 +1909,13 @@ const EDGE_FRAC_THRESHOLD: f32 = 0.9;
 fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let n = world.cells.len();
     if n == 0 {
-        // 47 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
+        // 50 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
         // + 3 birth/death + 1 atk_emit 0 + predation + 6 brain/density 0 + 2
-        // bonds + 6 bond/adhesion 0 + 2 hunter + 1 immune_frac 0.
+        // bonds + 6 bond/adhesion 0 + 2 hunter + 1 immune_frac 0 +
+        // 3 cell_state 0 (Sprint 80).
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -1964,6 +1969,14 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     // BOND_DAMPING=0.6) se dá detekovat selekční drift.
     let mut bond_stiff_sum = 0.0_f64;
     let mut bond_damp_sum = 0.0_f64;
+    // Sprint 80: bistable cell_state diagnostics. Mean + std + altruist_frac
+    // (cells s state > 0.6 = committed k altruist attractoru). Bimodální
+    // distribuce (mean okolo 0.5, std velký, altruist_frac mezi 0.3-0.7) =
+    // očekávaný steady-state. Unimodální drift k 0 = celá populace selfish
+    // = food share zcela vypnutý → tissue regime collapsuje.
+    let mut state_sum = 0.0_f64;
+    let mut state_sumsq = 0.0_f64;
+    let mut altruist_count = 0_u64;
     let current_gen = world.clock.generation;
     for c in &world.cells {
         let s = c.genome.max_speed as f64;
@@ -2044,6 +2057,13 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // Sprint 68 gene means.
         bond_stiff_sum += c.genome.bond_stiffness as f64;
         bond_damp_sum += c.genome.bond_damping as f64;
+        // Sprint 80 cell_state.
+        let cs = c.cell_state as f64;
+        state_sum += cs;
+        state_sumsq += cs * cs;
+        if cs > 0.6 {
+            altruist_count += 1;
+        }
     }
     let nf = n as f64;
     let spd_m = spd_sum / nf;
@@ -2095,6 +2115,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     // Sprint 68 gene means.
     let bond_stiff_m = bond_stiff_sum / nf;
     let bond_damp_m = bond_damp_sum / nf;
+    // Sprint 80 cell_state stats.
+    let state_m = state_sum / nf;
+    let state_d = ((state_sumsq / nf) - state_m * state_m).max(0.0).sqrt();
+    let altruist_frac = altruist_count as f64 / nf;
     // Sprint 29 spatial clustering metric: mean nearest-neighbor distance.
     // Sprint 43: grid lookup s expanding radius. Začni na GRID_CELL_SIZE (=64),
     // pokud nikdo není, double až po WORLD diagonal — typický nn dist je < 50,
@@ -2139,7 +2163,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let immune_f = immune_cells as f64 / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -2190,6 +2214,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         world.hunter_attacks_gen,
         world.hunters.len(),
         immune_f,
+        // Sprint 80 cell_state diagnostics.
+        state_m,
+        state_d,
+        altruist_frac,
     )
 }
 
@@ -2379,7 +2407,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();

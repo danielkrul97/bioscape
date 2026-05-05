@@ -8,7 +8,7 @@
 //! weights, dispatch compute, readback hidden + outputs. State on GPU mezi
 //! ticky **NE** drží — to je Sprint 47.
 
-use crate::{Brain, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS};
+use crate::{Brain, BRAIN_HIDDEN, BRAIN_HIDDEN_DEFAULT, BRAIN_INPUTS, BRAIN_OUTPUTS};
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -76,12 +76,13 @@ const B1_OFFSET: usize = BRAIN_HIDDEN * BRAIN_INPUTS;
 const W2_OFFSET: usize = B1_OFFSET + BRAIN_HIDDEN;
 const B2_OFFSET: usize = W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN;
 const _: () = assert!(W1_OFFSET == 0);
-const _: () = assert!(B1_OFFSET == 576);
-const _: () = assert!(W2_OFFSET == 592);
-// Sprint 66: BRAIN_OUTPUTS 9 → 10. B2_OFFSET = W2_OFFSET + OUTPUTS*HIDDEN
-// = 592 + 10*16 = 752. WEIGHTS_PER_CELL = 752 + 10 = 762.
-const _: () = assert!(B2_OFFSET == 752);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 762);
+// Sprint 80 (HIDDEN 16 → 32 storage bump): B1 = 32*52 = 1664, W2 = 1664+32 =
+// 1696, B2 = 1696+10*32 = 2016, WEIGHTS_PER_CELL = 2016+10 = 2026.
+// Pre-Sprint-80: B1=576, W2=592, B2=752, WEIGHTS_PER_CELL=762.
+const _: () = assert!(B1_OFFSET == 1664);
+const _: () = assert!(W2_OFFSET == 1696);
+const _: () = assert!(B2_OFFSET == 2016);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 2026);
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -2059,6 +2060,7 @@ impl CellsGpu {
         for i in 0..n {
             let off = i * BRAIN_WEIGHTS_PER_CELL;
             let mut b = Brain {
+                hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
                 w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
                 b1: [0.0; BRAIN_HIDDEN],
                 w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
@@ -2069,10 +2071,10 @@ impl CellsGpu {
                     b.w1[h][in_i] = f[off + h * BRAIN_INPUTS + in_i];
                 }
             }
-            for h in 0..BRAIN_HIDDEN { b.b1[h] = f[off + 576 + h]; }
+            for h in 0..BRAIN_HIDDEN { b.b1[h] = f[off + B1_OFFSET + h]; }
             for o in 0..BRAIN_OUTPUTS {
                 for h in 0..BRAIN_HIDDEN {
-                    b.w2[o][h] = f[off + 592 + o * BRAIN_HIDDEN + h];
+                    b.w2[o][h] = f[off + W2_OFFSET + o * BRAIN_HIDDEN + h];
                 }
             }
             for o in 0..BRAIN_OUTPUTS { b.b2[o] = f[off + B2_OFFSET + o]; }
@@ -2271,6 +2273,7 @@ impl CellsGpu {
         let data = s.get_mapped_range();
         let f: &[f32] = bytemuck::cast_slice(&data);
         let mut b = Brain {
+            hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
             w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
             b1: [0.0; BRAIN_HIDDEN],
             w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
@@ -2281,10 +2284,10 @@ impl CellsGpu {
                 b.w1[h][in_i] = f[h * BRAIN_INPUTS + in_i];
             }
         }
-        for h in 0..BRAIN_HIDDEN { b.b1[h] = f[576 + h]; }
+        for h in 0..BRAIN_HIDDEN { b.b1[h] = f[B1_OFFSET + h]; }
         for o in 0..BRAIN_OUTPUTS {
             for h in 0..BRAIN_HIDDEN {
-                b.w2[o][h] = f[592 + o * BRAIN_HIDDEN + h];
+                b.w2[o][h] = f[W2_OFFSET + o * BRAIN_HIDDEN + h];
             }
         }
         for o in 0..BRAIN_OUTPUTS { b.b2[o] = f[B2_OFFSET + o]; }
@@ -2732,6 +2735,7 @@ impl HebbianGpu {
         for i in 0..n {
             let off = i * BRAIN_WEIGHTS_PER_CELL;
             let mut b = Brain {
+                hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
                 w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
                 b1: [0.0; BRAIN_HIDDEN],
                 w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
@@ -2743,11 +2747,11 @@ impl HebbianGpu {
                 }
             }
             for h in 0..BRAIN_HIDDEN {
-                b.b1[h] = f[off + 576 + h];
+                b.b1[h] = f[off + B1_OFFSET + h];
             }
             for o in 0..BRAIN_OUTPUTS {
                 for h in 0..BRAIN_HIDDEN {
-                    b.w2[o][h] = f[off + 592 + o * BRAIN_HIDDEN + h];
+                    b.w2[o][h] = f[off + W2_OFFSET + o * BRAIN_HIDDEN + h];
                 }
             }
             for o in 0..BRAIN_OUTPUTS {
@@ -5681,10 +5685,16 @@ mod tests {
                 a
             })
             .collect();
+        // Sprint 80: dead zone (slots ≥ hidden_n) musí být 0 — odpovídá reálnému
+        // Cell.last_hidden, kde forward_with_state píše jen [0..hidden_n] a zbytek
+        // zůstává po init na 0. GPU shader zatím iteruje celý BRAIN_HIDDEN; z toho
+        // důvodu dead zone hidden×inputs * 0 = 0 update, match CPU bounded path.
         let last_hidden: Vec<[f32; BRAIN_HIDDEN]> = (0..n)
-            .map(|_| {
+            .enumerate()
+            .map(|(idx, _)| {
                 let mut a = [0.0_f32; BRAIN_HIDDEN];
-                for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
+                let h_n = brains[idx].hidden_n as usize;
+                for v in a[..h_n].iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
                 a
             })
             .collect();
