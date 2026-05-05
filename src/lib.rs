@@ -526,7 +526,7 @@ pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.05;
 /// 2 partneři +0.6 × FOOD_VALUE = +12 each. Total cluster gain je
 /// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál
 /// pro bonding — fitness payoff přímo, ne přes hunter immunity proxy.
-pub const BOND_FOOD_SHARE_FRAC: f32 = 0.3;
+pub const BOND_FOOD_SHARE_FRAC: f32 = 1.0;
 /// Sprint 87: cluster-size bonus pro food share fraction. Per-partner share =
 /// `FRAC × (1 + (n_bonds − 1) × BONUS) × donor_state`. Cells hluboko v tkáni
 /// (víc bondů) sdílí každému partnerovi vyšší podíl — empirie ze 300-gen
@@ -595,20 +595,25 @@ pub fn bond_defense_factor(n_bonds: u32) -> f32 {
 
 /// Sprint 92: exposure factor pro hunter damage. Edge cells fully exposed,
 /// interior cells fully shielded — selection pressure favorizuje větší +
-/// 3D-spherical clusters (max interior:perimeter ratio).
+/// 3D-spherical clusters.
 ///
-/// `exposure = max(0, 1 - n_bonds × EXPOSURE_PER_BOND)`. Hunter damage =
-/// `genome.damage_per_tick × exposure × dt`.
+/// Sprint 96: **non-linear quadratic falloff** — `((1 - n × EXPOSURE_PER_BOND))²`.
+/// Pre-S96 linear pomalu odměňovala 1-2 bondy (75/50% damage); selection
+/// favorizovala solo strategy. Quadratic dramaticky odměňuje first 1-2
+/// bondy (56/25% damage) → cost-benefit balance flips ve prospěch
+/// bonding. Sprint 95 negative result diagnosed nedostatečný defense
+/// reward jako kořen; S96 fixes přes funkční nelinearitu.
 ///
-/// - 0 bonds (solo) → 1.0 (full damage)
-/// - 1 bond → 0.75
-/// - 2 bonds → 0.5
-/// - 3 bonds → 0.25
-/// - ≥4 bonds → 0.0 (effectively immune; HUNTER_BOND_IMMUNITY_THRESHOLD
-///   navíc skipne target lookup → hunter ani neztratí čas chase)
+/// Linear (S92) → Quadratic (S96):
+/// - 0 bonds: 1.00 → 1.00 (unchanged)
+/// - 1 bond:  0.75 → **0.56** (33% better defense)
+/// - 2 bonds: 0.50 → **0.25** (50% better)
+/// - 3 bonds: 0.25 → **0.06** (76% better)
+/// - ≥4 bonds: 0.00 (still floor)
 #[inline]
 pub fn cell_exposure(n_bonds: u32) -> f32 {
-    (1.0 - (n_bonds as f32) * EXPOSURE_PER_BOND).max(0.0)
+    let linear = (1.0 - (n_bonds as f32) * EXPOSURE_PER_BOND).max(0.0);
+    linear * linear
 }
 
 // ─── Sprint 71: macropredator (Hunter) ────────────────────────────────────────
@@ -3991,14 +3996,15 @@ mod tests {
 
     #[test]
     fn cell_exposure_endpoints() {
-        // Sprint 92: solo cell fully exposed.
+        // Sprint 96: quadratic falloff — `(linear)²`. Solo cell fully exposed,
+        // first bondy mají dramatic defense bonus, ≥4 plně immune.
         assert!((cell_exposure(0) - 1.0).abs() < 1e-6);
-        // 1 bond → 0.75
-        assert!((cell_exposure(1) - 0.75).abs() < 1e-6);
-        // 2 bonds → 0.5
-        assert!((cell_exposure(2) - 0.5).abs() < 1e-6);
-        // 3 bonds → 0.25
-        assert!((cell_exposure(3) - 0.25).abs() < 1e-6);
+        // 1 bond → 0.75² = 0.5625
+        assert!((cell_exposure(1) - 0.5625).abs() < 1e-6);
+        // 2 bonds → 0.5² = 0.25
+        assert!((cell_exposure(2) - 0.25).abs() < 1e-6);
+        // 3 bonds → 0.25² = 0.0625
+        assert!((cell_exposure(3) - 0.0625).abs() < 1e-6);
         // 4+ bonds → 0 (effectively immune)
         assert!(cell_exposure(4).abs() < 1e-6);
         assert!(cell_exposure(10).abs() < 1e-6);

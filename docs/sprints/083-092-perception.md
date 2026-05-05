@@ -1133,7 +1133,73 @@ sebou, kterou cells mohou flank-uniknout.
   5. **Mandatory cluster reproduction** — solo cells reproduce 50 % rate
      (coercive)
 
-## Sprinty 96+ — open-ended
+## Sprint 96 — bond reward bump (food share 1.0 + quadratic exposure)
+
+- **Cíl:** Sprint 95 negative result diagnosed cost-benefit asymmetry —
+  partial defense (linear) + delayed cluster brain reward < immediate
+  bond costs. S96 ramps:
+  - **#1 BOND_FOOD_SHARE_FRAC: 0.3 → 0.6 (try 1) → 1.0 (final)** —
+    free reward per bond partner per donor meal. Při 1.0 každý
+    bonded partner dostane stejnou energy jako donor sám.
+  - **#2 cell_exposure non-linear quadratic:**
+    `((1 − n × 0.25))²` místo linear.
+    - 0 bonds: 1.00 unchanged (full damage)
+    - 1 bond: 0.75 → **0.56** (33 % better defense)
+    - 2 bonds: 0.50 → **0.25** (50 % better)
+    - 3 bonds: 0.25 → **0.06** (76 % better)
+    - ≥4 bonds: 0.00 (still floor)
+
+- **Smoke seed=0 80 gen — bonds PERSIST:**
+
+  | gen | cells | hunters | bonds_avg | bact_frac | formed/gen |
+  |-----|-------|---------|-----------|-----------|------------|
+  | 1   | 481   | 12      | 0.085     | 0.056     | 105        |
+  | 10  | 653   | 13      | 0.118     | 0.075     | **439**    |
+  | 30  | 592   | 10      | 0.056     | 0.039     | 58         |
+  | 50  | 545   | 36      | 0.033     | 0.022     | 13         |
+  | 70  | 502   | 50      | 0.072     | 0.056     | 23         |
+  | 80  | 532   | 50      | **0.086** | **0.079** | 37         |
+
+- **Klíčový rozdíl vs S95:**
+  - S95: peak gen 10-20, collapse k 0 do gen 50, žádný recovery.
+  - S96 v2: peak gen 10, dip gen 50-60 (po hunter cap), **recovery gen 70-80**
+    s sustained 5-8 % bact_frac + 37 formed/gen continuing.
+  - Bonding teď **evolučně persistentní**, ne jen transient appearance.
+    Selection equilibrium reached kde bonded lineage holds niche.
+
+- **Diagnóza success:** `FRAC = 0.6` (v1) NEstačil — bonds collapsed.
+  `FRAC = 1.0` (v2) překlopil cost-benefit balance:
+  - Bonded cell with 1 partner gets share = 1.0 × value × cell_state
+    × cluster_mult per partner meal. Spolu s vlastním meals → ~2x food
+    intake oproti solo (modulated by altruist state).
+  - Quadratic defense reward přidává to base solo cell s 1 bondem už nemá
+    75 % damage ale 56 % — meaningful immediate selection signal.
+
+- **Sprint 94 cluster brain mechanismus aktivovaný** — mean_bond_count
+  > 0 throughout late gens znamená pooled_hidden je actively averaged.
+  Long-run (300+ gen) verify, jestli cluster cognition driver evolution
+  beyond simple reward stacking.
+
+- **Test suite:** 139/139 pass. `cell_exposure_endpoints` test aktualizován
+  na quadratic values.
+
+- **Výstup:**
+  - `src/lib.rs`: `BOND_FOOD_SHARE_FRAC 0.3 → 1.0`, `cell_exposure`
+    quadratic formula, test update.
+
+- **Co Sprint 96 NEŘEŠÍ (S97+):**
+  - **Long-run validation** — 300-500 gen verify jestli sustained
+    bonding leads to actual cluster cognition emergence (Sprint 94
+    mechanismus exploited).
+  - **Cluster shape** — gradient defense favors high-density spheres
+    ale fyzika spring constraints možná drives toward chains. Diagnostic
+    metric (cluster surface:volume ratio) by ukázal.
+  - **Carnivore_avg drift behavior** — multi-trophic food chain status v
+    long-run.
+  - **Mandatory cluster reproduction** — pokud sustained 5-8 % bonding
+    není dost pro emergence, S97 by mohl coerce-it.
+
+## Sprinty 97+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud
