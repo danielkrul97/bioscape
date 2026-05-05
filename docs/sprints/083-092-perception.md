@@ -1075,7 +1075,65 @@ sebou, kterou cells mohou flank-uniknout.
   - **Information flow asymmetry** — currently mean. Could be max/sum/
     weighted by bond_age — gives senior bond partners více weight.
 
-## Sprinty 95+ — open-ended
+## Sprint 95 — bond formation incentive (negative result, useful insight)
+
+- **Cíl:** lower bond formation gates aby bonds skutečně formovaly. Sprint 94
+  cluster brain mechanismus existoval ale dormant, protože bonds nikdy
+  nedosáhly cluster threshold. S95 tuning:
+  - `INNATE_BOND_BIAS: 1.5 → 2.5` — random brains emit silnější output[9]
+  - `BOND_FORM_THRESHOLD: 0.2 → 0.0` — any positive emission triggers
+  - `BOND_FORM_TICKS: 10 → 5` — faster commit z brief contactů
+  - `BOND_FORMATION_COST: 0.5 → 0.2` — cheaper to form
+
+- **Smoke seed=0 60 gen — peak then collapse:**
+
+  | gen | bonds_formed | bonds_broken | mean_bonds | bact_frac |
+  |-----|--------------|--------------|------------|-----------|
+  | 1   | 76           | 126          | 0.058      | 0.034     |
+  | 10  | 250          | 414          | **0.183**  | 0.141     |
+  | 20  | 192          | 284          | **0.191**  | 0.121     |
+  | 30  | 40           | 69           | 0.055      | 0.038     |
+  | 40  | 6            | 4            | 0.014      | 0.014     |
+  | 50  | 1            | 2            | 0.000      | 0.000     |
+  | 60  | 1            | 1            | 0.000      | 0.000     |
+
+- **Diagnóza — negative result, useful insight:**
+  - **Mechanismus succeeded** — bonds form rychle v early gens. Lower gates
+    funkční. Pre-S95 bonds_avg ~0; post-S95 peak 0.19.
+  - **Selection prunes bonding** — peak gen 10-20, kolaps gen 30+. Cells s
+    bondy underperform solo cells. Formation rate drops 250 → 1 do gen 50.
+    Brain weights pull output[9] DOWN přes selekci — cells „learn not to
+    bond" navzdory innate bias.
+  - **Důvod:** cost-benefit asymmetry je nevýhodný pro bonding:
+    - **Cost (immediate, certain):** formation cost (0.2 even tunované),
+      maintenance per tick, reduced mobility (spring constraint),
+      partial damage od hunter (cells s 1-2 bondy mají expozici 0.5-0.75
+      = stále 50-75% damage z S92).
+    - **Reward (delayed, conditional):** cluster brain shared cognition
+      (S94 — random brains nedokážou exploit), full immunity jen na ≥4
+      bondy (zřídka dosaženo), food share 0.3 (S78).
+  - **Co tlumí selekci:** partial defense není dost protiváhy k cost.
+    Solo cells s plnou mobility a žádným formation cost outperform
+    bonded cells na current arms race trajectory.
+
+- **Test suite:** 139/139 pass.
+
+- **Výstup:**
+  - `src/lib.rs`: 4 const tuning (INNATE_BOND_BIAS 1.5→2.5,
+    BOND_FORM_THRESHOLD 0.2→0.0, BOND_FORM_TICKS 10→5,
+    BOND_FORMATION_COST 0.5→0.2).
+
+- **Sprint 96 candidates (řeší cost-benefit asymmetry):**
+  1. **BOND_FOOD_SHARE_FRAC bump 0.3 → 0.5+** — větší altruist reward
+  2. **Non-linear exposure** — `cell_exposure(n_bonds) = (max(0, 1 - n/4))²`
+     → 1/0.56/0.25/0.06/0 — 1-2 bonds get much better defense
+  3. **HUNTER_BOND_IMMUNITY_THRESHOLD 4 → 3** — easier full immunity
+  4. **Cluster reproduction bonus** — bonded cells reproduce at lower
+     energy threshold (e.g., `REPRODUCE_THRESHOLD × (1 - n_bonds × 0.1)`)
+  5. **Mandatory cluster reproduction** — solo cells reproduce 50 % rate
+     (coercive)
+
+## Sprinty 96+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud

@@ -122,7 +122,7 @@ pub const INNATE_ATTACK_BIAS: f32 = 0.0;
 /// physics (contact + same adhesion_type), selekce může negativně tunit
 /// (cells co nechtějí bondovat se učí brain weights pull b1[9] dolů).
 /// Filozoficky stejný posun jako kdyby attack měl positive bias místo 0.
-pub const INNATE_BOND_BIAS: f32 = 1.5;
+pub const INNATE_BOND_BIAS: f32 = 2.5;
 
 // Shared sim parameters consumed by both the Bevy renderer (`src/main.rs`)
 // and the headless harness (`src/bin/headless.rs`). Single source of truth —
@@ -469,7 +469,7 @@ pub const MAX_BONDS_PER_CELL: usize = 6;
 /// candidates. 10 ticks dovolí formaci i z krátkých but consenting contactů.
 /// Risk: nestabilní bondy formující se z náhodného mihem (mitigated tím,
 /// že bond_signal threshold zůstává 0.2).
-pub const BOND_FORM_TICKS: u32 = 10;
+pub const BOND_FORM_TICKS: u32 = 5;
 /// Tiků bez kontaktu po kterých contact_progress klesne na 0 (cleanup sparse
 /// FxHashMap). Krátký timeout — pár, který se rozejde, ztrácí "track" hned.
 pub const CONTACT_DECAY_TICKS: u32 = 5;
@@ -505,14 +505,14 @@ pub const BOND_BREAK_FACTOR: f32 = 2.5;
 pub const BOND_REST_LENGTH_SLACK: f32 = 1.05;
 /// Brain output[9] musí být ≥ tento threshold u OBOU buněk pro vznik bondu.
 /// Mirror MATING_PHEROMONE_THRESHOLD / ATTACK_THRESHOLD semantiku.
-pub const BOND_FORM_THRESHOLD: f32 = 0.2;
+pub const BOND_FORM_THRESHOLD: f32 = 0.0;
 /// Brain output[9] < tento threshold u některé z bonded cells → bond se
 /// explicit trhá tento tick. Negative = "pusť mě". Asymmetric: jeden silný
 /// negativní signál stačí (escape behavior).
 pub const BOND_BREAK_THRESHOLD: f32 = -0.5;
 /// Energy cost při formaci bondu (one-shot, paid by initiator). Ne-trivial,
 /// aby selekce váhala bonding vs free-roaming.
-pub const BOND_FORMATION_COST: f32 = 0.5;
+pub const BOND_FORMATION_COST: f32 = 0.2;
 /// Per-second cost udržování každého bondu (paid každý tick). Drobný — bond
 /// je výhoda (tissue stability), ale ne free. Sprint 74: 0.1 → 0.05 (2×
 /// cheaper). Sprint 73 ukázalo, že bonded 3-cell platí 3.0/gen vs solo
