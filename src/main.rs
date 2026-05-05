@@ -25,19 +25,22 @@ const DIAG_SYNC_TRANSFORMS: DiagnosticPath = DiagnosticPath::const_new("sim/sync
 const DIAG_TICKS_PER_FRAME: DiagnosticPath = DiagnosticPath::const_new("sim/ticks_per_frame");
 const DIAG_RENDER_OVERHEAD: DiagnosticPath = DiagnosticPath::const_new("sim/render_overhead_ms");
 use bioscape::{
-    reject_food_for_richness, Cell, Food, Phenotype, SimClock, SmellField, SpatialGrid, WorldMap,
-    ATTACK_THRESHOLD, CARRION_FOOD_COUNT, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
+    adhesion_velocity_delta, bond_velocity_delta, reject_food_for_richness, Bond, Cell, Food,
+    Phenotype, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
+    ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD, BOND_FORMATION_COST, BOND_FORM_THRESHOLD,
+    BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC, BOND_REST_LENGTH_SLACK, BRAIN_INPUTS,
+    CARRION_FOOD_COUNT, CELL_RADIUS, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
     DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
     HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE,
     MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH,
-    MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
-    PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
-    PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON,
-    PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
-    SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, THERMAL_NOISE, TICKS_PER_GENERATION,
-    WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
-    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD, BRAIN_INPUTS,
+    MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
+    PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
+    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
+    PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
+    SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z, SMELL_PER_FOOD,
+    SMELL_SAMPLE_EPSILON, THERMAL_NOISE, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES,
+    WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES,
+    WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 #[cfg(feature = "gpu")]
 use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu};
@@ -147,6 +150,24 @@ impl Default for FoodGrid {
     }
 }
 
+/// Sprint 66: monotonic counter pro Cell.cell_id přidělování. Initial pop
+/// uses ids 0..INITIAL_CELLS, takže start = INITIAL_CELLS. Children z
+/// reproduce čerpají odsud.
+#[derive(Resource)]
+struct NextCellId(u64);
+
+impl Default for NextCellId {
+    fn default() -> Self {
+        Self(INITIAL_CELLS as u64)
+    }
+}
+
+/// Sprint 66: per-pair contact tick tracker. Klíč je `(min_id, max_id)`
+/// stable Cell.cell_id páru. Resource žije celý běh — generation reset
+/// nemažeme (kontakt může běžet napříč generační hranicí).
+#[derive(Resource, Default)]
+struct ContactProgress(FxHashMap<(u64, u64), u32>);
+
 /// Sprint 52: GPU compute state pro renderer. Drží persistent CellsGpu +
 /// BrainGpu/HebbianGpu/BrownianGpu na shared GpuContext. Insert se v `setup`
 /// pokud GpuContext::new uspěje; pokud selže, Resource zůstává `None` a
@@ -226,8 +247,15 @@ struct FoodMaterial(Handle<StandardMaterial>);
 /// Sprint 36: per-lineage material cache. Lineage hue → handle do
 /// `Assets<StandardMaterial>`. Bevy automaticky deduplikuje stejné materialy
 /// na renderer instances draw call.
+///
+/// Sprint 69: keyovaný podle `adhesion_type` (0..ADHESION_TYPE_COUNT) místo
+/// `lineage_id`. 8 distinct hues = vidíš "tribes" na první pohled, jakmile
+/// začne Steinberg sorting (same-type cells gravitují k sobě). Pre-Sprint 69
+/// se barvilo podle lineage_hue (random hue per linii) — ten signal byl
+/// užitečný pro fyzickou separaci, ale přebíjel adhesion clustering. Lineage
+/// info zůstává v HUD + CSV `lineages` count.
 #[derive(Resource, Default)]
-struct LineageMaterials(FxHashMap<u64, Handle<StandardMaterial>>);
+struct AdhesionMaterials([Option<Handle<StandardMaterial>>; 8]);
 
 /// Sprint 36 orbit camera state. Camera obíhá kolem `target` ve sférických
 /// souřadnicích (yaw + pitch). Distance camera→target je fixní
@@ -321,7 +349,7 @@ fn main() {
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`
         // (rich zones jsou bílé, poor zelené). Margins jsou bílé.
         .insert_resource(ClearColor(Color::WHITE))
-        .init_resource::<LineageMaterials>()
+        .init_resource::<AdhesionMaterials>()
         .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
         .insert_resource(Clock(SimClock::new(
@@ -331,6 +359,8 @@ fn main() {
         .init_resource::<CellGrid>()
         .init_resource::<FoodGrid>()
         .init_resource::<FoodDensityFactor>()
+        .init_resource::<NextCellId>()
+        .init_resource::<ContactProgress>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
         .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay, rebuild_cell_grid).chain())
@@ -377,6 +407,7 @@ fn main() {
                 camera_pan_input,
                 update_orbit_camera_transform,
                 sync_transforms,
+                draw_bond_gizmos,
                 log_clock_events,
                 toggle_stats_overlay,
                 toggle_world_map_overlay,
@@ -392,7 +423,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut lineage_materials: ResMut<LineageMaterials>,
+    mut adhesion_materials: ResMut<AdhesionMaterials>,
     mut window: Single<&mut Window>,
 ) {
     window.set_maximized(true);
@@ -488,8 +519,14 @@ fn setup(
     let mut initial_cells: Vec<Cell> = Vec::with_capacity(INITIAL_CELLS);
     let mut slot_map = CellSlotMap::default();
     for i in 0..INITIAL_CELLS {
-        let cell = Cell::random(&mut rng, half, i as u64, 0);
-        let mat = lineage_material(&mut lineage_materials, &mut materials, cell.lineage_id);
+        // Sprint 66: cell_id == lineage_id pro initial pop (1:1 mapping). Po
+        // mating se cell_id čerpá z `NextCellId` resource counteru.
+        let cell = Cell::random(&mut rng, half, i as u64, 0, i as u64);
+        let mat = adhesion_material(
+            &mut adhesion_materials,
+            &mut materials,
+            cell.genome.adhesion_type,
+        );
         let entity = commands
             .spawn((
                 CellEntity(cell),
@@ -595,23 +632,34 @@ fn setup(
 /// lineage_id. Hue mapuje deterministicky přes `lineage_hue`. Cache zaručuje,
 /// že cells se stejným lineage sdílejí jeden material — Bevy je instance
 /// podle materialu pro draw call binning, takže shared material = 1 batch.
-fn lineage_material(
-    cache: &mut LineageMaterials,
+/// Sprint 69: 8 distinctních hues per `adhesion_type`, evenly spaced kolem
+/// kruhu. Lazy-cache — handle vznikne při první cell s daným typem; pak
+/// re-use. Same hue se zrcadlí do bond gizmo lines, takže shluk = barva
+/// těla + barva bond lines = jednolitý vizuální chunk.
+fn adhesion_material(
+    cache: &mut AdhesionMaterials,
     materials: &mut Assets<StandardMaterial>,
-    lineage_id: u64,
+    adhesion_type: u8,
 ) -> Handle<StandardMaterial> {
-    if let Some(h) = cache.0.get(&lineage_id) {
+    let idx = (adhesion_type as usize) % 8;
+    if let Some(h) = &cache.0[idx] {
         return h.clone();
     }
-    let hue = lineage_hue(lineage_id);
-    let color = Color::hsl(hue, 0.75, 0.55);
+    let hue = idx as f32 * (360.0 / 8.0);
+    let color = Color::hsl(hue, 0.85, 0.55);
     let handle = materials.add(StandardMaterial {
         base_color: color,
         perceptual_roughness: 0.6,
         ..default()
     });
-    cache.0.insert(lineage_id, handle.clone());
+    cache.0[idx] = Some(handle.clone());
     handle
+}
+
+/// Sprint 69: hue pro adhesion gizmo lines. Match s `adhesion_material`
+/// (= rovnoměrné rozdělení 360°/8 = 45° per type).
+fn adhesion_hue(adhesion_type: u8) -> f32 {
+    (adhesion_type as usize % 8) as f32 * (360.0 / 8.0)
 }
 
 /// Sprint 36: Quat z yaw + pitch pro orientaci ellipsoidu. Body's local +X
@@ -675,13 +723,6 @@ fn food_target(extent: &WorldExtent, factor: f32) -> usize {
     let z_extent = 2.0 * extent.half_z;
     let z_factor = (z_extent / 4.0).max(1.0);
     ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0) * z_factor) as usize
-}
-
-/// Stable u64 → hue mapping for lineage visualization. Knuth-style integer
-/// hash mixing — short, no allocation, decent distribution across [0, 360).
-fn lineage_hue(id: u64) -> f32 {
-    let h = id.wrapping_mul(2654435761).wrapping_add(id >> 16);
-    ((h % 360) as f32).rem_euclid(360.0)
 }
 
 fn update_food_density_cycle(
@@ -1293,6 +1334,46 @@ fn sync_transforms(
     diag.add_measurement(&DIAG_SYNC_TRANSFORMS, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
+/// Sprint 69: render persistent spring bonds jako gizmo lines. Hue podle
+/// `adhesion_type` (bondy se tvoří jen mezi same-type páry, takže obě cells
+/// sdílí hue). Toroidal wrap-aware: skip line, pokud raw distance > poloviny
+/// world (znamená že bond jde "přes okraj", straight line by visuálně lhala).
+fn draw_bond_gizmos(
+    cells: Query<&CellEntity, Without<Dying>>,
+    mut gizmos: Gizmos,
+) {
+    let mut id_to_pos: FxHashMap<u64, Vec3> = FxHashMap::default();
+    for cell in &cells {
+        id_to_pos.insert(
+            cell.0.cell_id,
+            Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]),
+        );
+    }
+    let half_x = SIMULATION_HALF[0];
+    let half_y = SIMULATION_HALF[1];
+    for cell in &cells {
+        let start = Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]);
+        let hue = adhesion_hue(cell.0.genome.adhesion_type);
+        let color = Color::hsl(hue, 0.85, 0.65);
+        for bond in cell.0.bonds.iter().flatten() {
+            let Some(end) = id_to_pos.get(&bond.other_cell_id) else {
+                continue;
+            };
+            // Each bond rendered jen jednou — kresli pouze pokud cell_id <
+            // partner_id (canonical owner pravidlo).
+            if cell.0.cell_id >= bond.other_cell_id {
+                continue;
+            }
+            let dx = (start.x - end.x).abs();
+            let dy = (start.y - end.y).abs();
+            if dx > half_x || dy > half_y {
+                continue;
+            }
+            gizmos.line(start, *end, color);
+        }
+    }
+}
+
 fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>) {
     if keys.just_pressed(KeyCode::Space) {
         if time.is_paused() {
@@ -1599,9 +1680,10 @@ fn update_stats_overlay(
 fn cell_reproduces_on_threshold(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     cell_mesh: Res<CellMesh>,
-    mut lineage_materials: ResMut<LineageMaterials>,
+    mut adhesion_materials: ResMut<AdhesionMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut slot_map: ResMut<CellSlotMap>,
+    mut next_cell_id: ResMut<NextCellId>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut commands: Commands,
 ) {
@@ -1649,12 +1731,21 @@ fn cell_reproduces_on_threshold(
         cell_b.0.energy *= 0.5;
         cell_a.0.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
         cell_b.0.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
-        to_spawn.push(bioscape::make_mating_child(&cell_a.0, &cell_b.0, &mut rng));
+        // Sprint 66: child gets stable cell_id from monotonic counter.
+        let child_id = next_cell_id.0;
+        next_cell_id.0 += 1;
+        to_spawn.push(bioscape::make_mating_child(
+            &cell_a.0, &cell_b.0, &mut rng, child_id,
+        ));
     }
 
     let mesh = cell_mesh.0.clone();
     for cell in to_spawn {
-        let mat = lineage_material(&mut lineage_materials, &mut materials, cell.lineage_id);
+        let mat = adhesion_material(
+            &mut adhesion_materials,
+            &mut materials,
+            cell.genome.adhesion_type,
+        );
         let entity = commands
             .spawn((
                 CellEntity(cell),
@@ -1777,6 +1868,13 @@ fn cell_predates_on_neighbor(
         .iter()
         .map(|(e, c)| (e, c.0.position))
         .collect();
+    // Sprint 69: per-cell bond count pro bond_defense_factor lookup v
+    // grid callback. Sebrané jednorázově ze stejného iter() — kompatibilní
+    // s rayon herd_counts pre-pass.
+    let bond_counts: FxHashMap<Entity, u32> = cells
+        .iter()
+        .map(|(e, c)| (e, c.0.n_bonds()))
+        .collect();
     let grid_ref = &grid.0;
     let herd_counts_vec: Vec<u32> = snapshot
         .par_iter()
@@ -1838,10 +1936,16 @@ fn cell_predates_on_neighbor(
                 let gain_raw = PREDATION_GAIN_PER_TICK + bonus;
                 let prey_neighbors = *herd_counts.get(&entity_b).unwrap_or(&0);
                 let dilution = 1.0 / (1.0 + DILUTION_K * prey_neighbors as f32);
-                let gain = gain_raw * dilution;
+                // Sprint 69: bonded prey takes less damage + yields less energy.
+                // bond_count_b je 0 pokud entity_b není v map (mrtvá / not yet
+                // v snapshot) — graceful fallback na "no defense".
+                let bond_count_b = *bond_counts.get(&entity_b).unwrap_or(&0);
+                let defense = bioscape::bond_defense_factor(bond_count_b);
+                let gain = gain_raw * dilution * defense;
+                let drain = PREDATION_DRAIN_PER_TICK * defense;
                 *energy_changes.entry(entity_a).or_insert(0.0) += gain;
-                *energy_changes.entry(entity_b).or_insert(0.0) -= PREDATION_DRAIN_PER_TICK;
-                *damage_changes.entry(entity_b).or_insert(0.0) += PREDATION_DRAIN_PER_TICK;
+                *energy_changes.entry(entity_b).or_insert(0.0) -= drain;
+                *damage_changes.entry(entity_b).or_insert(0.0) += drain;
             });
     }
 
@@ -1861,47 +1965,72 @@ fn cell_predates_on_neighbor(
 fn resolve_cell_collisions(
     grid: Res<CellGrid>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    mut contact_progress: ResMut<ContactProgress>,
     mut diag: Diagnostics,
 ) {
     let t_total = Instant::now();
     // Sprint 58: snapshot + rayon par compute deltas.
-    // Sprint 65: 3D position delta (pre-Sprint-65 byl jen xy — overhlédnutí
-    // ze Sprintu 53 volumetric expansion; cells se v z volně prolínaly).
-    // Plus inelastic velocity damping (closing component podél separation
-    // normal je halved per pair → eliminuje re-overlap oscilace).
-    let snapshot: Vec<(Entity, [f32; 3], [f32; 3], f32)> = cells
+    // Sprint 65: 3D position delta + inelastic velocity damping.
+    // Sprint 66: differential adhesion + persistent spring bonds + contact
+    // tick tracker pro hybrid bond formation. Snapshot rozšířen o cell_id,
+    // adhesion_type, bonds.
+    let snapshot: Vec<SnapEntry> = cells
         .iter()
-        .map(|(e, c)| (e, c.0.position, c.0.velocity, c.0.phenotype.effective_radius()))
+        .map(|(e, c)| SnapEntry {
+            entity: e,
+            cell_id: c.0.cell_id,
+            position: c.0.position,
+            velocity: c.0.velocity,
+            radius: c.0.phenotype.effective_radius(),
+            adhesion_type: c.0.genome.adhesion_type,
+            bonds: c.0.bonds,
+        })
         .collect();
-    // Sprint 65: O(1) velocity lookup pro per-pair v_rel computation. Bez
-    // tohoto FxHashMap by každý collision callback dělal linear scan snapshot
-    // (N×k×N = O(N²) per tick).
-    let velocity_map: FxHashMap<Entity, [f32; 3]> = snapshot
+    // O(1) lookups pro Phase 1 hot loop.
+    let entity_to_idx: FxHashMap<Entity, usize> = snapshot
         .iter()
-        .map(|(e, _, v, _)| (*e, *v))
+        .enumerate()
+        .map(|(i, s)| (s.entity, i))
+        .collect();
+    let id_to_idx: FxHashMap<u64, usize> = snapshot
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.cell_id, i))
         .collect();
     let grid_ref = &grid.0;
-    let deltas: Vec<(Entity, [f32; 3], [f32; 3])> = snapshot
+    // Phase 1 (parallel): per-cell delta + vel_delta + collected contacts.
+    let results: Vec<(Entity, [f32; 3], [f32; 3], Vec<u64>)> = snapshot
         .par_iter()
-        .filter_map(|(entity_a, pos_a, vel_a, radius_a)| {
-            let broad_r = CELL_RADIUS * (*radius_a + BROAD_PHASE_SIZE_BUDGET);
+        .map(|s_a| {
+            let entity_a = s_a.entity;
+            let pos_a = s_a.position;
+            let vel_a = s_a.velocity;
+            let radius_a = s_a.radius;
+            let cell_id_a = s_a.cell_id;
+            let collision_r = CELL_RADIUS * (radius_a + BROAD_PHASE_SIZE_BUDGET);
+            let adhesion_r = collision_r * ADHESION_RANGE_FACTOR;
+            let broad_r = collision_r.max(adhesion_r);
             let mut delta = [0.0_f32, 0.0_f32, 0.0_f32];
             let mut vel_delta = [0.0_f32, 0.0_f32, 0.0_f32];
+            let mut local_contacts: Vec<u64> = Vec::new();
             grid_ref.for_each_in_radius_toroidal(
-                *pos_a,
+                pos_a,
                 broad_r,
                 SIMULATION_HALF,
                 |entity_b, pos_b, radius_b| {
-                    if entity_b == *entity_a {
+                    if entity_b == entity_a {
                         return;
                     }
-                    let pair_r = CELL_RADIUS * (*radius_a + radius_b);
+                    let Some(&j_idx) = entity_to_idx.get(&entity_b) else {
+                        return;
+                    };
+                    let pair_r = CELL_RADIUS * (radius_a + radius_b);
                     let pair_r2 = pair_r * pair_r;
-                    // d_vec = pos_a - pos_b (b → a direction). Push a along +d_vec.
-                    let d_vec = bioscape::min_image_delta(pos_b, *pos_a, SIMULATION_HALF);
+                    let d_vec = bioscape::min_image_delta(pos_b, pos_a, SIMULATION_HALF);
                     let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
-                    if d2 < pair_r2 && d2 > 0.0 {
-                        let d = d2.sqrt();
+                    let d = d2.sqrt();
+                    let in_contact = d2 < pair_r2 && d2 > 0.0;
+                    if in_contact {
                         let overlap = pair_r - d;
                         let nx = d_vec[0] / d;
                         let ny = d_vec[1] / d;
@@ -1909,12 +2038,7 @@ fn resolve_cell_collisions(
                         delta[0] += nx * overlap * 0.5;
                         delta[1] += ny * overlap * 0.5;
                         delta[2] += nz * overlap * 0.5;
-                        // Sprint 65: velocity damping (inelastic). FxHashMap
-                        // O(1) lookup b's velocity (snapshot pre-built).
-                        let vel_b = velocity_map
-                            .get(&entity_b)
-                            .copied()
-                            .unwrap_or([0.0, 0.0, 0.0]);
+                        let vel_b = snapshot[j_idx].velocity;
                         let v_rel = [
                             vel_a[0] - vel_b[0],
                             vel_a[1] - vel_b[1],
@@ -1928,28 +2052,184 @@ fn resolve_cell_collisions(
                             vel_delta[1] += damp * ny;
                             vel_delta[2] += damp * nz;
                         }
+                        let cell_id_b = snapshot[j_idx].cell_id;
+                        if cell_id_a < cell_id_b {
+                            local_contacts.push(cell_id_b);
+                        }
+                    } else if d > 0.0 {
+                        let same_type =
+                            s_a.adhesion_type == snapshot[j_idx].adhesion_type;
+                        let dv = adhesion_velocity_delta(d_vec, d, pair_r, same_type);
+                        vel_delta[0] += dv[0];
+                        vel_delta[1] += dv[1];
+                        vel_delta[2] += dv[2];
                     }
                 },
             );
-            if delta != [0.0; 3] || vel_delta != [0.0; 3] {
-                Some((*entity_a, delta, vel_delta))
-            } else {
-                None
+            // Sprint 66: spring bond force pro každý živý bond.
+            for bond_opt in s_a.bonds.iter() {
+                if let Some(bond) = bond_opt {
+                    if let Some(&j_idx) = id_to_idx.get(&bond.other_cell_id) {
+                        let pos_j = snapshot[j_idx].position;
+                        let vel_j = snapshot[j_idx].velocity;
+                        let d_vec =
+                            bioscape::min_image_delta(pos_j, pos_a, SIMULATION_HALF);
+                        let dist =
+                            (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2])
+                                .sqrt();
+                        let (dv, _broken) =
+                            bond_velocity_delta(bond, d_vec, dist, vel_a, vel_j);
+                        vel_delta[0] += dv[0];
+                        vel_delta[1] += dv[1];
+                        vel_delta[2] += dv[2];
+                    }
+                }
             }
+            (entity_a, delta, vel_delta, local_contacts)
         })
         .collect();
 
-    for (entity, delta, vel_delta) in deltas {
-        if let Ok((_, mut cell)) = cells.get_mut(entity) {
-            cell.0.position[0] += delta[0];
-            cell.0.position[1] += delta[1];
-            cell.0.position[2] += delta[2];
-            cell.0.velocity[0] += vel_delta[0];
-            cell.0.velocity[1] += vel_delta[1];
-            cell.0.velocity[2] += vel_delta[2];
+    // Phase 2 (sequential): apply deltas + bond age/prune + contact tracker
+    // + bond formation.
+    let dt = 1.0 / FIXED_TIMESTEP_HZ;
+    let mut seen_pairs: FxHashSet<(u64, u64)> = FxHashSet::default();
+    for (entity, delta, vel_delta, contacts) in &results {
+        let Ok((_, mut cell)) = cells.get_mut(*entity) else {
+            continue;
+        };
+        cell.0.position[0] += delta[0];
+        cell.0.position[1] += delta[1];
+        cell.0.position[2] += delta[2];
+        cell.0.velocity[0] += vel_delta[0];
+        cell.0.velocity[1] += vel_delta[1];
+        cell.0.velocity[2] += vel_delta[2];
+        let cell_id_a = cell.0.cell_id;
+        for &other_id in contacts {
+            let key = (cell_id_a, other_id);
+            seen_pairs.insert(key);
+            let entry = contact_progress.0.entry(key).or_insert(0);
+            *entry = entry.saturating_add(1);
         }
     }
+    // Bond pruning + maintenance — re-snapshot positions po Phase 2.
+    let positions: FxHashMap<u64, [f32; 3]> = cells
+        .iter()
+        .map(|(_, c)| (c.0.cell_id, c.0.position))
+        .collect();
+    for (_, mut cell) in cells.iter_mut() {
+        let outputs_9 = cell.0.last_outputs[9];
+        let explicit_break = outputs_9 < BOND_BREAK_THRESHOLD;
+        let pos_i = cell.0.position;
+        let mut bond_count = 0_usize;
+        for slot in 0..MAX_BONDS_PER_CELL {
+            let Some(bond) = cell.0.bonds[slot] else { continue };
+            if explicit_break {
+                cell.0.bonds[slot] = None;
+                continue;
+            }
+            let Some(&pos_j) = positions.get(&bond.other_cell_id) else {
+                cell.0.bonds[slot] = None;
+                continue;
+            };
+            let d_vec = bioscape::min_image_delta(pos_j, pos_i, SIMULATION_HALF);
+            let d = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
+            if d > bond.rest_length * bioscape::BOND_BREAK_FACTOR || d <= f32::EPSILON {
+                cell.0.bonds[slot] = None;
+                continue;
+            }
+            if let Some(b) = cell.0.bonds[slot].as_mut() {
+                b.age_ticks = b.age_ticks.saturating_add(1);
+            }
+            bond_count += 1;
+        }
+        if bond_count > 0 {
+            cell.0.energy -= bond_count as f32 * BOND_MAINTENANCE_PER_SEC * dt;
+        }
+    }
+    // Contact tracker decay.
+    contact_progress.0.retain(|key, ticks| {
+        if seen_pairs.contains(key) {
+            true
+        } else if *ticks > CONTACT_DECAY_TICKS {
+            *ticks -= CONTACT_DECAY_TICKS;
+            true
+        } else {
+            false
+        }
+    });
+    // Bond formation — kandidáti, kteří dosáhli BOND_FORM_TICKS thresholdu.
+    let candidates: Vec<(u64, u64)> = contact_progress
+        .0
+        .iter()
+        .filter_map(|(&pair, &ticks)| if ticks >= BOND_FORM_TICKS { Some(pair) } else { None })
+        .collect();
+    for (id_a, id_b) in candidates {
+        let Some(&i_a) = id_to_idx.get(&id_a) else { continue };
+        let Some(&i_b) = id_to_idx.get(&id_b) else { continue };
+        let sa = &snapshot[i_a];
+        let sb = &snapshot[i_b];
+        if sa.adhesion_type != sb.adhesion_type {
+            continue;
+        }
+        let Ok([(_, mut ca), (_, mut cb)]) = cells.get_many_mut([sa.entity, sb.entity]) else {
+            continue;
+        };
+        if ca.0.last_outputs[9] <= BOND_FORM_THRESHOLD
+            || cb.0.last_outputs[9] <= BOND_FORM_THRESHOLD
+        {
+            continue;
+        }
+        let already = ca
+            .0
+            .bonds
+            .iter()
+            .any(|b| b.map(|bb| bb.other_cell_id == id_b).unwrap_or(false));
+        if already {
+            continue;
+        }
+        let slot_a = ca.0.bonds.iter().position(|b| b.is_none());
+        let slot_b = cb.0.bonds.iter().position(|b| b.is_none());
+        let (Some(sa_slot), Some(sb_slot)) = (slot_a, slot_b) else { continue };
+        let pos_a = ca.0.position;
+        let pos_b = cb.0.position;
+        let d_vec = bioscape::min_image_delta(pos_b, pos_a, SIMULATION_HALF);
+        let dist =
+            (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
+        let rest = dist * BOND_REST_LENGTH_SLACK;
+        // Sprint 68: per-bond stiffness/damping = mean obou cells' genes.
+        let stiffness =
+            (ca.0.genome.bond_stiffness + cb.0.genome.bond_stiffness) * 0.5;
+        let damping = (ca.0.genome.bond_damping + cb.0.genome.bond_damping) * 0.5;
+        ca.0.bonds[sa_slot] = Some(Bond {
+            other_cell_id: id_b,
+            rest_length: rest,
+            stiffness,
+            damping,
+            age_ticks: 0,
+        });
+        cb.0.bonds[sb_slot] = Some(Bond {
+            other_cell_id: id_a,
+            rest_length: rest,
+            stiffness,
+            damping,
+            age_ticks: 0,
+        });
+        ca.0.energy -= BOND_FORMATION_COST;
+        cb.0.energy -= BOND_FORMATION_COST;
+        contact_progress.0.remove(&(id_a, id_b));
+    }
     diag.add_measurement(&DIAG_COLLISIONS, || t_total.elapsed().as_secs_f64() * 1000.0);
+}
+
+/// Sprint 66: snapshot row pro renderer collision/adhesion/bond pass.
+struct SnapEntry {
+    entity: Entity,
+    cell_id: u64,
+    position: [f32; 3],
+    velocity: [f32; 3],
+    radius: f32,
+    adhesion_type: u8,
+    bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
 }
 
 fn tick_death_fade(

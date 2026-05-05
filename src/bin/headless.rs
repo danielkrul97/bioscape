@@ -7,13 +7,15 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    reject_food_for_richness, Cell, Food, SimClock, SmellField, SpatialGrid, WorldMap,
-    ATTACK_THRESHOLD, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS, COLLISION_RESTITUTION,
-    CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
-    FOOD_VALUE,
-    GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
-    HERD_RADIUS, INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
-    MATING_RADIUS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
+    adhesion_velocity_delta, bond_velocity_delta, reject_food_for_richness, Bond, Cell, Food,
+    SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR, ATTACK_THRESHOLD,
+    BOND_BREAK_THRESHOLD, BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS,
+    BOND_MAINTENANCE_PER_SEC, BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT,
+    CELL_RADIUS, COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
+    DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH,
+    GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, INITIAL_CELLS,
+    LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS,
+    MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
     PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD, SIZE_RATIO_THRESHOLD,
@@ -59,8 +61,12 @@ use std::time::Instant;
 const WORLD_HALF: [f32; 3] = [960.0, 540.0, 50.0];
 
 /// Sprint 48: versioned binary header pro checkpoint files.
+/// Sprint 66 bump: Cell rozšířen o `cell_id` + `bonds`, BRAIN_OUTPUTS 9→10.
+/// Sprint 68 bump: Genome rozšířen o `bond_stiffness` + `bond_damping`,
+/// Bond rozšířen o `stiffness` + `damping`. Starší V1/V2 už nelze
+/// deserializovat — load vrací error.
 const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 3;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -134,6 +140,18 @@ struct World {
     deaths_gen: u64,
     fertile_ticks_gen: u64,
     predation_events_gen: u64,
+    /// Sprint 66: monotonic counter pro stable Cell.cell_id přidělování.
+    /// Initial population uses 0..INITIAL_CELLS, takže start = INITIAL_CELLS.
+    next_cell_id: u64,
+    /// Sprint 66: per-pair (min_id, max_id) → consecutive contact ticks.
+    /// Vstupy se přidávají v `resolve_collisions` Phase 2 (sequential merge),
+    /// odebírají při decay timeout. Sparse — pouze dvojice s aktuálním kontaktem.
+    contact_progress: rustc_hash::FxHashMap<(u64, u64), u32>,
+    /// Sprint 66 diagnostic counter — počet bondů vytvořených v aktuální generaci.
+    /// Zatím log-only, future může být CSV column.
+    bonds_formed_gen: u64,
+    /// Sprint 66 diagnostic — počet bondů přervaných v aktuální generaci.
+    bonds_broken_gen: u64,
     mating_radius: f32,
     // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
     // může nastavit výš (potřeba pro bench při N > 1000).
@@ -202,7 +220,7 @@ impl World {
             map_seed,
         );
         let cells = (0..initial_cells)
-            .map(|i| Cell::random(rng, WORLD_HALF, i as u64, 0))
+            .map(|i| Cell::random(rng, WORLD_HALF, i as u64, 0, i as u64))
             .collect();
         let target = food_target(1.0);
         let foods = (0..target)
@@ -239,6 +257,10 @@ impl World {
             deaths_gen: 0,
             fertile_ticks_gen: 0,
             predation_events_gen: 0,
+            next_cell_id: initial_cells as u64,
+            contact_progress: rustc_hash::FxHashMap::default(),
+            bonds_formed_gen: 0,
+            bonds_broken_gen: 0,
             mating_radius,
             max_population,
             bench_timings: PhaseTimings::default(),
@@ -297,6 +319,15 @@ impl World {
                 ),
             ));
         }
+        // Sprint 66: re-derive next_cell_id z max(cell.cell_id) + 1. Contact
+        // progress se neukládá (per-tick state); restartuje prázdný.
+        let next_cell_id = chk
+            .cells
+            .iter()
+            .map(|c| c.cell_id)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
         Ok(Self {
             cells: chk.cells,
             foods: chk.foods,
@@ -316,6 +347,10 @@ impl World {
             deaths_gen: chk.deaths_gen,
             fertile_ticks_gen: chk.fertile_ticks_gen,
             predation_events_gen: chk.predation_events_gen,
+            next_cell_id,
+            contact_progress: rustc_hash::FxHashMap::default(),
+            bonds_formed_gen: 0,
+            bonds_broken_gen: 0,
             mating_radius: chk.mating_radius,
             max_population: chk.max_population,
             bench_timings: PhaseTimings::default(),
@@ -981,10 +1016,10 @@ impl World {
         // slotu. Max search radius = CELL_RADIUS × (radius_i + max_neighbor_r);
         // vyhledáme přes effective_radius_i + GRID_CELL_SIZE konzervativně.
         // Sprint 65: rozšířeno o velocity damping (inelastic, restitution=0).
-        // Closing velocity podél separation normal je vynulovaná — eliminuje
-        // re-overlap oscilace. delta[2] aktivní (pre-Sprint-65 byl 3D math
-        // ale apply pouze x/y v rendereru; headless měl 3D apply už od Sprint 53,
-        // tady jen sjednocujeme + přidáváme velocity).
+        // Sprint 66: rozšířeno o (1) differential adhesion (soft attractive
+        // force same-type, mírná repulze cross-type, mimo kontakt) a
+        // (2) persistent spring bonds (per-cell list, hookean spring + damping).
+        // Plus per-pair contact tick tracker pro hybrid bond formation.
         let n = self.cells.len();
         self.cell_grid.rebuild(
             self.cells
@@ -992,6 +1027,13 @@ impl World {
                 .enumerate()
                 .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
         );
+        // Sprint 66: cell_id → idx map pro O(1) bond lookup.
+        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.cell_id, i))
+            .collect();
         self.deltas_scratch.clear();
         self.deltas_scratch.resize(n, [0.0, 0.0, 0.0]);
         self.velocity_deltas_scratch.clear();
@@ -999,60 +1041,116 @@ impl World {
 
         let cell_grid = &self.cell_grid;
         let cells = &self.cells;
-        // Bound na search radius — 2× max radius v gridu by stačilo, ale
-        // GRID_CELL_SIZE je už ~64; používáme effective_radius_i × CELL_RADIUS × 2
-        // jako horní odhad (radius_j ≤ radius_i × ratio threshold). Pro jistotu
-        // bumpneme na CELL_RADIUS × max_axis × 2.
-        self.deltas_scratch
-            .par_iter_mut()
+        // Sprint 66: search radius = max(collision, adhesion). Adhesion má
+        // dosah pair_r × ADHESION_RANGE_FACTOR; pair_r = CELL_RADIUS × max_axis × 2.
+        // Pro jistotu používáme effective_radius_i × CELL_RADIUS × 2 × FACTOR.
+        // Per-i collected contact pairs: (other_cell_id, currently_in_contact).
+        // Phase 2 sequentially merges do contact_progress.
+        let contact_lists: Vec<Vec<u64>> = (0..n)
+            .into_par_iter()
+            .zip(self.deltas_scratch.par_iter_mut())
             .zip(self.velocity_deltas_scratch.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, (delta, vel_delta))| {
+            .map(|((i, delta), vel_delta)| {
                 let pos_i = cells[i].position;
                 let vel_i = cells[i].velocity;
                 let radius_i = cells[i].phenotype.effective_radius();
-                let search_r = CELL_RADIUS * (radius_i + cells[i].phenotype.max_axis() * 2.0);
-                cell_grid.for_each_in_radius_toroidal(pos_i, search_r, WORLD_HALF, |id_j, pos_j, radius_j| {
-                    if id_j == i {
-                        return;
-                    }
-                    let pair_r = CELL_RADIUS * (radius_i + radius_j);
-                    let pair_r2 = pair_r * pair_r;
-                    // d_vec = pos_i - pos_j (j → i direction). Push i along +d_vec.
-                    let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
-                    let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
-                    if d2 < pair_r2 && d2 > 0.0 {
+                let type_i = cells[i].genome.adhesion_type;
+                let collision_r = CELL_RADIUS * (radius_i + cells[i].phenotype.max_axis() * 2.0);
+                let adhesion_r =
+                    CELL_RADIUS * (radius_i + cells[i].phenotype.max_axis() * 2.0)
+                        * ADHESION_RANGE_FACTOR;
+                let search_r = collision_r.max(adhesion_r);
+                let mut local_contacts: Vec<u64> = Vec::new();
+                let cell_id_i = cells[i].cell_id;
+                cell_grid.for_each_in_radius_toroidal(
+                    pos_i,
+                    search_r,
+                    WORLD_HALF,
+                    |id_j, pos_j, radius_j| {
+                        if id_j == i {
+                            return;
+                        }
+                        let pair_r = CELL_RADIUS * (radius_i + radius_j);
+                        let pair_r2 = pair_r * pair_r;
+                        // d_vec = pos_i - pos_j (j → i direction). Push i along +d_vec.
+                        let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                        let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
                         let d = d2.sqrt();
-                        let overlap = pair_r - d;
-                        let nx = d_vec[0] / d;
-                        let ny = d_vec[1] / d;
-                        let nz = d_vec[2] / d;
-                        // Position depenetration (mass-symmetric, halved).
-                        delta[0] += nx * overlap * 0.5;
-                        delta[1] += ny * overlap * 0.5;
-                        delta[2] += nz * overlap * 0.5;
-                        // Sprint 65: velocity damping. v_rel_n = (v_i - v_j) · n.
-                        // Closing pair má v_rel_n < 0 (distance derivative).
-                        // Pro restitution=0 → Δv_i along n = -v_rel_n × 0.5 ×
-                        // (1 - restitution) = -v_rel_n × 0.5. Pro pair je
-                        // Newton 3rd law symmetric (j visits i later v par_iter).
-                        let vel_j = cells[id_j].velocity;
-                        let v_rel = [
-                            vel_i[0] - vel_j[0],
-                            vel_i[1] - vel_j[1],
-                            vel_i[2] - vel_j[2],
-                        ];
-                        let v_rel_n = v_rel[0] * nx + v_rel[1] * ny + v_rel[2] * nz;
-                        if v_rel_n < 0.0 {
-                            let damp = -v_rel_n * 0.5 * (1.0 - COLLISION_RESTITUTION);
-                            vel_delta[0] += damp * nx;
-                            vel_delta[1] += damp * ny;
-                            vel_delta[2] += damp * nz;
+                        let in_contact = d2 < pair_r2 && d2 > 0.0;
+                        if in_contact {
+                            let overlap = pair_r - d;
+                            let nx = d_vec[0] / d;
+                            let ny = d_vec[1] / d;
+                            let nz = d_vec[2] / d;
+                            // Position depenetration (mass-symmetric, halved).
+                            delta[0] += nx * overlap * 0.5;
+                            delta[1] += ny * overlap * 0.5;
+                            delta[2] += nz * overlap * 0.5;
+                            // Sprint 65: velocity damping (inelastic).
+                            let vel_j = cells[id_j].velocity;
+                            let v_rel = [
+                                vel_i[0] - vel_j[0],
+                                vel_i[1] - vel_j[1],
+                                vel_i[2] - vel_j[2],
+                            ];
+                            let v_rel_n =
+                                v_rel[0] * nx + v_rel[1] * ny + v_rel[2] * nz;
+                            if v_rel_n < 0.0 {
+                                let damp =
+                                    -v_rel_n * 0.5 * (1.0 - COLLISION_RESTITUTION);
+                                vel_delta[0] += damp * nx;
+                                vel_delta[1] += damp * ny;
+                                vel_delta[2] += damp * nz;
+                            }
+                        } else if d > 0.0 {
+                            // Sprint 66: soft adhesion mimo kontakt.
+                            let type_j = cells[id_j].genome.adhesion_type;
+                            let same_type = type_i == type_j;
+                            let dv = adhesion_velocity_delta(d_vec, d, pair_r, same_type);
+                            vel_delta[0] += dv[0];
+                            vel_delta[1] += dv[1];
+                            vel_delta[2] += dv[2];
+                        }
+                        // Contact tracker — recordujeme jen když cell_id_i je
+                        // nižší (deduping symmetric pair). bond_active stranu
+                        // ověříme v Phase 2 (potřeba čerstvý last_outputs[9]).
+                        let cell_id_j = cells[id_j].cell_id;
+                        if in_contact && cell_id_i < cell_id_j {
+                            local_contacts.push(cell_id_j);
+                        }
+                    },
+                );
+                // Sprint 66: aplikuj spring bond force pro každý living bond
+                // této cells. Pokud bond pointer dangling (cíl mrtvý) nebo
+                // overstretched, vrátíme zpět informaci pro phase-2 cleanup.
+                for bond_opt in cells[i].bonds.iter() {
+                    if let Some(bond) = bond_opt {
+                        if let Some(&j_idx) = id_to_idx.get(&bond.other_cell_id) {
+                            let pos_j = cells[j_idx].position;
+                            let vel_j = cells[j_idx].velocity;
+                            let d_vec =
+                                bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                            let dist =
+                                (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2])
+                                    .sqrt();
+                            let (dv, _broken) =
+                                bond_velocity_delta(bond, d_vec, dist, vel_i, vel_j);
+                            // Apply force only — the actual break decision
+                            // se rozhodne v Phase 2 (zápis vyžaduje &mut cells).
+                            vel_delta[0] += dv[0];
+                            vel_delta[1] += dv[1];
+                            vel_delta[2] += dv[2];
                         }
                     }
-                });
-            });
+                }
+                local_contacts
+            })
+            .collect();
 
+        // Phase 2: sequential apply position/velocity deltas + contact tracker
+        // update + bond pruning + bond formation. Vše drží borrow checker happy
+        // tím, že jednotlivé fields self.cells iterujeme v jednom průchodu.
+        let dt = 1.0 / FIXED_TIMESTEP_HZ;
         for ((cell, delta), vel_delta) in self
             .cells
             .iter_mut()
@@ -1066,6 +1164,171 @@ impl World {
             cell.velocity[1] += vel_delta[1];
             cell.velocity[2] += vel_delta[2];
         }
+
+        // Sprint 66: bond pruning + age + maintenance + explicit-break.
+        // Snapshot positions po Phase-2 apply; pak per-cell projdi bonds:
+        //  1. brain output[9] < BREAK_THRESHOLD → drop all bonds této cells.
+        //  2. cíl bondu zemřel (id chybí v map) → drop.
+        //  3. distance > rest × BREAK_FACTOR → drop (overstretch).
+        //  4. jinak inkrement age + accumulate per-cell bond count pro maintenance.
+        let mut bonds_broken_this_tick: u64 = 0;
+        let positions_snapshot: Vec<[f32; 3]> =
+            self.cells.iter().map(|c| c.position).collect();
+        for i in 0..self.cells.len() {
+            let outputs_9 = self.cells[i].last_outputs[9];
+            let explicit_break = outputs_9 < BOND_BREAK_THRESHOLD;
+            let pos_i = positions_snapshot[i];
+            let mut bond_count = 0_usize;
+            for slot in 0..MAX_BONDS_PER_CELL {
+                let Some(bond) = self.cells[i].bonds[slot] else { continue };
+                if explicit_break {
+                    self.cells[i].bonds[slot] = None;
+                    bonds_broken_this_tick += 1;
+                    continue;
+                }
+                let Some(&j_idx) = id_to_idx.get(&bond.other_cell_id) else {
+                    self.cells[i].bonds[slot] = None;
+                    bonds_broken_this_tick += 1;
+                    continue;
+                };
+                let pos_j = positions_snapshot[j_idx];
+                let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                let d = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
+                if d > bond.rest_length * bioscape::BOND_BREAK_FACTOR || d <= f32::EPSILON {
+                    self.cells[i].bonds[slot] = None;
+                    bonds_broken_this_tick += 1;
+                    continue;
+                }
+                if let Some(b) = self.cells[i].bonds[slot].as_mut() {
+                    b.age_ticks = b.age_ticks.saturating_add(1);
+                }
+                bond_count += 1;
+            }
+            if bond_count > 0 {
+                let cost = bond_count as f32 * BOND_MAINTENANCE_PER_SEC * dt;
+                self.cells[i].energy -= cost;
+            }
+        }
+        // Sprint 66: contact_progress update from this-tick's collected
+        // contact pairs. Increment for new contacts; decrement-or-prune for
+        // pairs not seen this tick. Then attempt bond formation pro kandidáty
+        // ≥ BOND_FORM_TICKS, kteří mají match adhesion_type + oba bond_active.
+        let mut seen_pairs: rustc_hash::FxHashSet<(u64, u64)> =
+            rustc_hash::FxHashSet::default();
+        // Accumulate per-pair "i side bond_active" flag — both sides must be true.
+        // Cell i shipped (other_id, bond_active_i); for cell j we look it up
+        // separately by checking cells[id_to_idx[j]].last_outputs[9].
+        for (i, contacts) in contact_lists.iter().enumerate() {
+            let cell_id_i = self.cells[i].cell_id;
+            for &other_id in contacts {
+                let key = (cell_id_i, other_id);
+                seen_pairs.insert(key);
+                let entry = self.contact_progress.entry(key).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        }
+        // Decay / prune unseen pairs. Použijeme retain s decrementing.
+        self.contact_progress.retain(|key, ticks| {
+            if seen_pairs.contains(key) {
+                true
+            } else {
+                if *ticks > CONTACT_DECAY_TICKS {
+                    *ticks -= CONTACT_DECAY_TICKS;
+                    true
+                } else {
+                    false
+                }
+            }
+        });
+        // Sprint 66: attempt bond formation pro pairs co dosáhly thresholdu.
+        // Kontrola: same adhesion_type, oba bond_active, oba mají volný slot.
+        // Při úspěchu: zápis bondu na obou stranách + cost na obě cells.
+        let mut bonds_formed_this_tick: u64 = 0;
+        let candidates: Vec<(u64, u64)> = self
+            .contact_progress
+            .iter()
+            .filter_map(|(&(a, b), &ticks)| {
+                if ticks >= BOND_FORM_TICKS {
+                    Some((a, b))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (id_a, id_b) in candidates {
+            let Some(&i_a) = id_to_idx.get(&id_a) else { continue };
+            let Some(&i_b) = id_to_idx.get(&id_b) else { continue };
+            if i_a == i_b {
+                continue;
+            }
+            // Cells must agree on adhesion_type + signal.
+            if self.cells[i_a].genome.adhesion_type
+                != self.cells[i_b].genome.adhesion_type
+            {
+                continue;
+            }
+            if self.cells[i_a].last_outputs[9] <= BOND_FORM_THRESHOLD
+                || self.cells[i_b].last_outputs[9] <= BOND_FORM_THRESHOLD
+            {
+                continue;
+            }
+            // Volné sloty?
+            let slot_a = self.cells[i_a]
+                .bonds
+                .iter()
+                .position(|b| b.is_none());
+            let slot_b = self.cells[i_b]
+                .bonds
+                .iter()
+                .position(|b| b.is_none());
+            let (Some(sa), Some(sb)) = (slot_a, slot_b) else {
+                continue;
+            };
+            // Skip if už bonded (např. po prior tick — defensive, contact_progress
+            // by se měl reseta při formaci, ale i bez toho ne-duplikujeme).
+            let already = self.cells[i_a]
+                .bonds
+                .iter()
+                .any(|b| b.map(|bb| bb.other_cell_id == id_b).unwrap_or(false));
+            if already {
+                continue;
+            }
+            let pos_a = positions_snapshot[i_a];
+            let pos_b = positions_snapshot[i_b];
+            let d_vec = bioscape::min_image_delta(pos_b, pos_a, WORLD_HALF);
+            let dist =
+                (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
+            let rest = dist * BOND_REST_LENGTH_SLACK;
+            // Sprint 68: per-bond stiffness/damping = mean obou cells' genes.
+            let stiffness = (self.cells[i_a].genome.bond_stiffness
+                + self.cells[i_b].genome.bond_stiffness)
+                * 0.5;
+            let damping = (self.cells[i_a].genome.bond_damping
+                + self.cells[i_b].genome.bond_damping)
+                * 0.5;
+            self.cells[i_a].bonds[sa] = Some(Bond {
+                other_cell_id: id_b,
+                rest_length: rest,
+                stiffness,
+                damping,
+                age_ticks: 0,
+            });
+            self.cells[i_b].bonds[sb] = Some(Bond {
+                other_cell_id: id_a,
+                rest_length: rest,
+                stiffness,
+                damping,
+                age_ticks: 0,
+            });
+            // One-shot cost rozdělen na obě cells.
+            self.cells[i_a].energy -= BOND_FORMATION_COST;
+            self.cells[i_b].energy -= BOND_FORMATION_COST;
+            bonds_formed_this_tick += 1;
+            // Reset progress entry — nepokouší se znova ihned formovat.
+            self.contact_progress.remove(&(id_a, id_b));
+        }
+        self.bonds_formed_gen += bonds_formed_this_tick;
+        self.bonds_broken_gen += bonds_broken_this_tick;
     }
 
     fn predate(&mut self) {
@@ -1111,7 +1374,7 @@ impl World {
         // Sprint 57: paralelní attack candidate gathering. Pass 2a sbírá
         // (i, j, gain) eventy bez sdílených writes; Pass 2b aggreguje sekvenčně
         // do energy/damage scratch (řeší race na victim j shared mezi attackery).
-        let attack_events: Vec<(usize, usize, f32)> = (0..n)
+        let attack_events: Vec<(usize, usize, f32, f32)> = (0..n)
             .into_par_iter()
             .flat_map_iter(|i| {
                 let attack_signal = cells[i].last_outputs[6].max(0.0);
@@ -1124,7 +1387,7 @@ impl World {
                 let heading = cells[i].heading;
                 let search_r =
                     CELL_RADIUS * (radius_a + cells[i].phenotype.max_axis() * 2.0);
-                let mut local: Vec<(usize, usize, f32)> = Vec::new();
+                let mut local: Vec<(usize, usize, f32, f32)> = Vec::new();
                 cell_grid.for_each_in_radius_toroidal(
                     pos_i,
                     search_r,
@@ -1156,8 +1419,12 @@ impl World {
                                 }
                             }
                             let dilution = 1.0 / (1.0 + DILUTION_K * herd_counts[j] as f32);
-                            gain *= dilution;
-                            local.push((i, j, gain));
+                            // Sprint 69: bonded prey takes less damage + yields
+                            // less energy. Group-defense benefit činí bondování
+                            // evolučně positive (Sprint 67.1 ukázal opak bez něj).
+                            let defense = bioscape::bond_defense_factor(cells[j].n_bonds());
+                            gain *= dilution * defense;
+                            local.push((i, j, gain, defense));
                         }
                     },
                 );
@@ -1166,10 +1433,12 @@ impl World {
             .collect();
 
         let events: u64 = attack_events.len() as u64;
-        for (i, j, gain) in attack_events {
+        for (i, j, gain, defense) in attack_events {
             self.energy_deltas_scratch[i] += gain;
-            self.energy_deltas_scratch[j] -= PREDATION_DRAIN_PER_TICK;
-            self.damage_deltas_scratch[j] += PREDATION_DRAIN_PER_TICK;
+            // Sprint 69: defense škáluje i drain + damage (consistent s gain).
+            let drain = PREDATION_DRAIN_PER_TICK * defense;
+            self.energy_deltas_scratch[j] -= drain;
+            self.damage_deltas_scratch[j] += drain;
         }
         self.predation_events_gen += events;
         for ((cell, energy_delta), dmg_delta) in self
@@ -1423,8 +1692,17 @@ impl World {
                 self.cells[b].genome.brain = brain_b;
             }
         }
+        // Sprint 66: pre-allocate cell_ids for each child before splitting
+        // self.cells (split_at_mut would conflict with self.next_cell_id access).
+        let child_ids: Vec<u64> = (0..matings.len())
+            .map(|_| {
+                let id = self.next_cell_id;
+                self.next_cell_id += 1;
+                id
+            })
+            .collect();
         let mut children = Vec::with_capacity(matings.len());
-        for &(a, b) in matings {
+        for (i, &(a, b)) in matings.iter().enumerate() {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
             let (left, right) = self.cells.split_at_mut(hi);
             let cell_lo = &mut left[lo];
@@ -1438,7 +1716,9 @@ impl World {
             cell_b.energy *= 0.5;
             cell_a.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
             cell_b.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
-            children.push(bioscape::make_mating_child(cell_a, cell_b, rng));
+            children.push(bioscape::make_mating_child(
+                cell_a, cell_b, rng, child_ids[i],
+            ));
         }
         children
     }
@@ -1527,7 +1807,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     if n == 0 {
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,{},{},0,0,0,0,0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -1535,6 +1815,8 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
             world.deaths_gen,
             world.fertile_ticks_gen,
             world.predation_events_gen,
+            world.bonds_formed_gen,
+            world.bonds_broken_gen,
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -1564,6 +1846,16 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let mut corner_count = 0_u64;
     let mut lineages: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut oldest_age: u64 = 0;
+    // Sprint 67 bond/adhesion diagnostics: per-cell aggregates pro CSV.
+    let mut bond_signal_sum = 0.0_f64;
+    let mut total_bonds = 0_u64;
+    let mut bonded_cells = 0_u64;
+    let mut adhesion_hist = [0_u64; bioscape::ADHESION_TYPE_COUNT as usize];
+    // Sprint 68: gene-level diagnostics — mean of bond_stiffness / bond_damping
+    // přes celou populaci. Porovnáním s initial draw centerem (BOND_STIFFNESS=4.0,
+    // BOND_DAMPING=0.6) se dá detekovat selekční drift.
+    let mut bond_stiff_sum = 0.0_f64;
+    let mut bond_damp_sum = 0.0_f64;
     let current_gen = world.clock.generation;
     for c in &world.cells {
         let s = c.genome.max_speed as f64;
@@ -1628,6 +1920,18 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         if age > oldest_age {
             oldest_age = age;
         }
+        // Sprint 67 bond/adhesion diagnostics.
+        bond_signal_sum += c.last_outputs[9].max(0.0) as f64;
+        let cell_bonds = c.bonds.iter().filter(|b| b.is_some()).count() as u64;
+        total_bonds += cell_bonds;
+        if cell_bonds > 0 {
+            bonded_cells += 1;
+        }
+        let t_idx = (c.genome.adhesion_type as usize) % adhesion_hist.len();
+        adhesion_hist[t_idx] += 1;
+        // Sprint 68 gene means.
+        bond_stiff_sum += c.genome.bond_stiffness as f64;
+        bond_damp_sum += c.genome.bond_damping as f64;
     }
     let nf = n as f64;
     let spd_m = spd_sum / nf;
@@ -1654,6 +1958,31 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let density_d = ((density_sumsq / nf) - density_m * density_m).max(0.0).sqrt();
     let dmg_m = dmg_sum / nf;
     let noise_m = noise_sum / nf;
+    // Sprint 67 bond/adhesion diagnostics.
+    let bond_signal_m = bond_signal_sum / nf;
+    let mean_bond_count = total_bonds as f64 / nf;
+    let bond_active_frac = bonded_cells as f64 / nf;
+    // Shannon entropy of adhesion_type distribution, normalized by log2(K)
+    // (K = ADHESION_TYPE_COUNT) — uniformní distribuce → 1.0, monokultura → 0.0.
+    let adhesion_entropy = {
+        let k = adhesion_hist.len() as f64;
+        if k <= 1.0 {
+            0.0
+        } else {
+            let mut h = 0.0_f64;
+            for &count in adhesion_hist.iter() {
+                if count == 0 {
+                    continue;
+                }
+                let p = count as f64 / nf;
+                h -= p * p.log2();
+            }
+            h / k.log2()
+        }
+    };
+    // Sprint 68 gene means.
+    let bond_stiff_m = bond_stiff_sum / nf;
+    let bond_damp_m = bond_damp_sum / nf;
     // Sprint 29 spatial clustering metric: mean nearest-neighbor distance.
     // Sprint 43: grid lookup s expanding radius. Začni na GRID_CELL_SIZE (=64),
     // pokud nikdo není, double až po WORLD diagonal — typický nn dist je < 50,
@@ -1697,7 +2026,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -1734,6 +2063,16 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         density_d,
         dmg_m,
         noise_m,
+        // Sprint 67 bond/adhesion diagnostics.
+        world.bonds_formed_gen,
+        world.bonds_broken_gen,
+        mean_bond_count,
+        bond_active_frac,
+        bond_signal_m,
+        adhesion_entropy,
+        // Sprint 68 gene means.
+        bond_stiff_m,
+        bond_damp_m,
     )
 }
 
@@ -1923,7 +2262,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();
@@ -1996,6 +2335,9 @@ fn main() {
             world.deaths_gen = 0;
             world.fertile_ticks_gen = 0;
             world.predation_events_gen = 0;
+            // Sprint 66: bond formation/break per-gen counters.
+            world.bonds_formed_gen = 0;
+            world.bonds_broken_gen = 0;
         }
         if world.cells.is_empty() {
             eprintln!("extinction at gen {}", world.clock.generation);

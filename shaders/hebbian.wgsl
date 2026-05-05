@@ -3,20 +3,20 @@
 // rule. CPU equivalent v lib.rs Brain::hebbian_update.
 //
 // Layout brain weights musí matchnout `lib::gpu::BRAIN_WEIGHTS_PER_CELL`
-// packing (Sprint 44 brain_forward.wgsl):
+// packing (Sprint 44 brain_forward.wgsl). Sprint 66 OUTPUTS=10:
 //   [0..576)   w1 row-major (HIDDEN × INPUTS)
 //   [576..592) b1
-//   [592..736) w2 row-major (OUTPUTS × HIDDEN)
-//   [736..745) b2
+//   [592..752) w2 row-major (OUTPUTS × HIDDEN) — 10*16 = 160
+//   [752..762) b2
 
 const BRAIN_INPUTS: u32 = 36u;
 const BRAIN_HIDDEN: u32 = 16u;
-const BRAIN_OUTPUTS: u32 = 9u;
+const BRAIN_OUTPUTS: u32 = 10u;
 const W1_OFFSET: u32 = 0u;
 const B1_OFFSET: u32 = 576u;
 const W2_OFFSET: u32 = 592u;
-const B2_OFFSET: u32 = 736u;
-const WEIGHTS_PER_CELL: u32 = 745u;
+const B2_OFFSET: u32 = 752u;
+const WEIGHTS_PER_CELL: u32 = 762u;
 
 struct HebbianParams {
     num_cells: u32,

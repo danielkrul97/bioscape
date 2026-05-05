@@ -47,10 +47,13 @@ pub const BRAIN_INPUTS: usize = BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT;
 // (positive = emit more above baseline, costs energy), 3=morph_length,
 // 4=morph_width, 5=morph_spike, 6=attack, 7=turn_pitch (Sprint 33),
 // 8=morph_height (Sprint 34, appended kvůli zachování existujících indexů).
+// Sprint 66: 9=bond_signal — pozitivní (>BOND_FORM_THRESHOLD) povoluje vznik
+// spring bondů, silně negativní (<BOND_BREAK_THRESHOLD) trhá existující bondy.
+// Indexy 0–8 zachované, jen append.
 // Sprint 26 morph signals: signal × MORPH_RATE × dt přičteno k phenotype dim
 // každý tick, energy cost ∝ |delta|. Sprint 27 attack: gating signál pro
 // `predate` — bez aktivního output[6] > THRESHOLD se predace nestane.
-pub const BRAIN_OUTPUTS: usize = 9;
+pub const BRAIN_OUTPUTS: usize = 10;
 /// Inicializační bias na thrust output bin v `Brain::random`. Bez něj má ~½
 /// random brainů thrust output blízko nuly (cell se sotva hýbe), což vytvářelo
 /// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce
@@ -64,6 +67,9 @@ pub const INNATE_PHEROMONE_BIAS: f32 = 1.0;
 /// ne default. Záměrně 0 — chceme měřit, jestli selekce attack chování objeví
 /// sama, nebo zůstane utlumený. Negative bias by ho aktivně potlačoval.
 pub const INNATE_ATTACK_BIAS: f32 = 0.0;
+/// Sprint 66 bond signal bias (b2[9]). Default 0 — bond formation se musí
+/// objevit selekcí, ne jako prior. Stejná filozofie jako attack bias.
+pub const INNATE_BOND_BIAS: f32 = 0.0;
 
 // Shared sim parameters consumed by both the Bevy renderer (`src/main.rs`)
 // and the headless harness (`src/bin/headless.rs`). Single source of truth —
@@ -309,6 +315,112 @@ pub const MATING_COOLDOWN_TICKS: u32 = 10;
 /// scope-cut na universal gentle.
 pub const CARRION_DECAY_PER_SEC: f32 = 0.0005;
 
+// Sprint 66: differential adhesion (Steinberg) + persistent spring bonds.
+// Steinbergova differential-adhesion hypothesis: buňky stejného CAM/cadherin
+// typu drží spolu silněji než hetero-pair. V simu je to 2-úrovňové:
+//   1. Stateless soft attraction (běží každý tick v broad-phase) — výsledek
+//      je tekutý agregát, fluid sorting podle adhesion_type.
+//   2. Stateful spring bonds (persistent) — vznikají až po prolonged contact
+//      + brain output[9] consent na obou stranách. Drží pevný tvar tkáně.
+/// Počet diskrétních adhesion typů (cadherin-like CAM tokens). 8 = pohodlných
+/// 3 bity, dost pro emergentní niches bez sparse-population per type problému.
+pub const ADHESION_TYPE_COUNT: u8 = 8;
+/// Pravděpodobnost mutace adhesion_type per dítě. Při flipu se vybere uniformně
+/// jiný typ (∈ 0..ADHESION_TYPE_COUNT, ≠ původní). Pomalá rychlost — adhesion
+/// niche je strategicky stabilní, příliš časté flipy by rozbily clusters
+/// dřív než se prosadí selekce. 5 % dává průměrně 1 změnu za 20 generací.
+pub const ADHESION_MUTATION_RATE: f32 = 0.05;
+/// Dosah soft-attraction síly v násobcích pair-radius (CELL_RADIUS × (r_i + r_j)).
+/// 3× kontaktní vzdálenost = mírná lokální atrakce, neaplikuje se přes celé
+/// vision_radius. Zkrátit by zúžilo aglomeraci na overlap-only; rozšířit by
+/// vytvářelo dálkový shoaling efekt přes Steinbergův framework.
+pub const ADHESION_RANGE_FACTOR: f32 = 3.0;
+/// Peak attractive acceleration (pre-mass), aplikuje se jako Δv per tick.
+/// Same-type pair → cells se sbližují. Linearly škáluje (1 - d/R). Tuned tak,
+/// aby per-tick magnitude ~= drag×v_typ při d=0.5R, takže adhesion balancuje
+/// Brownian noise + drift, ne aby cells "schluckly" do single point.
+pub const ADHESION_STRENGTH: f32 = 8.0;
+/// Cross-type interaction. Steinbergův klasik: hetero-pair je *méně* atraktivní
+/// (negative = mírně repulsivní), což emergentně oddělí typy do clusterů
+/// podobných k tissue-segregation. -0.3 = 1/4 of same-type magnitude.
+pub const ADHESION_CROSS_TYPE: f32 = -0.3;
+/// Maximum spring bondů per cell. Sphere packing kissing 12, ale soft cells
+/// se realisticky drží ≤ 6 sousedů. Fixní array → no heap alloc.
+pub const MAX_BONDS_PER_CELL: usize = 6;
+/// Tiků kontaktu (cells in collision range, mutual bond_signal active) než se
+/// vytvoří spring bond. 30 ticks = 0.5 s při 60 Hz — protekce proti single-tick
+/// pasáži (random sblížení), ale ne tak dlouhá, aby selekce nestihla bonding
+/// vyzkoušet v rámci generace (10 s).
+pub const BOND_FORM_TICKS: u32 = 30;
+/// Tiků bez kontaktu po kterých contact_progress klesne na 0 (cleanup sparse
+/// FxHashMap). Krátký timeout — pár, který se rozejde, ztrácí "track" hned.
+pub const CONTACT_DECAY_TICKS: u32 = 5;
+/// Spring constant k (acceleration / displacement / mass). 4 dává natural
+/// freq ~ √4 / mass; pro mass=1 je perioda ~π s. Damping ji rychle utlumí.
+/// Sprint 68: per-bond stiffness se ukládá do Bond struct při formaci jako
+/// průměr `genome.bond_stiffness` obou cells. BOND_STIFFNESS zůstává jen
+/// jako center pro initial draw v Genome::random.
+pub const BOND_STIFFNESS: f32 = 4.0;
+/// Sprint 68: per-cell `genome.bond_stiffness` rozsah. Široký rozsah aby
+/// selekce mohla zkoušet jak floppy (k≈0.5, slouží spíš jako adhesion bond)
+/// tak rigid (k≈16, snapne při menší deformaci).
+pub const MIN_BOND_STIFFNESS: f32 = 0.5;
+pub const MAX_BOND_STIFFNESS: f32 = 16.0;
+/// Damping podél spring axis pro relativní velocity. Bez damping by spring
+/// oscilace explodovala (Sprint 65 collision damping je 0.5; bond má jiný
+/// regime — drží spojené). 0.6 = critically damped pro typický mass.
+/// Sprint 68: per-bond — ukládá se do Bond struct při formaci jako průměr
+/// `genome.bond_damping` obou cells. BOND_DAMPING zůstává jako initial
+/// draw center.
+pub const BOND_DAMPING: f32 = 0.6;
+/// Sprint 68: per-cell `genome.bond_damping` rozsah. 0 = under-damped (springs
+/// kmitají), 2 = over-damped (rychle ztuhne). 0.6 ≈ critical pro typický mass.
+pub const MIN_BOND_DAMPING: f32 = 0.0;
+pub const MAX_BOND_DAMPING: f32 = 2.0;
+/// Bond se trhá při current_length > rest_length × factor. 2.5 = 150 % strain
+/// před break — silný stretch (cell se vlastní motorikou trhá z agregátu)
+/// vs naturální oscilace ne-rozbije bond.
+pub const BOND_BREAK_FACTOR: f32 = 2.5;
+/// Násobitel kontaktní vzdálenosti pro rest_length. 1.05 = mírný "buffer"
+/// (kontakt drží trochu volněji než exact touching) → preventivní polštář
+/// proti inicial overlap při formaci.
+pub const BOND_REST_LENGTH_SLACK: f32 = 1.05;
+/// Brain output[9] musí být ≥ tento threshold u OBOU buněk pro vznik bondu.
+/// Mirror MATING_PHEROMONE_THRESHOLD / ATTACK_THRESHOLD semantiku.
+pub const BOND_FORM_THRESHOLD: f32 = 0.2;
+/// Brain output[9] < tento threshold u některé z bonded cells → bond se
+/// explicit trhá tento tick. Negative = "pusť mě". Asymmetric: jeden silný
+/// negativní signál stačí (escape behavior).
+pub const BOND_BREAK_THRESHOLD: f32 = -0.5;
+/// Energy cost při formaci bondu (one-shot, paid by initiator). Ne-trivial,
+/// aby selekce váhala bonding vs free-roaming.
+pub const BOND_FORMATION_COST: f32 = 0.5;
+/// Per-second cost udržování každého bondu (paid každý tick). Drobný — bond
+/// je výhoda (tissue stability), ale ne free.
+pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.1;
+/// Sprint 69: predation damage / gain reduction per active bond, kořist-side.
+/// Bonded cluster sdílí defense — útok na bonded prey vrací míň energie
+/// predátorovi a působí míň damage. Per-bond reduction (capped) převrací
+/// Sprint 67.1 závěr, že bonding je individual fitness-cost — teď je to
+/// group-defense benefit, který by měl být evolučně positive selekcí pro
+/// bondování. 15 % per bond × cap 4 = max 60 % reduction (4-bond clusters
+/// jsou v podstatě immune krátce; predátor pořád dostane něco z 1- a 2-bond cells).
+pub const BOND_DEFENSE_FRAC: f32 = 0.15;
+/// Maximum bondů, které se počítají do defense multiplikátoru. Cap brání
+/// stacking abuse (cell s 6 bondy = 100% immune). 4 = sweet spot, kde
+/// střední cluster (3-4 bondy) má smysluplnou ochranu, ale solo cell jasně
+/// horší (jen 0.85× damage).
+pub const BOND_DEFENSE_CAP: u32 = 4;
+
+/// Sprint 69: multiplikátor predation gain + damage podle počtu kořistních
+/// bondů. Vrací hodnotu v [0.4, 1.0]. n_bonds=0 → 1.0 (no defense), n_bonds≥4
+/// → 1.0 - 0.15×4 = 0.4 (max defense). Linear in n_bonds.
+#[inline]
+pub fn bond_defense_factor(n_bonds: u32) -> f32 {
+    let capped = n_bonds.min(BOND_DEFENSE_CAP) as f32;
+    1.0 - BOND_DEFENSE_FRAC * capped
+}
+
 pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_speed: 3.0,
     sigma_hue: 5.0,
@@ -320,6 +432,12 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_spike_length: 0.03,
     sigma_shell: 0.03,
     sigma_brain: 0.2,
+    adhesion_flip_rate: ADHESION_MUTATION_RATE,
+    // Sprint 68: bond physics genes — pomalejší drift než body params kvůli
+    // sub-procentní bond_active_frac v Sprint 67.1 long-run smoke (selekce
+    // má slabý signál, větší sigma by způsobil random walk).
+    sigma_bond_stiffness: 0.3,
+    sigma_bond_damping: 0.05,
 };
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     drag: DRAG_COEFFICIENT,
@@ -442,6 +560,8 @@ impl Brain {
         // Innate attack bias: Sprint 27 — default 0 (opt-in). Mění se přes
         // konstantu, ne ad-hoc tady, ať se chování dá testovat A/B.
         b2[6] += INNATE_ATTACK_BIAS;
+        // Sprint 66 bond signal bias — opt-in jako attack.
+        b2[9] += INNATE_BOND_BIAS;
         Self { w1, b1, w2, b2 }
     }
 
@@ -556,6 +676,12 @@ pub struct MutationConfig {
     pub sigma_spike_length: f32,
     pub sigma_shell: f32,
     pub sigma_brain: f32,
+    /// Sprint 66: pravděpodobnost flipu adhesion_type per dítě.
+    pub adhesion_flip_rate: f32,
+    /// Sprint 68: gaussian sigma pro bond_stiffness gen.
+    pub sigma_bond_stiffness: f32,
+    /// Sprint 68: gaussian sigma pro bond_damping gen.
+    pub sigma_bond_damping: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -571,6 +697,16 @@ pub struct Genome {
     pub spike_length: f32,
     /// Sprint 41: shell jako passive damage absorber.
     pub shell_thickness: f32,
+    /// Sprint 66: differential-adhesion CAM token (∈ 0..ADHESION_TYPE_COUNT).
+    /// Same-type cells na sebe atraktivně působí (Steinberg sorting), cross-type
+    /// pair má mírnou repulzi. Také gateway pro spring bond formation.
+    pub adhesion_type: u8,
+    /// Sprint 68: per-cell spring stiffness contribution. Bond mezi dvěma
+    /// cells používá průměr obou stiffness při formaci (uložený do Bond struct).
+    pub bond_stiffness: f32,
+    /// Sprint 68: per-cell spring damping contribution. Stejná semantika jako
+    /// bond_stiffness — pair-mean uložený do Bond.
+    pub bond_damping: f32,
     pub brain: Brain,
 }
 
@@ -592,11 +728,34 @@ impl Genome {
             // Sprint 41: mírný počáteční mean, žádný extreme spawn — selekce
             // si shell vytáhne nahoru, pokud má smysl.
             shell_thickness: rng.random_range(0.0..0.2),
+            // Sprint 66: uniform draw napříč ADHESION_TYPE_COUNT typů. Initial
+            // populace tak má rovnoměrnou type distribution; selekce + drift
+            // pak modifikují frekvence.
+            adhesion_type: rng.random_range(0..ADHESION_TYPE_COUNT),
+            // Sprint 68: initial draw kolem global default ±50 %. Selekce +
+            // drift pak rozhrnou rozsah.
+            bond_stiffness: rng.random_range(BOND_STIFFNESS * 0.5..BOND_STIFFNESS * 1.5),
+            bond_damping: rng.random_range(BOND_DAMPING * 0.5..BOND_DAMPING * 1.5),
             brain: Brain::random(rng),
         }
     }
 
     pub fn mutate(&self, rng: &mut impl Rng, cfg: &MutationConfig) -> Self {
+        // Sprint 66: discrete adhesion_type. Při flipu náhodně vyberu jiný
+        // typ ≠ self.adhesion_type. Pokud ADHESION_TYPE_COUNT == 1, fallback
+        // ponechá hodnotu (žádný "jiný" typ neexistuje).
+        let adhesion_type = if cfg.adhesion_flip_rate > 0.0
+            && ADHESION_TYPE_COUNT > 1
+            && rng.random::<f32>() < cfg.adhesion_flip_rate
+        {
+            let mut new_t = rng.random_range(0..ADHESION_TYPE_COUNT - 1);
+            if new_t >= self.adhesion_type {
+                new_t += 1;
+            }
+            new_t
+        } else {
+            self.adhesion_type
+        };
         Self {
             max_speed: (self.max_speed + gaussian(rng) * cfg.sigma_speed).max(MIN_SPEED),
             color_hue: (self.color_hue + gaussian(rng) * cfg.sigma_hue).rem_euclid(HUE_RANGE),
@@ -612,6 +771,11 @@ impl Genome {
                 .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH),
             shell_thickness: (self.shell_thickness + gaussian(rng) * cfg.sigma_shell)
                 .clamp(MIN_SHELL_THICKNESS, MAX_SHELL_THICKNESS),
+            adhesion_type,
+            bond_stiffness: (self.bond_stiffness + gaussian(rng) * cfg.sigma_bond_stiffness)
+                .clamp(MIN_BOND_STIFFNESS, MAX_BOND_STIFFNESS),
+            bond_damping: (self.bond_damping + gaussian(rng) * cfg.sigma_bond_damping)
+                .clamp(MIN_BOND_DAMPING, MAX_BOND_DAMPING),
             brain: self.brain.mutate(rng, cfg.sigma_brain),
         }
     }
@@ -629,6 +793,9 @@ impl Genome {
             body_height: if rng.random::<bool>() { a.body_height } else { b.body_height },
             spike_length: if rng.random::<bool>() { a.spike_length } else { b.spike_length },
             shell_thickness: if rng.random::<bool>() { a.shell_thickness } else { b.shell_thickness },
+            adhesion_type: if rng.random::<bool>() { a.adhesion_type } else { b.adhesion_type },
+            bond_stiffness: if rng.random::<bool>() { a.bond_stiffness } else { b.bond_stiffness },
+            bond_damping: if rng.random::<bool>() { a.bond_damping } else { b.bond_damping },
             brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
     }
@@ -739,6 +906,36 @@ impl Phenotype {
     }
 }
 
+/// Sprint 66: persistent spring bond mezi dvěma buňkami. Stateful — drží se
+/// mezi ticky, dokud se neutrhne (overstretch) nebo cíl nezemře. Bond je
+/// **directed** v Cell.bonds slotu (cell_i drží bond → other_cell_id), ale
+/// druhá strana má symmetrický slot (Newton 3rd law se realizuje tím, že
+/// každý cell aplikuje vlastní spring force).
+///
+/// Sprint 68: per-bond stiffness + damping (mean obou cells' genome při
+/// formaci) — bond je fyzicky jedna pružina, takže k a c jsou symmetric
+/// per-pair. Mutace brzdy/tuhosti nezmění existující bondy, ovlivní jen
+/// budoucí formace; tato semantika dělá bondy "stabilními kontrakty"
+/// místo per-tick re-evaluation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Bond {
+    /// Stable identifier druhé buňky (Cell.cell_id). Rezolvuje se na index
+    /// per-tick přes `FxHashMap<u64, usize>`. Pokud cíl zemřel, bond je
+    /// dangling — pruning pass ho zahodí.
+    pub other_cell_id: u64,
+    /// Klidová délka spring (světové jednotky). Set při formaci bondu na
+    /// `current_distance × BOND_REST_LENGTH_SLACK`.
+    pub rest_length: f32,
+    /// Sprint 68: per-bond spring constant. Set při formaci jako mean obou
+    /// `genome.bond_stiffness`.
+    pub stiffness: f32,
+    /// Sprint 68: per-bond damping. Set při formaci jako mean obou
+    /// `genome.bond_damping`.
+    pub damping: f32,
+    /// Tiků od formace. Diagnostic/logging — neovlivňuje fyziku.
+    pub age_ticks: u32,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Cell {
     pub position: [f32; 3],
@@ -777,6 +974,13 @@ pub struct Cell {
     /// Sprint 42: refractory period po mating, decremented per tick. Mating
     /// gating čte `== 0`.
     pub reproduce_cooldown_ticks: u32,
+    /// Sprint 66: stable identifier pro bond resolution. Monotonic, přidělen
+    /// World-level counterem při spawnu / mating childu. Lineage_id je sdílený
+    /// per linie (ne unique per cell), takže potřebujeme samostatný cell_id.
+    pub cell_id: u64,
+    /// Sprint 66: persistent spring bonds. Fixní array `Option<Bond>` aby Cell
+    /// zůstal `Copy` a žádný heap alloc per cell. Empty slots = `None`.
+    pub bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
     pub phenotype: Phenotype,
     pub genome: Genome,
 }
@@ -787,9 +991,17 @@ impl Cell {
         world_half: [f32; 3],
         lineage_id: u64,
         lineage_birth_gen: u64,
+        cell_id: u64,
     ) -> Self {
         let genome = Genome::random(rng);
-        Self::from_genome(rng, genome, world_half, lineage_id, lineage_birth_gen)
+        Self::from_genome(rng, genome, world_half, lineage_id, lineage_birth_gen, cell_id)
+    }
+
+    /// Sprint 69: count of populated bond slots. Used in predation defense
+    /// (`bond_defense_factor`) — víc bondů = větší ochrana proti útoku.
+    #[inline]
+    pub fn n_bonds(&self) -> u32 {
+        self.bonds.iter().filter(|b| b.is_some()).count() as u32
     }
 
     pub fn from_genome(
@@ -798,6 +1010,7 @@ impl Cell {
         world_half: [f32; 3],
         lineage_id: u64,
         lineage_birth_gen: u64,
+        cell_id: u64,
     ) -> Self {
         let direction = rng.random_range(0.0..TAU);
         let phenotype = Phenotype::from_genome(&genome);
@@ -838,6 +1051,8 @@ impl Cell {
             damage_accum: 0.0,
             age: 0,
             reproduce_cooldown_ticks: 0,
+            cell_id,
+            bonds: [None; MAX_BONDS_PER_CELL],
             phenotype,
             genome,
         }
@@ -1325,7 +1540,13 @@ where
 /// dělá caller před voláním). Random direction pro startovní heading +
 /// crossover + mutate genomu, fresh phenotype z genomu (žádný Lamarckismus),
 /// brain stav reset (last_*=0). Energy = a.energy + b.energy (caller už halved).
-pub fn make_mating_child(parent_a: &Cell, parent_b: &Cell, rng: &mut impl Rng) -> Cell {
+/// Sprint 66: caller poskytuje `cell_id` (World-level monotonic counter).
+pub fn make_mating_child(
+    parent_a: &Cell,
+    parent_b: &Cell,
+    rng: &mut impl Rng,
+    cell_id: u64,
+) -> Cell {
     // RNG draw order zachovává pre-refactor sekvenci: crossover/mutate FIRST,
     // pak direction. Změna pořadí by porušila CSV identity / reproducibility.
     let child_genome = Genome::crossover(&parent_a.genome, &parent_b.genome, rng)
@@ -1359,9 +1580,99 @@ pub fn make_mating_child(parent_a: &Cell, parent_b: &Cell, rng: &mut impl Rng) -
         // Sprint 42: child startuje s plnou cooldown — rodičovská cooldown
         // se nastaví v binárkách po `make_mating_child`, nezasáhne childa.
         reproduce_cooldown_ticks: 0,
+        cell_id,
+        // Sprint 66: child startuje bez bondů (čistý slate). Bondy se vytvoří
+        // podle vlastního chování dítěte, neinheritují se po rodičích.
+        bonds: [None; MAX_BONDS_PER_CELL],
         phenotype: child_phenotype,
         genome: child_genome,
     }
+}
+
+/// Sprint 66: differential-adhesion kernel pro jeden pár (i, j), aplikuje
+/// se ze strany i. Vrací `[Δvx, Δvy, Δvz]` přírůstek na velocity_i (před
+/// vynásobením `dt`). Same-type → soft attraction (positive coefficient,
+/// pulls i toward j). Cross-type → mírná repulze (negative). Zapojí se až
+/// **mimo** kontakt (d > pair_r), takže nekoliduje s collision depenetration.
+/// Force shape: linearní falloff `(1 - d/R)`, kde R = `ADHESION_RANGE_FACTOR
+/// × pair_r`. Mimo R → 0, takže není potřeba další distance gate v hot loop.
+///
+/// Vstup `delta_ji` je `pos_i - pos_j` (toroidal min-imaged); `dist`
+/// je jeho délka (caller už spočítal). `pair_r` je kontaktní vzdálenost
+/// (CELL_RADIUS × (radius_i + radius_j)). `same_type` rozlišuje cadherin
+/// kompatibilitu.
+pub fn adhesion_velocity_delta(
+    delta_ji: [f32; 3],
+    dist: f32,
+    pair_r: f32,
+    same_type: bool,
+) -> [f32; 3] {
+    if dist <= pair_r || dist <= 0.0 {
+        return [0.0; 3];
+    }
+    let range = pair_r * ADHESION_RANGE_FACTOR;
+    if dist >= range {
+        return [0.0; 3];
+    }
+    // Linear falloff: 1 at d=pair_r, 0 at d=range.
+    let falloff = (range - dist) / (range - pair_r);
+    // Coefficient: positive same-type pulls i toward j (negative along delta_ji
+    // = pos_i - pos_j). Cross-type negative coefficient flips sign → push apart.
+    let coeff = if same_type {
+        ADHESION_STRENGTH
+    } else {
+        ADHESION_STRENGTH * ADHESION_CROSS_TYPE
+    };
+    let inv_d = 1.0 / dist;
+    let nx = delta_ji[0] * inv_d;
+    let ny = delta_ji[1] * inv_d;
+    let nz = delta_ji[2] * inv_d;
+    let mag = -coeff * falloff;
+    [mag * nx, mag * ny, mag * nz]
+}
+
+/// Sprint 66: spring-bond force pro jeden bond (drží cell_i, ukazuje na j).
+/// Vrací `(velocity_delta_i, broken)` — broken=true pokud se bond v tomto
+/// ticku trhá (overstretch). Caller zodpovídá za clear bondu. Damping
+/// aplikujeme na rel velocity podél spring osy → utlumí oscilace bez
+/// over-damping (kritické pro stabilní tissue).
+///
+/// `delta_ji` = `pos_i - pos_j` (toroidal min-imaged), `dist` jeho délka,
+/// `vel_i`, `vel_j` aktuální velocities (caller předal). Vrací delta NA
+/// velocity_i, j strana ji aplikuje sama z vlastního Bond slotu (Newton
+/// 3rd law symmetric).
+pub fn bond_velocity_delta(
+    bond: &Bond,
+    delta_ji: [f32; 3],
+    dist: f32,
+    vel_i: [f32; 3],
+    vel_j: [f32; 3],
+) -> ([f32; 3], bool) {
+    let break_len = bond.rest_length * BOND_BREAK_FACTOR;
+    if dist > break_len || dist <= f32::EPSILON {
+        return ([0.0; 3], true);
+    }
+    let inv_d = 1.0 / dist;
+    let nx = delta_ji[0] * inv_d;
+    let ny = delta_ji[1] * inv_d;
+    let nz = delta_ji[2] * inv_d;
+    // Spring: extension = dist - rest. Pozitivní = roztažení → pulls i toward j
+    // (force along -n_ji, kde n_ji ukazuje od j k i). Negativní = stlačení →
+    // pushes i away from j (force along +n_ji).
+    let extension = dist - bond.rest_length;
+    // Sprint 68: per-bond stiffness/damping (uložené při formaci jako mean
+    // obou cells' genome values). BOND_STIFFNESS / BOND_DAMPING konstanty
+    // jen pro initial draw v Genome::random.
+    let spring = -bond.stiffness * extension;
+    // Damping: relativní velocity podél normálu. v_rel = v_i - v_j; closing
+    // pair má v_rel·n < 0 (pos_i přibližuje k pos_j). Damping force opacuje
+    // relative motion → -bond.damping × v_rel_n × n.
+    let v_rel_n = (vel_i[0] - vel_j[0]) * nx
+        + (vel_i[1] - vel_j[1]) * ny
+        + (vel_i[2] - vel_j[2]) * nz;
+    let damp = -bond.damping * v_rel_n;
+    let mag = spring + damp;
+    ([mag * nx, mag * ny, mag * nz], false)
 }
 
 /// Sprint 53: 3D volumetric scalar field s explicit-Jacobi diffusion + decay.
@@ -1866,6 +2177,9 @@ mod tests {
             body_height: 1.0,
             spike_length: 0.0,
             shell_thickness: 0.0,
+            adhesion_type: 0,
+            bond_stiffness: BOND_STIFFNESS,
+            bond_damping: BOND_DAMPING,
             brain: dummy_brain(),
         }
     }
@@ -1882,6 +2196,9 @@ mod tests {
             sigma_spike_length: 0.0,
             sigma_shell: 0.0,
             sigma_brain: 0.0,
+            adhesion_flip_rate: 0.0,
+            sigma_bond_stiffness: 0.0,
+            sigma_bond_damping: 0.0,
         }
     }
 
@@ -1898,6 +2215,9 @@ mod tests {
             body_height: 1.0,
             spike_length: 0.4,
             shell_thickness: 0.0,
+            adhesion_type: 0,
+            bond_stiffness: BOND_STIFFNESS,
+            bond_damping: BOND_DAMPING,
             brain: Brain {
                 w1: [[1.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
                 b1: [0.3; BRAIN_HIDDEN],
@@ -1934,6 +2254,9 @@ mod tests {
             sigma_spike_length: 10.0,
             sigma_shell: 10.0,
             sigma_brain: 10.0,
+            adhesion_flip_rate: 0.5,
+            sigma_bond_stiffness: 100.0,
+            sigma_bond_damping: 10.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -1977,6 +2300,8 @@ mod tests {
             damage_accum: 0.0,
             age: 0,
             reproduce_cooldown_ticks: 0,
+            cell_id: 0,
+            bonds: [None; MAX_BONDS_PER_CELL],
             phenotype,
             genome,
         }
@@ -2144,6 +2469,9 @@ mod tests {
             body_height: 0.7,
             spike_length: 0.0,
             shell_thickness: 0.0,
+            adhesion_type: 1,
+            bond_stiffness: 2.0,
+            bond_damping: 0.3,
             brain: dummy_brain(),
         };
         let b = Genome {
@@ -2156,6 +2484,9 @@ mod tests {
             body_height: 1.3,
             spike_length: 0.8,
             shell_thickness: 0.5,
+            adhesion_type: 5,
+            bond_stiffness: 8.0,
+            bond_damping: 1.0,
             brain: dummy_brain(),
         };
         for _ in 0..100 {
@@ -2695,6 +3026,9 @@ mod tests {
             sigma_spike_length: 0.0,
             sigma_shell: 100.0,
             sigma_brain: 0.0,
+            adhesion_flip_rate: 0.0,
+            sigma_bond_stiffness: 0.0,
+            sigma_bond_damping: 0.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -2773,7 +3107,7 @@ mod tests {
         tubby.phenotype.body_length = 2.0;
         tubby.phenotype.body_width = 2.0;
         tubby.phenotype.body_height = 2.0;
-        let outputs = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let outputs = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         unit.apply_brain_motor(&outputs, 1.0);
         tubby.apply_brain_motor(&outputs, 1.0);
         let unit_v = unit.velocity[0].abs();
@@ -2851,9 +3185,9 @@ mod tests {
     fn child_starts_with_zero_age_and_cooldown() {
         let mut rng = rand::rng();
         let g = dummy_genome();
-        let cell_a = Cell::from_genome(&mut rng, g, [100.0, 100.0, 0.0], 0, 0);
-        let cell_b = Cell::from_genome(&mut rng, g, [100.0, 100.0, 0.0], 0, 0);
-        let child = make_mating_child(&cell_a, &cell_b, &mut rng);
+        let cell_a = Cell::from_genome(&mut rng, g, [100.0, 100.0, 0.0], 0, 0, 1);
+        let cell_b = Cell::from_genome(&mut rng, g, [100.0, 100.0, 0.0], 0, 0, 2);
+        let child = make_mating_child(&cell_a, &cell_b, &mut rng, 3);
         assert_eq!(child.age, 0);
         assert_eq!(child.reproduce_cooldown_ticks, 0);
     }
@@ -2954,5 +3288,150 @@ mod tests {
         grid.for_each_in_radius([100.0, 10.0, 0.0], 60.0, |id, _, _| b.push(id));
 
         assert_eq!(a, b, "two identical queries returned different order");
+    }
+
+    // === Sprint 66: differential adhesion + spring bonds ===
+
+    #[test]
+    fn adhesion_is_zero_inside_contact() {
+        // d <= pair_r: collision depenetration handles, adhesion no-op.
+        let pair_r = 10.0;
+        let delta = [pair_r * 0.5, 0.0, 0.0];
+        let v = adhesion_velocity_delta(delta, pair_r * 0.5, pair_r, true);
+        assert_eq!(v, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn adhesion_is_zero_beyond_range() {
+        let pair_r = 10.0;
+        let range = pair_r * ADHESION_RANGE_FACTOR;
+        let d = range + 1.0;
+        let delta = [d, 0.0, 0.0];
+        let v = adhesion_velocity_delta(delta, d, pair_r, true);
+        assert_eq!(v, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn adhesion_pulls_same_type_inward() {
+        // pos_i - pos_j = +x (i je vpravo od j); same-type → attraction
+        // znamená velocity i přírůstek směrem -x (k j).
+        let pair_r = 10.0;
+        let d = pair_r * 1.5;
+        let delta = [d, 0.0, 0.0];
+        let v = adhesion_velocity_delta(delta, d, pair_r, true);
+        assert!(v[0] < 0.0, "expected pull toward j, got Δv = {:?}", v);
+        assert_eq!(v[1], 0.0);
+        assert_eq!(v[2], 0.0);
+    }
+
+    #[test]
+    fn adhesion_repels_cross_type_outward() {
+        let pair_r = 10.0;
+        let d = pair_r * 1.5;
+        let delta = [d, 0.0, 0.0];
+        let v = adhesion_velocity_delta(delta, d, pair_r, false);
+        assert!(v[0] > 0.0, "expected push away, got Δv = {:?}", v);
+    }
+
+    #[test]
+    fn bond_spring_pulls_when_stretched() {
+        // Bond rest 5, current 10 (stretched) → cell i taženo k j.
+        let bond = Bond { other_cell_id: 1, rest_length: 5.0, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
+        let delta = [10.0, 0.0, 0.0];
+        let (v, broken) = bond_velocity_delta(&bond, delta, 10.0, [0.0; 3], [0.0; 3]);
+        assert!(!broken);
+        assert!(v[0] < 0.0, "stretched bond should pull i toward j, got {:?}", v);
+    }
+
+    #[test]
+    fn bond_spring_pushes_when_compressed() {
+        // Bond rest 10, current 5 (compressed) → cell i tlačeno od j.
+        let bond = Bond { other_cell_id: 1, rest_length: 10.0, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
+        let delta = [5.0, 0.0, 0.0];
+        let (v, broken) = bond_velocity_delta(&bond, delta, 5.0, [0.0; 3], [0.0; 3]);
+        assert!(!broken);
+        assert!(v[0] > 0.0, "compressed bond should push i away, got {:?}", v);
+    }
+
+    #[test]
+    fn bond_breaks_past_break_factor() {
+        let rest = 5.0;
+        let bond = Bond { other_cell_id: 1, rest_length: rest, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
+        let stretched = rest * BOND_BREAK_FACTOR + 0.1;
+        let (v, broken) = bond_velocity_delta(
+            &bond,
+            [stretched, 0.0, 0.0],
+            stretched,
+            [0.0; 3],
+            [0.0; 3],
+        );
+        assert!(broken, "bond should break past BOND_BREAK_FACTOR");
+        assert_eq!(v, [0.0; 3]);
+    }
+
+    #[test]
+    fn bond_damping_opposes_closing_velocity() {
+        // Cell i at +x, j at origin, bond at rest. v_i moves toward j (−x).
+        // Damping should *resist* closing → push i back (+x).
+        let bond = Bond { other_cell_id: 1, rest_length: 5.0, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
+        let delta = [5.0, 0.0, 0.0];
+        let v_i = [-1.0, 0.0, 0.0];
+        let v_j = [0.0, 0.0, 0.0];
+        let (dv, _) = bond_velocity_delta(&bond, delta, 5.0, v_i, v_j);
+        assert!(dv[0] > 0.0, "damping should oppose closing motion, got {:?}", dv);
+    }
+
+    #[test]
+    fn bond_defense_factor_solo_is_unity() {
+        assert!((bond_defense_factor(0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bond_defense_factor_scales_linearly_until_cap() {
+        // 1 bond → 0.85, 2 → 0.70, 3 → 0.55, 4 → 0.40 (cap), 5+ → 0.40.
+        assert!((bond_defense_factor(1) - 0.85).abs() < 1e-6);
+        assert!((bond_defense_factor(2) - 0.70).abs() < 1e-6);
+        assert!((bond_defense_factor(3) - 0.55).abs() < 1e-6);
+        assert!((bond_defense_factor(4) - 0.40).abs() < 1e-6);
+        assert!((bond_defense_factor(5) - 0.40).abs() < 1e-6);
+        assert!((bond_defense_factor(MAX_BONDS_PER_CELL as u32) - 0.40).abs() < 1e-6);
+    }
+
+    #[test]
+    fn n_bonds_counts_only_populated_slots() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut cell = Cell::random(&mut rng, [960.0, 540.0, 50.0], 0, 0, 0);
+        assert_eq!(cell.n_bonds(), 0);
+        cell.bonds[0] = Some(Bond {
+            other_cell_id: 99,
+            rest_length: 5.0,
+            age_ticks: 0,
+            stiffness: BOND_STIFFNESS,
+            damping: 0.6,
+        });
+        cell.bonds[3] = Some(Bond {
+            other_cell_id: 100,
+            rest_length: 5.0,
+            age_ticks: 0,
+            stiffness: BOND_STIFFNESS,
+            damping: 0.6,
+        });
+        assert_eq!(cell.n_bonds(), 2);
+    }
+
+    #[test]
+    fn adhesion_works_across_toroidal_boundary() {
+        // Cell i at x=950, j at x=-950, world half_x=960. Min-image delta
+        // by měl být ~20 (přes wrap), ne ~1900.
+        let world_half = [960.0, 540.0, 50.0];
+        let pos_i = [950.0, 0.0, 0.0];
+        let pos_j = [-950.0, 0.0, 0.0];
+        let pair_r = 10.0;
+        let d_vec = min_image_delta(pos_j, pos_i, world_half);
+        let d = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
+        assert!(d < 25.0, "min-image distance should be ~20, got {}", d);
+        let v = adhesion_velocity_delta(d_vec, d, pair_r, true);
+        // Pull from i toward j přes wrap = +x (i is at +950, j wraps to +970).
+        assert!(v[0] > 0.0, "expected wrap-aware pull, got {:?}", v);
     }
 }

@@ -29,7 +29,7 @@ fn make_inputs() -> [f32; BRAIN_INPUTS] {
 
 fn make_cell(seed: u64) -> Cell {
     let mut rng = StdRng::seed_from_u64(seed);
-    Cell::random(&mut rng, WORLD_HALF, seed, 0)
+    Cell::random(&mut rng, WORLD_HALF, seed, 0, seed)
 }
 
 fn make_smell_field(populated: bool) -> SmellField {

@@ -5,19 +5,19 @@
 // Váhy (binding 2): N × WEIGHTS_PER_CELL f32, AoS po cells. Per-cell:
 //   [0..576)   w1 row-major (HIDDEN rows × INPUTS cols)
 //   [576..592) b1
-//   [592..736) w2 row-major (OUTPUTS rows × HIDDEN cols)
-//   [736..745) b2
+//   [592..752) w2 row-major (OUTPUTS rows × HIDDEN cols) — Sprint 66 OUTPUTS=10
+//   [752..762) b2 — Sprint 66 OUTPUTS=10
 // Hidden (binding 3): N × BRAIN_HIDDEN f32, write-back.
 // Outputs (binding 4): N × BRAIN_OUTPUTS f32, write-back.
 
 const BRAIN_INPUTS: u32 = 36u;
 const BRAIN_HIDDEN: u32 = 16u;
-const BRAIN_OUTPUTS: u32 = 9u;
+const BRAIN_OUTPUTS: u32 = 10u; // Sprint 66: +1 (bond signal output[9])
 const W1_OFFSET: u32 = 0u;
 const B1_OFFSET: u32 = 576u;        // BRAIN_HIDDEN * BRAIN_INPUTS
 const W2_OFFSET: u32 = 592u;        // B1 + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 736u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN
-const WEIGHTS_PER_CELL: u32 = 745u; // B2 + BRAIN_OUTPUTS
+const B2_OFFSET: u32 = 752u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN (10*16)
+const WEIGHTS_PER_CELL: u32 = 762u; // B2 + BRAIN_OUTPUTS
 
 struct Params {
     num_cells: u32,

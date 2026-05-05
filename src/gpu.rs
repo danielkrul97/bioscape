@@ -78,8 +78,10 @@ const B2_OFFSET: usize = W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN;
 const _: () = assert!(W1_OFFSET == 0);
 const _: () = assert!(B1_OFFSET == 576);
 const _: () = assert!(W2_OFFSET == 592);
-const _: () = assert!(B2_OFFSET == 736);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 745);
+// Sprint 66: BRAIN_OUTPUTS 9 → 10. B2_OFFSET = W2_OFFSET + OUTPUTS*HIDDEN
+// = 592 + 10*16 = 752. WEIGHTS_PER_CELL = 752 + 10 = 762.
+const _: () = assert!(B2_OFFSET == 752);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 762);
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -2073,7 +2075,7 @@ impl CellsGpu {
                     b.w2[o][h] = f[off + 592 + o * BRAIN_HIDDEN + h];
                 }
             }
-            for o in 0..BRAIN_OUTPUTS { b.b2[o] = f[off + 736 + o]; }
+            for o in 0..BRAIN_OUTPUTS { b.b2[o] = f[off + B2_OFFSET + o]; }
             out.push(b);
         }
         drop(data);
@@ -2285,7 +2287,7 @@ impl CellsGpu {
                 b.w2[o][h] = f[592 + o * BRAIN_HIDDEN + h];
             }
         }
-        for o in 0..BRAIN_OUTPUTS { b.b2[o] = f[736 + o]; }
+        for o in 0..BRAIN_OUTPUTS { b.b2[o] = f[B2_OFFSET + o]; }
         drop(data);
         self.brain_weights_rb.unmap();
         b
@@ -2749,7 +2751,7 @@ impl HebbianGpu {
                 }
             }
             for o in 0..BRAIN_OUTPUTS {
-                b.b2[o] = f[off + 736 + o];
+                b.b2[o] = f[off + B2_OFFSET + o];
             }
             out.push(b);
         }
@@ -2987,7 +2989,7 @@ impl MotorGpu {
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let n = capacity as u64;
         (
-            mk("motor-outputs", n * 9 * f as u64, stor_dst),
+            mk("motor-outputs", n * BRAIN_OUTPUTS as u64 * f as u64, stor_dst),
             mk("motor-headings", n * f as u64, stor_dst),
             mk("motor-pitches", n * f as u64, stor_dst),
             mk("motor-max-speeds", n * f as u64, stor_dst),
@@ -5742,7 +5744,7 @@ mod tests {
         let n = 64;
         let dt = 1.0_f32 / 60.0;
         let mut cells: Vec<Cell> = (0..n)
-            .map(|_| Cell::random(&mut rng, [960.0, 540.0, 2.0], 0, 0))
+            .map(|i| Cell::random(&mut rng, [960.0, 540.0, 2.0], 0, 0, i as u64))
             .collect();
         let outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
             .map(|_| {
@@ -6207,8 +6209,8 @@ mod tests {
         let world_half: [f32; 3] = [960.0, 540.0, 2.0];
         // Spawn cells s mírnou velocity / angular_velocity aby step měl co dělat.
         let mut cells: Vec<Cell> = (0..n)
-            .map(|_| {
-                let mut c = Cell::random(&mut rng, world_half, 0, 0);
+            .map(|i| {
+                let mut c = Cell::random(&mut rng, world_half, 0, 0, i as u64);
                 c.angular_velocity = rng.random_range(-0.3_f32..0.3);
                 c.pitch_velocity = rng.random_range(-0.05_f32..0.05);
                 c.last_outputs[6] = rng.random_range(-0.5_f32..1.0);

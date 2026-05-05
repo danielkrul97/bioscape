@@ -39,6 +39,13 @@ bevy = { version = "0.18", default-features = false, features = [
     "3d_bevy_render",
     "bevy_core_pipeline",
     "bevy_pbr",
+    # Sprint 69: gizmo lines pro bond visualization (debug-line drawing
+    # napřímo z systému přes `Gizmos` system param). Oba feature flagy
+    # potřeba — `bevy_gizmos` je data+systems, `bevy_gizmos_render` je actual
+    # rendering pipeline (bez něj se line resources sbírají, ale nikdy
+    # nedostanou na obrazovku).
+    "bevy_gizmos",
+    "bevy_gizmos_render",
     # UI overlays (Node + Text); bevy_text comes in transitively via 2d_bevy_render
     "bevy_ui",
     "bevy_ui_render",
