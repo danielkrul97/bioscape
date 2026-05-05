@@ -916,16 +916,108 @@ dilution, food share) + horizontální layers (thermal/light fields).
     - GPU adhesion + bond shaders.
     - Anisotropic cell collision (ellipsoid geometry).
 
-## Sprinty 70–72 — open-ended
+## Sprint 70 — cluster-aware reproduction + 250-gen verification
 
-- **Sprint 70+:** Thermal stratification (temperature field z-gradient).
-- **Sprint 70+:** Light field z-attenuation (photic vs aphotic zones).
-- **Sprint 70+:** GPU collision wire (3D + velocity damping + adhesion mirror).
-- **Sprint 70+:** Anisotropic cell collision (ellipsoid geometry).
-- **Sprint 70+:** Bigger horizontal world expansion + dynamic GPU
+- **Cíl:** dotáhnout bond density z 60-gen ~6 % (Sprint 69) k true tissue
+  regimu (15-20 % active). Hypotéza: bondy zanikají, protože nově rozené
+  cells spawnou „někde mezi rodiči" (current `make_mating_child` midpoint),
+  typicky daleko od parent's bond network — bond clustery rostou jen
+  organicky přes náhodný kontakt, smrtí cells se zmenšují. **Cluster-aware
+  spawn** posune dítě uvnitř bonded parent's clusteru → bond network roste
+  i přes reprodukci, ne se jen rozpadá smrtí.
+
+  **Plán implementace:**
+
+  *Body 1 — `pick_cluster_parent` helper (lib.rs):*
+  - Pure funkce: bere oba parents + child's adhesion_type, vrací
+    `Option<&Cell>` = parent, ke kterému se má child spawn-it.
+  - Priorita: bonded parent matchující adhesion_type → bonded parent
+    bez match → None (= midpoint fallback).
+
+  *Body 2 — `make_mating_child` cluster-aware spawn:*
+  - Po `Genome::crossover` + direction draw přidat 3 nepodmínečné
+    `rng.random_range` pro x/y/z jitter (z je 0.3× — užší z-rang).
+    Unconditional draw zachovává RNG draw order konzistentní napříč
+    všemi children, ne jen bonded větví.
+  - Pokud `pick_cluster_parent` vrátí `Some(p)`: child position =
+    `p.position + jitter`. Jinak: midpoint (pre-Sprint-70 chování).
+
+  *Body 3 — `CLUSTER_SPAWN_RADIUS = 8.0`:*
+  - 0.8× pair_radius pro typical post-evolution body (radius ~1.0,
+    pair_r ≈ 10) — child se spawne uvnitř bond contact distance, takže
+    existing collision-based bond formation chytne v <1 s.
+
+- **Konstanty:**
+  - `CLUSTER_SPAWN_RADIUS: f32 = 8.0` nový.
+
+- **Výstup:**
+  - `src/lib.rs`: `pick_cluster_parent` + `make_mating_child` rozšířen.
+  - **Test suite: 90/90 pass** (85 baseline + 5 nové: pick_cluster prefer
+    matching, fallback to any bonded, none when neither, mating spawns
+    near bonded parent, midpoint when neither bonded).
+  - **Long-run smoke seed=0, 250 gen, default world, CPU:**
+    - Wall-clock 275.3 s = **545 ticks/s** (Sprint 67.1 720, Sprint 68 617,
+      Sprint 69 631 @ 60-gen — Sprint 70 pomalejší kvůli denser bond
+      networks → víc collision events, `resolve_collisions` 142.9 µs vs
+      Sprint 69 ~100 µs). Final pop 632.
+    - **Bond density trajectory:**
+
+      | Gen | mean_bond_count | predation_events | spk_avg |
+      |-----|-----------------|-------------------|---------|
+      | 40  | 0.020 | 3515 | 0.324 |
+      | 60  | 0.023 | 2065 | 0.366 |
+      | 100 | 0.015 | 1335 | 0.285 |
+      | 140 | 0.032 | 1572 | 0.146 |
+      | **160** | **0.054** | 1479 | 0.111 |
+      | **180** | **0.057 (peak)** | 435 | 0.075 |
+      | 200 | 0.041 | 269 | 0.055 |
+      | 249 | 0.028 | **0** | 0.078 |
+
+- **Závěr — emergent předator-extinction event:**
+  - **Cluster-aware spawn mechanicky funguje** (testy ✓, bond density
+    peak 0.057 @ gen 180 vs Sprint 67.1 baseline 0.039 = +46 %).
+  - **Ale ecosystem-level effect je jiný, než hypotéza předpokládala.**
+    Kombinace Sprint 69 defense + Sprint 70 cluster spawn = bonded
+    clustery přežívaly natolik dobře, že **predace ztratila fitness
+    payoff** → predátoři vyhynuli (`spk_avg` 0.32 → 0.05, predation_events
+    3500 → 0). Bez predátorů bond defense bonus zmizel, bondování
+    stagnovalo na ~3 %.
+  - **Tipping point nebyl k tissue persistence, ale k peaceful niche
+    s extreme aspect ratio** (asp 1.0 → 12.3 = pure speed swimmery).
+    Selekce našla jiný attraktor: vyhnout se predaci útěkem místo bondingu.
+  - **Sprint 71+ musí rebalancovat:** buď slabší defense
+    (`BOND_DEFENSE_FRAC` 0.15 → 0.08), nebo nový predator pressure
+    (e.g. spike-bonus zvýšit, baseline attack incentive). Bez stable
+    predace bondování nemá selekční signál.
+
+- **Poznámky:**
+  - **RNG draw order:** přidání 3 unconditional `random_range` calls v
+    `make_mating_child` mění RNG trajectory napříč all seedy. Sprint 70
+    seed=0 NENÍ apples-to-apples s Sprint 67.1/68/69 seed=0. Comparison
+    je v ranges (peak vs baseline), ne v point matchingu.
+  - **Asp_avg 12.3 je extrémní** — body length/width = 12. Cells jsou
+    skoro 1D čáry. Spike crashed (0.05) takže to nejsou predator
+    needles; nejspíš pure-foraging streamliners co se vyhýbají
+    všemu kontaktu (lower collision = lower energy loss).
+  - **Energy crash 222 → 74** je consequence (no predation = no
+    energy transfer between cells, ekosystém běží jen na food eat).
+  - **Test `mating_child_spawns_at_midpoint_when_neither_parent_bonded`
+    zachycuje regression** — pre-Sprint-70 behavior se reproduces když
+    parents nemají bondy (= většina ranných gen).
+
+## Sprinty 71–72 — open-ended
+
+- **Sprint 71 (priorita):** rebalance defense vs predation. Sprint 70
+  long-run odhalil emergent predator extinction při current `BOND_DEFENSE_FRAC=0.15`.
+  Kandidáti: snížit FRAC na 0.08, zvýšit `SPIKE_PREDATION_BONUS`, nebo
+  přidat baseline attack incentive. Cíl: udržet predaci jako stable
+  selekční tlak na bondování napříč 250+ gen.
+- **Sprint 71+:** HUD overlay s real-time bond stats (renderer mirror
+  CSV diagnostiky ze Sprintu 67).
+- **Sprint 71+:** Thermal stratification (temperature field z-gradient).
+- **Sprint 71+:** Light field z-attenuation (photic vs aphotic zones).
+- **Sprint 71+:** GPU collision wire (3D + velocity damping + adhesion mirror).
+- **Sprint 71+:** Anisotropic cell collision (ellipsoid geometry).
+- **Sprint 71+:** Bigger horizontal world expansion + dynamic GPU
   SpatialHash sizing.
-- **Sprint 70+:** Spatial autocorrelation adhesion_type clustering metric.
-- **Sprint 70+:** Long-run smoke (250+ gen) post-Sprint-69 verification —
-  zda defense bonus dotáhne bond_active_frac k tissue-formation regimu.
-- **Sprint 70+:** HUD overlay s real-time bond stats (renderer mirror CSV
-  diagnostiky ze Sprintu 67).
+- **Sprint 71+:** Spatial autocorrelation adhesion_type clustering metric.

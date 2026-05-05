@@ -398,6 +398,13 @@ pub const BOND_FORMATION_COST: f32 = 0.5;
 /// Per-second cost udržování každého bondu (paid každý tick). Drobný — bond
 /// je výhoda (tissue stability), ale ne free.
 pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.1;
+/// Sprint 70: jitter radius pro cluster-aware reproduction. Když má parent
+/// bondy a child se má spawn-it blízko něj (uvnitř bond network), použije
+/// se random offset v ±tomto rangi. 8.0 = 0.8× pair_radius pro typical
+/// post-evolution body (radius ~1.0, pair_r ≈ 10) — tj. uvnitř bond contact
+/// distance, takže existing collision-based bond formation chytne v <1 s.
+pub const CLUSTER_SPAWN_RADIUS: f32 = 8.0;
+
 /// Sprint 69: predation damage / gain reduction per active bond, kořist-side.
 /// Bonded cluster sdílí defense — útok na bonded prey vrací míň energie
 /// predátorovi a působí míň damage. Per-bond reduction (capped) převrací
@@ -1541,6 +1548,38 @@ where
 /// crossover + mutate genomu, fresh phenotype z genomu (žádný Lamarckismus),
 /// brain stav reset (last_*=0). Energy = a.energy + b.energy (caller už halved).
 /// Sprint 66: caller poskytuje `cell_id` (World-level monotonic counter).
+/// Sprint 70: vybere parent, do jehož bond clusteru se má spawn dítě. Priorita:
+/// 1. Parent s bondy + adhesion_type matchující childovu (= dítě se chytne
+///    do existujícího clusteru téhož typu).
+/// 2. Pokud ani jeden parent nemá matchující adhesion, ale jeden má bondy,
+///    spawn k němu (50 % šance, že se chytne — adhesion mismatch znamená,
+///    že to není bond formation kandidát, ale aspoň blízká poloha).
+/// 3. Pokud ani jeden parent nemá bondy, vrátí `None` → caller spawne na
+///    midpoint (pre-Sprint-70 chování).
+pub fn pick_cluster_parent<'a>(
+    parent_a: &'a Cell,
+    parent_b: &'a Cell,
+    child_adhesion_type: u8,
+) -> Option<&'a Cell> {
+    let a_bonded = parent_a.n_bonds() > 0;
+    let b_bonded = parent_b.n_bonds() > 0;
+    let a_match = a_bonded && parent_a.genome.adhesion_type == child_adhesion_type;
+    let b_match = b_bonded && parent_b.genome.adhesion_type == child_adhesion_type;
+    if a_match {
+        return Some(parent_a);
+    }
+    if b_match {
+        return Some(parent_b);
+    }
+    if a_bonded {
+        return Some(parent_a);
+    }
+    if b_bonded {
+        return Some(parent_b);
+    }
+    None
+}
+
 pub fn make_mating_child(
     parent_a: &Cell,
     parent_b: &Cell,
@@ -1552,14 +1591,37 @@ pub fn make_mating_child(
     let child_genome = Genome::crossover(&parent_a.genome, &parent_b.genome, rng)
         .mutate(rng, &MUTATION_CONFIG);
     let direction = rng.random_range(0.0..TAU);
+    // Sprint 70: cluster-aware jitter. Draw vždycky (i když ho nepoužijeme)
+    // — RNG draw order pak zůstane consistent napříč all children, ne jen
+    // bonded-parent větví. Z jitter je 0.3× kvůli užšímu z-rangi (±50 vs xy ±960).
+    let jitter_x: f32 = rng.random_range(-CLUSTER_SPAWN_RADIUS..CLUSTER_SPAWN_RADIUS);
+    let jitter_y: f32 = rng.random_range(-CLUSTER_SPAWN_RADIUS..CLUSTER_SPAWN_RADIUS);
+    let jitter_z: f32 = rng.random_range(
+        -CLUSTER_SPAWN_RADIUS * 0.3..CLUSTER_SPAWN_RADIUS * 0.3,
+    );
     let mid_pos = [
         (parent_a.position[0] + parent_b.position[0]) * 0.5,
         (parent_a.position[1] + parent_b.position[1]) * 0.5,
         (parent_a.position[2] + parent_b.position[2]) * 0.5,
     ];
+    // Sprint 70: pokud má kterýkoliv parent bondy + jeho adhesion_type matchuje
+    // childovu, spawn dítě uvnitř jeho bond clusteru. Tím dochází k tipping
+    // pointu mezi „cells occasionally bond" a „persistent multi-cell
+    // organisms" — children rostou bond network místo aby ho jen redukovaly
+    // skrz death (Sprint 67.1 + 69 ukázaly net formed-broken < 0).
+    let cluster_parent =
+        pick_cluster_parent(parent_a, parent_b, child_genome.adhesion_type);
+    let pos = match cluster_parent {
+        Some(p) => [
+            p.position[0] + jitter_x,
+            p.position[1] + jitter_y,
+            p.position[2] + jitter_z,
+        ],
+        None => mid_pos,
+    };
     let child_phenotype = Phenotype::from_genome(&child_genome);
     Cell {
-        position: mid_pos,
+        position: pos,
         velocity: [
             direction.cos() * child_genome.max_speed,
             direction.sin() * child_genome.max_speed,
@@ -3417,6 +3479,108 @@ mod tests {
             damping: 0.6,
         });
         assert_eq!(cell.n_bonds(), 2);
+    }
+
+    #[test]
+    fn pick_cluster_parent_prefers_bonded_matching_adhesion() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut a = Cell::random(&mut rng, [960.0, 540.0, 50.0], 0, 0, 0);
+        let mut b = Cell::random(&mut rng, [960.0, 540.0, 50.0], 1, 0, 1);
+        a.genome.adhesion_type = 3;
+        b.genome.adhesion_type = 5;
+        a.bonds[0] = Some(Bond {
+            other_cell_id: 99,
+            rest_length: 5.0,
+            stiffness: BOND_STIFFNESS,
+            damping: 0.6,
+            age_ticks: 0,
+        });
+        // Child adhesion=3 → match s parent_a, který má bond.
+        let pick = pick_cluster_parent(&a, &b, 3);
+        assert!(pick.is_some());
+        assert_eq!(pick.unwrap().cell_id, a.cell_id);
+    }
+
+    #[test]
+    fn pick_cluster_parent_falls_back_to_any_bonded() {
+        let mut rng = StdRng::seed_from_u64(8);
+        let mut a = Cell::random(&mut rng, [960.0, 540.0, 50.0], 0, 0, 0);
+        let mut b = Cell::random(&mut rng, [960.0, 540.0, 50.0], 1, 0, 1);
+        a.genome.adhesion_type = 3;
+        b.genome.adhesion_type = 5;
+        b.bonds[0] = Some(Bond {
+            other_cell_id: 99,
+            rest_length: 5.0,
+            stiffness: BOND_STIFFNESS,
+            damping: 0.6,
+            age_ticks: 0,
+        });
+        // Child adhesion=7 — match neither — ale b má bondy → fallback.
+        let pick = pick_cluster_parent(&a, &b, 7);
+        assert!(pick.is_some());
+        assert_eq!(pick.unwrap().cell_id, b.cell_id);
+    }
+
+    #[test]
+    fn pick_cluster_parent_returns_none_when_neither_bonded() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let a = Cell::random(&mut rng, [960.0, 540.0, 50.0], 0, 0, 0);
+        let b = Cell::random(&mut rng, [960.0, 540.0, 50.0], 1, 0, 1);
+        assert!(pick_cluster_parent(&a, &b, 0).is_none());
+    }
+
+    #[test]
+    fn mating_child_spawns_near_bonded_parent() {
+        let mut rng = StdRng::seed_from_u64(123);
+        let mut a = Cell::random(&mut rng, [960.0, 540.0, 50.0], 0, 0, 0);
+        let mut b = Cell::random(&mut rng, [960.0, 540.0, 50.0], 1, 0, 1);
+        a.position = [100.0, 100.0, 0.0];
+        b.position = [-100.0, -100.0, 0.0];
+        a.genome.adhesion_type = 3;
+        b.genome.adhesion_type = 3;
+        a.bonds[0] = Some(Bond {
+            other_cell_id: 99,
+            rest_length: 5.0,
+            stiffness: BOND_STIFFNESS,
+            damping: 0.6,
+            age_ticks: 0,
+        });
+        // Force child adhesion=3 by making both parents have type 3 →
+        // crossover deterministic na typu (pre-mutation), mutation sice může
+        // flipnout, ale 5% rate × seed 123 to nestane (test verifuje deterministic).
+        let child = make_mating_child(&a, &b, &mut rng, 42);
+        // Child adhesion mohl mutovat, ale spawn pozice byla rozhodnuta podle
+        // child.genome.adhesion_type. Pokud child má type 3, spawn by měl
+        // být blízko a (jediný bonded). Pokud mutoval, jeden z parents stejně
+        // má bondy → fallback. Tedy child by měl být v každém případě blízko
+        // parent_a (= jediný bonded), max do CLUSTER_SPAWN_RADIUS od něho.
+        let dx = (child.position[0] - a.position[0]).abs();
+        let dy = (child.position[1] - a.position[1]).abs();
+        let dz = (child.position[2] - a.position[2]).abs();
+        assert!(
+            dx <= CLUSTER_SPAWN_RADIUS && dy <= CLUSTER_SPAWN_RADIUS
+                && dz <= CLUSTER_SPAWN_RADIUS * 0.3 + 1e-3,
+            "child spawn pozice mimo cluster jitter range — dx={} dy={} dz={}",
+            dx,
+            dy,
+            dz
+        );
+    }
+
+    #[test]
+    fn mating_child_spawns_at_midpoint_when_neither_parent_bonded() {
+        let mut rng = StdRng::seed_from_u64(456);
+        let mut a = Cell::random(&mut rng, [960.0, 540.0, 50.0], 0, 0, 0);
+        let mut b = Cell::random(&mut rng, [960.0, 540.0, 50.0], 1, 0, 1);
+        a.position = [100.0, 100.0, 0.0];
+        b.position = [-100.0, -100.0, 0.0];
+        // Žádný bond → midpoint (0, 0, 0).
+        let child = make_mating_child(&a, &b, &mut rng, 42);
+        assert!(
+            child.position[0].abs() < 1e-3 && child.position[1].abs() < 1e-3,
+            "child spawn pozice měla být midpoint (0, 0), got {:?}",
+            child.position
+        );
     }
 
     #[test]
