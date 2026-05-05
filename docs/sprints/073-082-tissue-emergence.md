@@ -253,17 +253,84 @@ hunt damage vs bond maintenance.
     - Direct cluster reward (energy sharing).
     - Anisotropic body penalty pro cluster-incompatible shapes.
 
-## Sprinty 76–82 — open-ended
+## Sprint 76 — lower thresholds (immunity 3→2 + form_ticks 30→10)
 
-- **Sprint 76 (priorita):** `HUNTER_BOND_IMMUNITY_THRESHOLD` 3 → 2
-  (single-line). Hypotéza: snazší cíl pro immunity → immune_frac
-  vyleze nad 0.05.
-- **Sprint 76+:** `BOND_FORM_TICKS` 30 → 10 — rychlejší formace.
-- **Sprint 76+:** Cluster food share mechanic (bonded cells share
-  eaten food % s partnery) — direct fitness reward.
-- **Sprint 76+:** Anisotropic shape penalty — cells s extrém asp >5
-  nemůžou bondovat (cluster-incompatible body).
-- **Sprint 76+:** Hunter persistent target chase logic.
-- **Sprint 76+:** HUD overlay s real-time bond stats.
-- **Sprint 76+:** Photic / thermal stratification.
-- **Sprint 76+:** GPU collision shader, anisotropic collision.
+- **Cíl:** snížit dosažitelný cíl pro multicelularitu. Sprint 75 dosáhlo
+  immune_frac=0.002 @ 3-bond threshold = symbolický průlom, ale evolučně
+  marginal. Sprint 76 zkouší dva současně:
+  1. `HUNTER_BOND_IMMUNITY_THRESHOLD` 3 → **2** — pair / triad cluster
+     stačí na immunity (ne plnokrevné quartet).
+  2. `BOND_FORM_TICKS` 30 → **10** (~0.17 s) — bondy se formují i z
+     krátkých contactů, aby cells s speed 190 nestihly utéct před
+     formací.
+
+- **Konstanty:**
+  - `HUNTER_BOND_IMMUNITY_THRESHOLD` 3 → 2
+  - `BOND_FORM_TICKS` 30 → 10
+
+- **Výstup:**
+  - `src/lib.rs`: 2 const updates + comments. Existující `0..3` bond
+    setup v hunter testech zůstává valid (3 bondy stále ≥ threshold 2).
+  - **Test suite: 95/95 pass.**
+  - **Long-run smoke seed=0, 1000 gen, default world, CPU:**
+    - Wall-clock 696.6 s = **861 ticks/s**. Final pop 575.
+    - **MAJOR breakthrough:**
+
+      | Gen | spd | asp | mBond | hunt_atks | immune_frac |
+      |-----|-----|------|-------|-----------|-------------|
+      | 2   | ~75 | ~1.0 | ~0.15 | ~5500 | **0.034 (peak!)** |
+      | 27  | ~95 | ~1.5 | **0.210 (peak!)** | ~3500 | 0.025 |
+      | 49  | 143 | 1.85 | **0.149** | 2633 | **0.031** |
+      | 99  | 163 | 6.19 | 0.092 | 2564 | 0.008 |
+      | 199 | 187 | 11.3 | 0.000 | 3216 | 0 |
+      | 999 | 190 | 12.6 | 0.000 | 2610 | 0 |
+
+    - **Peak `mBond=0.210` = 2.4× vs Sprint 75's 0.088, 4.7× vs S73 baseline.**
+    - **Peak `immune_frac=0.034` = 17× vs Sprint 75's 0.002.** 3.4 %
+      populace dosáhlo immunity (vs marginal 0.2 %).
+    - **Sustained tissue regime gen 27-99:** mBond > 0.09, immune_frac
+      pohybuje 0.008-0.034. Krátká, ale **proto-tissue real**.
+
+- **Závěr — proto-tissue confirmed, ale pořád transient:**
+  - **Mechanic průlom:** snížení threshold + form_ticks otevřel prostor
+    pro cluster formation, který Sprint 73-75 absent. Cells s asp~1.5-2
+    v gen 25-50 fyzicky vytvářely 2-3 bondové mini-clustery.
+  - **Selekce stále nakonec bonded population eliminuje.** Gen 99 už
+    asp=6.2, gen 199 asp=11.3 — streamlining race vyhrál nad clustering.
+  - **Asp=12 needle attractor je strukturální problém.** Cells s asp 12
+    fyzicky nemůžou clusterovat s 2 sousedy v rovině; bonded clustery
+    z gen 25-50 (asp 1.5) byly geometricky možné, ale jakmile populace
+    konvergovala k needle phenotype, cluster path se zavřel.
+
+- **Implikace pro Sprint 77+:**
+  - **Cap asp.** Tři páky k zamezení needle attractor:
+    1. **`MIN_BODY_WIDTH` 0.3 → 0.8** (also `MIN_BODY_HEIGHT`) — cap
+       asp na ~5 (length 4 / width 0.8). Single-line config change.
+    2. Asp-aware bond formation gating — `if asp > 5: no bond`.
+       Cells přímo selektovány proti extreme elongation pro cluster path.
+    3. Drag model rebalance — currently anisotropic drag favorizuje
+       streamlined; pokud rebalance ke „rounder is faster", asp evolves
+       differently. Větší scope, fundamentální fyzika change.
+  - **Doporučuju #1** (config change). Sprint 73 pattern (single
+    const + 1000-gen verify) drží.
+
+- **Poznámky:**
+  - **Wall-clock 861 ticks/s** comparable s S74/S75 (793, 892). Hunt
+    phase + collision phase oba zatížené, ale dohromady stable.
+  - **Hunter pressure end-to-end** ✓: 2127-3216 atks/gen. Constant.
+  - **Co Sprint 76 NEŘEŠÍ (Sprint 77+):**
+    - Asp=12 needle attractor (real bottleneck pro tissue stability).
+    - Cluster food share, persistent hunter chase, HUD.
+
+## Sprinty 77–82 — open-ended
+
+- **Sprint 77 (priorita):** `MIN_BODY_WIDTH` + `MIN_BODY_HEIGHT` 0.3 → 0.8
+  → cap asp ~5. Hypotéza: bez needle phenotype cells si zachovají
+  cluster-friendly body shape, immune_frac sustained > 0.05 do gen 500+.
+- **Sprint 77+:** Cluster food share — bonded cells sdílejí % eaten
+  food s partnery. Direct fitness reward.
+- **Sprint 77+:** Hunter persistent target chase logic.
+- **Sprint 77+:** HUD overlay s real-time bond stats.
+- **Sprint 77+:** Photic / thermal stratification.
+- **Sprint 77+:** GPU collision shader, anisotropic collision.
+- **Sprint 77+:** Spatial autocorrelation adhesion_type clustering metric.

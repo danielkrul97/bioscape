@@ -365,10 +365,13 @@ pub const ADHESION_CROSS_TYPE: f32 = -0.3;
 /// se realisticky drží ≤ 6 sousedů. Fixní array → no heap alloc.
 pub const MAX_BONDS_PER_CELL: usize = 6;
 /// Tiků kontaktu (cells in collision range, mutual bond_signal active) než se
-/// vytvoří spring bond. 30 ticks = 0.5 s při 60 Hz — protekce proti single-tick
-/// pasáži (random sblížení), ale ne tak dlouhá, aby selekce nestihla bonding
-/// vyzkoušet v rámci generace (10 s).
-pub const BOND_FORM_TICKS: u32 = 30;
+/// vytvoří spring bond. Sprint 71 měl 30 (= 0.5 s při 60 Hz). Sprint 76:
+/// 30 → 10 (~0.17 s) — Sprint 75 smoke ukázal, že cells se speed 190 mají
+/// brief contacts; 30 ticks gating filtroval většinu reálných bond
+/// candidates. 10 ticks dovolí formaci i z krátkých but consenting contactů.
+/// Risk: nestabilní bondy formující se z náhodného mihem (mitigated tím,
+/// že bond_signal threshold zůstává 0.2).
+pub const BOND_FORM_TICKS: u32 = 10;
 /// Tiků bez kontaktu po kterých contact_progress klesne na 0 (cleanup sparse
 /// FxHashMap). Krátký timeout — pár, který se rozejde, ztrácí "track" hned.
 pub const CONTACT_DECAY_TICKS: u32 = 5;
@@ -494,9 +497,13 @@ pub const HUNTER_ACC: f32 = 80.0;
 /// brzy najde cell + zacílí.
 pub const HUNTER_IDLE_DRIFT: f32 = 30.0;
 /// Bond count threshold pro immunity. Cells s ≥ tomuto počtu bondů Hunter
-/// nemůže atakovat — cluster je „too big to swallow". 3 = exact tipping
-/// point; minimum bond network size pro „proto-tissue" v této simu.
-pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 3;
+/// nemůže atakovat — cluster je „too big to swallow". Sprint 71 měl 3
+/// (proto-tissue minimum). Sprint 76: 3 → 2 — Sprint 75 1000-gen smoke
+/// ukázal, že 3-bond threshold byl dosažitelný jen 0.2 % cells krátce;
+/// cells s evolved asp~12 (1D needles) fyzicky neclusterují s 3 sousedy.
+/// 2-bond cluster je „pair / triad" minimum — pořád proto-multicelular,
+/// ale dosažitelný pro elongated body shapes (line of pairs).
+pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 2;
 
 /// Sprint 71: non-evolving environmental predator. Pohybuje se pseudo-AI
 /// (seek nejbližší cell ∈ vision range, jinak random drift). Atakuje cells
