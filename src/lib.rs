@@ -16,6 +16,15 @@ pub mod gpu;
 
 const HUE_RANGE: f32 = 360.0;
 const MIN_SPEED: f32 = 1.0;
+/// Sprint 73: horní cap pro `genome.max_speed`. Pre-Sprint-73 nebyl žádný cap,
+/// jen MIN_SPEED floor — sigma_speed=3.0 mutation drift v Sprint 72 1000-gen
+/// smoke produkoval mean spd 344 (12 % nad HUNTER_MAX_SPEED=300). Bez cap
+/// je arms race degenerative — outrun je vždy levnější než cluster path,
+/// takže multicelularita nikdy nepřijde. 200 = mírně pod Sprint 71 baseline
+/// 218 → HUNTER_MAX_SPEED=300 reálně neutekatelný → cluster path se stává
+/// jediná viable defense. Nominal cap, ne hard cieling — sigma_speed pořád
+/// dovoluje fluktuace v rámci capu.
+pub const MAX_SPEED: f32 = 200.0;
 const MIN_VISION: f32 = 1.0;
 const MIN_TURN_RATE: f32 = 0.1;
 pub const INITIAL_ENERGY: f32 = 100.0;
@@ -936,7 +945,8 @@ impl Genome {
             self.adhesion_type
         };
         Self {
-            max_speed: (self.max_speed + gaussian(rng) * cfg.sigma_speed).max(MIN_SPEED),
+            max_speed: (self.max_speed + gaussian(rng) * cfg.sigma_speed)
+                .clamp(MIN_SPEED, MAX_SPEED),
             color_hue: (self.color_hue + gaussian(rng) * cfg.sigma_hue).rem_euclid(HUE_RANGE),
             vision_radius: (self.vision_radius + gaussian(rng) * cfg.sigma_vision).max(MIN_VISION),
             turn_rate: (self.turn_rate + gaussian(rng) * cfg.sigma_turn_rate).max(MIN_TURN_RATE),
@@ -2495,6 +2505,7 @@ mod tests {
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
             assert!(m.max_speed >= MIN_SPEED);
+            assert!(m.max_speed <= MAX_SPEED, "Sprint 73: speed cap respected");
             assert!(m.color_hue >= 0.0 && m.color_hue < HUE_RANGE);
             assert!(m.vision_radius >= MIN_VISION);
             assert!(m.turn_rate >= MIN_TURN_RATE);
