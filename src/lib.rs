@@ -405,8 +405,11 @@ pub const BOND_BREAK_THRESHOLD: f32 = -0.5;
 /// aby selekce váhala bonding vs free-roaming.
 pub const BOND_FORMATION_COST: f32 = 0.5;
 /// Per-second cost udržování každého bondu (paid každý tick). Drobný — bond
-/// je výhoda (tissue stability), ale ne free.
-pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.1;
+/// je výhoda (tissue stability), ale ne free. Sprint 74: 0.1 → 0.05 (2×
+/// cheaper). Sprint 73 ukázalo, že bonded 3-cell platí 3.0/gen vs solo
+/// 0.17/gen → 18× inverted. Halving maintenance + 2× hunt damage +
+/// 1.5× hunters target ~5× shrink toward break-even.
+pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.05;
 /// Sprint 70: jitter radius pro cluster-aware reproduction. Když má parent
 /// bondy a child se má spawn-it blízko něj (uvnitř bond network), použije
 /// se random offset v ±tomto rangi. 8.0 = 0.8× pair_radius pro typical
@@ -449,8 +452,12 @@ pub fn bond_defense_factor(n_bonds: u32) -> f32 {
 
 /// Cílový počet hunterů ve světě. Sprint 71 měl 3 = příliš sparse
 /// (escape-by-speed cells našly free corridors). Sprint 72: 8 hunterů
-/// pokrývá víc paths, solo cell má kratší survival window.
-pub const HUNTER_TARGET_COUNT: usize = 8;
+/// pokrývá víc paths, solo cell má kratší survival window. Sprint 74:
+/// 12 — Sprint 73 1000-gen smoke ukázal, že 8 hunterů × 1500 atks/gen
+/// = jen 0.17 energy/cell/gen damage, což je 18× méně než bond
+/// maintenance 3.0/gen → solo dominuje. 12 hunterů + víc damage zvedá
+/// solo cost.
+pub const HUNTER_TARGET_COUNT: usize = 12;
 /// Vision range Hunteru — vidí cells v této vzdálenosti, aktivně k nim
 /// míří. Mimo range = random walk. Sprint 72 zvětšen 120 → 200 (větší
 /// než MATING_RADIUS=200, takže hunters detekují cells dřív než stihnou
@@ -461,8 +468,11 @@ pub const HUNTER_VISION_RADIUS: f32 = 200.0;
 pub const HUNTER_ATTACK_RADIUS: f32 = 18.0;
 /// Damage per tick, který Hunter působí cells v attack range. Aplikuje se
 /// jako energy loss + damage_accum (brain damage signal). Lineární per tick,
-/// no spike bonus (Hunter je sám bez evolved phenotype).
-pub const HUNTER_DAMAGE_PER_TICK: f32 = 4.0;
+/// no spike bonus (Hunter je sám bez evolved phenotype). Sprint 74: 4 → 8
+/// (2× lethaler). Sprint 73 ukázalo, že solo cells absorbovaly 0.17/gen
+/// damage bez problému; 2× zvýší to k ~0.35, což stále nemusí stačit, ale
+/// kombinováno s víc hunterů + levnějším bondem se dostávámě k flip pointu.
+pub const HUNTER_DAMAGE_PER_TICK: f32 = 8.0;
 /// Hunter top speed. Sprint 71 měl 220 — cells dotáhly průměr na 218 a
 /// outrun se ukázal jako viable escape route (asp 12.6 pure speedy cells).
 /// Sprint 72: 300, nad teoretický cell max_speed cap. Cells nemůžou outrun
