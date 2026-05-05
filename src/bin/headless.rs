@@ -945,11 +945,37 @@ impl World {
                     temperature_local,
                 };
                 cell.apply_shell_absorb(dt);
-                bioscape::populate_brain_inputs(cell, &sensors, vision_r)
+                let mut inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
+                bioscape::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
+                inputs
             })
             .collect();
 
-        // Phase 2: GPU forward batch.
+        // Sprint 97: Phase 1b: pool max-magnitude přes bond network. Provede se
+        // PŘED GPU uploadem aby brain forward už dostal pooled inputs.
+        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.cell_id, i))
+            .collect();
+        let pooled_inputs: Vec<[f32; BRAIN_INPUTS]> = self
+            .cells
+            .par_iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let own = inputs_vec[i];
+                bioscape::pool_bonded_sensors(cell, &own, |partner_id| {
+                    let idx = id_to_idx.get(&partner_id).copied()?;
+                    if idx == i {
+                        return None;
+                    }
+                    Some(inputs_vec[idx])
+                })
+            })
+            .collect();
+
+        // Phase 2: GPU forward batch (using pooled inputs).
         let mut hiddens = vec![[0.0_f32; BRAIN_HIDDEN]; n];
         let mut outputs = vec![[0.0_f32; BRAIN_OUTPUTS]; n];
         {
@@ -958,7 +984,7 @@ impl World {
                 .as_mut()
                 .expect("brain_act_gpu called without gpu");
             gpu.forward_batch(
-                &inputs_vec,
+                &pooled_inputs,
                 self.cells.iter().map(|c| &c.genome.brain),
                 &mut hiddens,
                 &mut outputs,
@@ -970,7 +996,7 @@ impl World {
             .par_iter_mut()
             .enumerate()
             .for_each(|(i, cell)| {
-                cell.last_inputs = inputs_vec[i];
+                cell.last_inputs = pooled_inputs[i];
                 cell.last_hidden = hiddens[i];
                 cell.last_outputs = outputs[i];
                 cell.apply_brain_motor(&outputs[i], dt);
@@ -1032,14 +1058,16 @@ impl World {
         let tick = self.clock.tick;
         let gen = self.clock.generation;
 
-        self.cells
+        // Sprint 97: dvojfáze pro cluster sensor pooling. Phase 1: gather + apply
+        // own gains. Phase 2: pool max-magnitude přes bond network + brain forward.
+        let inputs_vec: Vec<[f32; BRAIN_INPUTS]> = self
+            .cells
             .par_iter_mut()
             .enumerate()
-            .for_each(|(i, cell)| {
+            .map(|(i, cell)| {
                 let pos = cell.position;
                 let vision_r = cell.genome.vision_radius;
                 let vr2 = vision_r * vision_r;
-                // Sprint 83: cone filter — viz `gather` v main.rs.
                 let fov = cell.genome.vision_fov;
                 let skip_cone = fov >= bioscape::MAX_VISION_FOV;
                 let cos_fov = fov.cos();
@@ -1097,9 +1125,33 @@ impl World {
                 };
 
                 cell.apply_shell_absorb(dt);
-                let inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
-                let (hidden, outputs) = cell.genome.brain.forward_with_state(&inputs);
-                cell.last_inputs = inputs;
+                let mut inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
+                bioscape::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
+                inputs
+            })
+            .collect();
+
+        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.cell_id, i))
+            .collect();
+
+        self.cells
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, cell)| {
+                let own = inputs_vec[i];
+                let pooled = bioscape::pool_bonded_sensors(cell, &own, |partner_id| {
+                    let idx = id_to_idx.get(&partner_id).copied()?;
+                    if idx == i {
+                        return None;
+                    }
+                    Some(inputs_vec[idx])
+                });
+                let (hidden, outputs) = cell.genome.brain.forward_with_state(&pooled);
+                cell.last_inputs = pooled;
                 cell.last_hidden = hidden;
                 cell.last_outputs = outputs;
                 cell.apply_brain_motor(&outputs, dt);
@@ -2154,7 +2206,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // 7 hunter genome 0 (Sprint 89) + 2 diet/exposure 0 (Sprint 93).
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2242,13 +2294,23 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     // Sprint 93: per-cell diet + defense diagnostics.
     let mut carnivore_sum = 0.0_f64;
     let mut exposure_sum = 0.0_f64;
+    // Sprint 97: per-category sensor_gain means. Specialization signal —
+    // pokud cluster cells off-loadují roli, kategoriální mean se rozjede
+    // (vision drop u defenders, vision spike u scouts apod.).
+    let mut gain_sum = [0.0_f64; bioscape::N_SENSOR_CATEGORIES];
     for c in &world.cells {
         carnivore_sum += c.genome.carnivore_score as f64;
         exposure_sum += bioscape::cell_exposure(c.n_bonds()) as f64;
+        for k in 0..bioscape::N_SENSOR_CATEGORIES {
+            gain_sum[k] += c.genome.sensor_gains[k] as f64;
+        }
     }
     let cell_count = world.cells.len();
     let carnivore_m = if cell_count > 0 { carnivore_sum / cell_count as f64 } else { 0.0 };
     let exposure_m = if cell_count > 0 { exposure_sum / cell_count as f64 } else { 0.0 };
+    let gain_vis_m = if cell_count > 0 { gain_sum[bioscape::SENSOR_CATEGORY_VISION] / cell_count as f64 } else { 0.0 };
+    let gain_chem_m = if cell_count > 0 { gain_sum[bioscape::SENSOR_CATEGORY_CHEMISTRY] / cell_count as f64 } else { 0.0 };
+    let gain_def_m = if cell_count > 0 { gain_sum[bioscape::SENSOR_CATEGORY_DEFENSIVE] / cell_count as f64 } else { 0.0 };
     let n_hunters = world.hunters.len();
     if n_hunters > 0 {
         for h in &world.hunters {
@@ -2474,7 +2536,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let immune_f = immune_cells as f64 / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -2548,6 +2610,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // Sprint 93 diet + defense diagnostics.
         carnivore_m,
         exposure_m,
+        // Sprint 97 sensor_gain category means.
+        gain_vis_m,
+        gain_chem_m,
+        gain_def_m,
     )
 }
 
@@ -2750,7 +2816,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();

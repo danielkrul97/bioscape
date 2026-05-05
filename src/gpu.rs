@@ -6326,7 +6326,11 @@ mod tests {
             thermal_optimum_penalty: 0.0,
             ..PHYSICS_CONFIG
         };
+        // Sprint 97: GPU step shader nepočítá sensor_gain drain (gain je v
+        // genome a CPU-side aplikuje apply_energy_costs). Zero sensor_gains
+        // na CPU side aby parity zůstala — ne aby step shader řešil i tohle.
         for c in cells.iter_mut() {
+            c.genome.sensor_gains = [0.0; crate::N_SENSOR_CATEGORIES];
             c.step(dt, world_half, 0, 0, &test_physics);
         }
 

@@ -1282,6 +1282,17 @@ fn cells_brain_act(
         bioscape::populate_brain_inputs(cell, &sensors, vision_r)
     };
 
+    // Sprint 97: dvojfázový pipeline pro cluster sensor pooling.
+    // Phase 1: gather + apply per-cell sensor gains, ulož do id-keyed mapy.
+    // Phase 2: pool max-magnitude přes bond network + brain forward.
+    let mut id_to_inputs: rustc_hash::FxHashMap<u64, [f32; BRAIN_INPUTS]> =
+        rustc_hash::FxHashMap::default();
+    for (entity, mut cell) in &mut cells {
+        let mut inputs = gather(entity, &mut cell.0);
+        bioscape::apply_sensor_gains(&mut inputs, &cell.0.genome.sensor_gains);
+        id_to_inputs.insert(cell.0.cell_id, inputs);
+    }
+
     #[cfg(feature = "gpu")]
     if let Some(gpu) = gpu_state {
         let n = slot_map.len();
@@ -1292,11 +1303,20 @@ fn cells_brain_act(
         // Build inputs vec indexed by slot. Iterate alive query, look up slot,
         // place inputs at slot index. Slots jsou dense 0..n.
         let mut inputs_by_slot: Vec<[f32; BRAIN_INPUTS]> = vec![[0.0; BRAIN_INPUTS]; n];
-        for (entity, mut cell) in &mut cells {
+        for (entity, cell) in cells.iter() {
             let Some(slot) = slot_map.slot_of(entity) else {
                 continue;
             };
-            inputs_by_slot[slot] = gather(entity, &mut cell.0);
+            let own = id_to_inputs
+                .get(&cell.0.cell_id)
+                .copied()
+                .unwrap_or([0.0; BRAIN_INPUTS]);
+            inputs_by_slot[slot] = bioscape::pool_bonded_sensors(&cell.0, &own, |partner_id| {
+                if partner_id == cell.0.cell_id {
+                    return None;
+                }
+                id_to_inputs.get(&partner_id).copied()
+            });
         }
         let t_gpu = Instant::now();
         gpu.cells.upload_inputs(&inputs_by_slot);
@@ -1318,8 +1338,17 @@ fn cells_brain_act(
 
     // CPU fallback (no GPU available or feature disabled).
     let _ = slot_map;
-    for (entity, mut cell) in &mut cells {
-        let inputs = gather(entity, &mut cell.0);
+    for (_entity, mut cell) in &mut cells {
+        let own = id_to_inputs
+            .get(&cell.0.cell_id)
+            .copied()
+            .unwrap_or([0.0; BRAIN_INPUTS]);
+        let inputs = bioscape::pool_bonded_sensors(&cell.0, &own, |partner_id| {
+            if partner_id == cell.0.cell_id {
+                return None;
+            }
+            id_to_inputs.get(&partner_id).copied()
+        });
         let (hidden, outputs) = cell.0.genome.brain.forward_with_state(&inputs);
         cell.0.last_inputs = inputs;
         cell.0.last_hidden = hidden;

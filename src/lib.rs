@@ -671,6 +671,46 @@ pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 4;
 /// 0.25 → 0/1/2/3+ bonds dávají exposure 1.0/0.75/0.5/0.25. Při 4+ bonds
 /// exposure floor = 0 a hunter neuvidí target (HUNTER_BOND_IMMUNITY_THRESHOLD).
 pub const EXPOSURE_PER_BOND: f32 = 0.25;
+
+/// Sprint 97: per-tick energy drain coefficient pro sensor specialization.
+/// `drain = sum(sensor_gains) × this × dt`. Default sum = 3 × 1.0 = 3 →
+/// `3 × 0.3 = 0.9/sec` baseline drain (porovnatelný s body cost 0.5/sec).
+/// Cells, které sníží gains v category (turn off duplicate sensors v cluster),
+/// šetří proportionally — sensor specialization je net-positive.
+pub const SENSOR_GAIN_COST: f32 = 0.3;
+/// Sprint 97: range pro `sensor_gains` per category. 0 = sensor effectively
+/// off, 1 = neutral, 2 = boosted (lepší detection range, vyšší cost).
+pub const MIN_SENSOR_GAIN: f32 = 0.0;
+pub const MAX_SENSOR_GAIN: f32 = 2.0;
+/// Sprint 97: 3 sensor categories indexované do `Genome.sensor_gains`:
+/// 0 = Vision (food delta, cell delta, rel_size, density),
+/// 1 = Chemistry (smell, pheromone — chemical gradients ve fields),
+/// 2 = Defensive (damage signal, thermal_local).
+/// Proprio sensors (energy, speed, heading) jsou always-on, žádný gain
+/// — vlastní stav cell musí znát i v deep specialist módě.
+pub const SENSOR_CATEGORY_VISION: usize = 0;
+pub const SENSOR_CATEGORY_CHEMISTRY: usize = 1;
+pub const SENSOR_CATEGORY_DEFENSIVE: usize = 2;
+pub const N_SENSOR_CATEGORIES: usize = 3;
+
+/// Sprint 97: maps brain input slot index → sensor category. Returns `None`
+/// pro proprio slots (not gained, not pooled). Used by `apply_sensor_gains`
+/// (per-cell gain multiply) + `pool_bonded_sensors` (max-pool environmental
+/// slots přes bond network).
+#[inline]
+pub fn sensor_slot_category(slot: usize) -> Option<usize> {
+    match slot {
+        // Food delta (slot 0,1,15) + cell delta (2,3,16) + rel_size (6) +
+        // density (13) → Vision
+        0 | 1 | 2 | 3 | 6 | 13 | 15 | 16 => Some(SENSOR_CATEGORY_VISION),
+        // Smell (7,8,17) + pheromone (11,12,19) → Chemistry
+        7 | 8 | 11 | 12 | 17 | 19 => Some(SENSOR_CATEGORY_CHEMISTRY),
+        // Damage (14) + thermal (20) → Defensive
+        14 | 20 => Some(SENSOR_CATEGORY_DEFENSIVE),
+        // Energy (4), speed (5), heading (9,10,18) → proprio, no gain
+        _ => None,
+    }
+}
 /// Sprint 84: hunter směrový FOV half-angle (rad). π/3 = 60° → 120° cone.
 /// Predátoři klasicky mají frontal eyes; cells mohou flank-uniknout do blind
 /// spotu. Pevná konstanta (Hunter nemá genom), ne pod selekcí.
@@ -1337,6 +1377,8 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_thermal_optimum: 0.5,
     // Sprint 92: carnivore_score drift. 0.02 = 2 % range/gen.
     sigma_carnivore_score: 0.02,
+    // Sprint 97: sensor_gains drift. 0.04 = 2 % range / gen.
+    sigma_sensor_gain: 0.04,
 };
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     drag: DRAG_COEFFICIENT,
@@ -1676,6 +1718,10 @@ pub struct MutationConfig {
     /// Pomalejší než ostatní geny — diet shift vyžaduje food availability
     /// signal (selekce přes eat efficiency × food_kind), který je sám pomalý.
     pub sigma_carnivore_score: f32,
+    /// Sprint 97: sensor_gains per-category gaussian sigma. 0.04 = 2 % of
+    /// [MIN, MAX] = [0, 2] range/gen. Drift k specializaci vyžaduje cluster
+    /// pooling signal — selekce je conditional na bond presence.
+    pub sigma_sensor_gain: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1719,7 +1765,18 @@ pub struct Genome {
     /// herbivore-leaning (cells potřebují plant food survive cold start).
     #[serde(default)]
     pub carnivore_score: f32,
+    /// Sprint 97: per-category sensor gain ∈ [MIN, MAX]. Index 0 = Vision,
+    /// 1 = Chemistry, 2 = Defensive. Modulates input strength + per-tick
+    /// energy drain (`sum × SENSOR_GAIN_COST`). Cluster cells s pooled sensors
+    /// mohou turn off duplicate sensors → save energy → role differentiation
+    /// emergent (scout cells vision-specialist, smell cells chemistry-specialist).
+    #[serde(default = "default_sensor_gains")]
+    pub sensor_gains: [f32; N_SENSOR_CATEGORIES],
     pub brain: Brain,
+}
+
+fn default_sensor_gains() -> [f32; N_SENSOR_CATEGORIES] {
+    [1.0; N_SENSOR_CATEGORIES]
 }
 
 fn default_thermal_optimum() -> f32 {
@@ -1774,6 +1831,14 @@ impl Genome {
             // drop sites. Bez tohoto je multi-trophic food chain dormant
             // dokud sigma drift nedotlačí > 0.5 (mnoho gens).
             carnivore_score: rng.random_range(0.0..0.5),
+            // Sprint 97: random uniform [0.7, 1.3] per category — small spread
+            // around neutral 1.0 aby initial population měla mírně varied
+            // sensor profiles bez immediate dramatic specialization.
+            sensor_gains: [
+                rng.random_range(0.7..1.3),
+                rng.random_range(0.7..1.3),
+                rng.random_range(0.7..1.3),
+            ],
             brain: Brain::random(rng),
         }
     }
@@ -1841,6 +1906,17 @@ impl Genome {
             } else {
                 self.carnivore_score
             },
+            // Sprint 97: per-category gaussian drift, clamp [MIN, MAX].
+            sensor_gains: {
+                let mut g = self.sensor_gains;
+                if cfg.sigma_sensor_gain > 0.0 {
+                    for v in g.iter_mut() {
+                        *v = (*v + gaussian(rng) * cfg.sigma_sensor_gain)
+                            .clamp(MIN_SENSOR_GAIN, MAX_SENSOR_GAIN);
+                    }
+                }
+                g
+            },
             brain: {
                 let mut b = self.brain.mutate(rng, cfg.sigma_brain);
                 // Sprint 80 Sprint C: structural mutace. Default rate=0.0 →
@@ -1899,6 +1975,18 @@ impl Genome {
                 a.carnivore_score
             } else {
                 b.carnivore_score
+            },
+            // Sprint 97: per-category bool crossover.
+            sensor_gains: {
+                let mut g = [0.0_f32; N_SENSOR_CATEGORIES];
+                for k in 0..N_SENSOR_CATEGORIES {
+                    g[k] = if rng.random::<bool>() {
+                        a.sensor_gains[k]
+                    } else {
+                        b.sensor_gains[k]
+                    };
+                }
+                g
             },
             brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
@@ -2345,6 +2433,11 @@ impl Cell {
         // `dt`, ne `dt_eff` — penalty není Q10-modulated.
         let dev = (temp - self.genome.thermal_optimum) / 13.0;
         self.energy -= dev * dev * physics.thermal_optimum_penalty * dt;
+        // Sprint 97: sensor gain drain. Sum gains × cost × dt_eff (Q10-modulated
+        // jako ostatní biological costs). Cluster cells which off-load sensor
+        // duties to specialists (gain → 0 v category) save energy proportionally.
+        let total_sensor_gain: f32 = self.genome.sensor_gains.iter().sum();
+        self.energy -= total_sensor_gain * SENSOR_GAIN_COST * dt_eff;
     }
 
     /// Sprint 54: xy modulo wrap (toroidal cylinder topology), z bounce.
@@ -2827,6 +2920,57 @@ pub fn populate_brain_inputs(
     inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
         .copy_from_slice(&cell.pooled_hidden[..BRAIN_RECURRENT]);
     inputs
+}
+
+/// Sprint 97: in-place multiplication brain inputs × per-category sensor_gains.
+/// Applies gains to environmental + defensive slots, leaves proprio slots
+/// (energy, speed, heading) untouched. Solo cells s gain < 1.0 lose info,
+/// cluster cells s pooling can compensate via partner signals.
+#[inline]
+pub fn apply_sensor_gains(inputs: &mut [f32; BRAIN_INPUTS], gains: &[f32; N_SENSOR_CATEGORIES]) {
+    for slot in 0..BRAIN_INPUTS_SENSORY {
+        if let Some(cat) = sensor_slot_category(slot) {
+            inputs[slot] *= gains[cat];
+        }
+    }
+}
+
+/// Sprint 97: pool environmental + defensive sensor slots přes bond network.
+/// Max-pooling — for each slot, take maximum over self + bonded partners
+/// (post-gain-multiplied values). Allows specialization: cell A s vision gain=0
+/// dostane visibility z partnera B s vision gain=2.0 přes max pool.
+///
+/// Proprio slots (energy, speed, heading) NEpoolováno — vlastní stav cells
+/// musí být individuální. Recurrent slots (21..52) mají vlastní mechanismus
+/// `pool_bonded_hidden` (S94 mean pooling).
+///
+/// Solo cell (no bonds): output == self_inputs. Pair / cluster: max nad
+/// self + 1-hop partners.
+pub fn pool_bonded_sensors<F>(
+    cell: &Cell,
+    own_inputs: &[f32; BRAIN_INPUTS],
+    lookup_partner_inputs: F,
+) -> [f32; BRAIN_INPUTS]
+where
+    F: Fn(u64) -> Option<[f32; BRAIN_INPUTS]>,
+{
+    let mut pooled = *own_inputs;
+    for bond_slot in cell.bonds.iter().flatten() {
+        if let Some(partner_inputs) = lookup_partner_inputs(bond_slot.other_cell_id) {
+            for slot in 0..BRAIN_INPUTS_SENSORY {
+                if sensor_slot_category(slot).is_some() {
+                    let p = partner_inputs[slot];
+                    if p.abs() > pooled[slot].abs() {
+                        // Use max-magnitude (preserves sign for directional
+                        // signals like food_dx; partner with stronger signal
+                        // wins). Solo equivalent to self.
+                        pooled[slot] = p;
+                    }
+                }
+            }
+        }
+    }
+    pooled
 }
 
 /// Sprint 94: compute pooled `last_hidden` for a single cell — mean over
@@ -3640,6 +3784,10 @@ mod tests {
             vision_fov: INITIAL_VISION_FOV,
             thermal_optimum: THERMAL_REF_TEMP,
             carnivore_score: 0.0,
+            // Sprint 97: zero gains v test fixture aby legacy energy-drain testy
+            // (pre-S97) neviděly sensor_gain cost. Per-test override když test
+            // sensor pooling testuje.
+            sensor_gains: [0.0; N_SENSOR_CATEGORIES],
             brain: dummy_brain(),
         }
     }
@@ -3663,6 +3811,7 @@ mod tests {
             sigma_vision_fov: 0.0,
             sigma_thermal_optimum: 0.0,
             sigma_carnivore_score: 0.0,
+            sigma_sensor_gain: 0.0,
         }
     }
 
@@ -3685,6 +3834,7 @@ mod tests {
             vision_fov: INITIAL_VISION_FOV,
             thermal_optimum: THERMAL_REF_TEMP,
             carnivore_score: 0.0,
+            sensor_gains: [1.0; N_SENSOR_CATEGORIES],
             brain: Brain {
                 hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
                 w1: [[1.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
@@ -3729,6 +3879,7 @@ mod tests {
             sigma_vision_fov: 10.0,
             sigma_thermal_optimum: 100.0,
             sigma_carnivore_score: 100.0,
+            sigma_sensor_gain: 100.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -3992,6 +4143,100 @@ mod tests {
         let pooled = pool_bonded_hidden(&cell, |_| None);
         // Pool falls back to self only.
         assert_eq!(pooled, cell.last_hidden);
+    }
+
+    #[test]
+    fn sensor_slot_category_covers_known_indices() {
+        // Sprint 97: každý sensory slot v 0..BRAIN_INPUTS_SENSORY musí buď
+        // vrátit Some(category) nebo None (proprio). Žádný slot nevypadne.
+        // Defensive (damage_norm) je slot 14, density slot 20.
+        assert_eq!(sensor_slot_category(0), Some(SENSOR_CATEGORY_VISION));
+        assert_eq!(sensor_slot_category(7), Some(SENSOR_CATEGORY_CHEMISTRY));
+        assert_eq!(sensor_slot_category(14), Some(SENSOR_CATEGORY_DEFENSIVE));
+        assert_eq!(sensor_slot_category(20), Some(SENSOR_CATEGORY_DEFENSIVE));
+        // Proprio slot (energy/speed/heading) → None.
+        assert!(sensor_slot_category(4).is_none());
+    }
+
+    #[test]
+    fn apply_sensor_gains_scales_only_categorized_slots() {
+        // Sprint 97: gains aplikuje na sensory slots, proprio nedotčeno.
+        let mut inputs = [1.0_f32; BRAIN_INPUTS];
+        let gains = [2.0, 0.5, 0.0];
+        apply_sensor_gains(&mut inputs, &gains);
+        // Vision slot 0 = 2× gain
+        assert!((inputs[0] - 2.0).abs() < 1e-6);
+        // Chemistry slot 7 = 0.5× gain
+        assert!((inputs[7] - 0.5).abs() < 1e-6);
+        // Defensive slot 14 = 0× gain
+        assert!((inputs[14] - 0.0).abs() < 1e-6);
+        // Proprio slot 4 → unchanged.
+        assert!((inputs[4] - 1.0).abs() < 1e-6);
+        // Recurrent slot mimo BRAIN_INPUTS_SENSORY → unchanged.
+        assert!((inputs[BRAIN_INPUTS_SENSORY] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pool_bonded_sensors_solo_cell_returns_own() {
+        // Sprint 97: solo cell bez bonds → pooled == own (žádný partner).
+        let cell = base_cell();
+        let mut own = [0.0; BRAIN_INPUTS];
+        own[0] = 0.5;
+        own[7] = -0.3;
+        let pooled = pool_bonded_sensors(&cell, &own, |_| None);
+        assert_eq!(pooled, own);
+    }
+
+    #[test]
+    fn pool_bonded_sensors_takes_max_magnitude_from_partner() {
+        // Sprint 97: partner má silnější vision signal → pooled převezme partner.
+        // Magnitude-based pooling (abs()) — invertovaný gradient (-0.9) přebije
+        // slabý kladný (0.2).
+        let mut cell = base_cell();
+        cell.cell_id = 1;
+        cell.bonds[0] = Some(Bond {
+            other_cell_id: 2,
+            rest_length: 5.0,
+            stiffness: BOND_STIFFNESS,
+            damping: BOND_DAMPING,
+            age_ticks: 0,
+        });
+        let mut own = [0.0; BRAIN_INPUTS];
+        own[0] = 0.2;
+        own[7] = 0.5;
+        let mut partner = [0.0; BRAIN_INPUTS];
+        partner[0] = -0.9;
+        partner[7] = 0.1;
+        let pooled = pool_bonded_sensors(&cell, &own, |id| {
+            if id == 2 { Some(partner) } else { None }
+        });
+        // Vision slot: |-0.9| > |0.2| → partner wins
+        assert!((pooled[0] - (-0.9)).abs() < 1e-6);
+        // Chemistry slot: |0.5| > |0.1| → own wins
+        assert!((pooled[7] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pool_bonded_sensors_ignores_proprio_slots() {
+        // Sprint 97: proprio (energy, speed, heading) NESMÍ poolnout — každá
+        // buňka má svůj vlastní stav.
+        let mut cell = base_cell();
+        cell.bonds[0] = Some(Bond {
+            other_cell_id: 7,
+            rest_length: 5.0,
+            stiffness: BOND_STIFFNESS,
+            damping: BOND_DAMPING,
+            age_ticks: 0,
+        });
+        let mut own = [0.0; BRAIN_INPUTS];
+        own[4] = 0.1; // proprio
+        let mut partner = [0.0; BRAIN_INPUTS];
+        partner[4] = 0.99; // partner higher proprio
+        let pooled = pool_bonded_sensors(&cell, &own, |id| {
+            if id == 7 { Some(partner) } else { None }
+        });
+        // Proprio slot 4 zůstává own — nebyl poolen.
+        assert!((pooled[4] - 0.1).abs() < 1e-6);
     }
 
     #[test]
@@ -4439,6 +4684,7 @@ mod tests {
             vision_fov: MIN_VISION_FOV,
             thermal_optimum: MIN_THERMAL_OPTIMUM,
             carnivore_score: 0.0,
+            sensor_gains: [MIN_SENSOR_GAIN; N_SENSOR_CATEGORIES],
             brain: dummy_brain(),
         };
         let b = Genome {
@@ -4457,6 +4703,7 @@ mod tests {
             vision_fov: MAX_VISION_FOV,
             thermal_optimum: MAX_THERMAL_OPTIMUM,
             carnivore_score: 1.0,
+            sensor_gains: [MAX_SENSOR_GAIN; N_SENSOR_CATEGORIES],
             brain: dummy_brain(),
         };
         for _ in 0..100 {
@@ -4775,6 +5022,7 @@ mod tests {
             sigma_vision_fov: 0.0,
             sigma_thermal_optimum: 0.0,
             sigma_carnivore_score: 0.0,
+            sigma_sensor_gain: 0.0,
         };
         let mut current = g;
         // Iteruj N >= (BRAIN_HIDDEN - DEFAULT). Po naplnění capu se další
@@ -5228,6 +5476,7 @@ mod tests {
             sigma_vision_fov: 0.0,
             sigma_thermal_optimum: 0.0,
             sigma_carnivore_score: 0.0,
+            sigma_sensor_gain: 0.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);

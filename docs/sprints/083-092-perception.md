@@ -1199,7 +1199,82 @@ sebou, kterou cells mohou flank-uniknout.
   - **Mandatory cluster reproduction** — pokud sustained 5-8 % bonding
     není dost pro emergence, S97 by mohl coerce-it.
 
-## Sprinty 97+ — open-ended
+## Sprint 97 — cluster sensor pooling + per-cell specialization
+
+- **Cíl:** Variant B z S96 follow-up plánu. Driver pro role differentiation
+  uvnitř clusterů: každá cell má per-category sensor gain coefficients
+  (vision / chemistry / defensive). Higher gain = stronger signal +
+  higher metabolic cost. V clusteru se bonded cells mohou na sebe
+  spolehnout — partner s high vision_gain "shareuje" silný signal přes
+  max-magnitude pooling napříč bond network. Solo cells musí všechny
+  kategorie nést sami; cluster cells mohou off-loadnout (gain → 0
+  v category) a spolehnout na specialistu.
+
+- **Mechanismus:**
+  - `Genome.sensor_gains: [f32; 3]` — per-category multiplier ∈ [0.0, 2.0]
+  - `apply_sensor_gains(inputs, gains)` — modulace sensory slotů 0..20
+    (vision: 0,1,2,3,6,13,15,16; chemistry: 7,8,11,12,17,19;
+    defensive: 14,20; proprio 4,5,9,10,18 — bez gain).
+  - `pool_bonded_sensors(cell, own, lookup)` — max-magnitude pool napříč
+    bonded partners. Pro každý sensory slot: `if |partner| > |pooled| → partner`.
+    Proprio sloty NESDÍLENY (každá cell vlastní state).
+  - `apply_energy_costs` drain: `Σ gains × SENSOR_GAIN_COST × dt_eff = 0.3 × Σ`.
+  - Init: random [0.7, 1.3] per category. Mutace: gaussian σ = 0.04.
+
+- **Pipeline order:** populate_brain_inputs → apply_sensor_gains
+  (per-cell) → pool_bonded_sensors (across bond network) → brain forward.
+
+- **GPU coverage:** `--gpu` (brain_act_gpu) plně podporuje gains + pooling
+  na CPU side před GPU upload. `--gpu-full` (fully fused step shader)
+  zatím skipne — vyžadovalo by populate_inputs.wgsl + sensor_gains buffer
+  upload, latentní debt jako S87 thermal_optimum.
+
+- **Test coverage:** 9 nových tests:
+  - `sensor_slot_category_covers_known_indices` — slot mapping je úplný
+  - `apply_sensor_gains_scales_only_categorized_slots` — proprio + recurrent
+    nedotčeny
+  - `pool_bonded_sensors_solo_cell_returns_own` — no bonds → identity
+  - `pool_bonded_sensors_takes_max_magnitude_from_partner` — magnitudo
+    pooling, partnerův silnější signal vyhrává
+  - `pool_bonded_sensors_ignores_proprio_slots` — energy/speed/heading
+    nesdíleny
+  - +6 helpers (sensor_slot_category endpoints, gains range, dummy_genome
+    fixture s sensor_gains [0.0; 3] aby legacy energy-drain testy
+    neviděly nový cost).
+
+- **Smoke seed=42 30 gen (CPU):**
+
+  | gen | cells | bonds_avg | gain_vis | gain_chem | gain_def | carn |
+  |-----|-------|-----------|----------|-----------|----------|------|
+  | 30  | 610   | 0.16      | 0.83     | 0.84      | 1.12     | 0.06 |
+
+  - 144/144 lib testů pass. Sim healthy, mutation pressure aktivní
+    (gain_def drift k 1.12, vision/chem k 0.83 — defensive bonus),
+    žádný runaway crash.
+
+- **Co Sprint 97 NEŘEŠÍ:**
+  - **Long-run specialization signal** — 30 gen není dost pro role
+    differentiation. Potřebný 200-500 gen sweep pro sledování per-cluster
+    gain variance vs. solo gain mean.
+  - **`--gpu-full` parity** — sensor_gains drain + pool zatím CPU only.
+    GPU full path (latentní debt) vyžaduje aux buffer expansion + WGSL
+    populate_inputs gain multiplier.
+  - **Diagnostic per-cluster** — `gain_*_avg` aggregates přes celou
+    populaci; chybí breakdown solo vs. bonded vs. cluster-only mean.
+
+- **Výstup:**
+  - `src/lib.rs`: `SENSOR_GAIN_COST`, `MIN/MAX_SENSOR_GAIN`, kategorie
+    indices, `sensor_slot_category`, `apply_sensor_gains`,
+    `pool_bonded_sensors`, `Genome.sensor_gains`, `MutationConfig.sigma_sensor_gain`.
+  - `src/main.rs`: `cells_brain_act` dvojfázový pipeline (gather + gains
+    do mapy → pool + brain forward).
+  - `src/bin/headless.rs`: stejný dvojfázový pattern v `brain_act` +
+    `brain_act_gpu`. CSV +3 columns: `gain_vis_avg`, `gain_chem_avg`,
+    `gain_def_avg`.
+  - `src/gpu.rs`: GPU step parity test zeruje sensor_gains na CPU (mirror
+    pattern S87).
+
+## Sprinty 98+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud
