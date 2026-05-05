@@ -1721,6 +1721,10 @@ fn default_thermal_optimum() -> f32 {
     THERMAL_REF_TEMP
 }
 
+fn default_pooled_hidden() -> [f32; BRAIN_HIDDEN] {
+    [0.0; BRAIN_HIDDEN]
+}
+
 fn default_vision_fov() -> f32 {
     INITIAL_VISION_FOV
 }
@@ -2064,6 +2068,16 @@ pub struct Cell {
     pub last_inputs: [f32; BRAIN_INPUTS],
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
+    /// Sprint 94: cluster-shared brain. Pre-tick mean `last_hidden` přes
+    /// bond network (self + bonded partners). Brain recurrent input slots
+    /// 21..52 čtou `pooled_hidden` místo `last_hidden` — cluster cells
+    /// získají přístup ke kolektivní paměti (proto-distributed cognition).
+    /// Solo cells: pooled_hidden == last_hidden (no neighbors). Bonded cells:
+    /// average over cluster → bigger effective context window.
+    /// `serde(default)` returns zeros pro backward-compat (= same as fresh
+    /// cell s žádnou prior activity, behavior matches pre-Sprint-94).
+    #[serde(default = "default_pooled_hidden")]
+    pub pooled_hidden: [f32; BRAIN_HIDDEN],
     /// Sprint 30: nedobrovolný energy drain akumulovaný v aktuálním ticku
     /// (predation + hazard). Brain ho čte v dalším ticku jako input[14]
     /// (damage signal), pak resetuje na 0. Voluntární cost se NEZAPISUJE
@@ -2154,6 +2168,7 @@ impl Cell {
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
+            pooled_hidden: [0.0; BRAIN_HIDDEN],
             damage_accum: 0.0,
             age: 0,
             reproduce_cooldown_ticks: 0,
@@ -2799,9 +2814,50 @@ pub fn populate_brain_inputs(
     // tanh(0) = 0 na ref. Diurnal/seasonal posuny mohou krátkodobě saturovat
     // k ±1, což je akceptovatelná oversaturace pro brain signal.
     inputs[20] = ((sensors.temperature_local - THERMAL_REF_TEMP) / 10.0).tanh();
+    // Sprint 94: cluster-shared brain. Recurrent slots (21..52) čtou
+    // `pooled_hidden` (mean self + bonded neighbors z předchozího ticku)
+    // místo `last_hidden`. Solo cells: pool == self → behavior identical
+    // s pre-Sprint-94. Cluster cells: shared memory → effective větší
+    // context window, drives proto-distributed cognition.
     inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
-        .copy_from_slice(&cell.last_hidden[..BRAIN_RECURRENT]);
+        .copy_from_slice(&cell.pooled_hidden[..BRAIN_RECURRENT]);
     inputs
+}
+
+/// Sprint 94: compute pooled `last_hidden` for a single cell — mean over
+/// self + bonded neighbors. Output should be assigned to `cell.pooled_hidden`
+/// pre brain_act phase. Bond lookup: `bond.other_cell_id → idx` via caller-
+/// supplied lookup (HashMap or array). Missing neighbors (despawned mid-tick)
+/// jsou skipnuty.
+///
+/// Solo cell (n_bonds=0): output == self.last_hidden (no change).
+/// Pair (1 bond): output = (self + partner) / 2.
+/// Triad / cluster: arithmetic mean over alive bonded subgraph (1-hop only,
+/// no transitive — keeps O(n_bonds) per cell, no graph traversal cost).
+pub fn pool_bonded_hidden<F>(
+    cell: &Cell,
+    lookup_partner_hidden: F,
+) -> [f32; BRAIN_HIDDEN]
+where
+    F: Fn(u64) -> Option<[f32; BRAIN_HIDDEN]>,
+{
+    let mut acc = cell.last_hidden;
+    let mut count = 1.0_f32;
+    for slot in cell.bonds.iter().flatten() {
+        if let Some(partner_hidden) = lookup_partner_hidden(slot.other_cell_id) {
+            for k in 0..BRAIN_HIDDEN {
+                acc[k] += partner_hidden[k];
+            }
+            count += 1.0;
+        }
+    }
+    if count > 1.0 {
+        let inv = 1.0 / count;
+        for k in 0..BRAIN_HIDDEN {
+            acc[k] *= inv;
+        }
+    }
+    acc
 }
 
 /// Sprint 31: rejection test pro spatial food clustering. Vrací `true` =
@@ -2960,6 +3016,7 @@ pub fn make_mating_child(
         last_inputs: [0.0; BRAIN_INPUTS],
         last_hidden: [0.0; BRAIN_HIDDEN],
         last_outputs: [0.0; BRAIN_OUTPUTS],
+        pooled_hidden: [0.0; BRAIN_HIDDEN],
         damage_accum: 0.0,
         age: 0,
         // Sprint 42: child startuje s plnou cooldown — rodičovská cooldown
@@ -3874,6 +3931,65 @@ mod tests {
     }
 
     #[test]
+    fn pool_bonded_hidden_solo_cell_returns_self() {
+        // Sprint 94: solo cell s no bonds → pooled == last_hidden.
+        let mut cell = base_cell();
+        for k in 0..BRAIN_HIDDEN {
+            cell.last_hidden[k] = (k as f32) * 0.1;
+        }
+        let pooled = pool_bonded_hidden(&cell, |_| None);
+        assert_eq!(pooled, cell.last_hidden);
+    }
+
+    #[test]
+    fn pool_bonded_hidden_pair_averages() {
+        // Sprint 94: pair cell A bonded to B → A.pooled = (A.last + B.last) / 2.
+        let mut cell = base_cell();
+        cell.cell_id = 1;
+        cell.bonds[0] = Some(Bond {
+            other_cell_id: 2,
+            rest_length: 5.0,
+            stiffness: BOND_STIFFNESS,
+            damping: BOND_DAMPING,
+            age_ticks: 0,
+        });
+        for k in 0..BRAIN_HIDDEN {
+            cell.last_hidden[k] = 1.0;
+        }
+        let mut partner_hidden = [0.0; BRAIN_HIDDEN];
+        for k in 0..BRAIN_HIDDEN {
+            partner_hidden[k] = 3.0;
+        }
+        let pooled = pool_bonded_hidden(&cell, |id| {
+            if id == 2 { Some(partner_hidden) } else { None }
+        });
+        for k in 0..BRAIN_HIDDEN {
+            assert!((pooled[k] - 2.0).abs() < 1e-6, "expected 2.0, got {}", pooled[k]);
+        }
+    }
+
+    #[test]
+    fn pool_bonded_hidden_skips_dead_partners() {
+        // Sprint 94: missing partner (despawned mid-tick) skipped, pool jen
+        // s alive bonded.
+        let mut cell = base_cell();
+        cell.bonds[0] = Some(Bond {
+            other_cell_id: 99,
+            rest_length: 5.0,
+            stiffness: BOND_STIFFNESS,
+            damping: BOND_DAMPING,
+            age_ticks: 0,
+        });
+        for k in 0..BRAIN_HIDDEN {
+            cell.last_hidden[k] = 5.0;
+        }
+        // Dead partner returns None.
+        let pooled = pool_bonded_hidden(&cell, |_| None);
+        // Pool falls back to self only.
+        assert_eq!(pooled, cell.last_hidden);
+    }
+
+    #[test]
     fn cell_exposure_endpoints() {
         // Sprint 92: solo cell fully exposed.
         assert!((cell_exposure(0) - 1.0).abs() < 1e-6);
@@ -4133,6 +4249,7 @@ mod tests {
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
+            pooled_hidden: [0.0; BRAIN_HIDDEN],
             damage_accum: 0.0,
             age: 0,
             reproduce_cooldown_ticks: 0,

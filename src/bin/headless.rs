@@ -429,6 +429,9 @@ impl World {
 
         timed!(update_smell, self.update_smell(dt));
         timed!(update_pheromone, self.update_pheromone(dt));
+        // Sprint 94: pool last_hidden across bond network → cluster cells share
+        // recurrent state. Must run before brain_act (which reads pooled_hidden).
+        self.pool_bonded_hidden();
         timed!(brain_act, self.run_brain_act(dt));
         timed!(emit_pheromones, self.emit_pheromones(dt));
         timed!(apply_morph, self.apply_morph(dt));
@@ -972,6 +975,37 @@ impl World {
                 cell.last_outputs = outputs[i];
                 cell.apply_brain_motor(&outputs[i], dt);
             });
+    }
+
+    /// Sprint 94: pre-brain pass. Compute `pooled_hidden` per cell = mean
+    /// `last_hidden` over self + bonded partners (1-hop). Cluster cells
+    /// získají shared memory přes bond network. Solo cells: pooled == self.
+    /// O(n × avg_bonds) — pro pop ~500 a avg_bonds < 1 je negligible cost.
+    fn pool_bonded_hidden(&mut self) {
+        if self.cells.is_empty() {
+            return;
+        }
+        // Build cell_id → idx map once per tick.
+        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.cell_id, i))
+            .collect();
+        // Snapshot last_hidden array — read-only během compute, write-only
+        // do pooled_hidden, no aliasing issues.
+        let snapshot: Vec<[f32; BRAIN_HIDDEN]> =
+            self.cells.iter().map(|c| c.last_hidden).collect();
+        for (i, cell) in self.cells.iter_mut().enumerate() {
+            let pooled = bioscape::pool_bonded_hidden(cell, |partner_id| {
+                let idx = id_to_idx.get(&partner_id).copied()?;
+                if idx == i {
+                    return None;
+                }
+                Some(snapshot[idx])
+            });
+            cell.pooled_hidden = pooled;
+        }
     }
 
     fn brain_act(&mut self, dt: f32) {

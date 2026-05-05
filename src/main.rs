@@ -453,6 +453,7 @@ fn main() {
                     rebuild_food_grid,
                     update_smell_field,
                     update_pheromone_field,
+                    pool_bonded_hidden_cells,
                     cells_brain_act,
                     emit_pheromones,
                     apply_cell_morph,
@@ -1164,6 +1165,33 @@ fn emit_pheromones(
             .0
             .add_source([cell.0.position[0], cell.0.position[1], cell.0.position[2]], rate * dt);
         cell.0.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+    }
+}
+
+/// Sprint 94: pre-brain pass. Compute `pooled_hidden` per cell = mean
+/// `last_hidden` over self + bonded partners (1-hop). Cluster cells získají
+/// shared recurrent state. Solo cells: pooled == self. Runs before
+/// `cells_brain_act` v `FixedUpdate` chain.
+fn pool_bonded_hidden_cells(
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+) {
+    let snapshot: Vec<(u64, [f32; bioscape::BRAIN_HIDDEN])> = cells
+        .iter()
+        .map(|c| (c.0.cell_id, c.0.last_hidden))
+        .collect();
+    if snapshot.is_empty() {
+        return;
+    }
+    let id_to_hidden: rustc_hash::FxHashMap<u64, [f32; bioscape::BRAIN_HIDDEN]> =
+        snapshot.into_iter().collect();
+    for mut cell in &mut cells {
+        let pooled = bioscape::pool_bonded_hidden(&cell.0, |partner_id| {
+            if partner_id == cell.0.cell_id {
+                return None;
+            }
+            id_to_hidden.get(&partner_id).copied()
+        });
+        cell.0.pooled_hidden = pooled;
     }
 }
 

@@ -984,7 +984,98 @@ sebou, kterou cells mohou flank-uniknout.
   - **Predator brain efficiency** — random brain wastes energy on chase
     paths; Sprint 94+ Hebbian na hunter brain pomohlo.
 
-## Sprinty 94+ — open-ended
+## Sprint 94 — cluster-shared brain capacity (proto-distributed cognition)
+
+- **Cíl:** dát bondovaným cells **shared recurrent state** — bigger
+  effective brain context per cluster. Pre-Sprint-94 každá cell četla jen
+  vlastní `last_hidden` jako recurrent input (slot 21..52). Sprint 94
+  pooluje přes bond network — solo cell stale = self, bonded cells = mean
+  napříč 1-hop bond partners. **Proto-distributed cognition**: cluster
+  cells share memory, jeden „cluster mind" napříč N cells.
+
+- **Mechanismus:**
+  - `Cell.pooled_hidden: [f32; BRAIN_HIDDEN]` — pre-tick computed mean
+    `last_hidden` přes self + bonded partners. Solo: pool == self. Pair:
+    (self + partner) / 2. Cluster: arithmetic mean over alive 1-hop
+    bonded subgraph.
+  - `pool_bonded_hidden(cell, lookup)` — generic helper; caller dodá
+    closure `cell_id → Option<[f32; BRAIN_HIDDEN]>`. Despawned partners
+    (None) skipnuti, no graph traversal cost (1-hop only).
+  - `populate_brain_inputs` slots 21..52: čte `pooled_hidden` místo
+    `last_hidden`. Behavior change vs pre-S94: solo cells unchanged
+    (pool == self), bonded cells get averaged context.
+  - **System chain:** `pool_bonded_hidden_cells` (main.rs) /
+    `pool_bonded_hidden()` (headless) běží **before brain_act** v same
+    tick. Reads previous tick's `last_hidden` snapshot, writes current
+    tick's `pooled_hidden`. Brain_act pak forward-passes s pooled input.
+
+- **Selection pressure:**
+  - Cluster cells získají **bigger effective context window** — recurrent
+    state pooluje memories napříč multiple cells.
+  - Theoretical: cluster brain capacity ≈ `n_cells × BRAIN_HIDDEN` v
+    expressive power (každá cell přispívá k pool, brain forward weights
+    kombinují signály).
+  - Practical: random brains nemají výhodu z větší context (random
+    in → random out). Selection lag — cells musí evolvovat brain weights
+    co aktivně využijí pooled signál; pak cluster cognition outperforms
+    solo.
+  - **Bond formation NOT directly incentivized** — pooled brain je
+    benefit AFTER bond forms, not BEFORE. Sprint 95+ může přidat
+    explicit bond formation reward (lower formation cost, higher
+    BOND_FOOD_SHARE_FRAC, mandatory cluster reproduction).
+
+- **Smoke seed=0 60 gen:**
+  - `mean_bond_count`: 0.000 → 0.131 (mírný nárůst vs S93 baseline ~0)
+  - `exposure_avg`: 1.000 → 0.967 (slight decrease, more cells partially
+    shielded)
+  - Hunters cap reached gen 30 (parita s S93)
+  - Cell spd 58 → 169 (stejný evoluční pattern jako S93)
+  - **Subtle effect** — mechanismus aktivní, ale 60 gen nedostatek
+    k clear arms-race-like signal pro cluster cognition. Long-run 300-500
+    gen by ukázal lépe.
+
+- **Determinismus:** žádné nové RNG draws. `pool_bonded_hidden` je
+  deterministic given last_hidden snapshot. Sprint 94 = nový baseline
+  kvůli pooled_hidden field shift v Cell struct (serde default
+  všech-zeros pro backward-compat ale runtime behavior se mění od
+  prvního ticku s any bonds).
+
+- **Test suite:** 139/139 pass (136 z S93 + 3 nové: `pool_bonded_hidden_solo_cell_returns_self`,
+  `pool_bonded_hidden_pair_averages`, `pool_bonded_hidden_skips_dead_partners`).
+
+- **Výstup:**
+  - `src/lib.rs`: `Cell.pooled_hidden` field (serde default zeros),
+    `default_pooled_hidden` helper, `pool_bonded_hidden` public fn,
+    `populate_brain_inputs` reads pooled, init sites updated, 3 nové tests.
+  - `src/main.rs`: `pool_bonded_hidden_cells` Bevy system, registered
+    v FixedUpdate chain před `cells_brain_act`.
+  - `src/bin/headless.rs`: `pool_bonded_hidden` World method, called
+    v `tick()` před `run_brain_act`.
+
+- **Theoretical implications (LLM analogy):**
+  - Cluster jednoho ~50 cells × 32 hidden = 1600 effective neurons,
+    ~6 řádů pod GPT-3 (175B params).
+  - Architecture mismatch: bioscape brain je feedforward + recurrent
+    (Elman RNN), ne transformer. Žádná attention.
+  - Adjacent: emergent communication research (DeepMind, OpenAI) —
+    agents v shared environment evolvují proto-language. Cluster brain
+    je první krok tímto směrem.
+  - Bioscape value: **substrate pro evoluční emergence kolektivní
+    cognition**, ne deployable LLM artifact.
+
+- **Co Sprint 94 NEŘEŠÍ (S95+):**
+  - **Bond formation incentive** — random brains rarely cross output[9]
+    threshold. Bez tohoto pooled brain mechanismus stays mostly dormant.
+    S95: lower formation cost, higher INNATE_BOND_BIAS, nebo cluster-
+    reward signal (bigger food share for bonded cells).
+  - **Long-run validation** (300-500 gen) — verify cluster cognition
+    drives evolutionary trajectory, ne jen mechanical mean operation.
+  - **Multi-hop pooling** — currently 1-hop. Bigger clusters by mohly
+    benefit z transitive pooling (cell A pools B pools C indirect).
+  - **Information flow asymmetry** — currently mean. Could be max/sum/
+    weighted by bond_age — gives senior bond partners více weight.
+
+## Sprinty 95+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud
