@@ -3096,6 +3096,67 @@ mod tests {
     }
 
     #[test]
+    fn temperature_diurnal_surface_oscillates() {
+        // Sprint 86: surface (z = +half) osciluje ±DIURNAL_AMP přes 1 day.
+        // Bottom (z = -half) zůstává stabilní (normalized = 0 → diurnal × 0).
+        let half = [960.0, 540.0, 50.0];
+        let period = THERMAL_DIURNAL_PERIOD_TICKS;
+        // Quarter-day → sin(π/2) = +1 → surface = TOP + AMP, bottom = BOTTOM.
+        let t_q = period / 4;
+        let surf_q = temperature_at_z(50.0, half, t_q, 0);
+        let bot_q = temperature_at_z(-50.0, half, t_q, 0);
+        assert!((surf_q - (THERMAL_TOP + THERMAL_DIURNAL_AMP)).abs() < 0.05);
+        assert!((bot_q - THERMAL_BOTTOM).abs() < 0.05);
+        // Three-quarter-day → sin(3π/2) = -1 → surface = TOP − AMP.
+        let t_3q = 3 * period / 4;
+        let surf_3q = temperature_at_z(50.0, half, t_3q, 0);
+        assert!((surf_3q - (THERMAL_TOP - THERMAL_DIURNAL_AMP)).abs() < 0.05);
+        // Full day → sin(2π) = 0 → matches initial.
+        let surf_full = temperature_at_z(50.0, half, period, 0);
+        assert!((surf_full - THERMAL_TOP).abs() < 0.01);
+    }
+
+    #[test]
+    fn temperature_seasonal_uniform_shift() {
+        // Sprint 86: seasonal aplikuje stejný offset napříč all z (uniform shift).
+        // Surface i bottom posun stejně. Period = CYCLE_GEN_PERIOD = 50 gen.
+        let half = [960.0, 540.0, 50.0];
+        let period = CYCLE_GEN_PERIOD;
+        // Quarter-cycle → sin(π/2) = 1 → +SEASONAL_AMP shift.
+        let surf_q = temperature_at_z(50.0, half, 0, period / 4);
+        let bot_q = temperature_at_z(-50.0, half, 0, period / 4);
+        assert!((surf_q - (THERMAL_TOP + THERMAL_SEASONAL_AMP)).abs() < 0.05);
+        assert!((bot_q - (THERMAL_BOTTOM + THERMAL_SEASONAL_AMP)).abs() < 0.05);
+        // Half-cycle → sin(π) = 0 → no shift.
+        let surf_half = temperature_at_z(50.0, half, 0, period / 2);
+        assert!((surf_half - THERMAL_TOP).abs() < 0.05);
+        // Three-quarter-cycle → sin(3π/2) = -1 → -SEASONAL_AMP shift.
+        let surf_3q = temperature_at_z(50.0, half, 0, 3 * period / 4);
+        assert!((surf_3q - (THERMAL_TOP - THERMAL_SEASONAL_AMP)).abs() < 0.05);
+    }
+
+    #[test]
+    fn temperature_combined_seasonal_and_diurnal() {
+        // Sprint 86: seasonal i diurnal jsou aditivní. Quarter-day +
+        // quarter-season → surface = TOP + DIURNAL_AMP + SEASONAL_AMP,
+        // bottom = BOTTOM + SEASONAL_AMP.
+        let half = [960.0, 540.0, 50.0];
+        let t_q = THERMAL_DIURNAL_PERIOD_TICKS / 4;
+        let g_q = CYCLE_GEN_PERIOD / 4;
+        let surf = temperature_at_z(50.0, half, t_q, g_q);
+        let expected = THERMAL_TOP + THERMAL_DIURNAL_AMP + THERMAL_SEASONAL_AMP;
+        assert!(
+            (surf - expected).abs() < 0.05,
+            "combined surface {} ≠ expected {}",
+            surf,
+            expected
+        );
+        let bot = temperature_at_z(-50.0, half, t_q, g_q);
+        let expected_bot = THERMAL_BOTTOM + THERMAL_SEASONAL_AMP;
+        assert!((bot - expected_bot).abs() < 0.05);
+    }
+
+    #[test]
     fn metabolism_factor_q10_ratio() {
         // Q10 = 2.0 → biologické rychlosti přesně 2× per +10 sim-units T.
         let m_ref = metabolism_factor(THERMAL_REF_TEMP);

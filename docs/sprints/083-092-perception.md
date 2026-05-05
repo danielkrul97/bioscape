@@ -232,33 +232,107 @@ sebou, kterou cells mohou flank-uniknout.
   - Photic stratification — natural pair s thermal (depth-coupled niches).
   - GPU `vision_fov_factor` — latentní debt z Sprint 82.
 
-- **Sprint 86+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
+## Sprint 86 — thermal day/night + seasonal cycle
+
+- **Cíl:** static z-gradient teploty (Sprint 85) rozšířit o time-varying
+  oscilace. Reálný oceán má (1) **diurnal** cycle — surface warms ve dne,
+  cools v noci, hloubka stabilní (thermokline buffer); (2) **seasonal**
+  cycle — celé volume warms/cools across měsíců. Sprint 86 obě v
+  deterministickém analytickém formě (žádný field grid).
+
+- **Mechanismus:**
+  - Konstanty (`src/lib.rs`): `THERMAL_DIURNAL_AMP = 5.0` (peak surface
+    oscilace ±5°), `THERMAL_DIURNAL_PERIOD_TICKS = TICKS_PER_GENERATION` (1
+    day = 1 gen = 600 ticks = 10 s real-time), `THERMAL_SEASONAL_AMP = 4.0`
+    (peak uniform shift). Seasonal period reusne `CYCLE_GEN_PERIOD = 50 gen`
+    — sdílený s food density cyklem, takže warm season = abundant food,
+    cold = scarce. Natural ecological coupling.
+  - `temperature_at_z(z, world_half, tick, generation)`:
+    1. **Base** = lineární z-gradient (Sprint 85 unchanged).
+    2. **Seasonal** = `AMP × sin(TAU × (gen mod period) / period)`. Uniform.
+    3. **Diurnal** = `AMP × normalized_z × sin(TAU × (tick mod period) / period)`.
+       Surface-weighted (bottom = no oscillation, mirror reálné termokliny).
+    Modulo přes period drží phase v [0,1) bez f32 precision loss long runs.
+  - `metabolism_factor` time-agnostic (čistý Q10 power law).
+  - `Cell::step` signature rozšířen o `tick: u64, generation: u64` před
+    `physics`. Propagace do `apply_energy_costs` → `temperature_at_z`.
+    Tests passing `0, 0` → sin(0) = 0 → zachována Sprint 85 behavior.
+
+- **GPU parita (`shaders/step.wgsl` + `gpu.rs`):**
+  - `StepParamsGpu` rozšířen o 4 nové f32 pole: `thermal_diurnal_amp/seasonal_amp`
+    + `thermal_diurnal_phase/seasonal_phase`. Phases pre-computed CPU-side
+    (`tick mod period / period`) aby shader nemusel řešit u64 modulo.
+  - Shader mirror diurnal + seasonal offsets. Parity test passuje
+    s phase = 0.
+
+- **Smoke (seed=0, 60 gen — > 1 seasonal cycle):**
+  - Gen 0: temp_avg = 16.98 (REF baseline).
+  - Gen 25-40: temp_avg drop k 7.34 (peak winter cycle ~ gen 37.5 sin = -1
+    + populace deep z-migrate). Sezónní + niche selection synergize.
+  - Gen 50-60: temp_avg recovery 10.55 → 12.26 (warming back, populace
+    drží deep niche).
+  - fov_avg paralelně 3.14 → 2.41 (3 nezávislé selekční síly).
+  - Pop stabilní (200 → 633), žádný kolaps.
+
+- **Determinismus:** žádné nové RNG draws — diurnal i seasonal pure funkce
+  `tick` a `generation`. Sprint 86 = nový baseline kvůli temp formula
+  change, ale uvnitř deterministic. `tick = gen = 0` → output identical
+  s Sprint 85.
+
+- **Test suite:** 121/121 pass (118 z S85 + 3 nové: `temperature_diurnal_surface_oscillates`,
+  `temperature_seasonal_uniform_shift`, `temperature_combined_seasonal_and_diurnal`).
+  17 existing test step callsites updated o `0, 0` placeholder.
+
+- **Výstup:**
+  - `src/lib.rs`: 3 nové konstanty (`THERMAL_DIURNAL_AMP/PERIOD_TICKS/SEASONAL_AMP`),
+    `temperature_at_z` + `apply_energy_costs` + `Cell::step` signature
+    expansion, propagace tick/gen, 3 nové tests.
+  - `src/main.rs`: `step_cells` přebírá `Res<Clock>`, propaguje tick/gen.
+  - `src/bin/headless.rs`: `World::step` propaguje `self.clock.tick/gen`,
+    `--gpu-full` `StepParamsGpu` populace o phase fractions, CSV
+    `temperature_at_z` použije aktuální clock.
+  - `src/gpu.rs`: `StepParamsGpu` 4 nové f32 (amps + phases), parity test
+    setup s tick=0 fallback.
+  - `shaders/step.wgsl`: seasonal + diurnal offset, identický s CPU.
+  - `benches/headless_phases.rs`: 1 step callsite update.
+
+- **Co Sprint 86 NEŘEŠÍ (S87+):**
+  - Brain sensor pro thermal/temporal awareness. Cells žijí v time-varying
+    prostředí ale neví o čase. Kandidát: `time_of_day` nebo
+    `temperature_local`. Vyžaduje `BRAIN_INPUTS_SENSORY` resize.
+  - Stochastic noise field — random temperature perturbace nad analytickou
+    base.
+  - Climate trend (monotonic warming) — open-ended evolution stress test.
+  - Per-cell `thermal_optimum` gen.
+
+## Sprinty 87+ — open-ended
+
+- **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud
   cone filter vytváří dostatečný informační deficit; populace stabilizuje
   v cold-deep niche pokud Q10 selekce dominuje, nebo udrží warm-shallow
   lineage pokud food gradient kompenzuje thermal cost.
-- **Sprint 86+:** Brain input pro thermal sensing — `thermal_norm` jako
-  21. sensory slot. Vyžaduje `BRAIN_INPUTS_SENSORY: 20 → 21`, w1 resize.
-  Spustit pokud Sprint 85 long-run ukáže příliš pomalou behavioral
-  konvergenci.
-- **Sprint 86+:** `thermal_optimum` gen — per-cell preference. Driver pro
+- **Sprint 87+:** Brain input pro thermal/temporal sensing — `thermal_norm`
+  + `time_of_day_phase` jako 21./22. sensory sloty. Vyžaduje
+  `BRAIN_INPUTS_SENSORY: 20 → 22`, w1 resize.
+- **Sprint 87+:** `thermal_optimum` gen — per-cell preference. Driver pro
   diversifikaci napříč z-vrstvami místo trivial "all migrate down".
-- **Sprint 86+:** Photic stratification (z-gradient light field +
+- **Sprint 87+:** Photic stratification (z-gradient light field +
   photoreceptor sensor input). Natural pair s thermal — depth-coupled
   niches.
-- **Sprint 86+:** GPU `vision_fov_factor` v step.wgsl (latentní debt
+- **Sprint 87+:** Climate trend (monotonic warming) — open-ended evolution
+  stress test, populace musí evolvovat rychleji než klima.
+- **Sprint 87+:** Stochastic temperature noise field — random perturbace
+  nad analytickou base, lokální hot/cold spots.
+- **Sprint 87+:** GPU `vision_fov_factor` v step.wgsl (latentní debt
   z Sprint 82) — vyžaduje aux buffer expansion.
-- **Sprint 86+:** renderer screencast + HUD bond/state stats (z S80
+- **Sprint 87+:** renderer screencast + HUD bond/state stats (z S80
   odsunuto).
-- **Sprint 86+:** Cluster reproduction (S70 retry s S78 baseline).
-- **Sprint 86+:** `BOND_FOOD_SHARE_FRAC` sweep (0.1, 0.5, 0.7).
-- **Sprint 86+:** GPU collision shader, anisotropic collision.
-- **Sprint 86+:** Spatial autocorrelation adhesion_type clustering metric.
-- **Sprint 86+:** Brain output pro „active gaze" (decouple FOV direction
-  od body heading) — pokud long-run ukáže informační deficit s úzkým FOV.
-- **Sprint 86+:** Brain `vision_fov` input — feed half-angle do mozku jako
-  proprioceptive signal. Pravděpodobně redundantní (forward už je v
-  inputs).
-- **Sprint 86+:** Multiple eyes (2 sensory cones s overlap, blind zone
-  uprostřed). Natural extension k binocular vision; vyžaduje genom
-  decision (single fov vs vec of fovs) + sensor gather refactor.
+- **Sprint 87+:** Cluster reproduction (S70 retry s S78 baseline).
+- **Sprint 87+:** `BOND_FOOD_SHARE_FRAC` sweep (0.1, 0.5, 0.7).
+- **Sprint 87+:** GPU collision shader, anisotropic collision.
+- **Sprint 87+:** Spatial autocorrelation adhesion_type clustering metric.
+- **Sprint 87+:** Brain output pro „active gaze" (decouple FOV direction
+  od body heading).
+- **Sprint 87+:** Brain `vision_fov` input — feed half-angle do mozku.
+- **Sprint 87+:** Multiple eyes (2 sensory cones s overlap).
