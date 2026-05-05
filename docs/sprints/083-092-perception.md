@@ -503,7 +503,122 @@ sebou, kterou cells mohou flank-uniknout.
   - Subsurface scattering on cells (jelly translucency).
   - Cinematic camera modes / HUD graphs.
 
-## Sprinty 89+ — open-ended
+## Sprint 89 — Hunter evolution v1 (parametric genome, biological arms race)
+
+- **Cíl:** Pre-Sprint-89 byl Hunter non-evolving environmental feature
+  (S71 design): fixed konstanty řídily chování, žádný genom/energy/lifecycle.
+  Cells evolvovaly proti hunteru, hunter zpět nikdy → asymmetric selection.
+  Sprint 89 udělá z hunteru **evolvable entitu**: 8-gene heritable parameters,
+  lifecycle (energy, reprodukce, smrt, floor respawn). Bez brain v této fázi —
+  chování zůstává „seek nearest attackable prey" (S84), ale parametry jsou
+  per-hunter genové. Coevolution emerge přes diferenciální přežití.
+
+- **Mechanismus:**
+  - **HunterGenome (`src/lib.rs`):** 8 genes — `vision_radius` ([50, 400]),
+    `vision_fov` ([π/12, π]), `max_speed` ([100, 500]), `acceleration`
+    ([40, 160]), `attack_radius` ([10, 40]), `damage_per_tick` ([2, 16]),
+    `body_size` ([0.5, 2.5]), `color_hue` ([0, 360)). Init draws kolem S71-S84
+    const middle ranges + ~30 % spread (initial diversity). `random()` /
+    `mutate()` / `crossover()` jako Cell `Genome`.
+  - **HunterMutationConfig:** sigma per-gene ~3 % range/gen — vyšší než cell
+    `MUTATION_CONFIG` aby evolution signal byl viditelný v menší populaci.
+  - **Hunter struct expansion:** + `genome`, `energy`, `age`, `reproduce_cooldown_ticks`,
+    `lineage_id`, `lineage_birth_gen`. Constructor `Hunter::from_genome` +
+    `Hunter::random`.
+  - **Energy mechanics:** per-tick drain v `apply_energy_costs` — vision
+    (`radius × fov_factor × VISION_COST`), motion (`v² × MOTION_COST`),
+    body (`size³ × BODY_COST`), attack upkeep (`damage × ATTACK_UPKEEP`).
+    Gain v hunt phase: `damage_dealt × ENERGY_PER_DAMAGE` per attack tick.
+  - **Lifecycle:** death (energy ≤ 0 → drop `HUNTER_CARRION_DROP=2` carrion +
+    despawn), reproduce (energy ≥ `HUNTER_REPRODUCE_THRESHOLD=800` AND
+    cooldown 0 → split energy 50/50 + clone-with-mutate child), floor respawn
+    (n_hunters == 0 → 1 fresh random genome aby nedošlo k total predator
+    extinction blokující arms race), MAX_POP cap 50.
+  - **`nearest_attackable_cell` signature:** `&Hunter` místo `(pos, vel)` —
+    direct genome access pro vision_radius + vision_fov.
+
+- **Tuning v2 (po initial smoke):** Pre-tuning hunters mass-died gen 1 (motion
+  cost při v=300 dominated). Adjusted:
+  - `HUNTER_INITIAL_ENERGY`: 300 → 500 (delší survival window)
+  - `HUNTER_VISION_COST`: 0.03 → 0.01
+  - `HUNTER_MOTION_COST`: 0.0015 → 0.0001 (klíčový fix — pre-tuning 1350
+    energy/gen drain při v=300, post-tuning 90/gen)
+  - `HUNTER_BODY_COST`: 1.0 → 0.5
+  - `HUNTER_ATTACK_UPKEEP`: 0.05 → 0.02
+  - `HUNTER_ENERGY_PER_DAMAGE`: 1.0 → 3.0 (attack net-positive při contact)
+  - `HUNTER_REPRODUCE_THRESHOLD`: 600 → 800
+
+- **Lifecycle systems:**
+  - `main.rs::hunters_lifecycle` — Bevy system po `step_hunters`. Death pass
+    (despawn + spawn carrion FoodEntity), reproduce pass (commands.spawn child
+    HunterEntity), floor respawn (1 hunter pokud 0 alive). Resource
+    `NextHunterId` monotonic counter.
+  - `headless.rs::hunter_lifecycle` — mirror (Vec mutation místo ECS), volá
+    se po `hunt()` v `tick()`.
+
+- **CSV diagnostika (`headless.rs`):** 7 nových sloupců — `hunter_births`,
+  `hunter_deaths`, `h_spd_avg`, `h_vis_avg`, `h_fov_avg`, `h_dmg_avg`,
+  `h_size_avg`. CSV total 55 → 62 columns. Per-gen reset births/deaths
+  counters v generation transition.
+
+- **Smoke (seed=0, 100 gen) — ARMS RACE EMERGENCE:**
+
+  | gen | cells | n_hunters | h_spd | h_dmg | h_size | cells_spd | ratio |
+  |-----|-------|-----------|-------|-------|--------|-----------|-------|
+  | 0   | 200   | 12        | 282   | 8.59  | 1.22   | 59.3      | 4.78× |
+  | 30  | 691   | 6         | 324   | 11.27 | 1.41   | 124.2     | 2.61× |
+  | 60  | 506   | 9         | 347   | 11.59 | 1.50   | 151.2     | 2.29× |
+  | 100 | 540   | 18        | 348   | 11.71 | 1.49   | 191.4     | 1.82× |
+
+  **Arms race signal:** hunter:cell speed ratio **4.78× → 1.82×** za 100 gens
+  — cells caught up dramaticky (speed 59 → 191, +222 %), hunters partially
+  caught up (282 → 348, +23 %). Damage drift (+36 %) ukazuje selekci na
+  silnější útoky kompenzující rychlejší kořist. Pop dynamic (cells 200 →
+  500-700, hunters 4-18) je Lotka-Volterra-like — žádná extinction events
+  (díky floor respawn + MAX_POP cap), žádná runaway growth.
+
+- **Determinismus:** Sprint 89 = nový baseline. `Hunter::random` má extra
+  RNG draws (8 genome floats) per init — RNG sequence shifted od S88. Uvnitř
+  S89 deterministic.
+
+- **Test suite:** 129/129 pass (124 z S88 + 5 nových: `hunter_genome_random_in_range`,
+  `hunter_mutate_clamps_to_range`, `hunter_crossover_picks_from_either_parent`,
+  `hunter_apply_energy_costs_drains`, `make_hunter_child_splits_energy`).
+  Existing 7 hunter tests aktualizovány (Hunter literals + nearest_attackable_cell
+  signature change) — `make_test_hunter` helper s default genome.
+
+- **Výstup:**
+  - `src/lib.rs`: `HunterGenome` struct + impl, `HunterMutationConfig` +
+    `HUNTER_MUTATION_CONFIG`, 8 gene-range konstant (MIN/MAX_HUNTER_*),
+    9 lifecycle/energy konstant (HUNTER_INITIAL_ENERGY, REPRODUCE_THRESHOLD,
+    MAX_POP, VISION/MOTION/BODY/ATTACK_UPKEEP costs, ENERGY_PER_DAMAGE,
+    CARRION_DROP, REPRODUCE_COOLDOWN_TICKS), `Hunter` struct expansion,
+    `Hunter::from_genome` + `apply_energy_costs`, `make_hunter_child` helper,
+    `nearest_attackable_cell` signature, 5 nové tests + helper.
+  - `src/main.rs`: `Hunter::random` call sites, `step_hunters` refactor
+    (genome params, energy gain/drain), `hunters_lifecycle` system,
+    `NextHunterId` resource, system registration.
+  - `src/bin/headless.rs`: `World` + `next_hunter_id`/`hunter_births_gen`/
+    `hunter_deaths_gen` fields, init + checkpoint paths updated, `hunt()`
+    refactor, `hunter_lifecycle()` method, CSV writer + extinction-row + header
+    + per-gen reset.
+
+- **Co Sprint 89 NEŘEŠÍ (S90+):**
+  - **Hunter brain** — adaptive ambush/chase tactics, prey selection,
+    coordinated hunting. Big lift (Brain struct na Hunter, BRAIN_INPUTS
+    layout, GPU shader update). Pokud S89 long-run ukáže stable dynamics,
+    Sprint 90 přidá brain pro deeper coevolution.
+  - **Sexual reproduction for hunters** — pairing logic + crossover.
+    Asexual v1 dostatek pro arms race signal.
+  - **Hunter shell / armor gene** — defensive evolution. Cells mají shell,
+    hunters by mohli taky.
+  - **Inter-hunter cannibalism / pack hunting** — currently hunters ignorují
+    sebe. Group dynamics by mohly emerge přes brain (S90+).
+  - **Hunter checkpoint serialization** — current load_checkpoint resets
+    hunters s random genomy (lineage reset). Bincode serialize HunterGenome
+    by zachoval evolution napříč session.
+
+## Sprinty 90+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud

@@ -36,8 +36,8 @@ use bioscape::{
     BOND_REST_LENGTH_SLACK, BRAIN_INPUTS, CARRION_FOOD_COUNT, CELL_RADIUS,
     CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS,
     FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH, HAZARD_AMP,
-    HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS, HUNTER_ATTACK_RADIUS,
-    HUNTER_DAMAGE_PER_TICK, HUNTER_TARGET_COUNT, INITIAL_CELLS, LEARNING_RATE,
+    HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS,
+    HUNTER_TARGET_COUNT, INITIAL_CELLS, LEARNING_RATE,
     MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH,
     MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
     PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
@@ -165,6 +165,17 @@ struct NextCellId(u64);
 impl Default for NextCellId {
     fn default() -> Self {
         Self(INITIAL_CELLS as u64)
+    }
+}
+
+/// Sprint 89: monotonic counter pro hunter_id + lineage_id při reproduce
+/// nebo floor respawn. Init seed uses ids 0..HUNTER_TARGET_COUNT.
+#[derive(Resource)]
+struct NextHunterId(u64);
+
+impl Default for NextHunterId {
+    fn default() -> Self {
+        Self(HUNTER_TARGET_COUNT as u64)
     }
 }
 
@@ -339,15 +350,23 @@ struct EpochEnded {
 }
 
 fn main() {
-    App::new()
-        .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Bioscape".into(),
-                    ..default()
-                }),
-                ..default()
-            }),
+    // Sprint 87: bevy_diagnostic plugins jen na CLI flag `--diag`. Default
+    // run je tichý (žádný LogDiagnostics spam, žádný frame-time tracking
+    // overhead). `add_measurement` v existujících systémech zůstává unconditional
+    // — pokud diag není registrovaný, je no-op.
+    let want_diag = std::env::args().any(|a| a == "--diag");
+
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "Bioscape".into(),
+            ..default()
+        }),
+        ..default()
+    }));
+
+    if want_diag {
+        app.add_plugins((
             FrameTimeDiagnosticsPlugin::default(),
             LogDiagnosticsPlugin::default(),
         ))
@@ -365,8 +384,10 @@ fn main() {
         .register_diagnostic(Diagnostic::new(DIAG_GRID_REBUILD).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_SYNC_TRANSFORMS).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_TICKS_PER_FRAME).with_suffix(" ticks"))
-        .register_diagnostic(Diagnostic::new(DIAG_RENDER_OVERHEAD).with_suffix(" ms"))
-        .init_resource::<TickCounter>()
+        .register_diagnostic(Diagnostic::new(DIAG_RENDER_OVERHEAD).with_suffix(" ms"));
+    }
+
+    app.init_resource::<TickCounter>()
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`.
         // Sprint 88: white → ocean blue. Match s DistanceFog color tak aby
         // fog-fadeout splynul s pozadím (no harsh edges).
@@ -384,6 +405,7 @@ fn main() {
         .init_resource::<FoodGrid>()
         .init_resource::<FoodDensityFactor>()
         .init_resource::<NextCellId>()
+        .init_resource::<NextHunterId>()
         .init_resource::<ContactProgress>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
@@ -412,6 +434,7 @@ fn main() {
                     resolve_cell_collisions,
                     cell_predates_on_neighbor,
                     step_hunters,
+                    hunters_lifecycle,
                     cell_eats_food,
                     spawn_food,
                     cell_reproduces_on_threshold,
@@ -691,9 +714,12 @@ fn setup(
         emissive: LinearRgba::new(3.5, 0.0, 0.0, 1.0),
         ..default()
     });
+    // Sprint 89: každý hunter dostává random genome + lineage. Initial
+    // population spawnuje se tady; Sprint 89+ lifecycle (death/reproduce)
+    // mění populaci dynamicky v `step_hunters`.
     let mut hunter_rng = rand::rng();
     for i in 0..HUNTER_TARGET_COUNT {
-        let h = Hunter::random(&mut hunter_rng, half, i as u64);
+        let h = Hunter::random(&mut hunter_rng, half, i as u64, i as u64, 0);
         commands.spawn((
             HunterEntity(h),
             Mesh3d(hunter_mesh_handle.clone()),
@@ -1437,8 +1463,13 @@ fn cell_eats_food(
             // conservation — modeluje tissue cooperation).
             // Sprint 80: donor's cell_state moduluje fraction. State≈0
             // (selfish) → ~0% share; state≈1 (altruist) → plný 30% share.
-            // Tím vzniká uvnitř clusteru divergence rolí bez genetické změny.
-            let share_value = *value * bioscape::BOND_FOOD_SHARE_FRAC * donor_state;
+            // Sprint 87: cluster-size bonus — cells hluboko v tkáni sdílí
+            // víc, posiluje selekci proti tissue-regime collapse.
+            let n_bonds = bonds_copy.iter().filter(|b| b.is_some()).count() as f32;
+            let cluster_mult = 1.0 + (n_bonds - 1.0).max(0.0)
+                * bioscape::BOND_FOOD_SHARE_CLUSTER_BONUS;
+            let share_value =
+                *value * bioscape::BOND_FOOD_SHARE_FRAC * donor_state * cluster_mult;
             if share_value > 0.0 {
                 for bond_opt in bonds_copy.iter() {
                     if let Some(bond) = bond_opt {
@@ -1504,25 +1535,34 @@ fn sync_transforms(
 /// (vision range, n_bonds < threshold), pohni se k němu, attack pokud v dosahu.
 /// Two-pass kvůli borrow checkeru: pass 1 sbírá (entity, damage) během
 /// `&mut HunterEntity` iterace, pass 2 mutuje cells po uvolnění hunter borrow.
+///
+/// Sprint 89: heritable predator parameters. Vision/attack radius/damage z
+/// `genome` místo const. Per-tick energy costs (vision/motion/body/attack
+/// upkeep) volá Hunter::apply_energy_costs. Energy gain z attack proporčně
+/// damage × HUNTER_ENERGY_PER_DAMAGE — predator se musí krmit aby přežil.
+/// Lifecycle (death + reproduce + floor respawn) v separate systemu
+/// `hunters_lifecycle` runs po `step_hunters`.
 fn step_hunters(
     mut hunters: Query<&mut HunterEntity>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     fixed_time: Res<Time<Fixed>>,
 ) {
     let dt = fixed_time.delta_secs();
-    // Snapshot cells (Cell je Copy → cheap clone). Indexovaný pro
-    // `nearest_attackable_cell` lookup.
-    let cell_snapshot: Vec<(Entity, Cell)> =
-        cells.iter().map(|(e, c)| (e, c.0)).collect();
+    let cell_snapshot: Vec<(Entity, Cell)> = cells.iter().map(|(e, c)| (e, c.0)).collect();
     let cells_only: Vec<Cell> = cell_snapshot.iter().map(|(_, c)| *c).collect();
-    let attack_r2 = HUNTER_ATTACK_RADIUS * HUNTER_ATTACK_RADIUS;
     let mut rng = rand::rng();
+    // (cell_entity, damage_dealt) — apply k cells. Hunter dostává paralelní
+    // gain index po hunter loop dle hunter index.
     let mut attacks: Vec<(Entity, f32)> = Vec::new();
+    let mut hunter_gains: Vec<f32> = Vec::new();
     for mut h in &mut hunters {
-        let target_idx =
-            nearest_attackable_cell(h.0.position, h.0.velocity, &cells_only, SIMULATION_HALF);
+        let target_idx = nearest_attackable_cell(&h.0, &cells_only, SIMULATION_HALF);
         let target_pos = target_idx.map(|i| cells_only[i].position);
         h.0.step(target_pos, &mut rng, dt, SIMULATION_HALF);
+        let attack_r = h.0.genome.attack_radius;
+        let attack_r2 = attack_r * attack_r;
+        let damage = h.0.genome.damage_per_tick;
+        let mut gain = 0.0_f32;
         if let Some(i) = target_idx {
             let d = bioscape::min_image_delta(
                 h.0.position,
@@ -1531,15 +1571,118 @@ fn step_hunters(
             );
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if d2 < attack_r2 {
-                attacks.push((cell_snapshot[i].0, HUNTER_DAMAGE_PER_TICK * dt));
+                let damage_dealt = damage * dt;
+                attacks.push((cell_snapshot[i].0, damage_dealt));
+                gain = damage_dealt * bioscape::HUNTER_ENERGY_PER_DAMAGE;
             }
         }
+        h.0.apply_energy_costs(dt);
+        h.0.energy += gain;
+        hunter_gains.push(gain);
     }
     for (entity, damage) in attacks {
         if let Ok((_, mut cell)) = cells.get_mut(entity) {
             cell.0.energy -= damage;
             cell.0.damage_accum += damage;
         }
+    }
+    let _ = hunter_gains;
+}
+
+/// Sprint 89: hunter lifecycle — death (energy ≤ 0 → drop carrion + despawn),
+/// reproduce (energy ≥ THRESHOLD + cooldown 0 → split + clone+mutate child),
+/// floor respawn (n_hunters == 0 → 1 fresh genome). MAX_POP cap brání runaway.
+/// Asexual v1 — Sprint 91+ může přidat sexual pairing.
+fn hunters_lifecycle(
+    hunters: Query<(Entity, &HunterEntity)>,
+    extent: Res<WorldExtent>,
+    hunter_mesh: Res<HunterMesh>,
+    hunter_material: Res<HunterMaterial>,
+    food_mesh: Res<FoodMesh>,
+    food_material: Res<FoodMaterial>,
+    clock: Res<Clock>,
+    mut next_hunter_id: ResMut<NextHunterId>,
+    mut commands: Commands,
+) {
+    let mut rng = rand::rng();
+    let half = extent.as_array();
+    let current_gen = clock.0.generation;
+    let alive: Vec<(Entity, Hunter)> = hunters.iter().map(|(e, h)| (e, h.0)).collect();
+
+    // Floor respawn: pokud all extinct, spawn 1 fresh genome (předchází total
+    // predator collapse blokující arms race).
+    if alive.is_empty() {
+        let id = next_hunter_id.0;
+        next_hunter_id.0 += 1;
+        let h = Hunter::random(&mut rng, half, id, id, current_gen);
+        commands.spawn((
+            HunterEntity(h),
+            Mesh3d(hunter_mesh.0.clone()),
+            MeshMaterial3d(hunter_material.0.clone()),
+            Transform::from_xyz(h.position[0], h.position[1], h.position[2]),
+        ));
+        return;
+    }
+
+    // Death pass.
+    for (entity, h) in &alive {
+        if h.energy <= 0.0 {
+            commands.entity(*entity).despawn();
+            for _ in 0..bioscape::HUNTER_CARRION_DROP {
+                let pos = [
+                    (h.position[0] + rng.random_range(-CELL_RADIUS..CELL_RADIUS))
+                        .clamp(-half[0], half[0]),
+                    (h.position[1] + rng.random_range(-CELL_RADIUS..CELL_RADIUS))
+                        .clamp(-half[1], half[1]),
+                    h.position[2].clamp(-half[2], half[2]),
+                ];
+                commands.spawn((
+                    FoodEntity(Food { position: pos, age_ticks: 0 }),
+                    Mesh3d(food_mesh.0.clone()),
+                    MeshMaterial3d(food_material.0.clone()),
+                    Transform::from_xyz(pos[0], pos[1], pos[2]),
+                ));
+            }
+        }
+    }
+
+    // Reproduce pass — eligible parents s energy ≥ threshold + cooldown 0.
+    // Cap respektuje MAX_POP — alive count + this-tick spawns ≤ cap.
+    let alive_count = alive.iter().filter(|(_, h)| h.energy > 0.0).count();
+    let mut budget = bioscape::HUNTER_MAX_POP.saturating_sub(alive_count);
+    if budget == 0 {
+        return;
+    }
+    for (entity, h) in &alive {
+        if budget == 0 {
+            break;
+        }
+        if h.energy < bioscape::HUNTER_REPRODUCE_THRESHOLD {
+            continue;
+        }
+        if h.reproduce_cooldown_ticks > 0 {
+            continue;
+        }
+        // Halve parent energy + reset cooldown via mut access.
+        let id = next_hunter_id.0;
+        next_hunter_id.0 += 1;
+        let child = bioscape::make_hunter_child(h, &mut rng, half, id, current_gen);
+        // Spawn child entity.
+        commands.spawn((
+            HunterEntity(child),
+            Mesh3d(hunter_mesh.0.clone()),
+            MeshMaterial3d(hunter_material.0.clone()),
+            Transform::from_xyz(child.position[0], child.position[1], child.position[2]),
+        ));
+        // Update parent: split energy + reset cooldown. Use entity-targeted
+        // mutation via `commands.entity(...)` — direct &mut není dostupný (já
+        // držím snapshot). Workaround: insert new HunterEntity component s
+        // updated state.
+        let mut parent_after = *h;
+        parent_after.energy *= 0.5;
+        parent_after.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
+        commands.entity(*entity).insert(HunterEntity(parent_after));
+        budget -= 1;
     }
 }
 

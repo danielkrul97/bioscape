@@ -527,6 +527,13 @@ pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.05;
 /// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál
 /// pro bonding — fitness payoff přímo, ne přes hunter immunity proxy.
 pub const BOND_FOOD_SHARE_FRAC: f32 = 0.3;
+/// Sprint 87: cluster-size bonus pro food share fraction. Per-partner share =
+/// `FRAC × (1 + (n_bonds − 1) × BONUS) × donor_state`. Cells hluboko v tkáni
+/// (víc bondů) sdílí každému partnerovi vyšší podíl — empirie ze 300-gen
+/// runs ukázala kolaps tissue regimu (bond_active_frac → 0 do gen 200), takže
+/// linear bonus per added bond posiluje selekci pro velké clustery. n=1 →
+/// ×1.00, n=2 → ×1.15, n=6 (max) → ×1.75. Žádný cap (max je MAX_BONDS_PER_CELL=6).
+pub const BOND_FOOD_SHARE_CLUSTER_BONUS: f32 = 0.15;
 
 // ─── Sprint 80: bistabilní cell-state (epigenetic-like memory) ──────────────
 // Per-cell continuous scalar [0,1] s pozitivním feedbackem okolo 0.5 →
@@ -650,11 +657,182 @@ pub const HUNTER_VISION_FOV: f32 = core::f32::consts::PI / 3.0;
 /// nebo i drift, jen ne při startovním idle 0-vector.
 pub const HUNTER_FORWARD_SPEED_THRESHOLD_SQ: f32 = 1.0;
 
-/// Sprint 71: non-evolving environmental predator. Pohybuje se pseudo-AI
-/// (seek nejbližší cell ∈ vision range, jinak random drift). Atakuje cells
-/// s `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD` v attack range. Žádný
-/// genome, žádný brain, žádná smrt — Hunter je world feature, ne entity
-/// pod selekcí.
+// ─── Sprint 89: Hunter evolution v1 (parametric genome) ──────────────────────
+// Pre-Sprint-89 byl Hunter non-evolving — fixed const (HUNTER_VISION_RADIUS,
+// HUNTER_MAX_SPEED, HUNTER_DAMAGE_PER_TICK, …) řídily chování. Cells evolvovaly
+// proti hunteru, hunter nikdy zpět → asymmetric selection. Sprint 89 zavádí
+// `HunterGenome` + energy/reprodukce/smrt → biological arms race: hunter genes
+// drift dle predator success rate, cells continue evolving evasion.
+//
+// V1 = no brain. Behavior zůstává „seek nearest attackable" (S84), ale
+// parametry téhle behavior jsou per-hunter genové. Sprint 90 přidá brain.
+
+/// Gene ranges. Konstanty z S71-S84 (`HUNTER_VISION_RADIUS=200`, …) zůstávají
+/// jako defaults v `HunterGenome::random` initial draw range middle.
+pub const MIN_HUNTER_VISION_RADIUS: f32 = 50.0;
+pub const MAX_HUNTER_VISION_RADIUS: f32 = 400.0;
+pub const MIN_HUNTER_VISION_FOV: f32 = core::f32::consts::PI / 12.0;
+pub const MAX_HUNTER_VISION_FOV: f32 = core::f32::consts::PI;
+pub const MIN_HUNTER_MAX_SPEED: f32 = 100.0;
+pub const MAX_HUNTER_MAX_SPEED: f32 = 500.0;
+pub const MIN_HUNTER_ACC: f32 = 40.0;
+pub const MAX_HUNTER_ACC: f32 = 160.0;
+pub const MIN_HUNTER_ATTACK_RADIUS: f32 = 10.0;
+pub const MAX_HUNTER_ATTACK_RADIUS: f32 = 40.0;
+pub const MIN_HUNTER_DAMAGE: f32 = 2.0;
+pub const MAX_HUNTER_DAMAGE: f32 = 16.0;
+pub const MIN_HUNTER_BODY_SIZE: f32 = 0.5;
+pub const MAX_HUNTER_BODY_SIZE: f32 = 2.5;
+
+/// Initial energy při Hunter spawn / floor respawn. Vyšší než cell
+/// `INITIAL_ENERGY=100` — hunter potřebuje delší survival window než single
+/// chase cycle, který může trvat víc generation ticks bez kill.
+pub const HUNTER_INITIAL_ENERGY: f32 = 500.0;
+/// Energy threshold pro reprodukci. Při dosažení parent splituje energy 50/50
+/// se child + clone-with-mutate genome. 600 = 2× initial → predator musí
+/// úspěšně lovit ~1.5-2× initial-energy worth of prey aby reproduce.
+pub const HUNTER_REPRODUCE_THRESHOLD: f32 = 800.0;
+/// Cap pro hunter populace. Bez něj by predator boom (mnoho cells eaten)
+/// → exponenciální růst → prey extinction. 50 = 4× initial S71 count, dostatek
+/// pro arms race signal ale prevent runaway.
+pub const HUNTER_MAX_POP: usize = 50;
+/// Per-tick vision drain coefficient. `vision_radius × fov_factor × VISION_COST × dt`.
+/// Mírně vyšší než cell `VISION_COST_PER_RADIUS=0.02` — hunter má větší vision
+/// a musí investovat víc energie do detection.
+pub const HUNTER_VISION_COST: f32 = 0.01;
+/// Per-tick motion drain. `v² × MOTION_COST × dt`. Hunter má rychlejší pohyb
+/// + větší masu (body_size 1-2 vs cell ~1) → vyšší kinetic cost než cell
+/// `ENERGY_COST_PER_V_SQ=0.0008`.
+pub const HUNTER_MOTION_COST: f32 = 0.0001;
+/// Body maintenance per tick. `body_size³ × BODY_COST × dt`. Volume-scaled
+/// (jako cell). Bigger predator = víc tissue to maintain.
+pub const HUNTER_BODY_COST: f32 = 0.5;
+/// Attack-mode upkeep, always-on. `damage_per_tick × ATTACK_UPKEEP × dt`.
+/// Hunter „claws out" continuously — lze trade-off-it nižší damage = nižší
+/// upkeep, vhodné pro low-energy survivors.
+pub const HUNTER_ATTACK_UPKEEP: f32 = 0.02;
+/// Energy gain per damage dealt (proportional). Pokud ENERGY_PER_DAMAGE = 1.0
+/// a damage_per_tick = 8, single tick attack na cell vrací 8 energy. Při 60Hz
+/// a HUNTER_ATTACK_RADIUS contact, hunter může drainovat ~480 energy/sec
+/// ze single prey — fast kills sustain reprodukci.
+pub const HUNTER_ENERGY_PER_DAMAGE: f32 = 3.0;
+/// Carrion drops při hunter death. Mirror cell death (Sprint 27 carrion).
+/// 2× value default — hunter větší než cell, víc biomasy.
+pub const HUNTER_CARRION_DROP: usize = 2;
+/// Reproduce cooldown (ticks) po split. Brání instant re-reproduce před cell
+/// catch-up. ~1 generation = 600 ticks.
+pub const HUNTER_REPRODUCE_COOLDOWN_TICKS: u32 = 300;
+
+/// Sprint 89: per-hunter heritable parametry. Pre-Sprint-89 byly fixed
+/// const (HUNTER_VISION_RADIUS=200, HUNTER_MAX_SPEED=300, …); now drift
+/// per generation. Žádné brain weights, jen 8 scalar genes — V1 arms race
+/// běží v parametric space, ne behavioral.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HunterGenome {
+    pub vision_radius: f32,
+    pub vision_fov: f32,
+    pub max_speed: f32,
+    pub acceleration: f32,
+    pub attack_radius: f32,
+    pub damage_per_tick: f32,
+    pub body_size: f32,
+    pub color_hue: f32,
+}
+
+impl HunterGenome {
+    /// Initial random draw. Center middle ranges around S71-S84 const defaults
+    /// + ~30 % spread → initial population diversity dostatečná pro selekci
+    /// signal v 30-100 gen smoke.
+    pub fn random(rng: &mut impl Rng) -> Self {
+        Self {
+            vision_radius: rng.random_range(100.0..300.0),
+            vision_fov: rng.random_range(
+                core::f32::consts::PI / 6.0..core::f32::consts::PI * 0.75,
+            ),
+            max_speed: rng.random_range(200.0..400.0),
+            acceleration: rng.random_range(60.0..120.0),
+            attack_radius: rng.random_range(12.0..28.0),
+            damage_per_tick: rng.random_range(4.0..12.0),
+            body_size: rng.random_range(0.8..1.6),
+            color_hue: rng.random_range(0.0..HUE_RANGE),
+        }
+    }
+
+    pub fn mutate(&self, rng: &mut impl Rng, cfg: &HunterMutationConfig) -> Self {
+        Self {
+            vision_radius: (self.vision_radius + gaussian(rng) * cfg.sigma_vision_radius)
+                .clamp(MIN_HUNTER_VISION_RADIUS, MAX_HUNTER_VISION_RADIUS),
+            vision_fov: (self.vision_fov + gaussian(rng) * cfg.sigma_vision_fov)
+                .clamp(MIN_HUNTER_VISION_FOV, MAX_HUNTER_VISION_FOV),
+            max_speed: (self.max_speed + gaussian(rng) * cfg.sigma_max_speed)
+                .clamp(MIN_HUNTER_MAX_SPEED, MAX_HUNTER_MAX_SPEED),
+            acceleration: (self.acceleration + gaussian(rng) * cfg.sigma_acceleration)
+                .clamp(MIN_HUNTER_ACC, MAX_HUNTER_ACC),
+            attack_radius: (self.attack_radius + gaussian(rng) * cfg.sigma_attack_radius)
+                .clamp(MIN_HUNTER_ATTACK_RADIUS, MAX_HUNTER_ATTACK_RADIUS),
+            damage_per_tick: (self.damage_per_tick + gaussian(rng) * cfg.sigma_damage)
+                .clamp(MIN_HUNTER_DAMAGE, MAX_HUNTER_DAMAGE),
+            body_size: (self.body_size + gaussian(rng) * cfg.sigma_body_size)
+                .clamp(MIN_HUNTER_BODY_SIZE, MAX_HUNTER_BODY_SIZE),
+            color_hue: (self.color_hue + gaussian(rng) * cfg.sigma_color_hue)
+                .rem_euclid(HUE_RANGE),
+        }
+    }
+
+    pub fn crossover(a: &HunterGenome, b: &HunterGenome, rng: &mut impl Rng) -> Self {
+        Self {
+            vision_radius: if rng.random::<bool>() { a.vision_radius } else { b.vision_radius },
+            vision_fov: if rng.random::<bool>() { a.vision_fov } else { b.vision_fov },
+            max_speed: if rng.random::<bool>() { a.max_speed } else { b.max_speed },
+            acceleration: if rng.random::<bool>() { a.acceleration } else { b.acceleration },
+            attack_radius: if rng.random::<bool>() { a.attack_radius } else { b.attack_radius },
+            damage_per_tick: if rng.random::<bool>() {
+                a.damage_per_tick
+            } else {
+                b.damage_per_tick
+            },
+            body_size: if rng.random::<bool>() { a.body_size } else { b.body_size },
+            color_hue: if rng.random::<bool>() { a.color_hue } else { b.color_hue },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HunterMutationConfig {
+    pub sigma_vision_radius: f32,
+    pub sigma_vision_fov: f32,
+    pub sigma_max_speed: f32,
+    pub sigma_acceleration: f32,
+    pub sigma_attack_radius: f32,
+    pub sigma_damage: f32,
+    pub sigma_body_size: f32,
+    pub sigma_color_hue: f32,
+}
+
+/// Sprint 89: hunter mutation rates. Vyšší než cell `MUTATION_CONFIG` (sigma
+/// 1-3 % range/gen) — hunter populace menší (12-50), evolution signal slabší
+/// per fewer offspring. ~3-4 % range/gen aby drift byl viditelný v 100-gen
+/// smoke.
+pub const HUNTER_MUTATION_CONFIG: HunterMutationConfig = HunterMutationConfig {
+    sigma_vision_radius: 10.0,    // 2.9 % of [50, 400] range
+    sigma_vision_fov: 0.08,       // 2.8 % of FOV range
+    sigma_max_speed: 12.0,        // 3.0 % of [100, 500]
+    sigma_acceleration: 4.0,      // 3.3 % of [40, 160]
+    sigma_attack_radius: 1.0,     // 3.3 % of [10, 40]
+    sigma_damage: 0.4,            // 2.9 % of [2, 16]
+    sigma_body_size: 0.06,        // 3.0 % of [0.5, 2.5]
+    sigma_color_hue: 5.0,         // 1.4 % HUE_RANGE — slow drift, lineage tracking
+};
+
+/// Sprint 71: non-evolving environmental predator (Sprint 89 → evolving).
+/// Pohybuje se pseudo-AI (seek nejbližší cell ∈ vision range, jinak random
+/// drift). Atakuje cells s `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD` v
+/// attack range.
+///
+/// Sprint 89: + `genome` (8 heritable parameters), + `energy` (lifecycle),
+/// + lineage tracking. Hunter má teď reprodukci (asexual clone+mutate při
+/// energy ≥ HUNTER_REPRODUCE_THRESHOLD) a smrt (energy ≤ 0 → drop carrion +
+/// despawn). Bez brain — chování řízené genome parametry.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Hunter {
     pub position: [f32; 3],
@@ -662,26 +840,80 @@ pub struct Hunter {
     /// Stable identifier (procedural, monotonic při init). Nepoužívá se pro
     /// bond resolution — Hunter ≠ Cell.
     pub hunter_id: u64,
+    pub genome: HunterGenome,
+    pub energy: f32,
+    pub age: u64,
+    pub reproduce_cooldown_ticks: u32,
+    pub lineage_id: u64,
+    pub lineage_birth_gen: u64,
 }
 
 impl Hunter {
-    /// Random init pozice + zero velocity. World-half určuje rozsah.
-    pub fn random(rng: &mut impl Rng, world_half: [f32; 3], hunter_id: u64) -> Self {
+    /// Random init: random position + zero velocity + random genome.
+    pub fn random(
+        rng: &mut impl Rng,
+        world_half: [f32; 3],
+        hunter_id: u64,
+        lineage_id: u64,
+        lineage_birth_gen: u64,
+    ) -> Self {
+        let genome = HunterGenome::random(rng);
+        Self::from_genome(rng, genome, world_half, hunter_id, lineage_id, lineage_birth_gen)
+    }
+
+    /// Sprint 89: spawn s explicit genome (used by clone-with-mutate v reprodukci
+    /// a floor respawn). Position random, velocity zero, energy = INITIAL.
+    pub fn from_genome(
+        rng: &mut impl Rng,
+        genome: HunterGenome,
+        world_half: [f32; 3],
+        hunter_id: u64,
+        lineage_id: u64,
+        lineage_birth_gen: u64,
+    ) -> Self {
+        let pos_z = if world_half[2] > 0.0 {
+            rng.random_range(-world_half[2]..world_half[2])
+        } else {
+            0.0
+        };
         Self {
             position: [
                 rng.random_range(-world_half[0]..world_half[0]),
                 rng.random_range(-world_half[1]..world_half[1]),
-                rng.random_range(-world_half[2]..world_half[2]),
+                pos_z,
             ],
             velocity: [0.0; 3],
             hunter_id,
+            genome,
+            energy: HUNTER_INITIAL_ENERGY,
+            age: 0,
+            reproduce_cooldown_ticks: 0,
+            lineage_id,
+            lineage_birth_gen,
         }
+    }
+
+    /// Sprint 89: per-tick energy drains. Vision (∝ radius × fov_factor),
+    /// motion (∝ v²), body maintenance (∝ size³), attack upkeep (∝ damage).
+    /// Bez aging ramp (Sprint 42 cells aging) — hunter lifecycle krátký.
+    pub fn apply_energy_costs(&mut self, dt: f32) {
+        let fov_factor = vision_fov_factor(self.genome.vision_fov);
+        self.energy -= self.genome.vision_radius * HUNTER_VISION_COST * fov_factor * dt;
+        let v_mag_sq = self.velocity[0] * self.velocity[0]
+            + self.velocity[1] * self.velocity[1]
+            + self.velocity[2] * self.velocity[2];
+        self.energy -= v_mag_sq * HUNTER_MOTION_COST * dt;
+        let s = self.genome.body_size;
+        self.energy -= s * s * s * HUNTER_BODY_COST * dt;
+        self.energy -= self.genome.damage_per_tick * HUNTER_ATTACK_UPKEEP * dt;
     }
 
     /// Per-tick movement integration: target-seek pokud je cell ve vision
     /// range, jinak random drift. `target_pos` je `Some(pos)` z helperu
     /// `nearest_attackable_cell` (caller). World wrap (toroidal xy) aplikován
     /// stejně jako Cell::apply_world_bounce.
+    ///
+    /// Sprint 89: max_speed + acceleration z genome místo const.
     pub fn step(
         &mut self,
         target_pos: Option<[f32; 3]>,
@@ -689,15 +921,19 @@ impl Hunter {
         dt: f32,
         world_half: [f32; 3],
     ) {
+        self.age = self.age.saturating_add(1);
+        if self.reproduce_cooldown_ticks > 0 {
+            self.reproduce_cooldown_ticks -= 1;
+        }
+        let max_speed = self.genome.max_speed;
+        let acc = self.genome.acceleration;
         // Seek nebo random drift.
         let desired = match target_pos {
             Some(t) => {
-                // Min-image vector self→target (toroidal aware). `min_image_delta(a, b)`
-                // vrací `b - a`, takže `(self_pos, t)` dá `t - self_pos`.
                 let d = min_image_delta(self.position, t, world_half);
                 let mag = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
                 if mag > 1e-6 {
-                    let inv = HUNTER_MAX_SPEED / mag;
+                    let inv = max_speed / mag;
                     [d[0] * inv, d[1] * inv, d[2] * inv]
                 } else {
                     [0.0; 3]
@@ -709,29 +945,24 @@ impl Hunter {
                 rng.random_range(-HUNTER_IDLE_DRIFT * 0.3..HUNTER_IDLE_DRIFT * 0.3),
             ],
         };
-        // Steer velocity → desired s rate-limited acc. HUNTER_ACC = max
-        // change v jednotkách/s; dt-scaled cap brání over-shoot při velkých dt.
-        let max_delta = HUNTER_ACC * dt;
+        let max_delta = acc * dt;
         for i in 0..3 {
             let want = desired[i] - self.velocity[i];
             self.velocity[i] += want.clamp(-max_delta, max_delta);
         }
-        // Clamp speed.
         let speed_sq = self.velocity[0] * self.velocity[0]
             + self.velocity[1] * self.velocity[1]
             + self.velocity[2] * self.velocity[2];
-        let max_sq = HUNTER_MAX_SPEED * HUNTER_MAX_SPEED;
+        let max_sq = max_speed * max_speed;
         if speed_sq > max_sq {
-            let scale = HUNTER_MAX_SPEED / speed_sq.sqrt();
+            let scale = max_speed / speed_sq.sqrt();
             self.velocity[0] *= scale;
             self.velocity[1] *= scale;
             self.velocity[2] *= scale;
         }
-        // Integrate position.
         self.position[0] += self.velocity[0] * dt;
         self.position[1] += self.velocity[1] * dt;
         self.position[2] += self.velocity[2] * dt;
-        // Toroidal wrap xy, z bounce (mirror Cell::apply_world_bounce).
         let wx = 2.0 * world_half[0];
         let wy = 2.0 * world_half[1];
         if self.position[0] >= world_half[0] || self.position[0] < -world_half[0] {
@@ -749,34 +980,63 @@ impl Hunter {
     }
 }
 
+/// Sprint 89: asexual clone-with-mutate. Parent splituje energy 50/50
+/// se child, child dostává mutated genome + parent's lineage_id (lineage
+/// continuation). Caller sets cooldown + alloc hunter_id.
+pub fn make_hunter_child(
+    parent: &Hunter,
+    rng: &mut impl Rng,
+    world_half: [f32; 3],
+    hunter_id: u64,
+    current_gen: u64,
+) -> Hunter {
+    let child_genome = parent.genome.mutate(rng, &HUNTER_MUTATION_CONFIG);
+    let mut child = Hunter::from_genome(
+        rng,
+        child_genome,
+        world_half,
+        hunter_id,
+        parent.lineage_id,
+        current_gen,
+    );
+    // Spawn at parent position (later step + idle drift rozhází).
+    child.position = parent.position;
+    child.energy = parent.energy * 0.5;
+    child.reproduce_cooldown_ticks = HUNTER_REPRODUCE_COOLDOWN_TICKS;
+    child
+}
+
 /// Sprint 71: vrací `Some(cell_index)` nejbližší attackable cell ∈ vision
 /// range. „Attackable" = `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD`. Vrací
 /// nejbližší **z attackable** cells, ne nejbližší absolutně — Hunter nepronásleduje
 /// imune clustery (skill: cluster je viditelný, ale ne lovitelný; Hunter musí
 /// najít solo cell). Toroidal-aware přes `min_image_delta`.
 ///
-/// Sprint 84: směrový FOV. `hunter_velocity` určuje forward; cells mimo
-/// `HUNTER_VISION_FOV` kuželu nejsou viditelné. Idle hunter (velocity² <
+/// Sprint 84: směrový FOV. `hunter.velocity` určuje forward; cells mimo
+/// `genome.vision_fov` kuželu nejsou viditelné. Idle hunter (velocity² <
 /// `HUNTER_FORWARD_SPEED_THRESHOLD_SQ`) má fallback na omni — bez toho by
 /// hunter zaseknutý v 0-velocity stavu nikdy nenašel target.
+///
+/// Sprint 89: vision_radius + vision_fov teď z `hunter.genome` místo const.
+/// Heritable predator detection range/cone — selekce drift per generation.
 pub fn nearest_attackable_cell(
-    hunter_pos: [f32; 3],
-    hunter_velocity: [f32; 3],
+    hunter: &Hunter,
     cells: &[Cell],
     world_half: [f32; 3],
 ) -> Option<usize> {
-    let vision_r2 = HUNTER_VISION_RADIUS * HUNTER_VISION_RADIUS;
-    let cos_fov = HUNTER_VISION_FOV.cos();
-    let speed_sq = hunter_velocity[0] * hunter_velocity[0]
-        + hunter_velocity[1] * hunter_velocity[1]
-        + hunter_velocity[2] * hunter_velocity[2];
+    let vision_r = hunter.genome.vision_radius;
+    let vision_r2 = vision_r * vision_r;
+    let cos_fov = hunter.genome.vision_fov.cos();
+    let speed_sq = hunter.velocity[0] * hunter.velocity[0]
+        + hunter.velocity[1] * hunter.velocity[1]
+        + hunter.velocity[2] * hunter.velocity[2];
     let cone_active = speed_sq > HUNTER_FORWARD_SPEED_THRESHOLD_SQ;
     let forward = if cone_active {
         let inv = 1.0 / speed_sq.sqrt();
         [
-            hunter_velocity[0] * inv,
-            hunter_velocity[1] * inv,
-            hunter_velocity[2] * inv,
+            hunter.velocity[0] * inv,
+            hunter.velocity[1] * inv,
+            hunter.velocity[2] * inv,
         ]
     } else {
         [0.0; 3]
@@ -786,10 +1046,10 @@ pub fn nearest_attackable_cell(
         if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
             continue;
         }
-        // Sprint 84: vector from hunter to cell (= c.position − hunter_pos).
+        // Sprint 84: vector from hunter to cell (= c.position − hunter.pos).
         // Pre-Sprint-84 byl `d` drženo jako hunter_pos − c.position (jen pro d²
         // distance, kde znaménko nehraje); cone filter potřebuje směr.
-        let d = min_image_delta(hunter_pos, c.position, world_half);
+        let d = min_image_delta(hunter.position, c.position, world_half);
         let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
         if d2 >= vision_r2 {
             continue;
@@ -4951,6 +5211,155 @@ mod tests {
     }
 
     #[test]
+    fn hunter_genome_random_in_range() {
+        let mut rng = StdRng::seed_from_u64(0xA0);
+        for _ in 0..100 {
+            let g = HunterGenome::random(&mut rng);
+            assert!(g.vision_radius >= MIN_HUNTER_VISION_RADIUS);
+            assert!(g.vision_radius <= MAX_HUNTER_VISION_RADIUS);
+            assert!(g.vision_fov >= MIN_HUNTER_VISION_FOV);
+            assert!(g.vision_fov <= MAX_HUNTER_VISION_FOV);
+            assert!(g.max_speed >= MIN_HUNTER_MAX_SPEED);
+            assert!(g.max_speed <= MAX_HUNTER_MAX_SPEED);
+            assert!(g.acceleration >= MIN_HUNTER_ACC);
+            assert!(g.acceleration <= MAX_HUNTER_ACC);
+            assert!(g.attack_radius >= MIN_HUNTER_ATTACK_RADIUS);
+            assert!(g.attack_radius <= MAX_HUNTER_ATTACK_RADIUS);
+            assert!(g.damage_per_tick >= MIN_HUNTER_DAMAGE);
+            assert!(g.damage_per_tick <= MAX_HUNTER_DAMAGE);
+            assert!(g.body_size >= MIN_HUNTER_BODY_SIZE);
+            assert!(g.body_size <= MAX_HUNTER_BODY_SIZE);
+            assert!(g.color_hue >= 0.0 && g.color_hue < HUE_RANGE);
+        }
+    }
+
+    #[test]
+    fn hunter_mutate_clamps_to_range() {
+        let mut rng = rand::rng();
+        let g = HunterGenome::random(&mut rng);
+        let cfg = HunterMutationConfig {
+            sigma_vision_radius: 1000.0,
+            sigma_vision_fov: 100.0,
+            sigma_max_speed: 1000.0,
+            sigma_acceleration: 1000.0,
+            sigma_attack_radius: 100.0,
+            sigma_damage: 100.0,
+            sigma_body_size: 10.0,
+            sigma_color_hue: 1000.0,
+        };
+        for _ in 0..500 {
+            let m = g.mutate(&mut rng, &cfg);
+            assert!(
+                (MIN_HUNTER_VISION_RADIUS..=MAX_HUNTER_VISION_RADIUS).contains(&m.vision_radius)
+            );
+            assert!((MIN_HUNTER_VISION_FOV..=MAX_HUNTER_VISION_FOV).contains(&m.vision_fov));
+            assert!((MIN_HUNTER_MAX_SPEED..=MAX_HUNTER_MAX_SPEED).contains(&m.max_speed));
+            assert!((MIN_HUNTER_ACC..=MAX_HUNTER_ACC).contains(&m.acceleration));
+            assert!(
+                (MIN_HUNTER_ATTACK_RADIUS..=MAX_HUNTER_ATTACK_RADIUS).contains(&m.attack_radius)
+            );
+            assert!((MIN_HUNTER_DAMAGE..=MAX_HUNTER_DAMAGE).contains(&m.damage_per_tick));
+            assert!((MIN_HUNTER_BODY_SIZE..=MAX_HUNTER_BODY_SIZE).contains(&m.body_size));
+            assert!(m.color_hue >= 0.0 && m.color_hue < HUE_RANGE);
+        }
+    }
+
+    #[test]
+    fn hunter_crossover_picks_from_either_parent() {
+        let mut rng = rand::rng();
+        let a = HunterGenome {
+            vision_radius: MIN_HUNTER_VISION_RADIUS,
+            vision_fov: MIN_HUNTER_VISION_FOV,
+            max_speed: MIN_HUNTER_MAX_SPEED,
+            acceleration: MIN_HUNTER_ACC,
+            attack_radius: MIN_HUNTER_ATTACK_RADIUS,
+            damage_per_tick: MIN_HUNTER_DAMAGE,
+            body_size: MIN_HUNTER_BODY_SIZE,
+            color_hue: 10.0,
+        };
+        let b = HunterGenome {
+            vision_radius: MAX_HUNTER_VISION_RADIUS,
+            vision_fov: MAX_HUNTER_VISION_FOV,
+            max_speed: MAX_HUNTER_MAX_SPEED,
+            acceleration: MAX_HUNTER_ACC,
+            attack_radius: MAX_HUNTER_ATTACK_RADIUS,
+            damage_per_tick: MAX_HUNTER_DAMAGE,
+            body_size: MAX_HUNTER_BODY_SIZE,
+            color_hue: 200.0,
+        };
+        for _ in 0..100 {
+            let c = HunterGenome::crossover(&a, &b, &mut rng);
+            assert!(c.vision_radius == a.vision_radius || c.vision_radius == b.vision_radius);
+            assert!(c.max_speed == a.max_speed || c.max_speed == b.max_speed);
+            assert!(c.damage_per_tick == a.damage_per_tick || c.damage_per_tick == b.damage_per_tick);
+        }
+    }
+
+    #[test]
+    fn hunter_apply_energy_costs_drains() {
+        // Static hunter — no motion drain, only vision + body + attack upkeep.
+        let mut h = make_test_hunter([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let initial = h.energy;
+        h.apply_energy_costs(1.0);
+        assert!(h.energy < initial, "energy should drain in 1 sec, got {}", h.energy);
+        // Moving hunter drains more (motion adds v² × MOTION_COST × dt).
+        let mut moving = make_test_hunter([0.0, 0.0, 0.0], [100.0, 0.0, 0.0]);
+        moving.apply_energy_costs(1.0);
+        assert!(
+            moving.energy < h.energy,
+            "moving hunter should drain more: still={} moving={}",
+            h.energy,
+            moving.energy
+        );
+    }
+
+    #[test]
+    fn make_hunter_child_splits_energy() {
+        let mut rng = StdRng::seed_from_u64(0xCAB);
+        let half = [960.0, 540.0, 50.0];
+        let mut parent = make_test_hunter([10.0, 20.0, 0.0], [0.0; 3]);
+        parent.energy = 600.0;
+        parent.lineage_id = 42;
+        let child = make_hunter_child(&parent, &mut rng, half, 100, 5);
+        // Child energy = half of parent.
+        assert!((child.energy - 300.0).abs() < 1e-3, "child energy {}", child.energy);
+        // Child lineage_id inherits.
+        assert_eq!(child.lineage_id, 42);
+        // Child birth_gen = current_gen.
+        assert_eq!(child.lineage_birth_gen, 5);
+        // Child cooldown set.
+        assert_eq!(child.reproduce_cooldown_ticks, HUNTER_REPRODUCE_COOLDOWN_TICKS);
+        // Child position = parent position.
+        assert_eq!(child.position, parent.position);
+    }
+
+    /// Sprint 89: helper pro test hunter setup. Default genome (S71-S84
+    /// const-equivalent middle ranges), full energy, no cooldown.
+    fn make_test_hunter(pos: [f32; 3], vel: [f32; 3]) -> Hunter {
+        let genome = HunterGenome {
+            vision_radius: HUNTER_VISION_RADIUS,
+            vision_fov: HUNTER_VISION_FOV,
+            max_speed: HUNTER_MAX_SPEED,
+            acceleration: HUNTER_ACC,
+            attack_radius: HUNTER_ATTACK_RADIUS,
+            damage_per_tick: HUNTER_DAMAGE_PER_TICK,
+            body_size: 1.0,
+            color_hue: 0.0,
+        };
+        Hunter {
+            position: pos,
+            velocity: vel,
+            hunter_id: 0,
+            genome,
+            energy: HUNTER_INITIAL_ENERGY,
+            age: 0,
+            reproduce_cooldown_ticks: 0,
+            lineage_id: 0,
+            lineage_birth_gen: 0,
+        }
+    }
+
+    #[test]
     fn hunter_seeks_nearest_attackable_cell() {
         let mut rng = StdRng::seed_from_u64(11);
         let half = [960.0, 540.0, 50.0];
@@ -4962,9 +5371,9 @@ mod tests {
         let mut c1 = Cell::random(&mut rng, half, 1, 0, 1);
         c1.position = [50.0, 0.0, 0.0];
         cells.push(c1);
-        let hunter_pos = [0.0, 0.0, 0.0];
         // Sprint 84: idle hunter (velocity 0) → cone filter disabled, omni.
-        let pick = nearest_attackable_cell(hunter_pos, [0.0; 3], &cells, half);
+        let h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
+        let pick = nearest_attackable_cell(&h, &cells, half);
         assert_eq!(pick, Some(1));
     }
 
@@ -4990,7 +5399,8 @@ mod tests {
         let mut c1 = Cell::random(&mut rng, half, 1, 0, 1);
         c1.position = [60.0, 0.0, 0.0];
         cells.push(c1);
-        let pick = nearest_attackable_cell([0.0, 0.0, 0.0], [0.0; 3], &cells, half);
+        let h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
+        let pick = nearest_attackable_cell(&h, &cells, half);
         assert_eq!(pick, Some(1));
     }
 
@@ -5010,7 +5420,8 @@ mod tests {
             });
         }
         let cells = vec![c];
-        assert!(nearest_attackable_cell([0.0, 0.0, 0.0], [0.0; 3], &cells, half).is_none());
+        let h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
+        assert!(nearest_attackable_cell(&h, &cells, half).is_none());
     }
 
     #[test]
@@ -5022,12 +5433,12 @@ mod tests {
         let mut behind = Cell::random(&mut rng, half, 0, 0, 0);
         behind.position = [-50.0, 0.0, 0.0];
         let cells = vec![behind];
-        let hunter_pos = [0.0, 0.0, 0.0];
-        let hunter_vel = [50.0, 0.0, 0.0]; // forward = +X (speed_sq = 2500 > threshold)
-        // Cone aktivní, target vzadu → None.
-        assert!(nearest_attackable_cell(hunter_pos, hunter_vel, &cells, half).is_none());
+        // Hunter moving +X; target behind → cone reject.
+        let active_h = make_test_hunter([0.0, 0.0, 0.0], [50.0, 0.0, 0.0]);
+        assert!(nearest_attackable_cell(&active_h, &cells, half).is_none());
         // Idle hunter (velocity 0) → cone disabled → target nalezen.
-        assert!(nearest_attackable_cell(hunter_pos, [0.0; 3], &cells, half).is_some());
+        let idle_h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
+        assert!(nearest_attackable_cell(&idle_h, &cells, half).is_some());
     }
 
     #[test]
@@ -5038,7 +5449,8 @@ mod tests {
         let mut front = Cell::random(&mut rng, half, 0, 0, 0);
         front.position = [50.0, 0.0, 0.0];
         let cells = vec![front];
-        let pick = nearest_attackable_cell([0.0, 0.0, 0.0], [50.0, 0.0, 0.0], &cells, half);
+        let h = make_test_hunter([0.0, 0.0, 0.0], [50.0, 0.0, 0.0]);
+        let pick = nearest_attackable_cell(&h, &cells, half);
         assert_eq!(pick, Some(0));
     }
 
@@ -5050,7 +5462,8 @@ mod tests {
         let mut side = Cell::random(&mut rng, half, 0, 0, 0);
         side.position = [0.0, 50.0, 0.0];
         let cells = vec![side];
-        let pick = nearest_attackable_cell([0.0, 0.0, 0.0], [50.0, 0.0, 0.0], &cells, half);
+        let h = make_test_hunter([0.0, 0.0, 0.0], [50.0, 0.0, 0.0]);
+        let pick = nearest_attackable_cell(&h, &cells, half);
         assert!(pick.is_none());
     }
 
@@ -5058,11 +5471,7 @@ mod tests {
     fn hunter_step_moves_toward_target() {
         let mut rng = StdRng::seed_from_u64(14);
         let half = [960.0, 540.0, 50.0];
-        let mut h = Hunter {
-            position: [0.0, 0.0, 0.0],
-            velocity: [0.0, 0.0, 0.0],
-            hunter_id: 0,
-        };
+        let mut h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
         let target = [100.0, 0.0, 0.0];
         // Krok 1: velocity začne přibližovat k +x (toward target).
         h.step(Some(target), &mut rng, 1.0 / 60.0, half);
@@ -5074,11 +5483,7 @@ mod tests {
     fn hunter_step_random_walks_when_no_target() {
         let mut rng = StdRng::seed_from_u64(15);
         let half = [960.0, 540.0, 50.0];
-        let mut h = Hunter {
-            position: [0.0, 0.0, 0.0],
-            velocity: [0.0, 0.0, 0.0],
-            hunter_id: 0,
-        };
+        let mut h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
         // Bez targetu se velocity nenuluje (idle drift).
         for _ in 0..30 {
             h.step(None, &mut rng, 1.0 / 60.0, half);
