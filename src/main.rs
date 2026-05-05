@@ -1542,23 +1542,34 @@ fn sync_transforms(
 /// damage × HUNTER_ENERGY_PER_DAMAGE — predator se musí krmit aby přežil.
 /// Lifecycle (death + reproduce + floor respawn) v separate systemu
 /// `hunters_lifecycle` runs po `step_hunters`.
+///
+/// Sprint 90: brain-driven motion. Sensor gather → brain forward →
+/// apply_brain_motor → step (kinematic). Brain learns chase tactics over
+/// generations; INNATE_THRUST_BIAS dává initial forward motion.
 fn step_hunters(
     mut hunters: Query<&mut HunterEntity>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    smell: Res<SmellResource>,
     fixed_time: Res<Time<Fixed>>,
 ) {
     let dt = fixed_time.delta_secs();
     let cell_snapshot: Vec<(Entity, Cell)> = cells.iter().map(|(e, c)| (e, c.0)).collect();
     let cells_only: Vec<Cell> = cell_snapshot.iter().map(|(_, c)| *c).collect();
-    let mut rng = rand::rng();
-    // (cell_entity, damage_dealt) — apply k cells. Hunter dostává paralelní
-    // gain index po hunter loop dle hunter index.
     let mut attacks: Vec<(Entity, f32)> = Vec::new();
-    let mut hunter_gains: Vec<f32> = Vec::new();
     for mut h in &mut hunters {
+        // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain).
+        let sensors = bioscape::gather_hunter_sensors(&h.0, &cells_only, &smell.0, SIMULATION_HALF);
+        let target_idx_pre = nearest_attackable_cell(&h.0, &cells_only, SIMULATION_HALF);
+        let seek_target = target_idx_pre.map(|i| cells_only[i].position);
+        let inputs = bioscape::populate_hunter_brain_inputs(&mut h.0, &sensors);
+        let (hidden, outputs) = h.0.genome.brain.forward_with_state(&inputs);
+        h.0.last_inputs = inputs;
+        h.0.last_hidden = hidden;
+        h.0.last_outputs = outputs;
+        h.0.apply_brain_motor(&outputs, seek_target, dt, SIMULATION_HALF);
+        h.0.step(dt, SIMULATION_HALF);
+        // Attack check (post-step pozice).
         let target_idx = nearest_attackable_cell(&h.0, &cells_only, SIMULATION_HALF);
-        let target_pos = target_idx.map(|i| cells_only[i].position);
-        h.0.step(target_pos, &mut rng, dt, SIMULATION_HALF);
         let attack_r = h.0.genome.attack_radius;
         let attack_r2 = attack_r * attack_r;
         let damage = h.0.genome.damage_per_tick;
@@ -1578,7 +1589,6 @@ fn step_hunters(
         }
         h.0.apply_energy_costs(dt);
         h.0.energy += gain;
-        hunter_gains.push(gain);
     }
     for (entity, damage) in attacks {
         if let Ok((_, mut cell)) = cells.get_mut(entity) {
@@ -1586,7 +1596,6 @@ fn step_hunters(
             cell.0.damage_accum += damage;
         }
     }
-    let _ = hunter_gains;
 }
 
 /// Sprint 89: hunter lifecycle — death (energy ≤ 0 → drop carrion + despawn),

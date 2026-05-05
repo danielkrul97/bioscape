@@ -172,6 +172,10 @@ struct World {
     // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
     // může nastavit výš (potřeba pro bench při N > 1000).
     max_population: usize,
+    // Sprint 87 Hamilton-rule sweep: runtime overrides pro food share. Default
+    // = pre-sweep behavior (BOND_FOOD_SHARE_FRAC, no kin filter).
+    share_frac: f32,
+    kin_filter: bool,
     bench_timings: PhaseTimings,
     // Sprint 44: pokud `Some`, brain_act offloaduje forward pass na GPU.
     // Sensor gather + populate_brain_inputs + apply_brain_motor zůstává CPU.
@@ -290,6 +294,8 @@ impl World {
             hunter_deaths_gen: 0,
             mating_radius,
             max_population,
+            share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
+            kin_filter: false,
             bench_timings: PhaseTimings::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -394,6 +400,8 @@ impl World {
             hunter_deaths_gen: 0,
             mating_radius: chk.mating_radius,
             max_population: chk.max_population,
+            share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
+            kin_filter: false,
             bench_timings: PhaseTimings::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -1563,12 +1571,25 @@ impl World {
     /// scratch Vec během iterace `&mut self.hunters`, pass 2 apply mutace na
     /// `self.cells` po uvolnění hunter borrow.
     fn hunt(&mut self, rng: &mut impl Rng, dt: f32) {
+        let _ = rng; // Sprint 90: brain replaces idle drift, no rng needed in hunt.
         let cells_ref = &self.cells;
+        let smell = &self.smell;
         let mut attacks: Vec<(usize, f32)> = Vec::new();
         for hunter in &mut self.hunters {
+            // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain) +
+            // step (kinematic). Replaces Sprint 89 seek-based step.
+            let sensors = bioscape::gather_hunter_sensors(hunter, cells_ref, smell, WORLD_HALF);
+            let target_idx_pre = nearest_attackable_cell(hunter, cells_ref, WORLD_HALF);
+            let seek_target = target_idx_pre.map(|i| cells_ref[i].position);
+            let inputs = bioscape::populate_hunter_brain_inputs(hunter, &sensors);
+            let (hidden, outputs) = hunter.genome.brain.forward_with_state(&inputs);
+            hunter.last_inputs = inputs;
+            hunter.last_hidden = hidden;
+            hunter.last_outputs = outputs;
+            hunter.apply_brain_motor(&outputs, seek_target, dt, WORLD_HALF);
+            hunter.step(dt, WORLD_HALF);
+            // Attack check (post-step pozice).
             let target_idx = nearest_attackable_cell(hunter, cells_ref, WORLD_HALF);
-            let target_pos = target_idx.map(|i| cells_ref[i].position);
-            hunter.step(target_pos, rng, dt, WORLD_HALF);
             let attack_r = hunter.genome.attack_radius;
             let attack_r2 = attack_r * attack_r;
             let damage = hunter.genome.damage_per_tick;
@@ -1754,28 +1775,38 @@ impl World {
                 self.eaten_scratch[*food_idx] = true;
                 let bonds_copy;
                 let donor_state;
+                let donor_lineage;
                 {
                     let cell = &mut self.cells[cell_idx];
                     cell.energy += *value;
                     bonds_copy = cell.bonds;
                     donor_state = cell.cell_state;
+                    donor_lineage = cell.lineage_id;
                 }
                 // Sprint 80: donor's cell_state modulates share fraction.
                 // State≈0 (selfish) → ~0%; state≈1 (altruist) → plný 30%.
                 // Sprint 87: cluster-size bonus — víc bondů → vyšší share per
                 // partner. Empirie 300-gen: tissue regime kolaboval do gen 200,
                 // bonus posiluje selekci pro velké clustery.
+                // Sprint 87 Hamilton sweep: `self.share_frac` runtime override
+                // místo BOND_FOOD_SHARE_FRAC; `self.kin_filter` skipne sharing
+                // do partnerů s jiným lineage_id (= test relatedness coefficientu r).
                 let n_bonds = bonds_copy.iter().filter(|b| b.is_some()).count() as f32;
                 let cluster_mult = 1.0 + (n_bonds - 1.0).max(0.0)
                     * bioscape::BOND_FOOD_SHARE_CLUSTER_BONUS;
                 let share_value =
-                    *value * bioscape::BOND_FOOD_SHARE_FRAC * donor_state * cluster_mult;
+                    *value * self.share_frac * donor_state * cluster_mult;
                 if share_value > 0.0 {
                     for bond_opt in bonds_copy.iter() {
                         if let Some(bond) = bond_opt {
                             if let Some(&partner_idx) =
                                 id_to_idx.get(&bond.other_cell_id)
                             {
+                                if self.kin_filter
+                                    && self.cells[partner_idx].lineage_id != donor_lineage
+                                {
+                                    continue;
+                                }
                                 if partner_idx != cell_idx {
                                     share_deltas.push((partner_idx, share_value));
                                 }
@@ -2470,6 +2501,13 @@ fn main() {
     let load_path: Option<String> = raw_args
         .iter()
         .find_map(|a| a.strip_prefix("--load=").map(|s| s.to_string()));
+    // Sprint 87 Hamilton sweep: `--share-frac=X` runtime override pro
+    // BOND_FOOD_SHARE_FRAC, `--kin` zapne kin filter (food share jen na
+    // partnery se stejným lineage_id).
+    let share_frac_override: Option<f32> = raw_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--share-frac=").and_then(|s| s.parse().ok()));
+    let kin_filter = raw_args.iter().any(|a| a == "--kin");
     let args: Vec<String> = raw_args
         .iter()
         .filter(|a| !a.starts_with("--"))
@@ -2536,6 +2574,12 @@ fn main() {
     } else {
         World::new(&mut rng, map_seed, mating_radius, initial_cells, max_population)
     };
+    // Sprint 87 Hamilton sweep: aplikuj CLI overrides AFTER World::new (i po
+    // checkpoint load) — nikdy se neserializují, vždy z aktuálního CLI.
+    if let Some(sf) = share_frac_override {
+        world.share_frac = sf;
+    }
+    world.kin_filter = kin_filter;
 
     #[cfg(feature = "gpu")]
     if want_gpu_full {

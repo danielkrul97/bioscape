@@ -691,7 +691,7 @@ pub const HUNTER_INITIAL_ENERGY: f32 = 500.0;
 /// Energy threshold pro reprodukci. Při dosažení parent splituje energy 50/50
 /// se child + clone-with-mutate genome. 600 = 2× initial → predator musí
 /// úspěšně lovit ~1.5-2× initial-energy worth of prey aby reproduce.
-pub const HUNTER_REPRODUCE_THRESHOLD: f32 = 800.0;
+pub const HUNTER_REPRODUCE_THRESHOLD: f32 = 700.0;
 /// Cap pro hunter populace. Bez něj by predator boom (mnoho cells eaten)
 /// → exponenciální růst → prey extinction. 50 = 4× initial S71 count, dostatek
 /// pro arms race signal ale prevent runaway.
@@ -715,18 +715,29 @@ pub const HUNTER_ATTACK_UPKEEP: f32 = 0.02;
 /// a damage_per_tick = 8, single tick attack na cell vrací 8 energy. Při 60Hz
 /// a HUNTER_ATTACK_RADIUS contact, hunter může drainovat ~480 energy/sec
 /// ze single prey — fast kills sustain reprodukci.
-pub const HUNTER_ENERGY_PER_DAMAGE: f32 = 3.0;
+pub const HUNTER_ENERGY_PER_DAMAGE: f32 = 6.0;
 /// Carrion drops při hunter death. Mirror cell death (Sprint 27 carrion).
 /// 2× value default — hunter větší než cell, víc biomasy.
 pub const HUNTER_CARRION_DROP: usize = 2;
 /// Reproduce cooldown (ticks) po split. Brání instant re-reproduce před cell
 /// catch-up. ~1 generation = 600 ticks.
 pub const HUNTER_REPRODUCE_COOLDOWN_TICKS: u32 = 300;
+/// Sprint 90: brain output[0] turn_yaw multiplier (rad/sec). Hunter má
+/// pevnou turn_rate (ne gene); cells mají gene-encoded turn_rate ∈ [1, 5].
+/// 3.0 je mid-cell-range. Sprint 91+ může přidat jako gene.
+pub const HUNTER_TURN_RATE: f32 = 3.0;
+/// Sprint 90: brain output[7] turn_pitch multiplier (rad/sec). Pitch je
+/// klampovaný v Cell::integrate_kinematics; pro hunter pitch_velocity je
+/// volnější (no clamp), takže nižší rate brání overshoot.
+pub const HUNTER_PITCH_RATE: f32 = 1.0;
 
 /// Sprint 89: per-hunter heritable parametry. Pre-Sprint-89 byly fixed
 /// const (HUNTER_VISION_RADIUS=200, HUNTER_MAX_SPEED=300, …); now drift
-/// per generation. Žádné brain weights, jen 8 scalar genes — V1 arms race
-/// běží v parametric space, ne behavioral.
+/// per generation. Sprint 90: + `brain` (reuse cell Brain struct, hunter-
+/// specific input/output semantic mapping v `populate_hunter_brain_inputs`
+/// + `apply_brain_motor`). Adaptive chase behavior emerges from selection
+/// — random brains s positive INNATE_THRUST_BIAS startují s forward motion,
+/// úspěšní lovci reprodukují svůj brain.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HunterGenome {
     pub vision_radius: f32,
@@ -737,6 +748,14 @@ pub struct HunterGenome {
     pub damage_per_tick: f32,
     pub body_size: f32,
     pub color_hue: f32,
+    /// Sprint 90: behavioral controller. Reuse cell `Brain` struct (BRAIN_INPUTS
+    /// = 53, BRAIN_HIDDEN = 32, BRAIN_OUTPUTS = 10) — slot semantics
+    /// re-mapped pro hunter v `populate_hunter_brain_inputs` (slot 0/1/15
+    /// = nearest_prey delta, slot 7-8/17 = smell, slot 9-10/18 = heading,
+    /// slot 4 = energy, slot 5 = speed, slot 6 = prey_size_relative,
+    /// slot 13 = density). Used outputs: 0 (turn), 1 (thrust), 7 (pitch).
+    /// Cell-only outputs (morph, attack, bond) ignored by hunter motor.
+    pub brain: Brain,
 }
 
 impl HunterGenome {
@@ -755,6 +774,10 @@ impl HunterGenome {
             damage_per_tick: rng.random_range(4.0..12.0),
             body_size: rng.random_range(0.8..1.6),
             color_hue: rng.random_range(0.0..HUE_RANGE),
+            // Sprint 90: brain init s INNATE_THRUST_BIAS = 2.0 (z Brain::random).
+            // Random brains startují s positive thrust → forward motion. Selekce
+            // tuneuje turn/pitch outputs k ko-ordinovanému chase behavior.
+            brain: Brain::random(rng),
         }
     }
 
@@ -776,6 +799,7 @@ impl HunterGenome {
                 .clamp(MIN_HUNTER_BODY_SIZE, MAX_HUNTER_BODY_SIZE),
             color_hue: (self.color_hue + gaussian(rng) * cfg.sigma_color_hue)
                 .rem_euclid(HUE_RANGE),
+            brain: self.brain.mutate(rng, cfg.sigma_brain),
         }
     }
 
@@ -793,6 +817,7 @@ impl HunterGenome {
             },
             body_size: if rng.random::<bool>() { a.body_size } else { b.body_size },
             color_hue: if rng.random::<bool>() { a.color_hue } else { b.color_hue },
+            brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
     }
 }
@@ -807,6 +832,10 @@ pub struct HunterMutationConfig {
     pub sigma_damage: f32,
     pub sigma_body_size: f32,
     pub sigma_color_hue: f32,
+    /// Sprint 90: brain weights gaussian sigma. Same magnitude jako cell
+    /// `sigma_brain = 0.2` — brain landscape je velký, drift je naturally
+    /// slow přes 2058 weights/cell.
+    pub sigma_brain: f32,
 }
 
 /// Sprint 89: hunter mutation rates. Vyšší než cell `MUTATION_CONFIG` (sigma
@@ -822,6 +851,7 @@ pub const HUNTER_MUTATION_CONFIG: HunterMutationConfig = HunterMutationConfig {
     sigma_damage: 0.4,            // 2.9 % of [2, 16]
     sigma_body_size: 0.06,        // 3.0 % of [0.5, 2.5]
     sigma_color_hue: 5.0,         // 1.4 % HUE_RANGE — slow drift, lineage tracking
+    sigma_brain: 0.2,             // Sprint 90 — match cell sigma_brain
 };
 
 /// Sprint 71: non-evolving environmental predator (Sprint 89 → evolving).
@@ -830,9 +860,10 @@ pub const HUNTER_MUTATION_CONFIG: HunterMutationConfig = HunterMutationConfig {
 /// attack range.
 ///
 /// Sprint 89: + `genome` (8 heritable parameters), + `energy` (lifecycle),
-/// + lineage tracking. Hunter má teď reprodukci (asexual clone+mutate při
-/// energy ≥ HUNTER_REPRODUCE_THRESHOLD) a smrt (energy ≤ 0 → drop carrion +
-/// despawn). Bez brain — chování řízené genome parametry.
+/// + lineage tracking.
+/// Sprint 90: + brain-driven motion. Heading + pitch (mirror Cell), brain
+/// state (last_inputs/hidden/outputs). Random brain s INNATE_THRUST_BIAS
+/// startuje s forward motion; turn/pitch outputs evolve k chase tactics.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Hunter {
     pub position: [f32; 3],
@@ -846,6 +877,19 @@ pub struct Hunter {
     pub reproduce_cooldown_ticks: u32,
     pub lineage_id: u64,
     pub lineage_birth_gen: u64,
+    /// Sprint 90: yaw heading (rad). Brain output[0] modifikuje
+    /// `angular_velocity`, ten integrate v `step` jako Cell.
+    pub heading: f32,
+    /// Sprint 90: pitch (rad), unbounded — hunter vertical motion volnější
+    /// než cell (Cell má clamp na ±π/12).
+    pub pitch: f32,
+    pub angular_velocity: f32,
+    pub pitch_velocity: f32,
+    /// Sprint 90: brain I/O state pro recurrent kanál + diagnostics.
+    #[serde(with = "serde_arr_inputs")]
+    pub last_inputs: [f32; BRAIN_INPUTS],
+    pub last_hidden: [f32; BRAIN_HIDDEN],
+    pub last_outputs: [f32; BRAIN_OUTPUTS],
 }
 
 impl Hunter {
@@ -863,6 +907,7 @@ impl Hunter {
 
     /// Sprint 89: spawn s explicit genome (used by clone-with-mutate v reprodukci
     /// a floor respawn). Position random, velocity zero, energy = INITIAL.
+    /// Sprint 90: + heading random (TAU range), pitch 0, brain state zero.
     pub fn from_genome(
         rng: &mut impl Rng,
         genome: HunterGenome,
@@ -876,13 +921,18 @@ impl Hunter {
         } else {
             0.0
         };
+        let direction = rng.random_range(0.0..TAU);
         Self {
             position: [
                 rng.random_range(-world_half[0]..world_half[0]),
                 rng.random_range(-world_half[1]..world_half[1]),
                 pos_z,
             ],
-            velocity: [0.0; 3],
+            velocity: [
+                direction.cos() * genome.max_speed * 0.3,
+                direction.sin() * genome.max_speed * 0.3,
+                0.0,
+            ],
             hunter_id,
             genome,
             energy: HUNTER_INITIAL_ENERGY,
@@ -890,6 +940,13 @@ impl Hunter {
             reproduce_cooldown_ticks: 0,
             lineage_id,
             lineage_birth_gen,
+            heading: direction,
+            pitch: 0.0,
+            angular_velocity: 0.0,
+            pitch_velocity: 0.0,
+            last_inputs: [0.0; BRAIN_INPUTS],
+            last_hidden: [0.0; BRAIN_HIDDEN],
+            last_outputs: [0.0; BRAIN_OUTPUTS],
         }
     }
 
@@ -908,61 +965,95 @@ impl Hunter {
         self.energy -= self.genome.damage_per_tick * HUNTER_ATTACK_UPKEEP * dt;
     }
 
-    /// Per-tick movement integration: target-seek pokud je cell ve vision
-    /// range, jinak random drift. `target_pos` je `Some(pos)` z helperu
-    /// `nearest_attackable_cell` (caller). World wrap (toroidal xy) aplikován
-    /// stejně jako Cell::apply_world_bounce.
+    /// Sprint 90: brain-driven motion s **hybrid seek bootstrap**. Brain
+    /// outputs[0] = turn_yaw modulator, [1] = thrust, [7] = turn_pitch
+    /// modulator. Cell-only outputs (morph, attack signal, bond) ignored.
     ///
-    /// Sprint 89: max_speed + acceleration z genome místo const.
-    pub fn step(
+    /// Hybrid design pattern: seek-toward-prey direction (deterministic
+    /// oracle) je mixed s brain output (`HUNTER_BRAIN_SEEK_MIX = 0.6` seek
+    /// + 0.4 brain). Bez tohoto random initial brain neumí chase (random
+    /// turn output → spinning), populace kolabuje do floor respawn loop.
+    /// S hybridem brain modul dominantní seek direction (např. learned
+    /// ambush, prey selection, retreat při low energy). Když brain weights
+    /// evolvují k matching seek, mix se stane redundant; když brain learnuje
+    /// jiný strategy (cluster around hot zones, etc.), brain dominuje.
+    pub fn apply_brain_motor(
         &mut self,
-        target_pos: Option<[f32; 3]>,
-        rng: &mut impl Rng,
+        outputs: &[f32; BRAIN_OUTPUTS],
+        seek_target: Option<[f32; 3]>,
         dt: f32,
         world_half: [f32; 3],
     ) {
-        self.age = self.age.saturating_add(1);
-        if self.reproduce_cooldown_ticks > 0 {
-            self.reproduce_cooldown_ticks -= 1;
-        }
-        let max_speed = self.genome.max_speed;
-        let acc = self.genome.acceleration;
-        // Seek nebo random drift.
-        let desired = match target_pos {
+        let brain_turn = outputs[0].clamp(-1.0, 1.0);
+        let brain_pitch = outputs[7].clamp(-1.0, 1.0);
+        let thrust = outputs[1].clamp(-1.0, 1.0);
+        // Compute seek-based turn modulator.
+        let (seek_turn, seek_pitch) = match seek_target {
             Some(t) => {
                 let d = min_image_delta(self.position, t, world_half);
-                let mag = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                if mag > 1e-6 {
-                    let inv = max_speed / mag;
-                    [d[0] * inv, d[1] * inv, d[2] * inv]
-                } else {
-                    [0.0; 3]
+                let desired_yaw = d[1].atan2(d[0]);
+                // Shortest angular distance → [-π, π].
+                let mut yaw_diff = desired_yaw - self.heading;
+                while yaw_diff > core::f32::consts::PI {
+                    yaw_diff -= TAU;
                 }
+                while yaw_diff < -core::f32::consts::PI {
+                    yaw_diff += TAU;
+                }
+                let dist_xy = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                let desired_pitch = if dist_xy > 1e-3 {
+                    d[2].atan2(dist_xy)
+                } else {
+                    0.0
+                };
+                let pitch_diff = desired_pitch - self.pitch;
+                // Normalize na [-1, 1] motor space.
+                (
+                    (yaw_diff / core::f32::consts::PI).clamp(-1.0, 1.0),
+                    (pitch_diff / core::f32::consts::PI).clamp(-1.0, 1.0),
+                )
             }
-            None => [
-                rng.random_range(-HUNTER_IDLE_DRIFT..HUNTER_IDLE_DRIFT),
-                rng.random_range(-HUNTER_IDLE_DRIFT..HUNTER_IDLE_DRIFT),
-                rng.random_range(-HUNTER_IDLE_DRIFT * 0.3..HUNTER_IDLE_DRIFT * 0.3),
-            ],
+            None => (0.0, 0.0),
         };
-        let max_delta = acc * dt;
-        for i in 0..3 {
-            let want = desired[i] - self.velocity[i];
-            self.velocity[i] += want.clamp(-max_delta, max_delta);
-        }
+        let seek_mix = 0.6;
+        let turn = (brain_turn * (1.0 - seek_mix) + seek_turn * seek_mix).clamp(-1.0, 1.0);
+        let pitch_t =
+            (brain_pitch * (1.0 - seek_mix) + seek_pitch * seek_mix).clamp(-1.0, 1.0);
+        self.angular_velocity = turn * HUNTER_TURN_RATE;
+        self.pitch_velocity = pitch_t * HUNTER_PITCH_RATE;
+        let fwd = forward_vector(self.heading, self.pitch);
+        let acc = thrust * self.genome.acceleration;
+        self.velocity[0] += fwd[0] * acc * dt;
+        self.velocity[1] += fwd[1] * acc * dt;
+        self.velocity[2] += fwd[2] * acc * dt;
         let speed_sq = self.velocity[0] * self.velocity[0]
             + self.velocity[1] * self.velocity[1]
             + self.velocity[2] * self.velocity[2];
-        let max_sq = max_speed * max_speed;
+        let max_sq = self.genome.max_speed * self.genome.max_speed;
         if speed_sq > max_sq {
-            let scale = max_speed / speed_sq.sqrt();
+            let scale = self.genome.max_speed / speed_sq.sqrt();
             self.velocity[0] *= scale;
             self.velocity[1] *= scale;
             self.velocity[2] *= scale;
         }
+    }
+
+    /// Sprint 90: kinematic integration + heading update + toroidal wrap.
+    /// Pre-Sprint-90 step měl seek-target logic (Sprint 89); ten se přesunul
+    /// do brain (caller volá `apply_brain_motor` před step). Step je teď
+    /// čistě passive — integrate position + heading + pitch.
+    pub fn step(&mut self, dt: f32, world_half: [f32; 3]) {
+        self.age = self.age.saturating_add(1);
+        if self.reproduce_cooldown_ticks > 0 {
+            self.reproduce_cooldown_ticks -= 1;
+        }
+        // Integrate.
         self.position[0] += self.velocity[0] * dt;
         self.position[1] += self.velocity[1] * dt;
         self.position[2] += self.velocity[2] * dt;
+        self.heading += self.angular_velocity * dt;
+        self.pitch += self.pitch_velocity * dt;
+        // Toroidal wrap xy, z bounce.
         let wx = 2.0 * world_half[0];
         let wy = 2.0 * world_half[1];
         if self.position[0] >= world_half[0] || self.position[0] < -world_half[0] {
@@ -978,6 +1069,125 @@ impl Hunter {
             self.position[2] = self.position[2].clamp(-world_half[2], world_half[2]);
         }
     }
+}
+
+/// Sprint 90: hunter sensor context (subset of cell `BrainSensors` adapted
+/// pro predator semantics). „Prey" = nearest attackable cell (genome
+/// vision_radius + fov filter + n_bonds < HUNTER_BOND_IMMUNITY_THRESHOLD).
+#[derive(Debug, Clone, Copy)]
+pub struct HunterBrainSensors {
+    /// Min-image delta od hunter k nearest prey (cell.position − hunter.position).
+    pub nearest_prey: Option<[f32; 3]>,
+    /// Body size nearest prey (z `cell.phenotype.effective_radius`). Pre brain:
+    /// "kořist je menší / větší než já" → trade-off chase tactics.
+    pub nearest_prey_size: f32,
+    /// Počet attackable cells uvnitř vision range/cone (density signal).
+    pub neighbors_in_vision: u32,
+    /// Smell field gradient na hunter pozici. Cells emit smell when eating
+    /// food → chemical clue pro nearby cell activity.
+    pub smell_grad: [f32; 3],
+}
+
+/// Sprint 90: hunter sensor gather. Linear scan cells (n_hunters max 50,
+/// cell pop ~500 → 25k pair compares per tick × 50 hunters = 1.25M ops/tick
+/// — acceptable). Spatial grid by mohl optimalizovat při větších populacích.
+pub fn gather_hunter_sensors(
+    hunter: &Hunter,
+    cells: &[Cell],
+    smell: &SmellField,
+    world_half: [f32; 3],
+) -> HunterBrainSensors {
+    let vision_r = hunter.genome.vision_radius;
+    let vision_r2 = vision_r * vision_r;
+    let cos_fov = hunter.genome.vision_fov.cos();
+    let speed_sq = hunter.velocity[0] * hunter.velocity[0]
+        + hunter.velocity[1] * hunter.velocity[1]
+        + hunter.velocity[2] * hunter.velocity[2];
+    let cone_active = speed_sq > HUNTER_FORWARD_SPEED_THRESHOLD_SQ;
+    let forward = if cone_active {
+        let inv = 1.0 / speed_sq.sqrt();
+        [
+            hunter.velocity[0] * inv,
+            hunter.velocity[1] * inv,
+            hunter.velocity[2] * inv,
+        ]
+    } else {
+        [0.0; 3]
+    };
+    let mut best: Option<([f32; 3], f32, f32)> = None; // (delta, d2, prey_size)
+    let mut count: u32 = 0;
+    for c in cells {
+        if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
+            continue;
+        }
+        let d = min_image_delta(hunter.position, c.position, world_half);
+        let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if d2 >= vision_r2 {
+            continue;
+        }
+        if cone_active && !fov_cone_accept(d, d2, forward, cos_fov) {
+            continue;
+        }
+        count += 1;
+        let prey_size = c.phenotype.effective_radius();
+        match best {
+            None => best = Some((d, d2, prey_size)),
+            Some((_, bd2, _)) if d2 < bd2 => best = Some((d, d2, prey_size)),
+            _ => {}
+        }
+    }
+    let smell_grad = smell.gradient_at(hunter.position, SMELL_SAMPLE_EPSILON);
+    HunterBrainSensors {
+        nearest_prey: best.map(|(d, _, _)| d),
+        nearest_prey_size: best.map(|(_, _, s)| s).unwrap_or(0.0),
+        neighbors_in_vision: count,
+        smell_grad,
+    }
+}
+
+/// Sprint 90: brain input vector pro hunter. Reuse cell's 21-slot layout
+/// s hunter semantics:
+///   0,1,15: nearest_prey delta (= cell food slots)
+///   2,3,16: filler (cell uses cell-cell delta — not relevant pro predator)
+///   4: own_energy / HUNTER_REPRODUCE_THRESHOLD
+///   5: own_speed / max_speed
+///   6: prey_size_relative (prey/own — pre brain "small target" awareness)
+///   7,8,17: smell_grad x/y/z
+///   9,10,18: heading_x/y/z (forward vector)
+///   11-13,19,20: filler / repurpose later
+///   13: density_in_vision (count / DENSITY_NORM_COUNT)
+///   14: filler (cell uses damage)
+///   21..52: recurrent (last_hidden)
+pub fn populate_hunter_brain_inputs(
+    hunter: &mut Hunter,
+    sensors: &HunterBrainSensors,
+) -> [f32; BRAIN_INPUTS] {
+    let vision_r = hunter.genome.vision_radius.max(0.01);
+    let max_speed = hunter.genome.max_speed.max(1e-3);
+    let speed_xy = hunter.velocity[0].hypot(hunter.velocity[1]);
+    let speed_norm = (speed_xy / max_speed).clamp(0.0, 1.0);
+    let energy_norm = (hunter.energy / HUNTER_REPRODUCE_THRESHOLD).clamp(0.0, 1.5);
+    let mut inputs = [0.0_f32; BRAIN_INPUTS];
+    if let Some(d) = sensors.nearest_prey {
+        inputs[0] = d[0] / vision_r;
+        inputs[1] = d[1] / vision_r;
+        inputs[15] = d[2] / vision_r;
+        let own_size = hunter.genome.body_size.max(0.01);
+        inputs[6] = (sensors.nearest_prey_size - own_size) / own_size;
+    }
+    inputs[4] = energy_norm;
+    inputs[5] = speed_norm;
+    inputs[7] = (sensors.smell_grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
+    inputs[8] = (sensors.smell_grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
+    inputs[17] = (sensors.smell_grad[2] * SMELL_NORMALIZATION_GAIN).tanh();
+    let fwd = forward_vector(hunter.heading, hunter.pitch);
+    inputs[9] = fwd[0];
+    inputs[10] = fwd[1];
+    inputs[18] = fwd[2];
+    inputs[13] = (sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
+    inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
+        .copy_from_slice(&hunter.last_hidden[..BRAIN_RECURRENT]);
+    inputs
 }
 
 /// Sprint 89: asexual clone-with-mutate. Parent splituje energy 50/50
@@ -5246,6 +5456,7 @@ mod tests {
             sigma_damage: 100.0,
             sigma_body_size: 10.0,
             sigma_color_hue: 1000.0,
+            sigma_brain: 100.0,
         };
         for _ in 0..500 {
             let m = g.mutate(&mut rng, &cfg);
@@ -5276,6 +5487,7 @@ mod tests {
             damage_per_tick: MIN_HUNTER_DAMAGE,
             body_size: MIN_HUNTER_BODY_SIZE,
             color_hue: 10.0,
+            brain: dummy_brain(),
         };
         let b = HunterGenome {
             vision_radius: MAX_HUNTER_VISION_RADIUS,
@@ -5286,6 +5498,7 @@ mod tests {
             damage_per_tick: MAX_HUNTER_DAMAGE,
             body_size: MAX_HUNTER_BODY_SIZE,
             color_hue: 200.0,
+            brain: dummy_brain(),
         };
         for _ in 0..100 {
             let c = HunterGenome::crossover(&a, &b, &mut rng);
@@ -5335,6 +5548,7 @@ mod tests {
 
     /// Sprint 89: helper pro test hunter setup. Default genome (S71-S84
     /// const-equivalent middle ranges), full energy, no cooldown.
+    /// Sprint 90: + dummy brain (zero weights), heading 0, pitch 0.
     fn make_test_hunter(pos: [f32; 3], vel: [f32; 3]) -> Hunter {
         let genome = HunterGenome {
             vision_radius: HUNTER_VISION_RADIUS,
@@ -5345,6 +5559,7 @@ mod tests {
             damage_per_tick: HUNTER_DAMAGE_PER_TICK,
             body_size: 1.0,
             color_hue: 0.0,
+            brain: dummy_brain(),
         };
         Hunter {
             position: pos,
@@ -5356,6 +5571,13 @@ mod tests {
             reproduce_cooldown_ticks: 0,
             lineage_id: 0,
             lineage_birth_gen: 0,
+            heading: 0.0,
+            pitch: 0.0,
+            angular_velocity: 0.0,
+            pitch_velocity: 0.0,
+            last_inputs: [0.0; BRAIN_INPUTS],
+            last_hidden: [0.0; BRAIN_HIDDEN],
+            last_outputs: [0.0; BRAIN_OUTPUTS],
         }
     }
 
@@ -5468,30 +5690,92 @@ mod tests {
     }
 
     #[test]
-    fn hunter_step_moves_toward_target() {
-        let mut rng = StdRng::seed_from_u64(14);
+    fn hunter_step_integrates_velocity() {
+        // Sprint 90: step je teď čistě integration. Set velocity manuálně
+        // (replikuje brain motor output), step posune position.
         let half = [960.0, 540.0, 50.0];
-        let mut h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
-        let target = [100.0, 0.0, 0.0];
-        // Krok 1: velocity začne přibližovat k +x (toward target).
-        h.step(Some(target), &mut rng, 1.0 / 60.0, half);
-        assert!(h.velocity[0] > 0.0, "expected +x velocity, got {:?}", h.velocity);
-        assert!(h.position[0] > 0.0, "expected +x position, got {:?}", h.position);
+        let mut h = make_test_hunter([0.0, 0.0, 0.0], [60.0, 0.0, 0.0]);
+        h.step(1.0 / 60.0, half);
+        assert!(
+            (h.position[0] - 1.0).abs() < 0.05,
+            "expected pos.x ≈ 1.0 po 1 ticku s v=60, got {}",
+            h.position[0]
+        );
     }
 
     #[test]
-    fn hunter_step_random_walks_when_no_target() {
-        let mut rng = StdRng::seed_from_u64(15);
-        let half = [960.0, 540.0, 50.0];
+    fn hunter_apply_brain_motor_thrusts_forward() {
+        // Sprint 90: positive thrust output → velocity gain podél forward
+        // (heading=0, pitch=0 → forward = +X).
+        let half = [1000.0, 1000.0, 50.0];
         let mut h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
-        // Bez targetu se velocity nenuluje (idle drift).
-        for _ in 0..30 {
-            h.step(None, &mut rng, 1.0 / 60.0, half);
-        }
-        let speed_sq = h.velocity[0] * h.velocity[0]
-            + h.velocity[1] * h.velocity[1]
-            + h.velocity[2] * h.velocity[2];
-        assert!(speed_sq > 1e-3, "idle drift should produce nonzero velocity, got {:?}", h.velocity);
+        let mut outputs = [0.0_f32; BRAIN_OUTPUTS];
+        outputs[1] = 1.0; // full thrust
+        h.apply_brain_motor(&outputs, None, 1.0 / 60.0, half);
+        assert!(
+            h.velocity[0] > 0.0,
+            "expected +x velocity po thrust, got {:?}",
+            h.velocity
+        );
+    }
+
+    #[test]
+    fn hunter_apply_brain_motor_turn_yaw_sets_angular() {
+        // Sprint 90: brain turn output (no seek target) → angular_velocity ×
+        // (1.0 - seek_mix) = brain × 0.4. Bez seek targetu seek_turn = 0.
+        let half = [1000.0, 1000.0, 50.0];
+        let mut h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
+        let mut outputs = [0.0_f32; BRAIN_OUTPUTS];
+        outputs[0] = 1.0;
+        h.apply_brain_motor(&outputs, None, 1.0 / 60.0, half);
+        // turn = 1.0 × 0.4 + 0.0 × 0.6 = 0.4 → angular_velocity = 0.4 × HUNTER_TURN_RATE.
+        let expected = 0.4 * HUNTER_TURN_RATE;
+        assert!(
+            (h.angular_velocity - expected).abs() < 1e-4,
+            "expected angular_velocity ≈ {}, got {}",
+            expected,
+            h.angular_velocity
+        );
+    }
+
+    #[test]
+    fn hunter_apply_brain_motor_seek_dominates_chase() {
+        // Sprint 90: hybrid mix — seek (60 %) + brain (40 %). Target přímo
+        // vlevo (90° from forward = +X), neutral brain output → angular_velocity
+        // toward +Y.
+        let half = [1000.0, 1000.0, 50.0];
+        let mut h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
+        let outputs = [0.0_f32; BRAIN_OUTPUTS]; // neutral brain
+        let target = [0.0, 100.0, 0.0]; // +Y direction
+        h.apply_brain_motor(&outputs, Some(target), 1.0 / 60.0, half);
+        // Seek wants yaw toward +Y (= π/2). yaw_diff = π/2 - 0 = π/2 → seek_turn
+        // = (π/2)/π = 0.5 → mixed turn = 0.0×0.4 + 0.5×0.6 = 0.3 → angular_velocity
+        // = 0.3 × HUNTER_TURN_RATE.
+        assert!(
+            h.angular_velocity > 0.0,
+            "expected positive angular_velocity (turning toward +Y), got {}",
+            h.angular_velocity
+        );
+    }
+
+    #[test]
+    fn populate_hunter_brain_inputs_writes_prey_delta() {
+        let mut h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
+        let sensors = HunterBrainSensors {
+            nearest_prey: Some([100.0, 50.0, 10.0]),
+            nearest_prey_size: 1.5,
+            neighbors_in_vision: 3,
+            smell_grad: [0.0; 3],
+        };
+        let inputs = populate_hunter_brain_inputs(&mut h, &sensors);
+        // vision_radius = HUNTER_VISION_RADIUS = 200; prey_dx/200 = 0.5.
+        assert!((inputs[0] - 0.5).abs() < 1e-4);
+        assert!((inputs[1] - 0.25).abs() < 1e-4);
+        assert!((inputs[15] - 0.05).abs() < 1e-4);
+        // density 3 / DENSITY_NORM_COUNT = 1.0 → tanh(1.0) ≈ 0.762
+        assert!((inputs[13] - 1.0_f32.tanh()).abs() < 1e-4);
+        // prey_size_relative = (1.5 - 1.0) / 1.0 = 0.5
+        assert!((inputs[6] - 0.5).abs() < 1e-4);
     }
 
     #[test]

@@ -618,7 +618,114 @@ sebou, kterou cells mohou flank-uniknout.
     hunters s random genomy (lineage reset). Bincode serialize HunterGenome
     by zachoval evolution napříč session.
 
-## Sprinty 90+ — open-ended
+## Sprint 90 — Hunter brain (hybrid seek + brain modulation)
+
+- **Cíl:** Sprint 89 ukázal hunter parameter evolution (genome drift). Brain
+  přidává adaptive chase tactics — random cell brain s INNATE_THRUST_BIAS
+  startuje s forward motion, evolution tuneuje turn/pitch outputs k
+  prey-coordinated chase.
+
+- **Mechanismus:**
+  - **HunterGenome.brain:** reuse cell `Brain` struct (BRAIN_INPUTS=53,
+    HIDDEN=32, OUTPUTS=10). Slot semantics re-mapped pro hunter:
+    0/1/15 = nearest_prey delta, 4 = own_energy, 5 = own_speed, 6 =
+    prey_size_relative, 7-8/17 = smell_grad, 9-10/18 = heading, 13 =
+    density. Used outputs: 0 (turn), 1 (thrust), 7 (pitch). Cell-only
+    outputs (morph, attack, bond) ignored.
+  - **Hunter struct:** + `heading`, `pitch`, `angular_velocity`, `pitch_velocity`,
+    `last_inputs/hidden/outputs`. Hunter::from_genome inits heading random,
+    pitch 0, brain state zero.
+  - **`HunterBrainSensors`:** `nearest_prey` delta, `nearest_prey_size`,
+    `neighbors_in_vision`, `smell_grad`. Linear scan cells (n_hunters max
+    50, cell pop ~500 → 25k pair compares × 50 hunters = 1.25M ops/tick).
+  - **`gather_hunter_sensors`:** filter cells by vision_radius + cone
+    (genome) + `n_bonds < HUNTER_BOND_IMMUNITY_THRESHOLD`. Returns nearest
+    + count + smell.
+  - **`populate_hunter_brain_inputs`:** maps sensors → `[f32; BRAIN_INPUTS]`
+    s hunter-specific slot semantics (= cell layout, repurposed). Recurrent
+    last_hidden copied to slots 21..52.
+  - **`Hunter::apply_brain_motor` HYBRID design:** `seek_mix = 0.6` —
+    deterministic seek-toward-prey direction mixed s brain output (40 %).
+    Bez tohoto random initial brain neumí chase (random turn output =
+    spinning), populace kolabuje do floor respawn loop. S hybridem brain
+    moduluje dominantní seek (např. learned prey selection, retreat při
+    low energy). Když brain weights evolvují k matching seek, mix se stane
+    redundant; když brain learnuje jiný strategy, brain dominuje.
+  - **`Hunter::step` refaktor:** pure kinematic integration (position +
+    heading + pitch), žádný seek logic. Caller volá `apply_brain_motor`
+    před step.
+  - **HUNTER_TURN_RATE = 3.0, HUNTER_PITCH_RATE = 1.0** (mid-cell range).
+    Sprint 91+ může přidat jako gene.
+
+- **Energy economics tuning v3:**
+  - Pre-tune (V1 pure brain): pop crashed to 1, no reproduction —
+    random brain s thrust ale random turn nestíhá chase.
+  - V2 (hybrid 60/40): better chase ale energy still pod-tuned, single
+    hunter survives via floor respawn.
+  - **V3 final:** `HUNTER_ENERGY_PER_DAMAGE: 3.0 → 6.0`,
+    `HUNTER_REPRODUCE_THRESHOLD: 800 → 700` — predace teď net-positive,
+    hunter populace dosáhne carrying capacity 50 v ~30 gens.
+
+- **Smoke seed=0 100 gen — predator-prey equilibrium s arms race:**
+
+  | gen | cells | c_spd | hunters | atk/gen | h_spd | h_dmg |
+  |-----|-------|-------|---------|---------|-------|-------|
+  | 0   | 200   | 59.3  | 12      | 0       | 285   | 8.95  |
+  | 10  | 845   | 87.3  | 8       | 506     | 290   | 8.85  |
+  | 30  | 730   | 134.9 | 17      | 2066    | 262   | 11.85 |
+  | 40  | 718   | 156.4 | **50**  | 6675    | 249   | 11.78 |
+  | 60  | 514   | 183.1 | 50      | 6985    | 249   | 11.78 |
+  | 100 | 730   | 191.4 | 50      | 7731    | 249   | 11.78 |
+
+  - **Cells +222 %** speed (59 → 191) — strong selection pod intense predation
+    (2000-7000 attacks/gen vs S89 200/gen).
+  - **Hunters hit MAX_POP** v gen 40, sustainable equilibrium (0 deaths
+    + 0 births since cap blokuje reproduction).
+  - **Hunter genome frozen** at gen 30 progenitor (h_spd=249, h_dmg=11.8) —
+    cap reached před selection diversity. **Limitace:** asexual reproduction +
+    pop cap → evolution stagnates po dosažení carrying capacity.
+
+- **Determinismus:** Sprint 90 = nový baseline (Brain init na hunter +
+  brain forward weights v každém ticku). Brain forward je deterministic
+  given inputs/weights. RNG draws posunuty.
+
+- **Test suite:** 132/132 pass (129 z S89 + 3 nové: `hunter_apply_brain_motor_thrusts_forward`,
+  `hunter_apply_brain_motor_turn_yaw_sets_angular`, `hunter_apply_brain_motor_seek_dominates_chase`,
+  + replaced 2 stale tests s pure-seek pattern). Plus
+  `populate_hunter_brain_inputs_writes_prey_delta`.
+
+- **Výstup:**
+  - `src/lib.rs`: `HUNTER_TURN_RATE` + `HUNTER_PITCH_RATE` consts,
+    `HunterGenome.brain` field, brain integration v random/mutate/crossover,
+    `HunterMutationConfig.sigma_brain` field, `Hunter` struct expansion
+    (heading/pitch/angular_velocity/pitch_velocity/last_inputs/hidden/outputs),
+    `Hunter::from_genome` init nová pole, `Hunter::apply_brain_motor` (hybrid),
+    `Hunter::step` refaktor (pure integration), `HunterBrainSensors` struct,
+    `gather_hunter_sensors` + `populate_hunter_brain_inputs` helpers,
+    energy economics tune (PER_DAMAGE 3→6, REPRODUCE_THRESHOLD 800→700),
+    4 nové tests + replaced 2.
+  - `src/main.rs`: `step_hunters` přebírá `Res<SmellResource>`, brain
+    forward + hybrid motor + step pipeline.
+  - `src/bin/headless.rs`: `hunt()` — sensor gather + brain forward +
+    hybrid motor + step.
+
+- **Co Sprint 90 NEŘEŠÍ (S91+):**
+  - **Sexual reproduction** — pairing logic + crossover mezi dvěma
+    hunters. Asexual + cap → genome stagnates po carrying capacity reached.
+    Sexual by zachoval diversity přes crossover.
+  - **Hebbian learning na hunter brain** — currently brain weights jen
+    from genome inheritance. Hebbian by dovolil within-life learning.
+  - **GPU brain forward pro hunters** — currently CPU-only. S 50 hunters
+    × forward pass každý tick je ~OK, ale GPU integration by sjednotila
+    pipeline s cells.
+  - **Larger hunter brain inputs** — některé sensory slots jsou nevyužité
+    (cell-cell delta, pheromone, damage). Mohly by být repurposed pro
+    predator-specific signály (např. inter-hunter awareness pro pack
+    hunting).
+  - **Higher MAX_POP** — 50 cap je tight, evolution stagnates rychle.
+    Vyšší cap (100-200) by dovolil delší selekční signal před equilibrium.
+
+## Sprinty 91+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud
