@@ -177,19 +177,93 @@ hunt damage vs bond maintenance.
     - Hunter persistent chase logic.
     - HUD overlay.
 
-## Sprinty 75–82 — open-ended
+## Sprint 75 — INNATE_BOND_BIAS = 1.5
 
-- **Sprint 75 (priorita):** `INNATE_BOND_BIAS` 0 → 1.5 — odbourat
-  formation gating. Hypotéza: random brainy budou bondovat by default,
-  selekce může pak rozhodnout (vs current „selekce musí bondování
-  najít z 0"). Cíl: immune_frac > 0.05 do gen 500.
-- **Sprint 75+:** Hunter persistent target + chase duration —
-  predator-style „commit to one prey".
-- **Sprint 75+:** HUD overlay s real-time bond stats v rendereru.
-- **Sprint 75+:** Photic stratification (z-gradient light field +
-  photoreceptor sensor input).
-- **Sprint 75+:** Thermal stratification (z-gradient temperature).
-- **Sprint 75+:** GPU collision shader (3D + adhesion + bonds mirror).
-- **Sprint 75+:** Anisotropic cell collision (ellipsoid geometry).
-- **Sprint 75+:** Cluster-aware reproduction tuning.
-- **Sprint 75+:** Spatial autocorrelation adhesion_type clustering metric.
+- **Cíl:** odbourat bond formation gating. Sprint 74 ukázal, že bondy
+  formace jsou **real bottleneck** (ne maintenance cost) — random brainy
+  s `INNATE_BOND_BIAS=0` dávají `output[9] > 0.2` jen sporadicky, takže
+  bondy se nestihnou hromadit do clusteru ≥3 (= immune k hunteru).
+  Sprint 75 zvyšuje bias na 1.5 → většina cells emituje signal nad
+  threshold by default. Selekce může pak negativně tunit (cells co
+  nechtějí bondovat se učí brain weights pull b1[9] dolů). Mirror Sprint
+  27 INNATE_ATTACK_BIAS philosophy.
+
+- **Konstanty:**
+  - `INNATE_BOND_BIAS` 0.0 → 1.5
+
+- **Výstup:**
+  - `src/lib.rs`: 1 const update + comment.
+  - **Test suite: 95/95 pass.**
+  - **Long-run smoke seed=0, 1000 gen, default world, CPU:**
+    - Wall-clock 672.8 s = **892 ticks/s** (S74 793, +12 %). Final pop 631.
+    - **Bond density:**
+
+      | Gen | spd | asp | mBond | hunt_atks | immune_frac |
+      |-----|-----|------|-------|-----------|-------------|
+      | 31  | ~110 | ~1.7 | ~0.087 | ~5000 | **0.002 (peak!)** |
+      | 38  | ~120 | ~2.0 | **0.088 (peak)** | ~4500 | ~0.001 |
+      | 49  | 148 | 2.2  | 0.051 | 2485 | 0 |
+      | 99  | 186 | 3.0  | 0.021 | 3015 | 0 |
+      | 199 | 191 | 10.2 | 0.000 | 2150 | 0 |
+      | 999 | 190 | 12.6 | 0.000 | 2855 | 0 |
+    - Peak `mean_bond_count = 0.088 @ gen 38` — **+29 % vs Sprint 74,
+      +96 % vs Sprint 73** baseline.
+    - Peak `immune_frac = 0.002 @ gen 31` — **PRVNÍ non-zero immune_frac
+      napříč Sprinty 73-75!** 0.2 % cells dosáhlo ≥3 bondů.
+
+- **Závěr — průlom v signálu, ale ne v ekonomice:**
+  - **Bias funguje mechanicky** ✓. Random brainy začínají bond signal
+    nad threshold → physics-driven bond formation. Bond density narostla
+    napříč všech 3 metrik (mBond, bond_active_frac, immune_frac).
+  - **Ale selekce stále favorizuje solo.** Po gen 50 cells s bondy
+    rapidně mizí (gen 199 mBond=0, gen 999 mBond=0). Bias dostává cells
+    do bondů, ale **bonded lineages nereprodukují víc než solo**. Cluster
+    advantage neexistuje — cells rychle losslužejí bond cost (formation +
+    maintenance) bez compensating fitness benefit.
+  - **Imbalance kořeny:** `HUNTER_BOND_IMMUNITY_THRESHOLD=3` je extrémní
+    benchmark. Cell musí mít 3 bondy current jednou — to znamená contact
+    s 3 různými same-type cells během krátké doby. S asp=2-3 (gen 30-50)
+    je to možné, ale jakmile cells konverguje k asp=12 needles, contact
+    je nemožný (1D čára nemá v xy projection prostor pro 3 sousedy).
+
+- **Implikace pro Sprint 76+:**
+  - **Lower threshold or direct reward.** Tři páky:
+    1. `HUNTER_BOND_IMMUNITY_THRESHOLD` 3 → **2** — dramaticky snadnější
+       cíl. Sprint 75 mělo 0.2 % @ 3-bond; @ 2-bond by se to mohlo
+       posunout k 5-10 %. Single-line change.
+    2. **Cluster food share** — když bonded cell eats food, share x %
+       energy s bonded partners. Direct positive reinforcement bondingu.
+       Větší scope (touch eat_food v lib + headless + main).
+    3. `BOND_FORM_TICKS` 30 → **10** — bondy formují z briefer contacts
+       → cells co se náhodně mihnou nestihnou bond. Risk: přefiltrované
+       random clustery.
+  - Kombinace **#1 + #3** je low-risk, single-file edit. **#2** je
+    fundamentálnější ale invasive.
+
+- **Poznámky:**
+  - **Wall-clock +12 % rychlejší** vs Sprint 74 (892 vs 793 ticks/s).
+    Důvod: víc bondů → cells lokálnější → cell_grid lookup cheaper.
+  - **Asp konverguje k 12.6 NEZÁVISLE na bond bias.** Streamlined needles
+    jsou attraktor pro foraging energy efficiency, ne anti-predator
+    strategy. Bonded cells s asp 2-3 (gen 30-50) byly aircon-friendly
+    pro cluster, ale jakmile asp evolovalo k 12, fyzicky nemohli bondovat.
+    Body shape evolution race-condition s bond formation.
+  - **Co Sprint 75 NEŘEŠÍ (Sprint 76+):**
+    - Threshold pro immunity (3 je možná moc).
+    - Direct cluster reward (energy sharing).
+    - Anisotropic body penalty pro cluster-incompatible shapes.
+
+## Sprinty 76–82 — open-ended
+
+- **Sprint 76 (priorita):** `HUNTER_BOND_IMMUNITY_THRESHOLD` 3 → 2
+  (single-line). Hypotéza: snazší cíl pro immunity → immune_frac
+  vyleze nad 0.05.
+- **Sprint 76+:** `BOND_FORM_TICKS` 30 → 10 — rychlejší formace.
+- **Sprint 76+:** Cluster food share mechanic (bonded cells share
+  eaten food % s partnery) — direct fitness reward.
+- **Sprint 76+:** Anisotropic shape penalty — cells s extrém asp >5
+  nemůžou bondovat (cluster-incompatible body).
+- **Sprint 76+:** Hunter persistent target chase logic.
+- **Sprint 76+:** HUD overlay s real-time bond stats.
+- **Sprint 76+:** Photic / thermal stratification.
+- **Sprint 76+:** GPU collision shader, anisotropic collision.

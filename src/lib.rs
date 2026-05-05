@@ -76,9 +76,17 @@ pub const INNATE_PHEROMONE_BIAS: f32 = 1.0;
 /// ne default. Záměrně 0 — chceme měřit, jestli selekce attack chování objeví
 /// sama, nebo zůstane utlumený. Negative bias by ho aktivně potlačoval.
 pub const INNATE_ATTACK_BIAS: f32 = 0.0;
-/// Sprint 66 bond signal bias (b2[9]). Default 0 — bond formation se musí
-/// objevit selekcí, ne jako prior. Stejná filozofie jako attack bias.
-pub const INNATE_BOND_BIAS: f32 = 0.0;
+/// Sprint 66 bond signal bias (b2[9]). Sprint 75: 0 → 1.5. Sprint 74 1000-gen
+/// smoke ukázal, že bond density crashed na 0 nehledě na economy rebalance —
+/// real bottleneck není maintenance cost, ale **formation gating**: random
+/// brainy s bias=0 dávají output[9] > BOND_FORM_THRESHOLD=0.2 jen sporadicky,
+/// takže bondy se nikdy nestihnou hromadit do clusteru ≥3 (= immune
+/// k hunteru). Bias 1.5 znamená default tanh(b1[9] + 1.5) ≈ 0.9 → většina
+/// cells emituje signal nad threshold by default. Bondy se formují přes
+/// physics (contact + same adhesion_type), selekce může negativně tunit
+/// (cells co nechtějí bondovat se učí brain weights pull b1[9] dolů).
+/// Filozoficky stejný posun jako kdyby attack měl positive bias místo 0.
+pub const INNATE_BOND_BIAS: f32 = 1.5;
 
 // Shared sim parameters consumed by both the Bevy renderer (`src/main.rs`)
 // and the headless harness (`src/bin/headless.rs`). Single source of truth —
