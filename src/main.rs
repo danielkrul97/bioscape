@@ -478,11 +478,13 @@ fn setup(
     commands.spawn((
         Camera3d::default(),
         Hdr,
-        // Sprint 88.2: TonyMcMapface → AcesFitted. Tony je explicitly „boring,
-        // does not increase contrast or saturation"; ACES má dramatic hue
-        // shifting + increased contrast + brights desaturate. Pro biologické
-        // cells s sytými hue (8 distinct adhesion types) je ACES výrazně lepší.
-        Tonemapping::AcesFitted,
+        // Sprint 88.2: TonyMcMapface → AcesFitted (increased saturation), pak
+        // S88.3: AcesFitted → Reinhard. ACES desaturuje brights („brights
+        // desaturate across the spectrum"); Reinhard je jediný tonemapper, kde
+        // „bright primaries and secondaries don't desaturate at all". Tradeoff:
+        // lots of hue shifting v brights (nepatrné posuny barev), ale pro
+        // 8 distinct adhesion hues je full saturation > hue purity.
+        Tonemapping::Reinhard,
         Bloom::NATURAL,
         DistanceFog {
             color: Color::srgb(0.08, 0.18, 0.30),
