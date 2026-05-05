@@ -1305,17 +1305,28 @@ fn cell_eats_food(
         })
         .collect();
 
+    // Sprint 78: cell_id → entity map pro food share lookup. Cells layout
+    // se v eat_food fázi nemění, takže build-once je bezpečný.
+    let id_to_entity: FxHashMap<u64, Entity> = cells
+        .iter()
+        .map(|(e, c)| (c.0.cell_id, e))
+        .collect();
+
     // Pass 2 (sequential): resolve race + apply energy + Hebbian. First-cell-wins
     // per food entity (matches pre-Sprint-58 ordering).
+    // Sprint 78: cluster food share. Sebráno do share_deltas Vec během iterace,
+    // aplikováno post-loop kvůli simultaneous mutable borrow.
     let mut eaten: FxHashSet<Entity> = FxHashSet::default();
+    let mut share_deltas: Vec<(Entity, f32)> = Vec::new();
     for ((entity, _, _, _, _, _), opt) in snapshot.iter().zip(candidates.iter()) {
         if let Some((food_e, value)) = opt {
             if eaten.contains(food_e) {
                 continue;
             }
             eaten.insert(*food_e);
-            if let Ok((_, mut cell)) = cells.get_mut(*entity) {
+            let bonds_copy = if let Ok((_, mut cell)) = cells.get_mut(*entity) {
                 cell.0.energy += *value;
+                let copy = cell.0.bonds;
                 if use_gpu_hebbian {
                     if let Some(slot) = slot_map.slot_of(*entity) {
                         if slot < rewards.len() {
@@ -1334,7 +1345,33 @@ fn cell_eats_food(
                         LEARNING_RATE,
                     );
                 }
+                copy
+            } else {
+                continue;
+            };
+            // Sprint 78: share s bonded partnery (free reward, no
+            // conservation — modeluje tissue cooperation).
+            let share_value = *value * bioscape::BOND_FOOD_SHARE_FRAC;
+            if share_value > 0.0 {
+                for bond_opt in bonds_copy.iter() {
+                    if let Some(bond) = bond_opt {
+                        if let Some(&partner_e) =
+                            id_to_entity.get(&bond.other_cell_id)
+                        {
+                            if partner_e != *entity {
+                                share_deltas.push((partner_e, share_value));
+                            }
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    // Sprint 78: aplikuj food share delty (po Pass 2 main loop).
+    for (e, delta) in share_deltas {
+        if let Ok((_, mut cell)) = cells.get_mut(e) {
+            cell.0.energy += delta;
         }
     }
 

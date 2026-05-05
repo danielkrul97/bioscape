@@ -1529,6 +1529,16 @@ impl World {
         self.eaten_scratch.clear();
         self.eaten_scratch.resize(self.foods.len(), false);
 
+        // Sprint 78: cell_id → idx map pro food share lookup. Cells layout
+        // se v eat_food nezmění (no spawn/despawn mid-fáze), takže build-once
+        // je bezpečný.
+        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.cell_id, i))
+            .collect();
+
         #[cfg(feature = "gpu")]
         let use_gpu_hebbian = self.gpu_full.is_some();
         #[cfg(not(feature = "gpu"))]
@@ -1583,21 +1593,49 @@ impl World {
         // Pass 2 (sequential): resolve. Per cell_idx v insertion order — first
         // cell to claim a food wins. Matches pre-Sprint-57 ordering (sekvenční
         // outer loop with eaten_scratch shortcut).
+        // Sprint 78: cluster food share. Pokud má eater bondy, partner cells
+        // dostávají `value × BOND_FOOD_SHARE_FRAC` extra energy (free reward,
+        // no conservation — modeluje tissue cooperation). Sebráno do
+        // share_deltas Vec během iterace, aplikováno post-loop kvůli
+        // simultaneous mutable borrow.
         let mut ate_cell_indices: Vec<usize> = Vec::new();
+        let mut share_deltas: Vec<(usize, f32)> = Vec::new();
         for (cell_idx, opt) in candidates.iter().enumerate() {
             if let Some((food_idx, value)) = opt {
                 if self.eaten_scratch[*food_idx] {
                     continue;
                 }
                 self.eaten_scratch[*food_idx] = true;
-                let cell = &mut self.cells[cell_idx];
-                cell.energy += *value;
+                let bonds_copy;
+                {
+                    let cell = &mut self.cells[cell_idx];
+                    cell.energy += *value;
+                    bonds_copy = cell.bonds;
+                }
+                let share_value = *value * bioscape::BOND_FOOD_SHARE_FRAC;
+                if share_value > 0.0 {
+                    for bond_opt in bonds_copy.iter() {
+                        if let Some(bond) = bond_opt {
+                            if let Some(&partner_idx) =
+                                id_to_idx.get(&bond.other_cell_id)
+                            {
+                                if partner_idx != cell_idx {
+                                    share_deltas.push((partner_idx, share_value));
+                                }
+                            }
+                        }
+                    }
+                }
                 if use_gpu_hebbian {
                     rewards[cell_idx] = 1.0;
                 } else {
                     ate_cell_indices.push(cell_idx);
                 }
             }
+        }
+        // Sprint 78: aplikuj food share delty (po Pass 2 main loop).
+        for (idx, delta) in share_deltas {
+            self.cells[idx].energy += delta;
         }
 
         // Pass 2b: CPU Hebbian update sekvenčně. Hebbian je ~700 ops × max

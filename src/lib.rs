@@ -427,6 +427,14 @@ pub const BOND_FORMATION_COST: f32 = 0.5;
 /// 0.17/gen → 18× inverted. Halving maintenance + 2× hunt damage +
 /// 1.5× hunters target ~5× shrink toward break-even.
 pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.05;
+/// Sprint 78: food-share fraction per bond. Když bonded cell eats food
+/// (FOOD_VALUE energy), každý bonded partner dostane `FOOD_VALUE × FRAC`
+/// extra energy (free reward, no energy conservation — modeluje „tissue
+/// metabolic cooperation"). Cluster s 2 bondy: eater +FOOD_VALUE,
+/// 2 partneři +0.6 × FOOD_VALUE = +12 each. Total cluster gain je
+/// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál
+/// pro bonding — fitness payoff přímo, ne přes hunter immunity proxy.
+pub const BOND_FOOD_SHARE_FRAC: f32 = 0.3;
 /// Sprint 70: jitter radius pro cluster-aware reproduction. Když má parent
 /// bondy a child se má spawn-it blízko něj (uvnitř bond network), použije
 /// se random offset v ±tomto rangi. 8.0 = 0.8× pair_radius pro typical

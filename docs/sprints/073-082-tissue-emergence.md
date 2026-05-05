@@ -383,13 +383,106 @@ hunt damage vs bond maintenance.
     - Direct fitness reward pro bonding (cluster food share).
     - Hunter persistent chase, HUD, photic/thermal.
 
-## Sprinty 78–82 — open-ended
+## Sprint 78 — cluster food share (BREAKTHROUGH)
 
-- **Sprint 78 (priorita):** Cluster food share — bonded cells sdílejí
-  % eaten food (např. 30 % per bond) s partnery. Direct positive
-  selection pressure. Touch eat_food v lib + headless + main.
-- **Sprint 78+:** Hunter persistent target chase logic.
-- **Sprint 78+:** HUD overlay s real-time bond stats.
-- **Sprint 78+:** Photic / thermal stratification.
-- **Sprint 78+:** GPU collision shader, anisotropic collision.
-- **Sprint 78+:** Spatial autocorrelation adhesion_type clustering metric.
+- **Cíl:** přidat **direct fitness reward** pro bondování. Sprint 73-77
+  ukázaly, že hunter immunity (přes bond defense) je nedostatečný benefit
+  — bondy sice formují, ale selekce nepreserve bonded lineages. Sprint 78
+  zkouší **explicit positive selection signal**: bonded cells sdílejí
+  fraction eaten food s partnery, takže být v clusteru = víc energie =
+  větší reprodukce.
+
+  **Mechanika:** když cell jí food (FOOD_VALUE × multipliers = energy V),
+  každý bonded partner dostane `V × BOND_FOOD_SHARE_FRAC` extra. Free
+  reward (no energy conservation) — modeluje „tissue metabolic
+  cooperation" / shared circulatory system. Cluster s 2 bondy:
+  eater +V, partneři +0.6V → total cluster gain 1.6× vs solo.
+
+- **Konstanty:**
+  - `BOND_FOOD_SHARE_FRAC: f32 = 0.3` nový.
+
+- **Výstup:**
+  - `src/lib.rs`: const + comment.
+  - `src/bin/headless.rs`: `eat_food` extended s id_to_idx pre-pass +
+    share_deltas Vec collected v Pass 2 + apply post-loop.
+  - `src/main.rs`: `cell_eats_food` mirror — id_to_entity map +
+    share_deltas + apply post-loop.
+  - **Test suite: 95/95 pass.**
+  - **Long-run smoke seed=0, 1000 gen, default world, CPU:**
+    - Wall-clock 891.8 s = **673 ticks/s** (S77 978 — slower kvůli
+      denser bond network → víc collision events). **Final pop 1035**
+      (S77 398 = **2.6× větší zdravější populace**).
+    - **MULTICELULARITA DOSAŽENA:**
+
+      | Gen | cells | mBond | bondAct | immune_frac | asp |
+      |-----|-------|-------|---------|-------------|-----|
+      | 49  | 568   | 0.46  | 0.36    | **0.086**   | 1.9 |
+      | 99  | 722   | 1.57  | 0.74    | **0.474**   | 3.8 |
+      | 199 | 830   | 1.99  | 0.82    | **0.575**   | 4.6 |
+      | 299 | 937   | 1.96  | 0.82    | **0.581**   | 4.7 |
+      | 499 | 903   | 1.91  | 0.79    | 0.555       | 4.8 |
+      | 699 | 953   | 2.11  | 0.84    | 0.623       | 4.7 |
+      | **891** | ~1030 | ~2.5 | ~0.84 | **0.728 (peak!)** | 4.5 |
+      | 999 | 1018  | 2.17  | 0.81    | **0.635**   | 4.4 |
+
+    - **Peak `mean_bond_count = 2.59 @ gen 862` — 12× vs S76's 0.21.**
+    - **Peak `immune_frac = 0.728 @ gen 891` — 72.8 % populace immune
+      proti hunteru, sustained > 0.5 napříč gen 200-1000.**
+    - **`bond_active_frac` saturuje 0.74-0.84** = 74-84 % cells je
+      v aktivním bond network. Tissue regime stable napříč 1000 gen.
+
+- **Závěr — multicelularita potvrzena:**
+  - **Sprint 78 je tipping point Decade 73-82.** Direct fitness reward
+    konečně přepsal selekční dynamiku — bondované lineages reprodukují
+    víc, dominují populaci, dosahují 2-3 bondy per cell average.
+  - **Hunter pressure stále aktivní** ✓: 1500-2700 atks/gen napříč 1000 gen.
+    Cells dělají immune_frac 60-70 % — hunter atakuje jen menšinu solo
+    cells / nově narozených. Solo niche je marginal — populace dominantně
+    multicelular.
+  - **Body shape converged k cluster-friendly** ~asp 4.5 (under cap 5).
+    No needle attractor, žádné extreme streamlining — cells si zachovaly
+    body shape vhodný pro cluster geometry.
+  - **Population doubled vs S77** (1035 vs 398). Tissue cooperation =
+    energy gain z food share + immunity from hunters = pop boost.
+
+- **Implikace pro Sprint 79+:**
+  - **Multicelularita je foundation, teď můžeme stavět nahoru.** Možnosti:
+    - **Cluster reproduction** — bonded clusters spawnou offspring uvnitř
+      clusteru (Sprint 70 retry s lepšími initial conditions). Tissue
+      přetrvává napříč generacemi.
+    - **HUD overlay** s tissue stats — visual confirmation v rendereru.
+    - **Renderer screencast** — zaznamenat 2-min visual průkaz tkání.
+    - **Photic / thermal stratification** — niche separation by depth
+      ve volume (S64 z=50). Diferencované tkáně podle hloubky.
+  - **Tuning sweep** — sledovat, jak `BOND_FOOD_SHARE_FRAC` ovlivňuje
+    výsledek. 0.3 funguje; 0.1 možná příliš slabé, 0.5+ možná
+    over-incentivuje (cluster everything regardless of niche).
+
+- **Poznámky:**
+  - **Wall-clock −31 % vs S77** kvůli vyšší cell density (1035 vs 398) +
+    víc collision/bond compute. Acceptable — 673 ticks/s je pořád dobré.
+  - **Population growth healthy.** Cells: 200 → 568 (gen 49) → 1018 (gen 999).
+    Žádný extinction, žádný oscillation crash.
+  - **Speed converged k 184-191** — at cap (200) ale ne pinned (S77/S77
+    byly 192). Cells pomaleji, protože cluster pohyb omezuje top speed.
+  - **Spike konvergoval k 0.02-0.05** (vs S77's 0.05-0.20). Bez potřeby
+    spike-driven defense (cluster immune) cells ho opustily.
+  - **Co Sprint 78 NEŘEŠÍ (Sprint 79+):**
+    - Cluster reproduction (offspring inheritance bond network).
+    - HUD overlay s tissue stats.
+    - Renderer screencast / visual proof.
+    - Photic stratification, GPU collision, anisotropic collision.
+
+## Sprinty 79–82 — open-ended
+
+- **Sprint 79 (priorita):** renderer screencast + HUD bond stats.
+  Konečně vidět tissue regime pohledem.
+- **Sprint 79+:** Cluster reproduction (Sprint 70 retry with S78
+  baseline) — offspring spawnou uvnitř parent clusteru.
+- **Sprint 79+:** `BOND_FOOD_SHARE_FRAC` sweep (0.1, 0.5, 0.7) —
+  najít balance ne-trivialní cluster vs nezávislé cells.
+- **Sprint 79+:** Photic stratification (z-gradient light field +
+  photoreceptor sensor input) — niche separation by depth.
+- **Sprint 79+:** Thermal stratification (z-gradient temperature).
+- **Sprint 79+:** GPU collision shader, anisotropic collision.
+- **Sprint 79+:** Spatial autocorrelation adhesion_type clustering metric.
