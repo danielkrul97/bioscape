@@ -368,10 +368,11 @@ fn main() {
         .register_diagnostic(Diagnostic::new(DIAG_RENDER_OVERHEAD).with_suffix(" ms"))
         .init_resource::<TickCounter>()
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`.
-        // Sprint 88: white → deep ocean blue. Match s DistanceFog color tak aby
-        // fog-fadeout splynul s pozadím (no harsh edges). HDR pipeline tone-mapuje
-        // tak, že drobně pod 0 v sRGB → near-black ale s mírným blue tintem.
-        .insert_resource(ClearColor(Color::srgb(0.02, 0.06, 0.12)))
+        // Sprint 88: white → ocean blue. Match s DistanceFog color tak aby
+        // fog-fadeout splynul s pozadím (no harsh edges).
+        // Sprint 88.1: bumped up — pre-fix bylo příliš tmavé, scéna prakticky
+        // black. Medium ocean blue drží underwater feel ale zachová viditelnost.
+        .insert_resource(ClearColor(Color::srgb(0.08, 0.18, 0.30)))
         .init_resource::<AdhesionMaterials>()
         .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
@@ -480,8 +481,8 @@ fn setup(
         Tonemapping::TonyMcMapface,
         Bloom::NATURAL,
         DistanceFog {
-            color: Color::srgb(0.04, 0.10, 0.18),
-            falloff: FogFalloff::ExponentialSquared { density: 0.0004 },
+            color: Color::srgb(0.08, 0.18, 0.30),
+            falloff: FogFalloff::ExponentialSquared { density: 0.0002 },
             ..default()
         },
         IsDefaultUiCamera,
@@ -495,18 +496,20 @@ fn setup(
     ));
 
     // Ambient + DirectionalLight pro 3D scénu. Sprint 88: tinted bluish ambient
-    // (underwater feel), reduced directional (HDR + bloom posílí highlights →
-    // pre-S88 ilumince by oversaturovaly bloom). DirectionalLight zůstává jako
-    // "sluneční" key light pronikající od povrchu šikmo.
+    // (underwater feel) + DirectionalLight jako "sluneční" key light pronikající
+    // od povrchu šikmo. Sprint 88.1: bumped up brightness — pre-fix illuminance
+    // 6000 + ambient 600 produkovaly blackout scene. HDR + bloom kombinaci nutno
+    // krmit dostatkem světla aby base scene byla viditelná, ne jen emissive
+    // bloom highlights.
     commands.spawn(AmbientLight {
-        color: Color::srgb(0.5, 0.7, 1.0),
-        brightness: 600.0,
+        color: Color::srgb(0.6, 0.75, 1.0),
+        brightness: 1500.0,
         ..default()
     });
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(0.95, 0.97, 1.0),
-            illuminance: 6000.0,
+            illuminance: 10000.0,
             shadows_enabled: false,
             ..default()
         },
@@ -715,18 +718,18 @@ fn adhesion_material(
     }
     let hue = idx as f32 * (360.0 / 8.0);
     // Sprint 85: saturation 0.85 → 1.0 — sytější body color.
-    // Sprint 88: emissive ∝ hue color s 0.4× multiplier. Pod HDR + Bloom
-    // se cells stanou „bioluminescent" — světélkují vlastní hue. Lower
-    // lightness 0.55 → 0.45 aby base + emissive nepřesvítily k bílé.
-    let color = Color::hsl(hue, 1.0, 0.45);
-    let emissive_color = Color::hsl(hue, 1.0, 0.4);
+    // Sprint 88: emissive ∝ hue color. Pod HDR + Bloom cells „bioluminescent".
+    // Sprint 88.1: lightness 0.45 → 0.55 (back to S85 brightness), emissive
+    // multiplier 0.8 → 0.6 — méně agresivní glow, primárně viditelnost base.
+    let color = Color::hsl(hue, 1.0, 0.55);
+    let emissive_color = Color::hsl(hue, 1.0, 0.45);
     let emissive_linear = emissive_color.to_linear();
     let handle = materials.add(StandardMaterial {
         base_color: color,
         emissive: LinearRgba::new(
-            emissive_linear.red * 0.8,
-            emissive_linear.green * 0.8,
-            emissive_linear.blue * 0.8,
+            emissive_linear.red * 0.6,
+            emissive_linear.green * 0.6,
+            emissive_linear.blue * 0.6,
             1.0,
         ),
         perceptual_roughness: 0.5,
