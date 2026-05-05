@@ -39,6 +39,8 @@ bevy = { version = "0.18", default-features = false, features = [
     "3d_bevy_render",
     "bevy_core_pipeline",
     "bevy_pbr",
+    # Sprint 88: post_process pro Bloom (atmospheric pass).
+    "bevy_post_process",
     # Sprint 69: gizmo lines pro bond visualization (debug-line drawing
     # napřímo z systému přes `Gizmos` system param). Oba feature flagy
     # potřeba — `bevy_gizmos` je data+systems, `bevy_gizmos_render` je actual

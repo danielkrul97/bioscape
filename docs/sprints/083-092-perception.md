@@ -417,7 +417,93 @@ sebou, kterou cells mohou flank-uniknout.
   - Brain output „active gaze".
   - Multiple eyes.
 
-## Sprinty 88+ — open-ended
+## Sprint 88 — atmospheric pass (renderer eye-candy v1)
+
+- **Cíl:** transformovat dev-tool look (white background, flat plastic
+  spheres) na art-piece look (deep ocean, bioluminescent cells). Quick-win
+  renderer pass, žádný sim impact — pouze visual layer. HDR+Bloom dovolí
+  emissive > 1.0 hodnoty bloom-out na halos; depth fog tints far objects
+  modře (atmospheric perspective); cells & hunter dostávají emissive
+  glow.
+
+- **Mechanismus:**
+  - **Cargo.toml:** `bevy_post_process` feature flag pro `Bloom`
+    component access (Bevy 0.18 přesunul Bloom z `core_pipeline` do
+    `bevy_post_process`).
+  - **Camera (`main.rs:setup`):**
+    - `Hdr` marker component — zero-sized, enables HDR backbuffer.
+    - `Tonemapping::TonyMcMapface` — modern filmic curve, dobrý dynamic
+      range pro biologické scény.
+    - `Bloom::NATURAL` — energy-conserving preset, intensity 0.15. Cells
+      s emissive > base získají soft halo.
+    - `DistanceFog` color `srgb(0.04, 0.10, 0.18)`, density 0.0004
+      ExponentialSquared. Fade-out far cells/floor do deep blue ambiance.
+  - **ClearColor:** `Color::WHITE` → `srgb(0.02, 0.06, 0.12)` (deep
+    blue-black). Match s fog color → no harsh edges between fog horizon
+    a background.
+  - **Lights:**
+    - AmbientLight: `WHITE` brightness 1500 → `srgb(0.5, 0.7, 1.0)` (cool
+      bluish), brightness 600. Underwater feel.
+    - DirectionalLight: illuminance 12000 → 6000, color slight cool
+      tint. Reduced kvůli HDR + Bloom — pre-S88 hodnoty by oversaturovaly
+      bloom highlights k pure white.
+  - **Cell material (`adhesion_material`):**
+    - HSL lightness 0.55 → 0.45 (darker base, lets emissive dominate).
+    - `emissive: hue × 0.8` linear — cells září vlastní hue (hue-coded
+      bioluminescence). 8 distinct adhesion-type "tribes" jsou ostře
+      rozlišené i v slabém ambient light.
+  - **Hunter material:**
+    - Base color stays dark red, emissive bumped na `LinearRgba(2.5, 0.2,
+      0.1)` — super-saturated red glow (HDR linear > 1.0). Bloom catches
+      → hunter visible jako menacing red beacon i z dálky přes fog.
+  - **Bond gizmo lines:**
+    - `Color::hsl(hue, 1.0, 0.6).to_linear() × 3.0` — multiplied linear
+      space. Bevy gizmos render do HDR backbuffer, super-bright values
+      Bloom catches → bondy svítí jako spring laser-lines, viditelné
+      i v denním ambient.
+
+- **Sim impact:** **žádný**. Visual-only change. Headless mode (no
+  renderer) unaffected. CSV/determinism preserved. Žádné nové RNG draws.
+
+- **GPU cost:** HDR backbuffer (RGBA16F místo RGBA8) + Bloom (mip pyramid
+  generation) + fog (additional uniform) + ExtendedMaterial ne-používáme,
+  takže emissive je v rámci stejného StandardMaterial pipeline. Estimated
+  +1-2 ms/frame na GTX 1060+; minor cost vs sim hot path.
+
+- **Test suite:** 124/124 pass — pure visual change, žádné sim regression.
+
+- **NETESTOVÁNO vizuálně** — implementační agent nemá GUI access, nemůže
+  spustit `cargo run` a porovnat output. User akce: `cargo run --features
+  dev` a vizuální ověření. Pokud:
+  - Cells nejsou vidět: bloom intensity příliš agresivní → snížit
+    `Bloom::NATURAL.intensity` nebo lower emissive multiplier.
+  - Fog příliš opaque: snížit `density` z 0.0004 na 0.0002.
+  - Background příliš tmavé: ClearColor `srgb(0.02, 0.06, 0.12)` →
+    bump na `(0.05, 0.10, 0.18)`.
+  - Hunter "exploduje" v bloom: emissive `LinearRgba(2.5, ..)` → 1.5.
+
+- **Výstup:**
+  - `Cargo.toml`: + `bevy_post_process` feature.
+  - `src/main.rs`: imports (Bloom, Tonemapping, DistanceFog, FogFalloff,
+    Hdr), camera spawn rozšířen o 4 components, ClearColor change, lights
+    re-tuned, `adhesion_material` emissive, hunter_material emissive boost,
+    bond gizmo HDR-multiplied color.
+
+- **Co Sprint 88 NEŘEŠÍ (S89+):**
+  - Per-cell energy-modulated emissive (cells dim/bright dle energy).
+    Vyžaduje per-tick material swap nebo ExtendedMaterial s instance
+    attributes — větší feature.
+  - Cell_state visual coupling (selfish blue ↔ altruist red blend).
+    Vyžaduje multi-axis material cache.
+  - Plankton particles / dust v pozadí.
+  - Volumetric smell/pheromone field overlay.
+  - God rays / light shafts.
+  - Cell trails (motion streaks).
+  - Predation flash / death ripple particles.
+  - Subsurface scattering on cells (jelly translucency).
+  - Cinematic camera modes / HUD graphs.
+
+## Sprinty 89+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud

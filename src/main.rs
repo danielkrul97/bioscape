@@ -1,12 +1,16 @@
 use bevy::asset::RenderAssetUsages;
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{
     Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, FrameTimeDiagnosticsPlugin,
     LogDiagnosticsPlugin, RegisterDiagnostic,
 };
 use bevy::image::Image;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
+use bevy::pbr::{DistanceFog, FogFalloff};
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::view::Hdr;
 use std::time::Instant;
 
 const DIAG_CELL_COUNT: DiagnosticPath = DiagnosticPath::const_new("sim/cell_count");
@@ -363,9 +367,11 @@ fn main() {
         .register_diagnostic(Diagnostic::new(DIAG_TICKS_PER_FRAME).with_suffix(" ticks"))
         .register_diagnostic(Diagnostic::new(DIAG_RENDER_OVERHEAD).with_suffix(" ms"))
         .init_resource::<TickCounter>()
-        // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`
-        // (rich zones jsou bílé, poor zelené). Margins jsou bílé.
-        .insert_resource(ClearColor(Color::WHITE))
+        // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`.
+        // Sprint 88: white → deep ocean blue. Match s DistanceFog color tak aby
+        // fog-fadeout splynul s pozadím (no harsh edges). HDR pipeline tone-mapuje
+        // tak, že drobně pod 0 v sRGB → near-black ale s mírným blue tintem.
+        .insert_resource(ClearColor(Color::srgb(0.02, 0.06, 0.12)))
         .init_resource::<AdhesionMaterials>()
         .init_resource::<OrbitCamera>()
         .insert_resource(Time::<Fixed>::from_hz(FIXED_TIMESTEP_HZ as f64))
@@ -461,9 +467,23 @@ fn setup(
     // Near/far explicitně dimenzované na CAMERA_OFFSET_DISTANCE — default_3d()
     // má far ~1000, ale camera je 3000 od target, takže by scéna padla za far
     // plane a vše by bylo culled.
+    //
+    // Sprint 88: HDR + Bloom + Tonemapping + DistanceFog atmospheric pass.
+    // HDR backbuffer dovolí emissive > 1.0 (cells/hunter glow), Bloom rozšíří
+    // bright pixels na soft halos, Tonemapping namapuje HDR rozsah na sRGB.
+    // DistanceFog přidá deep-ocean blue tint na vzdálené objekty (ortho má
+    // limited depth differentiation, ale fade k floor overlay je signifikantní).
     let initial_orbit = OrbitCamera::default();
     commands.spawn((
         Camera3d::default(),
+        Hdr,
+        Tonemapping::TonyMcMapface,
+        Bloom::NATURAL,
+        DistanceFog {
+            color: Color::srgb(0.04, 0.10, 0.18),
+            falloff: FogFalloff::ExponentialSquared { density: 0.0004 },
+            ..default()
+        },
         IsDefaultUiCamera,
         Projection::Orthographic(OrthographicProjection {
             scale: initial_orbit.scale,
@@ -474,16 +494,19 @@ fn setup(
         initial_orbit.transform(),
     ));
 
-    // Ambient + DirectionalLight pro 3D scénu. Bevy 0.18 typické hodnoty:
-    // ambient ~1000-2000, directional ~10000+ pro outdoor scénu.
+    // Ambient + DirectionalLight pro 3D scénu. Sprint 88: tinted bluish ambient
+    // (underwater feel), reduced directional (HDR + bloom posílí highlights →
+    // pre-S88 ilumince by oversaturovaly bloom). DirectionalLight zůstává jako
+    // "sluneční" key light pronikající od povrchu šikmo.
     commands.spawn(AmbientLight {
-        color: Color::WHITE,
-        brightness: 1500.0,
+        color: Color::srgb(0.5, 0.7, 1.0),
+        brightness: 600.0,
         ..default()
     });
     commands.spawn((
         DirectionalLight {
-            illuminance: 12000.0,
+            color: Color::srgb(0.95, 0.97, 1.0),
+            illuminance: 6000.0,
             shadows_enabled: false,
             ..default()
         },
@@ -641,11 +664,13 @@ fn setup(
     // Sprint 71: macropredator setup. Hunter mesh = větší sphere (4× CELL_RADIUS),
     // tmavě červený material — visually distinct od cells. HUNTER_TARGET_COUNT
     // hunters spawnou na náhodné pozice; constant pop, žádný respawn.
+    // Sprint 88: bumped emissive na red glow s HDR > 1.0 hodnoty — Bloom catches
+    // hunter jako menacing red beacon viditelný z dálky.
     let hunter_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS * 4.0).mesh().ico(2).unwrap());
     let hunter_material = materials.add(StandardMaterial {
-        base_color: Color::hsl(0.0, 0.7, 0.30),
+        base_color: Color::srgb(0.4, 0.05, 0.05),
         perceptual_roughness: 0.4,
-        emissive: Color::hsl(0.0, 0.6, 0.15).into(),
+        emissive: LinearRgba::new(2.5, 0.2, 0.1, 1.0),
         ..default()
     });
     let mut hunter_rng = rand::rng();
@@ -689,12 +714,22 @@ fn adhesion_material(
         return h.clone();
     }
     let hue = idx as f32 * (360.0 / 8.0);
-    // Sprint 85: saturation 0.85 → 1.0 — sytější body color, ostřejší
-    // adhesion-type rozlišení proti bílému ClearColoru.
-    let color = Color::hsl(hue, 1.0, 0.55);
+    // Sprint 85: saturation 0.85 → 1.0 — sytější body color.
+    // Sprint 88: emissive ∝ hue color s 0.4× multiplier. Pod HDR + Bloom
+    // se cells stanou „bioluminescent" — světélkují vlastní hue. Lower
+    // lightness 0.55 → 0.45 aby base + emissive nepřesvítily k bílé.
+    let color = Color::hsl(hue, 1.0, 0.45);
+    let emissive_color = Color::hsl(hue, 1.0, 0.4);
+    let emissive_linear = emissive_color.to_linear();
     let handle = materials.add(StandardMaterial {
         base_color: color,
-        perceptual_roughness: 0.6,
+        emissive: LinearRgba::new(
+            emissive_linear.red * 0.8,
+            emissive_linear.green * 0.8,
+            emissive_linear.blue * 0.8,
+            1.0,
+        ),
+        perceptual_roughness: 0.5,
         ..default()
     });
     cache.0[idx] = Some(handle.clone());
@@ -1519,7 +1554,11 @@ fn draw_bond_gizmos(
         let start = Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]);
         let hue = adhesion_hue(cell.0.genome.adhesion_type);
         // Sprint 85: saturation 0.85 → 1.0, match s body color v adhesion_material.
-        let color = Color::hsl(hue, 1.0, 0.65);
+        // Sprint 88: linear color × 3.0 multiplier — Bevy gizmos render do HDR
+        // backbufferu, super-bright hodnoty Bloom catches → bondy svítí jako
+        // skutečné spring laser-lines.
+        let base = Color::hsl(hue, 1.0, 0.6).to_linear();
+        let color = Color::linear_rgba(base.red * 3.0, base.green * 3.0, base.blue * 3.0, 1.0);
         for bond in cell.0.bonds.iter().flatten() {
             let Some(end) = id_to_pos.get(&bond.other_cell_id) else {
                 continue;
