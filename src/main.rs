@@ -9,7 +9,7 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::pbr::{DistanceFog, ExtendedMaterial, FogFalloff, MaterialExtension};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{AsBindGroup, Extent3d, TextureDimension, TextureFormat};
 use bevy::shader::ShaderRef;
 use bevy::render::view::Hdr;
 use std::time::Instant;
@@ -101,31 +101,16 @@ const ORBIT_SENSITIVITY: f32 = 0.005;
 /// při startu, hot-reload v dev mode.
 const BIO_SHADER_PATH: &str = "shaders/bio_material.wgsl";
 
-/// Sprint 91: shader-side struct GPU layout. `ShaderType` derive zajistí
-/// 16-byte alignment + matching layout s WGSL `BioParams`. `Reflect` je
-/// požadován protože owner `BioMaterialExt` taky derivuje Reflect.
-#[derive(ShaderType, Reflect, Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct BioParams {
-    pub pattern_kind: u32,
-    pub scale: f32,
-    pub intensity: f32,
-    pub _pad: f32,
-}
-
-/// Sprint 91: procedurální texture extension nad `StandardMaterial`. Single
-/// shader handles obě cell + hunter — `pattern_kind` field switchne mezi
-/// jelly membrane (0) a chitinous scales (1). Voronoi noise s world_normal
-/// jako texture coordinate → texture rotates s mesh.
+/// Sprint 91: empty marker extension nad `StandardMaterial` — žádné custom
+/// uniformy. Shader detekuje hunter vs cell přes `emissive.r > 2.0` (hunter
+/// má LinearRgba(3.5, 0, 0)). Tím se vyhne Bevy 0.18 ExtendedMaterial uniform
+/// binding layout issue (binding 100 neproside validation v `pbr_opaque_mesh_pipeline`).
 ///
-/// Single `#[uniform(100)]` field s ShaderType-derived struct → AsBindGroup
-/// generuje 1 binding s celým struct uvnitř. (Multi-field same-binding by
-/// vyžadovalo bindless mode nebo specific webgl2 cfg.)
+/// Pattern_kind se přepíná in-shader podle base material color → 1 shader
+/// handles obě cell + hunter. Hunter material má pure-red HDR emissive,
+/// cell materials max ~1.0 emissive intensity.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
-pub struct BioMaterialExt {
-    #[uniform(100)]
-    pub params: BioParams,
-}
+pub struct BioMaterialExt {}
 
 impl MaterialExtension for BioMaterialExt {
     fn fragment_shader() -> ShaderRef {
@@ -763,17 +748,11 @@ fn setup(
         base: StandardMaterial {
             base_color: Color::srgb(0.85, 0.05, 0.05),
             perceptual_roughness: 0.4,
+            // Sprint 91: emissive.r >= 3.5 → shader detekuje jako HUNTER pattern.
             emissive: LinearRgba::new(3.5, 0.0, 0.0, 1.0),
             ..default()
         },
-        extension: BioMaterialExt {
-            params: BioParams {
-                pattern_kind: 1,
-                scale: 14.0,
-                intensity: 1.0,
-                _pad: 0.0,
-            },
-        },
+        extension: BioMaterialExt {},
     });
     // Sprint 89: každý hunter dostává random genome + lineage. Initial
     // population spawnuje se tady; Sprint 89+ lifecycle (death/reproduce)
@@ -829,6 +808,7 @@ fn adhesion_material(
     let handle = bio_materials.add(BioMaterial {
         base: StandardMaterial {
             base_color: color,
+            // Sprint 91: emissive max ~1.0 → shader detekuje jako CELL pattern.
             emissive: LinearRgba::new(
                 emissive_linear.red,
                 emissive_linear.green,
@@ -838,14 +818,7 @@ fn adhesion_material(
             perceptual_roughness: 0.5,
             ..default()
         },
-        extension: BioMaterialExt {
-            params: BioParams {
-                pattern_kind: 0,
-                scale: 6.0,
-                intensity: 1.0,
-                _pad: 0.0,
-            },
-        },
+        extension: BioMaterialExt {},
     });
     cache.0[idx] = Some(handle.clone());
     handle

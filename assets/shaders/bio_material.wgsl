@@ -3,27 +3,18 @@
 // ExtendedMaterial<StandardMaterial, BioMaterialExt>; tento shader override
 // fragment a moduluje `pbr_input.material` před apply_pbr_lighting.
 //
-// Pattern_kind:
-//   0 = CELL (jelly membrane: bright Voronoi edges, dim cores, smooth)
-//   1 = HUNTER (chitinous scales: dark edges, bright centers, partial metallic)
+// Pattern_kind se nezprává uniformem (binding 100 vs Bevy 0.18 layout = pain),
+// ale detekce ze `pbr_input.material.emissive.r`:
+//   emissive.r > 2.0 → HUNTER (chitinous scales) — hunter má LinearRgba(3.5,0,0)
+//   else            → CELL (jelly membrane)
 //
-// Texture coord = world_normal × scale → texture rotates with cell (looks 3D-baked
-// na povrchu mesh).
+// Texture coord = world_normal × scale → texture rotates s mesh.
 
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing, alpha_discard},
     forward_io::{VertexOutput, FragmentOutput},
 }
-
-struct BioParams {
-    pattern_kind: u32,
-    scale: f32,
-    intensity: f32,
-    _pad: f32,
-}
-
-@group(2) @binding(100) var<uniform> bio: BioParams;
 
 fn hash31(p: vec3<f32>) -> f32 {
     let h = dot(p, vec3<f32>(127.1, 311.7, 74.7));
@@ -75,36 +66,40 @@ fn fragment(
     pbr_input.material.base_color =
         alpha_discard(pbr_input.material, pbr_input.material.base_color);
 
-    // Procedurální coordinate = world_normal × scale. Normal je unit vector
-    // → world_position-independent → texture „nedrifuje" když cell letí
-    // prostorem.
-    let p = in.world_normal * bio.scale;
+    // Detect hunter vs cell přes emissive intensity. Hunter má emissive.r >= 3.5,
+    // cells max 1.0 (HSL lightness 0.5 = LinearRgba.r ≤ 1.0).
+    let is_hunter = pbr_input.material.emissive.r > 2.0;
+
+    // Procedurální coord = world_normal × scale. Hunter má denser pattern (14)
+    // pro „scaly" look; cells coarser (6) pro membrane segments.
+    let scale = select(6.0, 14.0, is_hunter);
+    let p = in.world_normal * scale;
     let v = voronoi(p);
     let edge = smoothstep(0.0, 0.2, v.y - v.x);
 
-    if (bio.pattern_kind == 0u) {
-        // CELL: jelly membrane. Bright Voronoi edges (membrane web),
-        // dim cores (cytoplasm). Emissive boost na edges → bioluminescence.
-        let core_factor = 1.0 - edge;
-        pbr_input.material.base_color =
-            vec4<f32>(pbr_input.material.base_color.rgb * mix(0.4, 1.4, edge) * bio.intensity,
-                      pbr_input.material.base_color.a);
-        pbr_input.material.emissive =
-            vec4<f32>(pbr_input.material.emissive.rgb * (1.0 + edge * 2.5),
-                      pbr_input.material.emissive.a);
-        pbr_input.material.perceptual_roughness = mix(0.3, 0.7, core_factor);
-    } else {
+    if (is_hunter) {
         // HUNTER: chitinous scales. Dark edges (between scales), bright
         // centers (scale plates). Partial metallic na edges → reflective armor.
         let scale_center = 1.0 - edge;
         pbr_input.material.base_color =
-            vec4<f32>(pbr_input.material.base_color.rgb * mix(0.3, 1.2, scale_center) * bio.intensity,
+            vec4<f32>(pbr_input.material.base_color.rgb * mix(0.3, 1.2, scale_center),
                       pbr_input.material.base_color.a);
         pbr_input.material.emissive =
             vec4<f32>(pbr_input.material.emissive.rgb * mix(2.5, 0.5, edge),
                       pbr_input.material.emissive.a);
         pbr_input.material.perceptual_roughness = mix(0.2, 0.6, edge);
         pbr_input.material.metallic = mix(0.0, 0.4, edge);
+    } else {
+        // CELL: jelly membrane. Bright Voronoi edges (membrane web),
+        // dim cores (cytoplasm). Emissive boost na edges → bioluminescence.
+        let core_factor = 1.0 - edge;
+        pbr_input.material.base_color =
+            vec4<f32>(pbr_input.material.base_color.rgb * mix(0.4, 1.4, edge),
+                      pbr_input.material.base_color.a);
+        pbr_input.material.emissive =
+            vec4<f32>(pbr_input.material.emissive.rgb * (1.0 + edge * 2.5),
+                      pbr_input.material.emissive.a);
+        pbr_input.material.perceptual_roughness = mix(0.3, 0.7, core_factor);
     }
 
     var out: FragmentOutput;
