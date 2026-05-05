@@ -36,7 +36,7 @@ use bioscape::{
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_INPUTS, CARRION_FOOD_COUNT, CELL_RADIUS,
     CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS,
-    FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE, GENERATIONS_PER_EPOCH, HAZARD_AMP,
+    FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, GENERATIONS_PER_EPOCH, HAZARD_AMP,
     HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS,
     HUNTER_TARGET_COUNT, INITIAL_CELLS, LEARNING_RATE,
     MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH,
@@ -177,7 +177,7 @@ impl Default for CellGrid {
 }
 
 #[derive(Resource)]
-struct FoodGrid(SpatialGrid<Entity, ()>);
+struct FoodGrid(SpatialGrid<Entity, bioscape::FoodKind>);
 
 impl Default for FoodGrid {
     fn default() -> Self {
@@ -1423,16 +1423,22 @@ fn cell_eats_food(
         })
         .collect();
     let food_grid_ref = &food_grid.0;
+    // Sprint 92: snapshot s carnivore_score per cell pro food efficiency lookup.
+    let cell_carnivore: std::collections::HashMap<Entity, f32> = cells
+        .iter()
+        .map(|(e, c)| (e, c.0.genome.carnivore_score))
+        .collect();
     let candidates: Vec<Option<(Entity, f32)>> = snapshot
         .par_iter()
-        .map(|(_entity, pos, max_axis, dims, heading, pitch)| {
+        .map(|(entity, pos, max_axis, dims, heading, pitch)| {
             let eat_r = EAT_RADIUS * *max_axis;
+            let carnivore_score = cell_carnivore.get(entity).copied().unwrap_or(0.0);
             let mut ate: Option<(Entity, f32)> = None;
             food_grid_ref.for_each_in_radius_toroidal(
                 *pos,
                 eat_r,
                 SIMULATION_HALF,
-                |food_e, food_pos, _| {
+                |food_e, food_pos, food_kind| {
                     if ate.is_some() {
                         return;
                     }
@@ -1440,15 +1446,21 @@ fn cell_eats_food(
                     let md = bioscape::min_image_delta(*pos, food_pos, SIMULATION_HALF);
                     let ghost_pos = [pos[0] + md[0], pos[1] + md[1], food_pos[2]];
                     if bioscape::eat_test_pose(*pos, *heading, *pitch, *dims, ghost_pos, EAT_RADIUS) {
-                        let value = FOOD_VALUE
+                        // Sprint 92: food value = base_value(kind) × multiplier × value_factor
+                        // × eat_efficiency(kind, carnivore_score). Hunter carrion má
+                        // vyšší base ale vyžaduje carnivore digestion; plant herbivore.
+                        let efficiency = bioscape::eat_efficiency(food_kind, carnivore_score);
+                        let value = bioscape::food_base_value(food_kind)
                             * food_multiplier(
                                 world_map.0.sample([food_pos[0], food_pos[1], 0.0]),
                             )
                             * Food {
                                 position: food_pos,
                                 age_ticks: 0,
+                                kind: food_kind,
                             }
-                            .value_factor();
+                            .value_factor()
+                            * efficiency;
                         ate = Some((food_e, value));
                     }
                 },
@@ -1625,7 +1637,11 @@ fn step_hunters(
             );
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if d2 < attack_r2 {
-                let damage_dealt = damage * dt;
+                // Sprint 92: edge-vulnerability — damage scales s exposure
+                // (= 1 - n_bonds × EXPOSURE_PER_BOND). Solo cells take full
+                // damage, deeply interior cells take 0.
+                let exposure = bioscape::cell_exposure(cells_only[i].n_bonds());
+                let damage_dealt = damage * exposure * dt;
                 attacks.push((cell_snapshot[i].0, damage_dealt));
                 gain = damage_dealt * bioscape::HUNTER_ENERGY_PER_DAMAGE;
             }
@@ -1689,7 +1705,11 @@ fn hunters_lifecycle(
                     h.position[2].clamp(-half[2], half[2]),
                 ];
                 commands.spawn((
-                    FoodEntity(Food { position: pos, age_ticks: 0 }),
+                    FoodEntity(Food {
+                        position: pos,
+                        age_ticks: 0,
+                        kind: bioscape::FoodKind::HunterCarrion,
+                    }),
                     Mesh3d(food_mesh.0.clone()),
                     MeshMaterial3d(food_material.0.clone()),
                     Transform::from_xyz(pos[0], pos[1], pos[2]),
@@ -2238,7 +2258,11 @@ fn cell_dies_on_zero_energy(
                     cell.0.position[2].clamp(-half[2], half[2]),
                 ];
                 commands.spawn((
-                    FoodEntity(Food { position: pos, age_ticks: 0 }),
+                    FoodEntity(Food {
+                        position: pos,
+                        age_ticks: 0,
+                        kind: bioscape::FoodKind::Carrion,
+                    }),
                     Mesh3d(food_mesh.0.clone()),
                     MeshMaterial3d(food_material.0.clone()),
                     Transform::from_xyz(pos[0], pos[1], pos[2]),
@@ -2281,7 +2305,7 @@ fn rebuild_food_grid(
     mut grid: ResMut<FoodGrid>,
     foods: Query<(Entity, &FoodEntity)>,
 ) {
-    grid.0.rebuild(foods.iter().map(|(e, f)| (e, f.0.position, ())));
+    grid.0.rebuild(foods.iter().map(|(e, f)| (e, f.0.position, f.0.kind)));
 }
 
 // Generous broad-phase upper bound on "other" effective_radius — captures

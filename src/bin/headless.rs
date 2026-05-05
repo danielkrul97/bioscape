@@ -13,7 +13,7 @@ use bioscape::{
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
     COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
-    DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, FOOD_VALUE,
+    DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
     GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
     HERD_RADIUS, HUNTER_TARGET_COUNT,
     INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
@@ -129,7 +129,7 @@ struct World {
     // neighbors používá — `cell_grid` před brain_act/resolve_collisions/predate,
     // `food_grid` před brain_act/eat_food.
     cell_grid: SpatialGrid<usize, f32>,
-    food_grid: SpatialGrid<usize, ()>,
+    food_grid: SpatialGrid<usize, bioscape::FoodKind>,
     // Persistent scratch — reused per tick to avoid hot-loop allocations.
     deltas_scratch: Vec<[f32; 3]>,
     /// Sprint 65: collision velocity damping (inelastic) — per pair, closing
@@ -865,7 +865,7 @@ impl World {
             self.foods
                 .iter()
                 .enumerate()
-                .map(|(i, f)| (i, f.position, ())),
+                .map(|(i, f)| (i, f.position, f.kind)),
         );
 
         let cell_grid = &self.cell_grid;
@@ -893,7 +893,7 @@ impl World {
 
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
-                food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, ()| {
+                food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, _| {
                     let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 > vr2 || d2 >= best_food_d2 {
@@ -988,7 +988,7 @@ impl World {
             self.foods
                 .iter()
                 .enumerate()
-                .map(|(i, f)| (i, f.position, ())),
+                .map(|(i, f)| (i, f.position, f.kind)),
         );
 
         let cell_grid = &self.cell_grid;
@@ -1013,7 +1013,7 @@ impl World {
 
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
-                food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, ()| {
+                food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, _| {
                     let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 > vr2 || d2 >= best_food_d2 {
@@ -1602,7 +1602,10 @@ impl World {
                 );
                 let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                 if d2 < attack_r2 {
-                    let damage_dealt = damage * dt;
+                    // Sprint 92: edge-vulnerability — damage scales s exposure
+                    // (= 1 - n_bonds × EXPOSURE_PER_BOND).
+                    let exposure = bioscape::cell_exposure(cells_ref[i].n_bonds());
+                    let damage_dealt = damage * exposure * dt;
                     attacks.push((i, damage_dealt));
                     gain = damage_dealt * bioscape::HUNTER_ENERGY_PER_DAMAGE;
                 }
@@ -1636,7 +1639,11 @@ impl World {
                             .clamp(-WORLD_HALF[1], WORLD_HALF[1]),
                         pos[2].clamp(-WORLD_HALF[2], WORLD_HALF[2]),
                     ];
-                    self.foods.push(Food { position: p, age_ticks: 0 });
+                    self.foods.push(Food {
+                        position: p,
+                        age_ticks: 0,
+                        kind: bioscape::FoodKind::HunterCarrion,
+                    });
                 }
                 self.hunters.swap_remove(i);
                 self.hunter_deaths_gen += 1;
@@ -1691,7 +1698,7 @@ impl World {
             self.foods
                 .iter()
                 .enumerate()
-                .map(|(i, f)| (i, f.position, ())),
+                .map(|(i, f)| (i, f.position, f.kind)),
         );
         self.eaten_scratch.clear();
         self.eaten_scratch.resize(self.foods.len(), false);
@@ -1733,7 +1740,7 @@ impl World {
                     pos,
                     search_r,
                     WORLD_HALF,
-                    |idx, _fp, ()| {
+                    |idx, _fp, _kind| {
                         if ate.is_some() {
                             return;
                         }
@@ -1742,13 +1749,21 @@ impl World {
                         let ghost = Food {
                             position: [pos[0] + md[0], pos[1] + md[1], food.position[2]],
                             age_ticks: food.age_ticks,
+                            kind: food.kind,
                         };
                         if cell.eat_test(&ghost, EAT_RADIUS) {
-                            let value = FOOD_VALUE
+                            // Sprint 92: food value = base_value(kind) ×
+                            // multiplier × decay × eat_efficiency(kind, score).
+                            let efficiency = bioscape::eat_efficiency(
+                                food.kind,
+                                cell.genome.carnivore_score,
+                            );
+                            let value = bioscape::food_base_value(food.kind)
                                 * food_multiplier(
                                     map.sample([food.position[0], food.position[1], 0.0]),
                                 )
-                                * food.value_factor();
+                                * food.value_factor()
+                                * efficiency;
                             ate = Some((idx, value));
                         }
                     },
@@ -2026,7 +2041,11 @@ impl World {
                             .clamp(-half[1], half[1]),
                         cell.position[2].clamp(-half[2], half[2]),
                     ];
-                    new_foods.push(Food { position: pos, age_ticks: 0 });
+                    new_foods.push(Food {
+                        position: pos,
+                        age_ticks: 0,
+                        kind: bioscape::FoodKind::Carrion,
+                    });
                 }
             }
         }

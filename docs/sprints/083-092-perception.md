@@ -804,7 +804,118 @@ sebou, kterou cells mohou flank-uniknout.
   - **Energy-modulated emissive** — material reacts to cell.energy (low =
     dim, high = bright pulse). Vyžaduje per-instance uniform updates.
 
-## Sprinty 92+ — open-ended
+## Sprint 92 — edge-vulnerability + multi-trophic food
+
+- **Cíl:** dva souběžné continuous-gradient pressures driving cluster
+  complexity. Pre-Sprint-92: binary `n_bonds ≥ 2` immunity threshold (S76)
+  byl tipping point — po dosažení žádný další tlak na complexity. Sprint 92
+  replaces s **gradient damage scaling** (více bondů = méně damage) +
+  **multi-trophic food chain** (cluster diversifikace přes diet specialization).
+
+- **Mechanismus #1 — Edge-vulnerability:**
+  - Threshold `HUNTER_BOND_IMMUNITY_THRESHOLD: 2 → 4` — repurpose jako
+    discoverability cap (cells s ≥4 bondy hunter ignoruje, čistě efficiency
+    rozhodnutí).
+  - `cell_exposure(n_bonds) = max(0, 1 - n_bonds × EXPOSURE_PER_BOND)`,
+    `EXPOSURE_PER_BOND = 0.25`. Damage applied = `damage_per_tick × exposure × dt`:
+    - 0 bonds → 1.0 (full damage, solo cell)
+    - 1 bond → 0.75
+    - 2 bonds → 0.5
+    - 3 bonds → 0.25
+    - ≥4 bonds → 0.0 (effectively immune; threshold skipne i target lookup)
+  - Selection pressure: maximalizovat surface-area-to-volume ratio cluster
+    (= sphere). Drive toward větší 3D clusters s many bonds, ne jen S78 line-of-pairs.
+
+- **Mechanismus #3 — Multi-trophic food chain:**
+  - **`FoodKind` enum** (Plant=0, Carrion=1, HunterCarrion=2). Food struct +
+    `kind` field s serde default = Plant pro backward-compat.
+  - **Per-kind base value:** `PLANT_FOOD_VALUE = 20.0`, `CARRION_FOOD_VALUE
+    = 30.0`, `HUNTER_CARRION_FOOD_VALUE = 50.0`. Cell carrion má větší value
+    (concentrated biomass), hunter carrion ještě víc (apex predator drop).
+  - **`carnivore_score: f32` ∈ [0, 1]** gen na `Genome`. 0 = pure herbivore
+    (plant only), 1 = pure carnivore (hunter carrion only). Init range
+    [0.0, 0.3] — bias herbivore aby cells survive cold start.
+  - **`eat_efficiency(kind, score)`:** continuous trade-off:
+    - `Plant + score` → `1 - score` (herbivore best)
+    - `Carrion + score` → `0.5` (universal compromise food)
+    - `HunterCarrion + score` → `score` (carnivore best)
+  - **Drop tagging:** cell death → `Carrion`, hunter death → `HunterCarrion`,
+    ambient spawn → `Plant`. SpatialGrid<usize, FoodKind> carries kind v
+    grid lookup → eat path má kind bez extra Query.
+  - **Synergy:** mixed-diet cluster outperforms monoculture protože má
+    access ke všem food types. Per-cell specialization cooperates v
+    cluster — herbivore cells na plant patches, carnivore cells na hunter
+    carrion drop sites.
+
+- **Genome / MutationConfig changes:**
+  - `Genome.carnivore_score: f32` (serde default 0.0).
+  - `MutationConfig.sigma_carnivore_score: f32`, default `0.02` (~2 %
+    range/gen, pomalejší než ostatní geny aby selekce přes food availability
+    signal stihla operate).
+  - Genome::random init `[0.0, 0.3]`, mutate short-circuit pattern (sigma=0
+    → no draw).
+  - Crossover: standard bool draw.
+
+- **Determinismus:** Sprint 92 = nový baseline. RNG draws shifted o
+  carnivore_score initial draw. Inside S92 deterministic.
+
+- **Test suite:** 136/136 pass (132 z S91 + 4 nové: `cell_exposure_endpoints`,
+  `eat_efficiency_diet_specialization`, `food_base_value_per_kind`,
+  `carnivore_score_in_genome_random_initial_range`). Existing 2 hunter
+  immunity tests aktualizovány na nové threshold (HUNTER_BOND_IMMUNITY_THRESHOLD
+  místo hardcoded 3).
+
+- **Smoke seed=0 60 gen:**
+  - Mechanically funguje — cells evolve normálně, hunters lifecycle běží,
+    food kinds taggované.
+  - `immune_frac = 0.000` napříč gens — **selekční signal: žádný cluster
+    nedosáhne 4-bond threshold**. Pre-S92 binary immunity (≥2) byla
+    dosažitelná (~3-5 % cells), nový 4+ je hard cap.
+  - Gradient damage funguje implicitně — cells s 1-3 bondy berou redukovaný
+    damage proporčně k exposure. Bez explicit metric ale viditelné v
+    survival rate.
+
+- **Tuning concerns:**
+  - Hunter pop dropped k 1 (vs S90 cap 50) — exposure scaling reduces avg
+    damage per attack tick → hunter energy gain klesá → reproduce threshold
+    není dosažen často → pop nečerpá nahoru. Sprint 93+ bude tunit
+    HUNTER_ENERGY_PER_DAMAGE up nebo HUNTER_REPRODUCE_THRESHOLD down.
+  - Initial carnivore_score range [0, 0.3] může být too restrictive —
+    žádné carnivore cells initial → hunter carrion useless waste of compute
+    until mutation drift produces score > 0.5. Možný bump initial range to
+    [0, 0.5].
+  - CSV column `immune_frac` semantics shifted (≥4 bondy místo ≥2). Sprint
+    93 by mohl přidat `mean_exposure` nebo `n_bonds_avg` jako lepší
+    diagnostic.
+
+- **Výstup:**
+  - `src/lib.rs`: `EXPOSURE_PER_BOND` const, threshold bump 2→4, `cell_exposure`
+    helper, `FoodKind` enum + Food struct field, `PLANT/CARRION/HUNTER_CARRION_FOOD_VALUE`
+    consts, `food_base_value` + `eat_efficiency` helpers, `carnivore_score`
+    on Genome, `sigma_carnivore_score` on MutationConfig, mutate/crossover/random
+    integration, 4 nové tests, 2 hunter tests aktualizovány.
+  - `src/main.rs`: `FoodGrid<Entity, FoodKind>`, food spawn sites tagují
+    kind (Carrion na cell death, HunterCarrion na hunter death), eat path
+    používá `eat_efficiency(food_kind, carnivore_score)` a `food_base_value(kind)`,
+    hunter damage scales s `cell_exposure`.
+  - `src/bin/headless.rs`: stejné — `food_grid: SpatialGrid<usize, FoodKind>`,
+    eat path s efficiency, damage exposure, hunter death drops HunterCarrion.
+
+- **Co Sprint 92 NEŘEŠÍ (S93+):**
+  - **Visual differentiation food kinds** — všechny food entities mají
+    same green material. Plant/Carrion/HunterCarrion by mohly mít distinct
+    colors (green/brown/red).
+  - **Cluster-shape evolution metric** — surface:volume ratio diagnostic
+    pro CSV.
+  - **Carnivore_avg + food_kind_distribution v CSV** — track diet
+    specialization přes generations.
+  - **Hunter economy re-tune** — exposure scaling reduces avg damage per
+    attack → hunter pop kolabuje. Sprint 93 bump ENERGY_PER_DAMAGE.
+  - **Bond formation incentive** — current bond formation requires brain
+    output[9] threshold. Cluster grows pomalu; gradient defense reward
+    není guaranteed selekční tah pokud bond formation cost dominates.
+
+## Sprinty 93+ — open-ended
 
 - **Sprint 87+:** Long-run sweep (500-1000 gen) s monitoring `fov_avg` +
   `temp_avg` trajektorie. Hypotézy: úzký FOV (~π/4 .. π/2) emergne pokud

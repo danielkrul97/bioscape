@@ -593,6 +593,24 @@ pub fn bond_defense_factor(n_bonds: u32) -> f32 {
     1.0 - BOND_DEFENSE_FRAC * capped
 }
 
+/// Sprint 92: exposure factor pro hunter damage. Edge cells fully exposed,
+/// interior cells fully shielded — selection pressure favorizuje větší +
+/// 3D-spherical clusters (max interior:perimeter ratio).
+///
+/// `exposure = max(0, 1 - n_bonds × EXPOSURE_PER_BOND)`. Hunter damage =
+/// `genome.damage_per_tick × exposure × dt`.
+///
+/// - 0 bonds (solo) → 1.0 (full damage)
+/// - 1 bond → 0.75
+/// - 2 bonds → 0.5
+/// - 3 bonds → 0.25
+/// - ≥4 bonds → 0.0 (effectively immune; HUNTER_BOND_IMMUNITY_THRESHOLD
+///   navíc skipne target lookup → hunter ani neztratí čas chase)
+#[inline]
+pub fn cell_exposure(n_bonds: u32) -> f32 {
+    (1.0 - (n_bonds as f32) * EXPOSURE_PER_BOND).max(0.0)
+}
+
 // ─── Sprint 71: macropredator (Hunter) ────────────────────────────────────────
 // Sprint 70 long-run odhalil emergent predator-extinction event: cell-vs-cell
 // predace zkolapsovala, jakmile byly bonded clustery dostatečně tough. Sprint
@@ -638,14 +656,16 @@ pub const HUNTER_ACC: f32 = 80.0;
 /// Hunter random-walk noise při idle (no cell ve vision). Pomaly drift,
 /// brzy najde cell + zacílí.
 pub const HUNTER_IDLE_DRIFT: f32 = 30.0;
-/// Bond count threshold pro immunity. Cells s ≥ tomuto počtu bondů Hunter
-/// nemůže atakovat — cluster je „too big to swallow". Sprint 71 měl 3
-/// (proto-tissue minimum). Sprint 76: 3 → 2 — Sprint 75 1000-gen smoke
-/// ukázal, že 3-bond threshold byl dosažitelný jen 0.2 % cells krátce;
-/// cells s evolved asp~12 (1D needles) fyzicky neclusterují s 3 sousedy.
-/// 2-bond cluster je „pair / triad" minimum — pořád proto-multicelular,
-/// ale dosažitelný pro elongated body shapes (line of pairs).
-pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 2;
+/// Bond count threshold pro **discoverability** Hunteru. Cells s ≥ tomuto
+/// počtu bondů Hunter nepronásleduje (`nearest_attackable_cell` vrací None) —
+/// cluster je „too deeply interior to bother". Sprint 92: 2 → 4 — replaces
+/// binary immunity s gradient damage. Hunters chase low-bond cells normally,
+/// vysoký bond count = invisible target (čisté efficiency rozhodnutí).
+pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 4;
+/// Sprint 92: per-bond exposure reduction. `exposure = max(0, 1 - n_bonds × this)`.
+/// 0.25 → 0/1/2/3+ bonds dávají exposure 1.0/0.75/0.5/0.25. Při 4+ bonds
+/// exposure floor = 0 a hunter neuvidí target (HUNTER_BOND_IMMUNITY_THRESHOLD).
+pub const EXPOSURE_PER_BOND: f32 = 0.25;
 /// Sprint 84: hunter směrový FOV half-angle (rad). π/3 = 60° → 120° cone.
 /// Predátoři klasicky mají frontal eyes; cells mohou flank-uniknout do blind
 /// spotu. Pevná konstanta (Hunter nemá genom), ne pod selekcí.
@@ -1307,6 +1327,8 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // (range = 26 sim-units = TOP - BOTTOM). Pomalý drift aby selekce stihla
     // tlumit speciaci do depth-coupled niche, ne random walk.
     sigma_thermal_optimum: 0.5,
+    // Sprint 92: carnivore_score drift. 0.02 = 2 % range/gen.
+    sigma_carnivore_score: 0.02,
 };
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     drag: DRAG_COEFFICIENT,
@@ -1642,6 +1664,10 @@ pub struct MutationConfig {
     /// (~1.9 % range per gen) — pomalý drift relative k init populace
     /// uniform ∈ [BOTTOM, TOP], nechává selekci tlumit speciaci.
     pub sigma_thermal_optimum: f32,
+    /// Sprint 92: digestion specialization gen sigma. 0.02 = 2 % range/gen.
+    /// Pomalejší než ostatní geny — diet shift vyžaduje food availability
+    /// signal (selekce přes eat efficiency × food_kind), který je sám pomalý.
+    pub sigma_carnivore_score: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1679,6 +1705,12 @@ pub struct Genome {
     /// across range → speciace mezi cold-prefer / warm-prefer fenotypy.
     #[serde(default = "default_thermal_optimum")]
     pub thermal_optimum: f32,
+    /// Sprint 92: digestion specialization gen ∈ [0, 1]. 0 = pure herbivore
+    /// (plant food only), 1 = pure carnivore (hunter carrion only). Continuous
+    /// trade-off — eat_efficiency(food_kind, score). Init populace bias
+    /// herbivore-leaning (cells potřebují plant food survive cold start).
+    #[serde(default)]
+    pub carnivore_score: f32,
     pub brain: Brain,
 }
 
@@ -1724,6 +1756,10 @@ impl Genome {
             // RNG draw je breaking change pro Sprint 86 baseline (BRAIN_INPUTS
             // shape change už CSV reproducibility ztratila).
             thermal_optimum: rng.random_range(MIN_THERMAL_OPTIMUM..MAX_THERMAL_OPTIMUM),
+            // Sprint 92: bias toward herbivore (range [0, 0.3]) — cold start
+            // potřebuje plant food digestion. Selekce může driftovat carnivore
+            // pokud hunter carrion availability vytvoří nutritional opportunity.
+            carnivore_score: rng.random_range(0.0..0.3),
             brain: Brain::random(rng),
         }
     }
@@ -1783,6 +1819,14 @@ impl Genome {
             } else {
                 self.thermal_optimum
             },
+            // Sprint 92: short-circuit pattern. sigma_carnivore_score = 0.02
+            // default → ~2 % range/gen drift. Clamp na [0, 1].
+            carnivore_score: if cfg.sigma_carnivore_score > 0.0 {
+                (self.carnivore_score + gaussian(rng) * cfg.sigma_carnivore_score)
+                    .clamp(0.0, 1.0)
+            } else {
+                self.carnivore_score
+            },
             brain: {
                 let mut b = self.brain.mutate(rng, cfg.sigma_brain);
                 // Sprint 80 Sprint C: structural mutace. Default rate=0.0 →
@@ -1835,6 +1879,12 @@ impl Genome {
                 a.thermal_optimum
             } else {
                 b.thermal_optimum
+            },
+            // Sprint 92: standard bool crossover.
+            carnivore_score: if rng.random::<bool>() {
+                a.carnivore_score
+            } else {
+                b.carnivore_score
             },
             brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
@@ -2422,6 +2472,25 @@ impl Cell {
     }
 }
 
+/// Sprint 92: food kind tagged enum. Differentiates plant (ambient spawn,
+/// always available, baseline value), cell carrion (drops on cell death),
+/// hunter carrion (drops on hunter death, richest reward). Eat efficiency
+/// per kind je modulated by cell `genome.carnivore_score` ∈ [0, 1] —
+/// herbivore digestion vs carnivore digestion trade-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum FoodKind {
+    Plant = 0,
+    Carrion = 1,
+    HunterCarrion = 2,
+}
+
+impl Default for FoodKind {
+    fn default() -> Self {
+        FoodKind::Plant
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Food {
     pub position: [f32; 3],
@@ -2429,6 +2498,45 @@ pub struct Food {
     /// pro fresh food i carrion (univerzální decay, žádný carrion-specific
     /// staleness offset).
     pub age_ticks: u32,
+    /// Sprint 92: food kind. `serde(default)` returns Plant pro backward-
+    /// compat s pre-S92 checkpointy.
+    #[serde(default)]
+    pub kind: FoodKind,
+}
+
+/// Sprint 92: base food value per kind. Carrion má vyšší value než plant
+/// (concentrated biomass), hunter carrion ještě víc (apex predator drop).
+pub const PLANT_FOOD_VALUE: f32 = 20.0;
+pub const CARRION_FOOD_VALUE: f32 = 30.0;
+pub const HUNTER_CARRION_FOOD_VALUE: f32 = 50.0;
+
+#[inline]
+pub fn food_base_value(kind: FoodKind) -> f32 {
+    match kind {
+        FoodKind::Plant => PLANT_FOOD_VALUE,
+        FoodKind::Carrion => CARRION_FOOD_VALUE,
+        FoodKind::HunterCarrion => HUNTER_CARRION_FOOD_VALUE,
+    }
+}
+
+/// Sprint 92: digestion efficiency per food kind × cell `carnivore_score`.
+/// Continuous trade-off: 0 = pure herbivore (plant only), 1 = pure carnivore
+/// (hunter carrion only), 0.5 = mixed (everything moderate).
+///
+/// - Plant + score 0.0 → 1.0 (full)
+/// - Plant + score 1.0 → 0.0 (can't digest plants at all)
+/// - HunterCarrion + score 0.0 → 0.0 (can't digest)
+/// - HunterCarrion + score 1.0 → 1.0 (full)
+/// - Carrion (cell) → 0.5 universally — semi-digestible by both diets
+///   (compromise food, doesn't drive specialization)
+#[inline]
+pub fn eat_efficiency(kind: FoodKind, carnivore_score: f32) -> f32 {
+    let s = carnivore_score.clamp(0.0, 1.0);
+    match kind {
+        FoodKind::Plant => 1.0 - s,
+        FoodKind::Carrion => 0.5,
+        FoodKind::HunterCarrion => s,
+    }
 }
 
 impl Food {
@@ -2447,6 +2555,7 @@ impl Food {
                 z,
             ],
             age_ticks: 0,
+            kind: FoodKind::Plant,
         }
     }
 
@@ -3463,6 +3572,7 @@ mod tests {
             bond_damping: BOND_DAMPING,
             vision_fov: INITIAL_VISION_FOV,
             thermal_optimum: THERMAL_REF_TEMP,
+            carnivore_score: 0.0,
             brain: dummy_brain(),
         }
     }
@@ -3485,6 +3595,7 @@ mod tests {
             add_neuron_rate: 0.0,
             sigma_vision_fov: 0.0,
             sigma_thermal_optimum: 0.0,
+            sigma_carnivore_score: 0.0,
         }
     }
 
@@ -3506,6 +3617,7 @@ mod tests {
             bond_damping: BOND_DAMPING,
             vision_fov: INITIAL_VISION_FOV,
             thermal_optimum: THERMAL_REF_TEMP,
+            carnivore_score: 0.0,
             brain: Brain {
                 hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
                 w1: [[1.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
@@ -3549,6 +3661,7 @@ mod tests {
             add_neuron_rate: 0.0,
             sigma_vision_fov: 10.0,
             sigma_thermal_optimum: 100.0,
+            sigma_carnivore_score: 100.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -3753,6 +3866,62 @@ mod tests {
             (ratio - expected).abs() < 0.05,
             "warm/cold drain ratio {ratio} ≠ expected {expected}"
         );
+    }
+
+    #[test]
+    fn cell_exposure_endpoints() {
+        // Sprint 92: solo cell fully exposed.
+        assert!((cell_exposure(0) - 1.0).abs() < 1e-6);
+        // 1 bond → 0.75
+        assert!((cell_exposure(1) - 0.75).abs() < 1e-6);
+        // 2 bonds → 0.5
+        assert!((cell_exposure(2) - 0.5).abs() < 1e-6);
+        // 3 bonds → 0.25
+        assert!((cell_exposure(3) - 0.25).abs() < 1e-6);
+        // 4+ bonds → 0 (effectively immune)
+        assert!(cell_exposure(4).abs() < 1e-6);
+        assert!(cell_exposure(10).abs() < 1e-6);
+    }
+
+    #[test]
+    fn eat_efficiency_diet_specialization() {
+        // Pure herbivore preference for plant.
+        assert!((eat_efficiency(FoodKind::Plant, 0.0) - 1.0).abs() < 1e-6);
+        assert!(eat_efficiency(FoodKind::HunterCarrion, 0.0).abs() < 1e-6);
+        // Pure carnivore preference for hunter carrion.
+        assert!(eat_efficiency(FoodKind::Plant, 1.0).abs() < 1e-6);
+        assert!((eat_efficiency(FoodKind::HunterCarrion, 1.0) - 1.0).abs() < 1e-6);
+        // Mixed (0.5) — plant 0.5, carrion 0.5, hunter carrion 0.5.
+        assert!((eat_efficiency(FoodKind::Plant, 0.5) - 0.5).abs() < 1e-6);
+        assert!((eat_efficiency(FoodKind::Carrion, 0.5) - 0.5).abs() < 1e-6);
+        assert!((eat_efficiency(FoodKind::HunterCarrion, 0.5) - 0.5).abs() < 1e-6);
+        // Cell carrion: universally 0.5 — compromise food.
+        assert!((eat_efficiency(FoodKind::Carrion, 0.0) - 0.5).abs() < 1e-6);
+        assert!((eat_efficiency(FoodKind::Carrion, 1.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn food_base_value_per_kind() {
+        // Sprint 92: kind-dependent base values. Hunter carrion richest.
+        assert!((food_base_value(FoodKind::Plant) - PLANT_FOOD_VALUE).abs() < 1e-6);
+        assert!((food_base_value(FoodKind::Carrion) - CARRION_FOOD_VALUE).abs() < 1e-6);
+        assert!(
+            (food_base_value(FoodKind::HunterCarrion) - HUNTER_CARRION_FOOD_VALUE).abs() < 1e-6
+        );
+        assert!(food_base_value(FoodKind::HunterCarrion) > food_base_value(FoodKind::Plant));
+    }
+
+    #[test]
+    fn carnivore_score_in_genome_random_initial_range() {
+        let mut rng = StdRng::seed_from_u64(0xCA12);
+        for _ in 0..100 {
+            let g = Genome::random(&mut rng);
+            assert!(
+                (0.0..0.3).contains(&g.carnivore_score),
+                "carnivore_score {} out of init range [0, 0.3]",
+                g.carnivore_score
+            );
+        }
     }
 
     #[test]
@@ -4107,7 +4276,7 @@ mod tests {
             energy: 50.0,
             ..base_cell()
         };
-        let food = Food { position: [5.0, 0.0, 0.0], age_ticks: 0 };
+        let food = Food { position: [5.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
         assert!(cell.try_eat(&food, 8.0, 20.0));
         assert_eq!(cell.energy, 70.0);
     }
@@ -4118,7 +4287,7 @@ mod tests {
             energy: 50.0,
             ..base_cell()
         };
-        let food = Food { position: [20.0, 0.0, 0.0], age_ticks: 0 };
+        let food = Food { position: [20.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
         assert!(!cell.try_eat(&food, 8.0, 20.0));
         assert_eq!(cell.energy, 50.0);
     }
@@ -4141,6 +4310,7 @@ mod tests {
             bond_damping: 0.3,
             vision_fov: MIN_VISION_FOV,
             thermal_optimum: MIN_THERMAL_OPTIMUM,
+            carnivore_score: 0.0,
             brain: dummy_brain(),
         };
         let b = Genome {
@@ -4158,6 +4328,7 @@ mod tests {
             bond_damping: 1.0,
             vision_fov: MAX_VISION_FOV,
             thermal_optimum: MAX_THERMAL_OPTIMUM,
+            carnivore_score: 1.0,
             brain: dummy_brain(),
         };
         for _ in 0..100 {
@@ -4475,6 +4646,7 @@ mod tests {
             add_neuron_rate: 1.0,
             sigma_vision_fov: 0.0,
             sigma_thermal_optimum: 0.0,
+            sigma_carnivore_score: 0.0,
         };
         let mut current = g;
         // Iteruj N >= (BRAIN_HIDDEN - DEFAULT). Po naplnění capu se další
@@ -4800,10 +4972,10 @@ mod tests {
         // L=W=H=1, eat_factor=8 → ellipsoid degeneruje na sféru radius 8.
         // Backward-kompat se Sprint 40 sférickou eat-zónou.
         let cell = Cell { energy: 50.0, ..base_cell() };
-        let inside = Food { position: [5.0, 0.0, 0.0], age_ticks: 0 };
-        let outside = Food { position: [10.0, 0.0, 0.0], age_ticks: 0 };
-        let lateral_inside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0 };
-        let vertical_inside = Food { position: [0.0, 0.0, 5.0], age_ticks: 0 };
+        let inside = Food { position: [5.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+        let outside = Food { position: [10.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+        let lateral_inside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+        let vertical_inside = Food { position: [0.0, 0.0, 5.0], age_ticks: 0, kind: FoodKind::Plant };
         assert!(cell.eat_test(&inside, 8.0));
         assert!(!cell.eat_test(&outside, 8.0));
         assert!(cell.eat_test(&lateral_inside, 8.0));
@@ -4822,13 +4994,13 @@ mod tests {
             shell_thickness: 0.0,
         };
         // Forward at +14: inside ellipsoid (14/16 = 0.875).
-        let forward_inside = Food { position: [14.0, 0.0, 0.0], age_ticks: 0 };
+        let forward_inside = Food { position: [14.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
         // Lateral at +3.5: inside (3.5/4 = 0.875).
-        let lateral_inside = Food { position: [0.0, 3.5, 0.0], age_ticks: 0 };
+        let lateral_inside = Food { position: [0.0, 3.5, 0.0], age_ticks: 0, kind: FoodKind::Plant };
         // Forward at +17: outside (17/16 > 1).
-        let forward_outside = Food { position: [17.0, 0.0, 0.0], age_ticks: 0 };
+        let forward_outside = Food { position: [17.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
         // Lateral at +5: outside (5/4 > 1).
-        let lateral_outside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0 };
+        let lateral_outside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
         assert!(cell.eat_test(&forward_inside, 8.0));
         assert!(cell.eat_test(&lateral_inside, 8.0));
         assert!(!cell.eat_test(&forward_outside, 8.0));
@@ -4927,6 +5099,7 @@ mod tests {
             add_neuron_rate: 0.0,
             sigma_vision_fov: 0.0,
             sigma_thermal_optimum: 0.0,
+            sigma_carnivore_score: 0.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
@@ -5053,7 +5226,7 @@ mod tests {
 
     #[test]
     fn food_value_decays_with_age() {
-        let mut food = Food { position: [0.0, 0.0, 0.0], age_ticks: 0 };
+        let mut food = Food { position: [0.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
         assert!((food.value_factor() - 1.0).abs() < 1e-6);
         // 1 sec = 60 ticks → factor = 1 - CARRION_DECAY_PER_SEC.
         food.age_ticks = 60;
@@ -5068,7 +5241,7 @@ mod tests {
 
     #[test]
     fn food_expires_when_zero_value() {
-        let mut fresh = Food { position: [0.0, 0.0, 0.0], age_ticks: 0 };
+        let mut fresh = Food { position: [0.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
         assert!(fresh.age_step());
         // Past lifetime: age_step bump → value_factor = 0 → returns false.
         // F32 precision: použijeme age daleko za bod expirace, abychom se vyhli
@@ -5076,6 +5249,7 @@ mod tests {
         let mut expired = Food {
             position: [0.0, 0.0, 0.0],
             age_ticks: ((FIXED_TIMESTEP_HZ / CARRION_DECAY_PER_SEC) as u32) + 100,
+            kind: FoodKind::Plant,
         };
         assert!(!expired.age_step());
     }
@@ -5604,10 +5778,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(12);
         let half = [960.0, 540.0, 50.0];
         let mut cells: Vec<Cell> = Vec::new();
-        // Cell 0 nejbližší ale immune (3 bondy).
+        // Cell 0 nejbližší ale immune (Sprint 92: ≥ HUNTER_BOND_IMMUNITY_THRESHOLD = 4 bondy).
         let mut c0 = Cell::random(&mut rng, half, 0, 0, 0);
         c0.position = [10.0, 0.0, 0.0];
-        for slot in 0..3 {
+        for slot in 0..(HUNTER_BOND_IMMUNITY_THRESHOLD as usize) {
             c0.bonds[slot] = Some(Bond {
                 other_cell_id: 100 + slot as u64,
                 rest_length: 5.0,
@@ -5632,7 +5806,7 @@ mod tests {
         let half = [960.0, 540.0, 50.0];
         let mut c = Cell::random(&mut rng, half, 0, 0, 0);
         c.position = [10.0, 0.0, 0.0];
-        for slot in 0..3 {
+        for slot in 0..(HUNTER_BOND_IMMUNITY_THRESHOLD as usize) {
             c.bonds[slot] = Some(Bond {
                 other_cell_id: 100 + slot as u64,
                 rest_length: 5.0,
