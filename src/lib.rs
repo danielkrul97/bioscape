@@ -3917,8 +3917,8 @@ mod tests {
         };
         let mut forward = make_cell([10.0, 0.0, 0.0]);
         let mut sideways = make_cell([0.0, 10.0, 0.0]);
-        forward.step(1.0, [1000.0, 1000.0, 0.0], &physics);
-        sideways.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        forward.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
+        sideways.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         // |v| forward after step: 10 - drag·|v|·width·v = 10 - 0.01·10·1·10 = 9.0
         // |v| sideways after step: 10 - 0.01·10·2·10 = 8.0
         let v_forward = forward.velocity[0].hypot(forward.velocity[1]);
@@ -4227,14 +4227,14 @@ mod tests {
         let mut young = base_cell();
         young.age = 0;
         let young_energy_before = young.energy;
-        young.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        young.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         let young_drain = young_energy_before - young.energy;
 
         // Cell at age 600 (= 10s) → factor 1 + 0.005×10 = 1.05.
         let mut old = base_cell();
         old.age = 600;
         let old_energy_before = old.energy;
-        old.step(1.0, [1000.0, 1000.0, 0.0], &physics);
+        old.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
         let old_drain = old_energy_before - old.energy;
 
         assert!(
