@@ -3464,6 +3464,22 @@ impl Cell {
         generation: u64,
         physics: &PhysicsConfig,
     ) {
+        self.step_with_climate(dt, world_half, tick, generation, physics, 0.0);
+    }
+
+    /// Sprint 112: step se shock-aware climate offsetem. Caller (headless / main)
+    /// předem spočítá `climate_offset` přes `climate_shock_offset(...)` na cell
+    /// pozici a předá sem; vnitřní `apply_energy_costs` ho přičte k baseline
+    /// temperatuře. `climate_offset = 0.0` → byte-identical chování s `step`.
+    pub fn step_with_climate(
+        &mut self,
+        dt: f32,
+        world_half: [f32; 3],
+        tick: u64,
+        generation: u64,
+        physics: &PhysicsConfig,
+        climate_offset: f32,
+    ) {
         // Sprint 42: aging + cooldown decrement na začátku ticku, aby
         // apply_energy_costs viděl current age v ramp formuli.
         self.age = self.age.saturating_add(1);
@@ -3473,9 +3489,10 @@ impl Cell {
         self.integrate_kinematics(dt, world_half);
         self.apply_anisotropic_drag(dt, physics);
         self.apply_angular_drag(dt, physics);
-        // Sprint 86: tick + generation propagace pro time-varying thermal
-        // (diurnal + seasonal cykly v `temperature_at_z`).
-        self.apply_energy_costs(dt, world_half, tick, generation, physics);
+        // Sprint 86: tick + generation propagace pro time-varying thermal.
+        // Sprint 112: + climate_offset (default 0.0) z aktivních ClimateShift
+        // shocků, předem spočítaný callerem.
+        self.apply_energy_costs(dt, world_half, tick, generation, physics, climate_offset);
         self.apply_world_bounce(world_half);
         self.update_cell_state(dt);
     }
@@ -3568,8 +3585,10 @@ impl Cell {
         tick: u64,
         generation: u64,
         physics: &PhysicsConfig,
+        climate_offset: f32,
     ) {
-        let temp = temperature_at_z(self.position[2], world_half, tick, generation);
+        let temp =
+            temperature_at_z(self.position[2], world_half, tick, generation) + climate_offset;
         let metabolism = metabolism_factor(temp);
         let dt_eff = dt * metabolism;
         // Sprint 33: v_mag_sq zahrnuje 3D (vz != 0 v Sprint 35+).
@@ -5136,6 +5155,11 @@ pub fn shock_ramp_factor(event: &ShockEvent, generation: u64) -> f32 {
 /// peak ramp = 1.0 → drain × 2.0.
 pub const HAZARD_PULSE_MAX_MULTIPLIER_BONUS: f32 = 1.0;
 
+/// Sprint 112: max temperature offset (°C) per ClimateShift při peak intensity
+/// a full spatial mask. Default direction = warming (signed positive).
+/// Peak case: intensity=1, ramp=1, mask=1 → +5°C nad baseline `temperature_at_z`.
+pub const CLIMATE_SHIFT_MAX_OFFSET: f32 = 5.0;
+
 /// Sprint 110: multiplikátor hazard drainu na pozici `pos` při dané `(gen, tick)`.
 /// Default 1.0 (žádný HazardPulse aktivní). Pro každý active HazardPulse:
 /// `1.0 + intensity × ramp_factor × spatial_mask × HAZARD_PULSE_MAX_MULTIPLIER_BONUS`.
@@ -5179,6 +5203,69 @@ pub fn hazard_shock_multiplier(
         multiplier *= 1.0 + event.intensity * ramp * mask * HAZARD_PULSE_MAX_MULTIPLIER_BONUS;
     }
     multiplier
+}
+
+/// Sprint 112: signed temperature offset (°C) z ClimateShift shocků pro pozici
+/// `pos_xy`. Default 0.0 (žádný ClimateShift aktivní). Pro každý active event:
+/// `intensity × ramp_factor × spatial_mask × CLIMATE_SHIFT_MAX_OFFSET`.
+/// Spatial mask je smoothstep falloff přes xy plane (toroidal-aware), 1.0 pro
+/// global eventy bez center. Sčítá additivně přes všechny aktivní eventy
+/// (warming je positive — cooling by potřeboval per-event signed intensity,
+/// budoucí extension). Pure fn, deterministic.
+pub fn climate_shock_offset(
+    events: &[ShockEvent],
+    generation: u64,
+    pos_xy: [f32; 2],
+    world_half: [f32; 3],
+) -> f32 {
+    let mut total = 0.0_f32;
+    for event in events {
+        if event.kind != ShockKind::ClimateShift {
+            continue;
+        }
+        let ramp = shock_ramp_factor(event, generation);
+        if ramp <= 0.0 {
+            continue;
+        }
+        let mask = match (event.center_xy, event.radius) {
+            (Some(center), Some(radius)) if radius > 0.0 => {
+                let a = [pos_xy[0], pos_xy[1], 0.0];
+                let b = [center[0], center[1], 0.0];
+                let d_vec = min_image_delta(a, b, world_half);
+                let dist_xy = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1]).sqrt();
+                if dist_xy >= radius {
+                    0.0
+                } else {
+                    let t = (1.0 - dist_xy / radius).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                }
+            }
+            _ => 1.0,
+        };
+        if mask <= 0.0 {
+            continue;
+        }
+        total += event.intensity * ramp * mask * CLIMATE_SHIFT_MAX_OFFSET;
+    }
+    total
+}
+
+/// Sprint 112: shock-aware varianta `temperature_at_z`. K baseline gradientu
+/// přičítá sumu ClimateShift offsetů. Empty events nebo žádný ClimateShift
+/// aktivní → byte-identical s `temperature_at_z`. Renderer i headless volají
+/// tuto wrapper variantu, pure `temperature_at_z` zůstává nedotčená pro testy
+/// a backward-compat.
+#[inline]
+pub fn temperature_at_z_with_shocks(
+    z: f32,
+    world_half: [f32; 3],
+    tick: u64,
+    generation: u64,
+    events: &[ShockEvent],
+    pos_xy: [f32; 2],
+) -> f32 {
+    let base = temperature_at_z(z, world_half, tick, generation);
+    base + climate_shock_offset(events, generation, pos_xy, world_half)
 }
 
 #[cfg(test)]
@@ -5493,6 +5580,80 @@ mod tests {
         let bot = temperature_at_z(-50.0, half, t_q, g_q);
         let expected_bot = THERMAL_BOTTOM + THERMAL_SEASONAL_AMP;
         assert!((bot - expected_bot).abs() < 0.05);
+    }
+
+    #[test]
+    fn climate_offset_default_zero() {
+        let pos_xy = [123.0, -45.0];
+        // Empty events → 0.0.
+        let off = climate_shock_offset(&[], 50, pos_xy, WORLD_HALF);
+        assert!(off.abs() < 1e-6, "empty events must give 0.0, got {}", off);
+        // Non-ClimateShift event (HazardPulse) → 0.0.
+        let event = ShockEvent {
+            kind: ShockKind::HazardPulse,
+            start_gen: 0,
+            duration_gen: 10,
+            ramp_gens: 2,
+            intensity: 1.0,
+            center_xy: None,
+            radius: None,
+        };
+        let off = climate_shock_offset(&[event], 5, pos_xy, WORLD_HALF);
+        assert!(off.abs() < 1e-6, "HazardPulse must not affect climate, got {}", off);
+    }
+
+    #[test]
+    fn climate_offset_global_shift_at_peak() {
+        // Sprint 112: 1 global ClimateShift, intensity = 1, peak ramp = 1, no
+        // spatial → offset = CLIMATE_SHIFT_MAX_OFFSET (= 5.0).
+        let event = ShockEvent {
+            kind: ShockKind::ClimateShift,
+            start_gen: 100,
+            duration_gen: 10,
+            ramp_gens: 2,
+            intensity: 1.0,
+            center_xy: None,
+            radius: None,
+        };
+        // Plateau (gen 102..=107) → ramp = 1.0.
+        let off = climate_shock_offset(&[event], 105, [50.0, -10.0], WORLD_HALF);
+        assert!(
+            (off - CLIMATE_SHIFT_MAX_OFFSET).abs() < 1e-5,
+            "global peak must give CLIMATE_SHIFT_MAX_OFFSET, got {}",
+            off
+        );
+        // Pre-start: 0.0.
+        let off_before = climate_shock_offset(&[event], 99, [50.0, -10.0], WORLD_HALF);
+        assert!(off_before.abs() < 1e-6);
+        // Post-end: 0.0.
+        let off_after = climate_shock_offset(&[event], 110, [50.0, -10.0], WORLD_HALF);
+        assert!(off_after.abs() < 1e-6);
+    }
+
+    #[test]
+    fn temperature_with_shocks_matches_baseline_when_no_events() {
+        // Sprint 112: temperature_at_z_with_shocks musí být byte-identical
+        // s temperature_at_z když events.empty (default off path).
+        let half = [960.0, 540.0, 50.0];
+        let pos_xy = [200.0, -100.0];
+        for &(z, tick, gen) in &[
+            (0.0_f32, 0_u64, 0_u64),
+            (50.0, 100, 5),
+            (-50.0, 1000, 25),
+            (25.0, THERMAL_DIURNAL_PERIOD_TICKS / 4, CYCLE_GEN_PERIOD / 4),
+            (-25.0, 3 * THERMAL_DIURNAL_PERIOD_TICKS / 4, CYCLE_GEN_PERIOD / 2),
+        ] {
+            let base = temperature_at_z(z, half, tick, gen);
+            let with_shocks = temperature_at_z_with_shocks(z, half, tick, gen, &[], pos_xy);
+            assert_eq!(
+                base.to_bits(),
+                with_shocks.to_bits(),
+                "byte-identical required: z={}, tick={}, gen={}",
+                z,
+                tick,
+                gen
+            );
+        }
     }
 
     #[test]

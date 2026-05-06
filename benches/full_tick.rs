@@ -1,9 +1,142 @@
-// Sprint 57: full-tick end-to-end bench. Stub — fully fleshed in Bod 2.
-use criterion::{criterion_group, criterion_main, Criterion};
+// Sprint 111: end-to-end CPU-bound tick bench. World struct lives in
+// `src/bin/headless.rs` (binary-private), so we compose the same hot-path
+// phases via lib.rs public API: per-cell brain forward + populate inputs +
+// kinematics step, plus smell/pheromone field diffusion. Approximates ≥80 %
+// of headless tick CPU cost without dragging the GPU pipeline / collisions /
+// reproduce / hunter logic into the bench harness.
+use bioscape::{
+    forward_vector, populate_brain_inputs, Brain, BrainSensors, Cell, Food, PhysicsConfig,
+    SmellField, WorldMap, PHEROMONE_DECAY, PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES,
+    PHEROMONE_GRID_RES_Z, PHYSICS_CONFIG, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES,
+    SMELL_GRID_RES_Z, SMELL_PER_FOOD, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES,
+    WORLD_MAP_RES_Z,
+};
+use criterion::{
+    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use std::time::Duration;
 
-fn placeholder(c: &mut Criterion) {
-    c.bench_function("placeholder", |b| b.iter(|| 1 + 1));
+const WORLD_HALF: [f32; 3] = [960.0, 540.0, 50.0];
+const SEED: u64 = 42;
+const TICKS_PER_MEASUREMENT: u64 = 1000;
+const FOOD_PER_CELL: f32 = 0.4;
+
+struct BenchWorld {
+    cells: Vec<Cell>,
+    brains: Vec<Brain>,
+    foods: Vec<Food>,
+    smell: SmellField,
+    pheromone: SmellField,
+    map: WorldMap,
+    physics: PhysicsConfig,
+    tick: u64,
 }
 
-criterion_group!(benches, placeholder);
-criterion_main!(benches);
+impl BenchWorld {
+    fn new(n_cells: usize) -> Self {
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let map = WorldMap::new(
+            [WORLD_MAP_RES, WORLD_MAP_RES, WORLD_MAP_RES_Z],
+            [WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z],
+            WORLD_HALF,
+            0xC0FFEE,
+        );
+        let cells: Vec<Cell> = (0..n_cells)
+            .map(|i| Cell::random(&mut rng, WORLD_HALF, i as u64, 0, i as u64))
+            .collect();
+        let brains: Vec<Brain> = (0..n_cells).map(|_| Brain::random(&mut rng)).collect();
+        let n_food = ((n_cells as f32) * FOOD_PER_CELL) as usize;
+        let foods: Vec<Food> = (0..n_food)
+            .map(|_| Food::random(&mut rng, WORLD_HALF))
+            .collect();
+        let smell =
+            SmellField::new([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z], WORLD_HALF);
+        let pheromone = SmellField::new(
+            [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+            WORLD_HALF,
+        );
+        Self {
+            cells,
+            brains,
+            foods,
+            smell,
+            pheromone,
+            map,
+            physics: PHYSICS_CONFIG,
+            tick: 0,
+        }
+    }
+
+    fn tick(&mut self, dt: f32) -> f32 {
+        for food in &self.foods {
+            self.smell.add_source(food.position, SMELL_PER_FOOD * dt);
+        }
+        self.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
+        self.pheromone
+            .step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+
+        let mut acc = 0.0_f32;
+        for (cell, brain) in self.cells.iter_mut().zip(self.brains.iter_mut()) {
+            let smell_grad = self.smell.gradient_at(cell.position, 4.0);
+            let pheromone_grad = self.pheromone.gradient_at(cell.position, 4.0);
+            let sensors = BrainSensors {
+                nearest_food: None,
+                nearest_cell: None,
+                neighbors_in_vision: 0,
+                smell_grad,
+                pheromone_grad,
+                temperature_local: 17.0,
+            };
+            let inputs = populate_brain_inputs(cell, &sensors, cell.genome.vision_radius);
+            let (_h, outputs) = brain.forward_with_state(&inputs);
+            cell.angular_velocity = outputs[0];
+            cell.pitch_velocity = outputs[7];
+            let speed = cell.genome.max_speed * outputs[1].clamp(-1.0, 1.0);
+            let fwd = forward_vector(cell.heading, cell.pitch);
+            cell.velocity[0] = fwd[0] * speed;
+            cell.velocity[1] = fwd[1] * speed;
+            cell.velocity[2] = fwd[2] * speed;
+            cell.step(dt, WORLD_HALF, self.tick, 0, &self.physics);
+            acc += outputs[0];
+        }
+        let sample = self.map.sample(self.cells[0].position);
+        self.tick += 1;
+        acc + sample
+    }
+}
+
+fn bench_full_tick(c: &mut Criterion) {
+    let mut group = c.benchmark_group("full_tick");
+    for &n in &[1000usize, 2500, 5000] {
+        group.throughput(Throughput::Elements(TICKS_PER_MEASUREMENT * n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let mut world = BenchWorld::new(n);
+                    let dt = 1.0 / 60.0;
+                    let start = std::time::Instant::now();
+                    let mut sink = 0.0_f32;
+                    for _ in 0..TICKS_PER_MEASUREMENT {
+                        sink += world.tick(dt);
+                    }
+                    total += start.elapsed();
+                    black_box(sink);
+                }
+                total
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group! {
+    name = full_tick;
+    config = Criterion::default()
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(20));
+    targets = bench_full_tick
+}
+criterion_main!(full_tick);

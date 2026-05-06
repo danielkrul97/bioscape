@@ -1081,14 +1081,26 @@ fn step_cells(
     time: Res<Time>,
     extent: Res<WorldExtent>,
     clock: Res<Clock>,
+    events: Res<EventCalendarResource>,
     mut cells: Query<&mut CellEntity>,
 ) {
     let dt = time.delta_secs();
     let half = extent.as_array();
     let tick = clock.0.tick;
     let gen = clock.0.generation;
+    // Sprint 112: per-cell ClimateShift offset (default 0.0 → step_with_climate
+    // je byte-identical s step). Computed inline před step aby nebyl rebuild
+    // celé Cell::step signature potřeba.
+    let event_slice = &events.0.events;
     for mut cell in &mut cells {
-        cell.0.step(dt, half, tick, gen, &PHYSICS_CONFIG);
+        let climate_offset = bioscape::climate_shock_offset(
+            event_slice,
+            gen,
+            [cell.0.position[0], cell.0.position[1]],
+            half,
+        );
+        cell.0
+            .step_with_climate(dt, half, tick, gen, &PHYSICS_CONFIG, climate_offset);
     }
 }
 

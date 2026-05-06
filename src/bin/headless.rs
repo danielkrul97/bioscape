@@ -1188,11 +1188,32 @@ impl World {
         }
         // Sprint 57: stejně jako apply_morph, ~16 us sekvenčně vs ~30 us
         // paralelně — work per cell je příliš malý pro rayon. Sekvenční win.
+        // Sprint 112: per-cell climate_offset z aktivních ClimateShift shocků
+        // se počítá tady (jednou před apply_energy_costs). Default = 0.0 když
+        // events prázdné → step_with_climate je byte-identical s step().
         let tick = self.clock.tick;
         let gen = self.clock.generation;
+        let events = &self.events.events;
         for cell in &mut self.cells {
-            cell.step(dt, WORLD_HALF, tick, gen, &PHYSICS_CONFIG);
+            let climate_offset = bioscape::climate_shock_offset(
+                events,
+                gen,
+                [cell.position[0], cell.position[1]],
+                WORLD_HALF,
+            );
+            cell.step_with_climate(dt, WORLD_HALF, tick, gen, &PHYSICS_CONFIG, climate_offset);
         }
+    }
+
+    /// Sprint 112: per-cell climate offset helper, sdílený mezi tick hot path
+    /// a `write_stats` (CSV column `shock_climate_offset`).
+    fn climate_offset_at(&self, pos_xy: [f32; 2]) -> f32 {
+        bioscape::climate_shock_offset(
+            &self.events.events,
+            self.clock.generation,
+            pos_xy,
+            WORLD_HALF,
+        )
     }
 
     fn apply_food_gravity(&mut self, dt: f32) {
@@ -2904,12 +2925,24 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     // Sprint 111: shock observability + diversity metrics (Shannon attack
     // entropy, brain w1 frobenius std).
     let (shock_active, shock_hazard_max) = shock_summary(world);
+    // Sprint 112: per-population mean climate offset (suma signed offsetů /
+    // n). Identical 0.0 když events.empty nebo žádný ClimateShift aktivní.
+    let climate_offset_avg: f64 = if n > 0 {
+        let sum: f64 = world
+            .cells
+            .iter()
+            .map(|c| world.climate_offset_at([c.position[0], c.position[1]]) as f64)
+            .sum();
+        sum / nf
+    } else {
+        0.0
+    };
     let lineage_count = lineages.len();
     let behavioral_entropy_attack = attack_entropy(&world.cells);
     let weight_diversity_w1_norm = w1_frobenius_std(&world.cells);
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},0.000,1.000,{},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},1.000,{},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -2997,10 +3030,13 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         world.hunter_bonds_broken_gen,
         // Sprint 107: CPPN speciation distance.
         cppn_compat_m,
-        // Sprint 111: shock state + diversity metrics. climate_offset (0.0)
-        // a food_factor (1.0) jsou placeholdery do S112/S113.
+        // Sprint 111: shock state + diversity metrics. food_factor (1.0)
+        // je placeholder do S113.
+        // Sprint 112: shock_climate_offset = mean signed temperature offset
+        // přes všechny cells z aktivních ClimateShift shocků (0.0 default).
         shock_active,
         shock_hazard_max,
+        climate_offset_avg,
         lineage_count,
         behavioral_entropy_attack,
         weight_diversity_w1_norm,
