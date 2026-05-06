@@ -1721,6 +1721,18 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_carnivore_score: 0.02,
     // Sprint 97: sensor_gains drift. 0.04 = 2 % range / gen.
     sigma_sensor_gain: 0.04,
+    // Sprint 122: zapnutí discrete spike_count mutace + per-spike orientation drift.
+    // ~5 % cells per gen mění spike_count o ±1 (clamp [0, 5]). 0.05 rad ≈ 3°
+    // drift v azimuth/elevation per gen — slow per-spike directional evolution.
+    spike_count_mutation_rate: 0.05,
+    sigma_spike_orientation: 0.05,
+    // Sprint 123: complexity drift zapne se v Sprint 123. Sprint 122: 0.0 →
+    // complexity zůstává 0 → COMPLEXITY_*_GAIN multipliers = 1.0.
+    sigma_spike_complexity: 0.0,
+    // Sprint 122: per-non-primary spike length drift. Když spike_count_mutation_rate
+    // aktivuje slot, dítě dostane init length = 0 (nový spike), který
+    // postupně mutuje. 0.03 stejně jako sigma_spike_length (slot 0).
+    sigma_spike_length_secondary: 0.03,
 };
 // ─── Sprint 105: HyperNEAT CPPN scaffolding ─────────────────────────────────
 //
@@ -2967,6 +2979,23 @@ pub struct MutationConfig {
     /// [MIN, MAX] = [0, 2] range/gen. Drift k specializaci vyžaduje cluster
     /// pooling signal — selekce je conditional na bond presence.
     pub sigma_sensor_gain: f32,
+    /// Sprint 122: pravděpodobnost diskrétní mutace `spike_count` per dítě.
+    /// 0.05 = ~5 % cells per gen flip ±1 (clamp [0, SPIKE_SLOTS]). 0.0 = vypnuté
+    /// (Sprint 121 default — gen 0 spike_count=1 propaguje napříč evolucí).
+    /// Sprint 123: může enabled.
+    pub spike_count_mutation_rate: f32,
+    /// Sprint 122: gaussian sigma pro spike azimuth/elevation offsety
+    /// (rad/gen). 0.05 ≈ 3°/gen drift — slow per-spike directional evolution.
+    pub sigma_spike_orientation: f32,
+    /// Sprint 123: gaussian sigma pro spike complexity ∈ [0, 1] mutaci.
+    /// 0.0 = vypnuté (Sprint 121/122 default — complexity zaseknutý na 0,
+    /// COMPLEXITY_*_GAIN multiplikátory vrací 1.0).
+    pub sigma_spike_complexity: f32,
+    /// Sprint 122: gaussian sigma pro mutaci `length` na spike sloty 1..SPIKE_SLOTS
+    /// (= "non-primary" sloty, které pre-S122 byly drženy na 0). Slot 0 zachovává
+    /// existující `sigma_spike_length`. 0.0 = vypnuté → non-primary sloty
+    /// drift jen přes activation/deactivation pres `spike_count_mutation_rate`.
+    pub sigma_spike_length_secondary: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -3161,12 +3190,53 @@ impl Genome {
                 .clamp(MIN_BODY_HEIGHT, MAX_BODY_HEIGHT),
             spikes: {
                 let mut spikes = self.spikes;
-                let s0 = &mut spikes[0];
-                s0.length = (s0.length + gaussian(rng) * cfg.sigma_spike_length)
+                // Slot 0 (primary) — pre-S121 single-spike sémantika.
+                spikes[0].length = (spikes[0].length + gaussian(rng) * cfg.sigma_spike_length)
                     .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
+                // Sprint 122: secondary slots length drift (jen pokud sigma > 0).
+                if cfg.sigma_spike_length_secondary > 0.0 {
+                    for i in 1..SPIKE_SLOTS {
+                        spikes[i].length = (spikes[i].length
+                            + gaussian(rng) * cfg.sigma_spike_length_secondary)
+                            .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
+                    }
+                }
+                // Sprint 122: per-slot orientation drift (jen pokud sigma > 0).
+                if cfg.sigma_spike_orientation > 0.0 {
+                    for i in 0..SPIKE_SLOTS {
+                        spikes[i].azimuth_offset = (spikes[i].azimuth_offset
+                            + gaussian(rng) * cfg.sigma_spike_orientation)
+                            .clamp(MIN_SPIKE_AZIMUTH, MAX_SPIKE_AZIMUTH);
+                        spikes[i].elevation_offset = (spikes[i].elevation_offset
+                            + gaussian(rng) * cfg.sigma_spike_orientation)
+                            .clamp(MIN_SPIKE_ELEVATION, MAX_SPIKE_ELEVATION);
+                    }
+                }
+                // Sprint 123: per-slot complexity drift (jen pokud sigma > 0).
+                if cfg.sigma_spike_complexity > 0.0 {
+                    for i in 0..SPIKE_SLOTS {
+                        spikes[i].complexity = (spikes[i].complexity
+                            + gaussian(rng) * cfg.sigma_spike_complexity)
+                            .clamp(MIN_SPIKE_COMPLEXITY, MAX_SPIKE_COMPLEXITY);
+                    }
+                }
                 spikes
             },
-            spike_count: self.spike_count,
+            spike_count: {
+                // Sprint 122: discrete ±1 mutace s rate. Pokud rate = 0
+                // (Sprint 121 default), žádný RNG draw — byte-identical
+                // s pre-S122. Sprint 122 rate = 0.05 → ~5 % cells per gen flip.
+                if cfg.spike_count_mutation_rate > 0.0
+                    && rng.random::<f32>() < cfg.spike_count_mutation_rate
+                {
+                    let dir: bool = rng.random();
+                    let cur = self.spike_count as i32;
+                    let new = if dir { cur + 1 } else { cur - 1 };
+                    new.clamp(0, SPIKE_SLOTS as i32) as u8
+                } else {
+                    self.spike_count
+                }
+            },
             shell_thickness: (self.shell_thickness + gaussian(rng) * cfg.sigma_shell)
                 .clamp(MIN_SHELL_THICKNESS, MAX_SHELL_THICKNESS),
             adhesion_type,
@@ -3234,17 +3304,51 @@ impl Genome {
             body_height: if rng.random::<bool>() { a.body_height } else { b.body_height },
             spikes: {
                 let mut spikes = [Spike::ZERO; SPIKE_SLOTS];
+                // Slot 0: pre-S122 length-only crossover (zachovává byte-identity
+                // pro S121 testy s spike_count=1, complexity=0, orientation=0).
                 spikes[0].length = if rng.random::<bool>() {
                     a.spikes[0].length
                 } else {
                     b.spikes[0].length
                 };
+                // Sprint 122: per-slot multi-attribute crossover pro non-primary
+                // sloty + non-length atributy slotu 0. Short-circuit pokud rodiče
+                // mají identické hodnoty — žádný RNG draw, byte-identical když
+                // všechny S122 sigmy/rates = 0.
+                let pick_f32 = |a: f32, b: f32, rng: &mut dyn rand::RngCore| -> f32 {
+                    if a == b {
+                        a
+                    } else if rng.random::<bool>() {
+                        a
+                    } else {
+                        b
+                    }
+                };
+                spikes[0].azimuth_offset =
+                    pick_f32(a.spikes[0].azimuth_offset, b.spikes[0].azimuth_offset, rng);
+                spikes[0].elevation_offset = pick_f32(
+                    a.spikes[0].elevation_offset,
+                    b.spikes[0].elevation_offset,
+                    rng,
+                );
+                spikes[0].complexity = pick_f32(a.spikes[0].complexity, b.spikes[0].complexity, rng);
+                for i in 1..SPIKE_SLOTS {
+                    spikes[i].length = pick_f32(a.spikes[i].length, b.spikes[i].length, rng);
+                    spikes[i].azimuth_offset =
+                        pick_f32(a.spikes[i].azimuth_offset, b.spikes[i].azimuth_offset, rng);
+                    spikes[i].elevation_offset = pick_f32(
+                        a.spikes[i].elevation_offset,
+                        b.spikes[i].elevation_offset,
+                        rng,
+                    );
+                    spikes[i].complexity =
+                        pick_f32(a.spikes[i].complexity, b.spikes[i].complexity, rng);
+                }
                 spikes
             },
-            // Sprint 121: gen 0 ma uniformne spike_count = 1, pre-S122 zadny RNG
-            // draw — short-circuit pattern jako vision_fov v S82, drzi byte-
-            // identical CSV. Sprint 122 prejde na real bool crossover az s
-            // sigma_spike_count > 0.
+            // Sprint 121/122: short-circuit pokud parents shodné (pre-S122 vždy
+            // 1). Sprint 122 mutace začne flip ±1 → parents se rozejdou →
+            // bool draw aktivní.
             spike_count: if a.spike_count == b.spike_count {
                 a.spike_count
             } else if rng.random::<bool>() {
@@ -3958,9 +4062,55 @@ impl Cell {
         )
     }
 
-    /// Sprint 41: ellipsoidální acceptance + energy gain při hitu.
-    pub fn try_eat(&mut self, food: &Food, eat_factor: f32, food_value: f32) -> bool {
+    /// Sprint 122: rozšířený eat test — kombinuje ellipsoid (`eat_test`)
+    /// a per-spike forward grab cones u tipu spike. Spike kuželek má vrchol
+    /// `cell_pos + dir × (eff_radius + length)` (tip), osu = spike direction,
+    /// half-angle `SPIKE_GRAB_HALF_ANGLE × (1 + complexity × COMPLEXITY_GRAB_GAIN)`,
+    /// range `length × SPIKE_GRAB_REACH_BONUS` od tipu. Cell sní food pokud
+    /// projde ELLIPSOID NEBO kterýkoli aktivní spike kuželek. Pre-S122
+    /// (`spike_count = 0` nebo všechny `length = 0`) redukuje na `eat_test`.
+    pub fn eat_test_with_spikes(&self, food: &Food, eat_factor: f32) -> bool {
         if self.eat_test(food, eat_factor) {
+            return true;
+        }
+        let eff_r = self.phenotype.effective_radius();
+        for spike in self.phenotype.active_spikes() {
+            if spike.length <= 0.0 {
+                continue;
+            }
+            let dir = spike_direction(self.heading, self.pitch, spike);
+            let tip_dist = eff_r + spike.length;
+            let tip = [
+                self.position[0] + dir[0] * tip_dist,
+                self.position[1] + dir[1] * tip_dist,
+                self.position[2] + dir[2] * tip_dist,
+            ];
+            let dx = food.position[0] - tip[0];
+            let dy = food.position[1] - tip[1];
+            let dz = food.position[2] - tip[2];
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            let max_range = spike.length * SPIKE_GRAB_REACH_BONUS;
+            if dist_sq > max_range * max_range {
+                continue;
+            }
+            if dist_sq < f32::EPSILON {
+                return true;
+            }
+            let dist = dist_sq.sqrt();
+            let cos_food = (dx * dir[0] + dy * dir[1] + dz * dir[2]) / dist;
+            let half_angle =
+                SPIKE_GRAB_HALF_ANGLE * spike_complexity_grab_factor(spike.complexity);
+            if cos_food >= half_angle.cos() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Sprint 41: ellipsoidální acceptance + energy gain při hitu.
+    /// Sprint 122: zahrnuje per-spike grab cones (viz `eat_test_with_spikes`).
+    pub fn try_eat(&mut self, food: &Food, eat_factor: f32, food_value: f32) -> bool {
+        if self.eat_test_with_spikes(food, eat_factor) {
             self.energy += food_value;
             true
         } else {
@@ -5701,6 +5851,10 @@ mod tests {
             sigma_thermal_optimum: 0.0,
             sigma_carnivore_score: 0.0,
             sigma_sensor_gain: 0.0,
+            spike_count_mutation_rate: 0.0,
+            sigma_spike_orientation: 0.0,
+            sigma_spike_complexity: 0.0,
+            sigma_spike_length_secondary: 0.0,
         }
     }
 
@@ -5780,9 +5934,21 @@ mod tests {
             sigma_thermal_optimum: 100.0,
             sigma_carnivore_score: 100.0,
             sigma_sensor_gain: 100.0,
+            spike_count_mutation_rate: 0.5,
+            sigma_spike_orientation: 10.0,
+            sigma_spike_complexity: 10.0,
+            sigma_spike_length_secondary: 10.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);
+            for spike in m.spikes.iter() {
+                assert!((MIN_SPIKE_AZIMUTH..=MAX_SPIKE_AZIMUTH).contains(&spike.azimuth_offset));
+                assert!(
+                    (MIN_SPIKE_ELEVATION..=MAX_SPIKE_ELEVATION).contains(&spike.elevation_offset)
+                );
+                assert!((MIN_SPIKE_COMPLEXITY..=MAX_SPIKE_COMPLEXITY).contains(&spike.complexity));
+            }
+            assert!(m.spike_count <= SPIKE_SLOTS as u8);
             assert!(m.max_speed >= MIN_SPEED);
             assert!(m.max_speed <= MAX_SPEED, "Sprint 73: speed cap respected");
             assert!(m.color_hue >= 0.0 && m.color_hue < HUE_RANGE);
@@ -7455,6 +7621,10 @@ mod tests {
             sigma_thermal_optimum: 0.0,
             sigma_carnivore_score: 0.0,
             sigma_sensor_gain: 0.0,
+            spike_count_mutation_rate: 0.0,
+            sigma_spike_orientation: 0.0,
+            sigma_spike_complexity: 0.0,
+            sigma_spike_length_secondary: 0.0,
         };
         for _ in 0..1000 {
             let m = g.mutate(&mut rng, &cfg);

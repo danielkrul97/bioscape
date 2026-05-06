@@ -1627,8 +1627,6 @@ impl World {
                 }
                 let pos_i = cells[i].position;
                 let radius_a = cells[i].phenotype.effective_radius();
-                let spike = cells[i].phenotype.primary_spike_length();
-                let heading = cells[i].heading;
                 let search_r =
                     CELL_RADIUS * (radius_a + cells[i].phenotype.max_axis() * 2.0);
                 let mut local: Vec<(usize, usize, f32, f32)> = Vec::new();
@@ -1651,17 +1649,9 @@ impl World {
                             + d_vec[2] * d_vec[2];
                         if d2 < pair_r2 {
                             let mut gain = PREDATION_GAIN_PER_TICK;
-                            if spike > 0.0 && d2 > 0.0 {
-                                let inv_d = 1.0 / d2.sqrt();
-                                let to_j_x = -d_vec[0] * inv_d;
-                                let to_j_y = -d_vec[1] * inv_d;
-                                let cos_angle = heading.cos() * to_j_x + heading.sin() * to_j_y;
-                                if cos_angle >= bioscape::SPIKE_DOT_THRESHOLD {
-                                    gain += PREDATION_GAIN_PER_TICK
-                                        * spike
-                                        * bioscape::SPIKE_PREDATION_BONUS;
-                                }
-                            }
+                            // Sprint 122: multi-spike per-spike cone test +
+                            // complexity multiplikátor (S123 zapne complexity).
+                            gain += cells[i].spike_bonus_against(pos_j);
                             let dilution = 1.0 / (1.0 + DILUTION_K * herd_counts[j] as f32);
                             // Sprint 69: bonded prey takes less damage + yields
                             // less energy. Group-defense benefit činí bondování
