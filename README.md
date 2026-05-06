@@ -63,13 +63,13 @@ Rešerše vědeckého kontextu projektu (česky, srozumitelně i pro laika) je v
 
 ## Status
 
-80+ sprintů. Plná 3D simulace: ellipsoid morfologie (length × width × height + spike), 3D pohyb (yaw + pitch), gravitace s vztlakem, predace s attack-gate, mating přes pheromone signaling, food clustering ve world map, hazard zóny, recurrent brain (20 sensory + 16 recurrent vstupů × 16 hidden × 9 výstupů, Elman feedback), persistentní spring bondy → tissue regime, makropredátor (Hunter), bistabilní cell-state. Headless harness pro deterministické batch experimenty, 3D renderer s orbit kamerou.
+95+ sprintů. Plná 3D simulace: ellipsoid morfologie (length × width × height + spike), 3D pohyb (yaw + pitch), gravitace s vztlakem, predace s attack-gate + gradient exposure podle počtu bondů, mating přes pheromone signaling, food clustering ve world map, hazard zóny, thermal field (vertikální gradient + diurnal/seasonal oscilace, per-cell `thermal_optimum` gen), multi-trophic food (plant / carrion / hunter-carrion + evoluční `carnivore_score`), recurrent brain (21 sensory + 32 recurrent vstupů × 16 hidden — NEAT-style růst k 32 storage — × 10 výstupů, Elman feedback), cluster-shared brain pooling přes bonded peers (proto-distributed cognition), persistentní spring bondy → tissue regime, evolving Hunter s vlastním brainem (biological arms race), bistabilní cell-state. Headless harness pro deterministické batch experimenty, 3D renderer s orbit kamerou (HDR + bloom + fog + procedurální bio-textury).
 
 Detailní stav po sprintech: [`docs/sprints/`](docs/sprints/).
 
 ## Emergent behaviors
 
-Measured empirically in the **current code state** — three 300-generation headless runs (seeds 0, 1, 42) plus a 5-minute renderer screencast (`screenshots/screencast.mp4`). What selection actually produces, none of it directly coded. Each entry includes a biological analogy.
+Measured empirically — three 300-generation headless runs (seeds 0, 1, 42) plus a 5-minute renderer screencast (`screenshots/screencast.mp4`), **at the sprint-86 code state**. Subsequent sprints (87+: thermal sensor + per-cell optimum gene, Hunter brain + evolution, multi-trophic food, gradient hunter exposure, cluster-shared brain pooling, NEAT-style brain growth) changed selection pressure substantially — these findings would need remeasurement against the current code. What selection actually produces, none of it directly coded. Each entry includes a biological analogy.
 
 **Highly reproducible across seeds (CV < 5 %):**
 
