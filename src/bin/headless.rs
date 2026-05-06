@@ -428,7 +428,14 @@ impl World {
         if transitions.generation_ended.is_some() {
             let phase =
                 (self.clock.generation as f32 / CYCLE_GEN_PERIOD as f32) * std::f32::consts::TAU;
-            self.density_factor = 1.0 + CYCLE_AMPLITUDE * phase.sin();
+            let seasonal = 1.0 + CYCLE_AMPLITUDE * phase.sin();
+            // Sprint 113: FoodCrash multiplikátor (1.0 default). Compound
+            // přes všechny aktivní FoodCrash, clamp na FOOD_CRASH_MIN_FACTOR.
+            let shock_mult = bioscape::food_density_shock_multiplier(
+                &self.events.events,
+                self.clock.generation,
+            );
+            self.density_factor = seasonal * shock_mult;
         }
 
         macro_rules! timed {
@@ -2517,7 +2524,7 @@ fn food_target(factor: f32) -> usize {
 // "in corner" if both axes simultaneously meet that criterion.
 const EDGE_FRAC_THRESHOLD: f32 = 0.9;
 
-fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
+fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::io::Result<()> {
     let n = world.cells.len();
     if n == 0 {
         // 64 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
@@ -2530,9 +2537,12 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // Sprint 111: i v empty-pop branch reportujeme aktuální shock stav,
         // protože shocky existují nezávisle na živé populaci.
         let (shock_active, shock_hazard_max) = shock_summary(world);
+        // Sprint 113: shock_food_factor reportuje i v empty-pop branch.
+        let shock_food_factor =
+            bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,1.000,0,0.000,0.000",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,{:.3},0,0.000,0.000,{:.1}",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2550,6 +2560,8 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
             world.hunter_bonds_broken_gen,
             shock_active,
             shock_hazard_max,
+            shock_food_factor,
+            ticks_per_sec,
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -2940,9 +2952,13 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let lineage_count = lineages.len();
     let behavioral_entropy_attack = attack_entropy(&world.cells);
     let weight_diversity_w1_norm = w1_frobenius_std(&world.cells);
+    // Sprint 113: globální FoodCrash multiplikátor (1.0 default, < 1.0 při
+    // aktivním FoodCrash). Single per-gen scalar — žádný spatial average.
+    let shock_food_factor =
+        bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},1.000,{},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.1}",
         world.clock.generation,
         n,
         spd_m,
@@ -3030,16 +3046,19 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         world.hunter_bonds_broken_gen,
         // Sprint 107: CPPN speciation distance.
         cppn_compat_m,
-        // Sprint 111: shock state + diversity metrics. food_factor (1.0)
-        // je placeholder do S113.
+        // Sprint 111: shock state + diversity metrics.
         // Sprint 112: shock_climate_offset = mean signed temperature offset
         // přes všechny cells z aktivních ClimateShift shocků (0.0 default).
+        // Sprint 113: shock_food_factor = global FoodCrash multiplikátor
+        // (1.0 default, clamp na FOOD_CRASH_MIN_FACTOR floor).
         shock_active,
         shock_hazard_max,
         climate_offset_avg,
+        shock_food_factor,
         lineage_count,
         behavioral_entropy_attack,
         weight_diversity_w1_norm,
+        ticks_per_sec,
     )
 }
 
@@ -3412,10 +3431,10 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,ticks_per_sec"
     )
     .unwrap();
-    write_stats(&mut log, &world).unwrap();
+    write_stats(&mut log, &world, 0.0).unwrap();
 
     let baseline_samples = 10_000;
     let mut bsum = 0.0_f64;
@@ -3450,10 +3469,21 @@ fn main() {
     );
 
     let start = Instant::now();
+    let mut gen_start = Instant::now();
+    let mut gen_ticks = 0_u64;
     while world.clock.generation < max_gens {
         let gen_ended = world.tick(&mut rng);
+        gen_ticks += 1;
         if gen_ended.is_some() {
-            write_stats(&mut log, &world).unwrap();
+            let gen_elapsed = gen_start.elapsed().as_secs_f64();
+            let tps = if gen_elapsed > 0.0 {
+                gen_ticks as f64 / gen_elapsed
+            } else {
+                0.0
+            };
+            write_stats(&mut log, &world, tps).unwrap();
+            gen_start = Instant::now();
+            gen_ticks = 0;
             // Sprint 43: po první dokončené generaci vypiš per-fáze timing
             // (mikrosekundy total + průměr per tick). Reset accumulator.
             if world.clock.generation == 1 {

@@ -5250,6 +5250,36 @@ pub fn climate_shock_offset(
     total
 }
 
+/// Sprint 113: max drop multiplikátoru při peak intensity. Při intensity=1,
+/// peak ramp=1 → density_factor × 0.5 (= half food spawning).
+pub const FOOD_CRASH_MAX_DROP: f32 = 0.5;
+
+/// Sprint 113: hard floor pro density factor — i compound shocky nezpůsobí
+/// úplný food collapse (extinction). 0.1 = 10% baseline = survival possible
+/// pro adapted populace.
+pub const FOOD_CRASH_MIN_FACTOR: f32 = 0.1;
+
+/// Sprint 113: globální food density multiplikátor z aktivních FoodCrash shocků.
+/// Default 1.0 (žádný FoodCrash aktivní). Pro každý active FoodCrash:
+/// `multiplier *= 1.0 - intensity × ramp_factor × FOOD_CRASH_MAX_DROP`.
+/// Multiplicative compound přes všechny active FoodCrash. Žádná spatial maska —
+/// global per-tick scalar. Min clamp na `FOOD_CRASH_MIN_FACTOR` aby populace
+/// měla šanci přežít. Pure fn, deterministic.
+pub fn food_density_shock_multiplier(events: &[ShockEvent], generation: u64) -> f32 {
+    let mut mult = 1.0_f32;
+    for event in events {
+        if event.kind != ShockKind::FoodCrash {
+            continue;
+        }
+        let ramp = shock_ramp_factor(event, generation);
+        if ramp <= 0.0 {
+            continue;
+        }
+        mult *= 1.0 - event.intensity * ramp * FOOD_CRASH_MAX_DROP;
+    }
+    mult.max(FOOD_CRASH_MIN_FACTOR)
+}
+
 /// Sprint 112: shock-aware varianta `temperature_at_z`. K baseline gradientu
 /// přičítá sumu ClimateShift offsetů. Empty events nebo žádný ClimateShift
 /// aktivní → byte-identical s `temperature_at_z`. Renderer i headless volají
@@ -8434,5 +8464,85 @@ mod tests {
             WORLD_HALF,
         );
         assert!(m_near > m_mid, "near {} should exceed mid {}", m_near, m_mid);
+    }
+
+    #[test]
+    fn food_multiplier_default_one() {
+        // Empty events → 1.0.
+        let m = food_density_shock_multiplier(&[], 50);
+        assert!((m - 1.0).abs() < 1e-6, "empty events must give 1.0, got {}", m);
+        // Non-FoodCrash event (HazardPulse) → 1.0.
+        let event = ShockEvent {
+            kind: ShockKind::HazardPulse,
+            start_gen: 0,
+            duration_gen: 10,
+            ramp_gens: 2,
+            intensity: 1.0,
+            center_xy: None,
+            radius: None,
+        };
+        let m = food_density_shock_multiplier(&[event], 5);
+        assert!((m - 1.0).abs() < 1e-6, "HazardPulse must not affect food, got {}", m);
+    }
+
+    #[test]
+    fn food_multiplier_global_crash_drops() {
+        // Sprint 113: 1 global FoodCrash, intensity = 1, peak ramp = 1
+        // → mult = 1.0 - 1.0 × 1.0 × 0.5 = 0.5.
+        let event = ShockEvent {
+            kind: ShockKind::FoodCrash,
+            start_gen: 100,
+            duration_gen: 10,
+            ramp_gens: 2,
+            intensity: 1.0,
+            center_xy: None,
+            radius: None,
+        };
+        // Plateau (gen 102..=107) → ramp = 1.0.
+        let m = food_density_shock_multiplier(&[event], 105);
+        let expected = 1.0 - FOOD_CRASH_MAX_DROP;
+        assert!(
+            (m - expected).abs() < 1e-5,
+            "global peak must give 1 - FOOD_CRASH_MAX_DROP = {}, got {}",
+            expected,
+            m
+        );
+        // Pre-start: 1.0.
+        let m_before = food_density_shock_multiplier(&[event], 99);
+        assert!((m_before - 1.0).abs() < 1e-6, "pre-start must be 1.0, got {}", m_before);
+        // Post-end: 1.0.
+        let m_after = food_density_shock_multiplier(&[event], 110);
+        assert!((m_after - 1.0).abs() < 1e-6, "post-end must be 1.0, got {}", m_after);
+    }
+
+    #[test]
+    fn food_multiplier_compound_clamped() {
+        // Sprint 113: 3× FoodCrash s intensity=1, peak ramp současně:
+        // 0.5 × 0.5 × 0.5 = 0.125 (> 0.1 floor → no clamp, return raw).
+        let mk = |start: u64| ShockEvent {
+            kind: ShockKind::FoodCrash,
+            start_gen: start,
+            duration_gen: 10,
+            ramp_gens: 2,
+            intensity: 1.0,
+            center_xy: None,
+            radius: None,
+        };
+        let three = [mk(100), mk(100), mk(100)];
+        let m3 = food_density_shock_multiplier(&three, 105);
+        assert!(
+            (m3 - 0.125).abs() < 1e-5,
+            "3 crashes compound to 0.125, got {}",
+            m3
+        );
+        // 4× FoodCrash: 0.5^4 = 0.0625 < 0.1 floor → clamp to FOOD_CRASH_MIN_FACTOR.
+        let four = [mk(100), mk(100), mk(100), mk(100)];
+        let m4 = food_density_shock_multiplier(&four, 105);
+        assert!(
+            (m4 - FOOD_CRASH_MIN_FACTOR).abs() < 1e-5,
+            "4 crashes must clamp to FOOD_CRASH_MIN_FACTOR = {}, got {}",
+            FOOD_CRASH_MIN_FACTOR,
+            m4
+        );
     }
 }

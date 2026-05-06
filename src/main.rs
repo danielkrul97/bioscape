@@ -1008,13 +1008,18 @@ fn food_target(extent: &WorldExtent, factor: f32) -> usize {
 fn update_food_density_cycle(
     mut events: MessageReader<GenerationEnded>,
     clock: Res<Clock>,
+    calendar: Res<EventCalendarResource>,
     mut factor: ResMut<FoodDensityFactor>,
 ) {
     if events.read().next().is_none() {
         return;
     }
     let phase = (clock.0.generation as f32 / CYCLE_GEN_PERIOD as f32) * std::f32::consts::TAU;
-    factor.0 = 1.0 + CYCLE_AMPLITUDE * phase.sin();
+    let seasonal = 1.0 + CYCLE_AMPLITUDE * phase.sin();
+    // Sprint 113: FoodCrash multiplikátor (1.0 default).
+    let shock_mult =
+        bioscape::food_density_shock_multiplier(&calendar.0.events, clock.0.generation);
+    factor.0 = seasonal * shock_mult;
 }
 
 /// Cap virtual-time delta na 50 ms — limit catch-up FixedUpdate ticků (~4 při
