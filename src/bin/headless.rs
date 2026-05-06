@@ -8,8 +8,9 @@
 
 use bioscape::{
     adhesion_velocity_delta, bond_velocity_delta, nearest_attackable_cell,
-    reject_food_for_richness, Bond, Cell, Food, Hunter, SimClock, SmellField, SpatialGrid,
-    WorldMap, ADHESION_RANGE_FACTOR, ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
+    reject_food_for_richness, Bond, Cell, EventCalendar, Food, Hunter, ShockScheduleConfig,
+    SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR, ATTACK_THRESHOLD,
+    BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
     COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
@@ -166,6 +167,10 @@ struct World {
     // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
     // může nastavit výš (potřeba pro bench při N > 1000).
     max_population: usize,
+    /// Sprint 109: deterministicky vygenerovaný kalendář environmentálních
+    /// shocků. Default empty (no-op) — sim loop ho zatím nečte; integrace
+    /// efektů přijde v Sprintu 110+.
+    events: EventCalendar,
     // Sprint 87 Hamilton-rule sweep: runtime overrides pro food share. Default
     // = pre-sweep behavior (BOND_FOOD_SHARE_FRAC, no kin filter).
     share_frac: f32,
@@ -222,6 +227,7 @@ impl World {
         mating_radius: f32,
         initial_cells: usize,
         max_population: usize,
+        events: EventCalendar,
     ) -> Self {
         // Sprint 53: WorldMap a SmellField/Pheromone jsou plně 3D volumetric.
         // Food richness sampling používá z=0 (canonical surface depth) aby
@@ -292,6 +298,7 @@ impl World {
             hunter_bonds_broken_gen: 0,
             mating_radius,
             max_population,
+            events,
             share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
             bench_timings: PhaseTimings::default(),
@@ -401,6 +408,10 @@ impl World {
             hunter_bonds_broken_gen: 0,
             mating_radius: chk.mating_radius,
             max_population: chk.max_population,
+            // Sprint 109: kalendář není v checkpointu (per-tick state je
+            // deterministicky odvozen z World seed). Resume CLI musí znovu
+            // předat `--shocks-mean-gens`; jinak fresh empty.
+            events: EventCalendar::default(),
             share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
             bench_timings: PhaseTimings::default(),
@@ -2990,10 +3001,34 @@ fn main() {
         .iter()
         .find_map(|a| a.strip_prefix("--share-frac=").and_then(|s| s.parse().ok()));
     let kin_filter = raw_args.iter().any(|a| a == "--kin");
+    // Sprint 109: `--shocks-mean-gens N` (space-separated) nebo
+    // `--shocks-mean-gens=N` (= form). Default 0 = no-op (empty kalendář).
+    // `consumed_value_idx` drží pozici následujícího raw arg pokud je flag
+    // space-separated; ten se musí vyfiltrovat z positional setu.
+    let mut shocks_mean_gens: u32 = 0;
+    let mut consumed_value_idx: Option<usize> = None;
+    for (i, a) in raw_args.iter().enumerate() {
+        if let Some(rest) = a.strip_prefix("--shocks-mean-gens") {
+            if let Some(eq_val) = rest.strip_prefix('=') {
+                if let Ok(v) = eq_val.parse::<u32>() {
+                    shocks_mean_gens = v;
+                }
+            } else if rest.is_empty() {
+                if let Some(next) = raw_args.get(i + 1) {
+                    if let Ok(v) = next.parse::<u32>() {
+                        shocks_mean_gens = v;
+                        consumed_value_idx = Some(i + 1);
+                    }
+                }
+            }
+            break;
+        }
+    }
     let args: Vec<String> = raw_args
         .iter()
-        .filter(|a| !a.starts_with("--"))
-        .cloned()
+        .enumerate()
+        .filter(|(i, a)| !a.starts_with("--") && Some(*i) != consumed_value_idx)
+        .map(|(_, a)| a.clone())
         .collect();
     let seed: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let max_gens: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(500);
@@ -3035,9 +3070,20 @@ fn main() {
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
+    // Sprint 109: kalendář environmentálních shocků. Když mean_gens_between == 0,
+    // generate vrátí prázdný kalendář (no-op) — byte-identical s pre-S109 baseline.
+    let shock_cfg = if shocks_mean_gens > 0 {
+        ShockScheduleConfig {
+            mean_gens_between: shocks_mean_gens,
+            ..Default::default()
+        }
+    } else {
+        ShockScheduleConfig::default()
+    };
+    let events = EventCalendar::generate(seed, &shock_cfg, max_gens);
     let mut world = if let Some(path) = load_path.as_ref() {
         match World::load_checkpoint(Path::new(path)) {
-            Ok(w) => {
+            Ok(mut w) => {
                 eprintln!(
                     "checkpoint: loaded {} (cells={}, foods={}, gen={}, tick={})",
                     path,
@@ -3046,15 +3092,30 @@ fn main() {
                     w.clock.generation,
                     w.clock.tick,
                 );
+                w.events = events.clone();
                 w
             }
             Err(e) => {
                 eprintln!("checkpoint: load failed ({e}); starting fresh");
-                World::new(&mut rng, map_seed, mating_radius, initial_cells, max_population)
+                World::new(
+                    &mut rng,
+                    map_seed,
+                    mating_radius,
+                    initial_cells,
+                    max_population,
+                    events.clone(),
+                )
             }
         }
     } else {
-        World::new(&mut rng, map_seed, mating_radius, initial_cells, max_population)
+        World::new(
+            &mut rng,
+            map_seed,
+            mating_radius,
+            initial_cells,
+            max_population,
+            events,
+        )
     };
     // Sprint 87 Hamilton sweep: aplikuj CLI overrides AFTER World::new (i po
     // checkpoint load) — nikdy se neserializují, vždy z aktuálního CLI.
@@ -3196,6 +3257,11 @@ fn main() {
         world.foods.len(),
         max_population,
         rayon::current_num_threads()
+    );
+    eprintln!(
+        "shocks: mean_gens_between={} scheduled={} (sim loop integration arrives in S110+)",
+        shocks_mean_gens,
+        world.events.events.len()
     );
 
     let start = Instant::now();

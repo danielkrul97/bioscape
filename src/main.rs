@@ -33,8 +33,9 @@ const DIAG_TICKS_PER_FRAME: DiagnosticPath = DiagnosticPath::const_new("sim/tick
 const DIAG_RENDER_OVERHEAD: DiagnosticPath = DiagnosticPath::const_new("sim/render_overhead_ms");
 use bioscape::{
     adhesion_velocity_delta, bond_velocity_delta, nearest_attackable_cell,
-    reject_food_for_richness, Bond, Cell, Food, Hunter, Phenotype, SimClock, SmellField,
-    SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR, ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
+    reject_food_for_richness, Bond, Cell, EventCalendar, Food, Hunter, Phenotype,
+    ShockScheduleConfig, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
+    ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_INPUTS, CARRION_FOOD_COUNT, CELL_RADIUS,
     CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS,
@@ -216,6 +217,14 @@ struct ContactProgress(FxHashMap<(u64, u64), u32>);
 /// across ticks — bond formation gates na BOND_FORM_TICKS consecutive.
 #[derive(Resource, Default)]
 struct HunterContactProgress(FxHashMap<(u64, u64), u32>);
+
+/// Sprint 109: deterministicky vygenerovaný kalendář environmentálních shocků
+/// pro celý běh rendereru. Default empty — sim systémy ho zatím nečtou,
+/// integrace efektů přijde v Sprintu 110+. Init z env varu
+/// `BIOSCAPE_SHOCKS_MEAN_GENS` (parse u32); ignoruje ho při unset / `0`.
+#[derive(Resource, Default)]
+#[allow(dead_code)]
+struct EventCalendarResource(EventCalendar);
 
 /// Sprint 52: GPU compute state pro renderer. Drží persistent CellsGpu +
 /// BrainGpu/HebbianGpu/BrownianGpu na shared GpuContext. Insert se v `setup`
@@ -442,6 +451,31 @@ fn main() {
         .register_diagnostic(Diagnostic::new(DIAG_RENDER_OVERHEAD).with_suffix(" ms"));
     }
 
+    // Sprint 109: shock kalendář z env var `BIOSCAPE_SHOCKS_MEAN_GENS`. Když
+    // unset / 0 / parse fail, kalendář je prázdný (no-op, default). MAX_GENS
+    // pro rendererský běh je velký — interaktivní session typicky < 10k gen,
+    // 1M je hard cap aby `EventCalendar::generate` netočilo donekonečna.
+    let shocks_mean_gens: u32 = std::env::var("BIOSCAPE_SHOCKS_MEAN_GENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let shock_cfg = if shocks_mean_gens > 0 {
+        ShockScheduleConfig {
+            mean_gens_between: shocks_mean_gens,
+            ..Default::default()
+        }
+    } else {
+        ShockScheduleConfig::default()
+    };
+    let event_calendar = EventCalendar::generate(WORLD_MAP_SEED, &shock_cfg, 1_000_000);
+    if shocks_mean_gens > 0 {
+        eprintln!(
+            "shocks: mean_gens_between={} scheduled={} (sim integration arrives in S110+)",
+            shocks_mean_gens,
+            event_calendar.events.len()
+        );
+    }
+
     app.init_resource::<TickCounter>()
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`.
         // Sprint 88: white → ocean blue. Match s DistanceFog color tak aby
@@ -456,6 +490,7 @@ fn main() {
             TICKS_PER_GENERATION,
             GENERATIONS_PER_EPOCH,
         )))
+        .insert_resource(EventCalendarResource(event_calendar))
         .init_resource::<CellGrid>()
         .init_resource::<FoodGrid>()
         .init_resource::<FoodDensityFactor>()
