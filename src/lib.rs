@@ -1666,6 +1666,465 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // Sprint 97: sensor_gains drift. 0.04 = 2 % range / gen.
     sigma_sensor_gain: 0.04,
 };
+// ─── Sprint 105: HyperNEAT CPPN scaffolding ─────────────────────────────────
+//
+// CPPN (Compositional Pattern-Producing Network) je malá heterogenní NN
+// s diverse activation functions. V S106 bude generovat Brain weights na
+// základě geometric coords substrate neuronů. V S105 je standalone — datová
+// struktura, mutace, crossover, forward pass, tests.
+
+/// Activation functions for CPPN nodes. HyperNEAT-classic library —
+/// rozmanité tvary vedou k symetrickým / periodic patterns ve weight space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivationFn {
+    Linear,
+    Sigmoid,
+    Tanh,
+    Gaussian,
+    Sine,
+    Abs,
+    Step,
+}
+
+impl ActivationFn {
+    pub fn apply(&self, x: f32) -> f32 {
+        match self {
+            ActivationFn::Linear => x,
+            ActivationFn::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            ActivationFn::Tanh => x.tanh(),
+            ActivationFn::Gaussian => (-x * x).exp(),
+            ActivationFn::Sine => x.sin(),
+            ActivationFn::Abs => x.abs(),
+            ActivationFn::Step => {
+                if x >= 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    pub fn random(rng: &mut impl Rng) -> Self {
+        match rng.random_range(0..7) {
+            0 => ActivationFn::Linear,
+            1 => ActivationFn::Sigmoid,
+            2 => ActivationFn::Tanh,
+            3 => ActivationFn::Gaussian,
+            4 => ActivationFn::Sine,
+            5 => ActivationFn::Abs,
+            _ => ActivationFn::Step,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CppnNode {
+    pub id: u32,
+    pub activation: ActivationFn,
+    pub bias: f32,
+    /// Layer index pro topological sort. Inputs = 0, outputs = max_layer,
+    /// hidden ∈ (0, max_layer). Add_node split insertem dostane layer mezi
+    /// from a to.
+    pub layer: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CppnLink {
+    /// Innovation id — monotonic per-Cppn. Per-Cppn lokální (ne globální
+    /// jako v classic NEAT). Stačí pro speciation distance v rámci jedné
+    /// linie; cross-population alignment je proxy via crossover.
+    pub innovation: u32,
+    pub from: u32,
+    pub to: u32,
+    pub weight: f32,
+    pub enabled: bool,
+}
+
+/// Sprint 105: CPPN config. CPPN_INPUTS=6 stačí pro 3D substrate (x1,y1,z1,
+/// x2,y2,z2 = coords obou neuronů co spojuje). Plus volitelný bias input
+/// (1.0 const). CPPN_OUTPUTS=2: weight + link_existence (gate via threshold).
+pub const CPPN_INPUTS: usize = 7; // 6 coords + 1 bias-const
+pub const CPPN_OUTPUTS: usize = 2; // weight + link_exists
+/// Initial CPPN nodes count při random init: CPPN_INPUTS + CPPN_OUTPUTS
+/// + 1 hidden neuron na startup. Growable přes add_node mutace.
+pub const CPPN_INITIAL_HIDDEN: usize = 1;
+/// Maximum CPPN nodes celkem. Soft cap k zabránění memory blow-up. 64 dává
+/// (CPPN_INPUTS + CPPN_OUTPUTS + ~55 hidden), což pokryje phenotype rozsah
+/// většiny HyperNEAT studií.
+pub const CPPN_MAX_NODES: usize = 64;
+/// Maximum CPPN links — quadratic-ish growth s nodes, soft cap.
+pub const CPPN_MAX_LINKS: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cppn {
+    pub nodes: Vec<CppnNode>,
+    pub links: Vec<CppnLink>,
+    pub next_innovation: u32,
+}
+
+impl Cppn {
+    /// Random init: CPPN_INPUTS input nodes (Linear, layer 0) +
+    /// CPPN_OUTPUTS output nodes (Tanh, layer 2) + 1 hidden (random fn,
+    /// layer 1). Initial links: každý input → hidden + hidden → output
+    /// s random gaussian weight.
+    pub fn random(rng: &mut impl Rng) -> Self {
+        let mut nodes: Vec<CppnNode> = Vec::new();
+        let mut links: Vec<CppnLink> = Vec::new();
+        let mut next_id: u32 = 0;
+        // Inputs (layer 0).
+        let mut input_ids: Vec<u32> = Vec::with_capacity(CPPN_INPUTS);
+        for _ in 0..CPPN_INPUTS {
+            nodes.push(CppnNode {
+                id: next_id,
+                activation: ActivationFn::Linear,
+                bias: 0.0,
+                layer: 0,
+            });
+            input_ids.push(next_id);
+            next_id += 1;
+        }
+        // Outputs (layer 2). Tanh dává weights ∈ [-1,1] a link_exists ∈ [-1,1].
+        let mut output_ids: Vec<u32> = Vec::with_capacity(CPPN_OUTPUTS);
+        for _ in 0..CPPN_OUTPUTS {
+            nodes.push(CppnNode {
+                id: next_id,
+                activation: ActivationFn::Tanh,
+                bias: 0.0,
+                layer: 2,
+            });
+            output_ids.push(next_id);
+            next_id += 1;
+        }
+        // Hidden seed neurons (layer 1) s random activation.
+        let mut hidden_ids: Vec<u32> = Vec::with_capacity(CPPN_INITIAL_HIDDEN);
+        for _ in 0..CPPN_INITIAL_HIDDEN {
+            nodes.push(CppnNode {
+                id: next_id,
+                activation: ActivationFn::random(rng),
+                bias: gaussian(rng) * 0.5,
+                layer: 1,
+            });
+            hidden_ids.push(next_id);
+            next_id += 1;
+        }
+        // Initial links: full bipartite input→hidden + hidden→output.
+        let mut innovation: u32 = 0;
+        for &i in &input_ids {
+            for &h in &hidden_ids {
+                links.push(CppnLink {
+                    innovation,
+                    from: i,
+                    to: h,
+                    weight: gaussian(rng) * 1.0,
+                    enabled: true,
+                });
+                innovation += 1;
+            }
+        }
+        for &h in &hidden_ids {
+            for &o in &output_ids {
+                links.push(CppnLink {
+                    innovation,
+                    from: h,
+                    to: o,
+                    weight: gaussian(rng) * 1.0,
+                    enabled: true,
+                });
+                innovation += 1;
+            }
+        }
+        Cppn {
+            nodes,
+            links,
+            next_innovation: innovation,
+        }
+    }
+
+    /// Forward pass — feed-forward by layer. Inputs are mapped do prvních
+    /// CPPN_INPUTS nodů. Outputs returned ze posledních CPPN_OUTPUTS.
+    /// Layer-wise computation; cycles unsupported (add_link mutace
+    /// preventuje cykly — viz `mutate_add_link`).
+    pub fn forward(&self, inputs: [f32; CPPN_INPUTS]) -> [f32; CPPN_OUTPUTS] {
+        let mut activations: rustc_hash::FxHashMap<u32, f32> =
+            rustc_hash::FxHashMap::default();
+        for (i, n) in self.nodes.iter().take(CPPN_INPUTS).enumerate() {
+            activations.insert(n.id, inputs[i]);
+        }
+        // Process by layer (assumes layer monotonically increasing in nodes).
+        let max_layer = self.nodes.iter().map(|n| n.layer).max().unwrap_or(0);
+        for layer in 1..=max_layer {
+            for n in &self.nodes {
+                if n.layer != layer {
+                    continue;
+                }
+                let mut sum = n.bias;
+                for link in &self.links {
+                    if !link.enabled || link.to != n.id {
+                        continue;
+                    }
+                    if let Some(&x) = activations.get(&link.from) {
+                        sum += link.weight * x;
+                    }
+                }
+                activations.insert(n.id, n.activation.apply(sum));
+            }
+        }
+        let mut out = [0.0; CPPN_OUTPUTS];
+        let output_start = CPPN_INPUTS;
+        for o in 0..CPPN_OUTPUTS {
+            let id = self.nodes[output_start + o].id;
+            out[o] = *activations.get(&id).unwrap_or(&0.0);
+        }
+        out
+    }
+
+    /// Mutate weight of random enabled link gaussian-style.
+    pub fn mutate_weight(&mut self, rng: &mut impl Rng, sigma: f32) {
+        let active: Vec<usize> = self
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.enabled)
+            .map(|(i, _)| i)
+            .collect();
+        if active.is_empty() {
+            return;
+        }
+        let pick = active[rng.random_range(0..active.len())];
+        self.links[pick].weight += gaussian(rng) * sigma;
+    }
+
+    /// Add_node: split random enabled link, insert nový hidden node.
+    /// Old link disabled, dvě nové links (from→new, new→to) se přidají.
+    /// Layer nového = avg(from.layer, to.layer); pokud rovné, +1.
+    pub fn mutate_add_node(&mut self, rng: &mut impl Rng) {
+        if self.nodes.len() >= CPPN_MAX_NODES || self.links.len() + 2 > CPPN_MAX_LINKS {
+            return;
+        }
+        let active: Vec<usize> = self
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.enabled)
+            .map(|(i, _)| i)
+            .collect();
+        if active.is_empty() {
+            return;
+        }
+        let pick = active[rng.random_range(0..active.len())];
+        let original = self.links[pick];
+        let from_layer = self
+            .nodes
+            .iter()
+            .find(|n| n.id == original.from)
+            .map(|n| n.layer)
+            .unwrap_or(0);
+        let to_layer = self
+            .nodes
+            .iter()
+            .find(|n| n.id == original.to)
+            .map(|n| n.layer)
+            .unwrap_or(0);
+        let new_layer = if from_layer + 1 < to_layer {
+            from_layer + 1
+        } else {
+            // Need to re-layer downstream — push everything ≥ new_layer up.
+            let new_l = from_layer + 1;
+            for n in self.nodes.iter_mut() {
+                if n.layer >= new_l {
+                    n.layer += 1;
+                }
+            }
+            new_l
+        };
+        let new_id = self.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+        self.nodes.push(CppnNode {
+            id: new_id,
+            activation: ActivationFn::random(rng),
+            bias: 0.0,
+            layer: new_layer,
+        });
+        self.links[pick].enabled = false;
+        let inv1 = self.next_innovation;
+        let inv2 = self.next_innovation + 1;
+        self.next_innovation += 2;
+        self.links.push(CppnLink {
+            innovation: inv1,
+            from: original.from,
+            to: new_id,
+            weight: 1.0,
+            enabled: true,
+        });
+        self.links.push(CppnLink {
+            innovation: inv2,
+            from: new_id,
+            to: original.to,
+            weight: original.weight,
+            enabled: true,
+        });
+    }
+
+    /// Add_link: pick random pair (from, to) with from.layer < to.layer
+    /// (no cycles), kde žádný link mezi nimi yet. Weight gaussian.
+    pub fn mutate_add_link(&mut self, rng: &mut impl Rng, sigma: f32) {
+        if self.links.len() >= CPPN_MAX_LINKS {
+            return;
+        }
+        if self.nodes.len() < 2 {
+            return;
+        }
+        for _ in 0..16 {
+            let i_idx = rng.random_range(0..self.nodes.len());
+            let j_idx = rng.random_range(0..self.nodes.len());
+            if i_idx == j_idx {
+                continue;
+            }
+            let (from_node, to_node) = (&self.nodes[i_idx], &self.nodes[j_idx]);
+            if from_node.layer >= to_node.layer {
+                continue;
+            }
+            let exists = self
+                .links
+                .iter()
+                .any(|l| l.from == from_node.id && l.to == to_node.id);
+            if exists {
+                continue;
+            }
+            let inv = self.next_innovation;
+            self.next_innovation += 1;
+            self.links.push(CppnLink {
+                innovation: inv,
+                from: from_node.id,
+                to: to_node.id,
+                weight: gaussian(rng) * sigma,
+                enabled: true,
+            });
+            return;
+        }
+    }
+
+    /// Toggle enable/disable bit of random link.
+    pub fn mutate_toggle_link(&mut self, rng: &mut impl Rng) {
+        if self.links.is_empty() {
+            return;
+        }
+        let pick = rng.random_range(0..self.links.len());
+        self.links[pick].enabled = !self.links[pick].enabled;
+    }
+
+    /// Mutate activation function of random hidden node.
+    pub fn mutate_activation(&mut self, rng: &mut impl Rng) {
+        let hidden: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.layer != 0 && n.layer != 2) // skip inputs (layer 0) and seed outputs (layer 2)
+            .map(|(i, _)| i)
+            .collect();
+        if hidden.is_empty() {
+            return;
+        }
+        let pick = hidden[rng.random_range(0..hidden.len())];
+        self.nodes[pick].activation = ActivationFn::random(rng);
+    }
+
+    /// Apply suite of mutations per CppnMutationConfig.
+    pub fn mutate(&self, rng: &mut impl Rng, cfg: &CppnMutationConfig) -> Self {
+        let mut out = self.clone();
+        if rng.random::<f32>() < cfg.weight_rate {
+            out.mutate_weight(rng, cfg.sigma_weight);
+        }
+        if rng.random::<f32>() < cfg.add_node_rate {
+            out.mutate_add_node(rng);
+        }
+        if rng.random::<f32>() < cfg.add_link_rate {
+            out.mutate_add_link(rng, cfg.sigma_weight);
+        }
+        if rng.random::<f32>() < cfg.toggle_link_rate {
+            out.mutate_toggle_link(rng);
+        }
+        if rng.random::<f32>() < cfg.activation_rate {
+            out.mutate_activation(rng);
+        }
+        out
+    }
+
+    /// Crossover: align matching innovations (same id), random pick;
+    /// disjoint genes inherited from both. Speciation-aware. Bias = a
+    /// (pokud fitness není známa — symmetric).
+    pub fn crossover(a: &Cppn, b: &Cppn, rng: &mut impl Rng) -> Cppn {
+        // Collect node ids — union of both.
+        let mut nodes_map: rustc_hash::FxHashMap<u32, CppnNode> =
+            rustc_hash::FxHashMap::default();
+        for n in &a.nodes {
+            nodes_map.insert(n.id, *n);
+        }
+        for n in &b.nodes {
+            // If matching id, randomly pick. Otherwise inherit.
+            match nodes_map.get(&n.id) {
+                Some(_) if rng.random::<bool>() => {
+                    nodes_map.insert(n.id, *n);
+                }
+                None => {
+                    nodes_map.insert(n.id, *n);
+                }
+                _ => {}
+            }
+        }
+        let mut nodes: Vec<CppnNode> = nodes_map.into_values().collect();
+        nodes.sort_by_key(|n| n.id);
+
+        // Links: align by innovation. Matching → random pick. Disjoint → inherit from both.
+        let mut links_map: rustc_hash::FxHashMap<u32, CppnLink> =
+            rustc_hash::FxHashMap::default();
+        for l in &a.links {
+            links_map.insert(l.innovation, *l);
+        }
+        for l in &b.links {
+            match links_map.get(&l.innovation) {
+                Some(_) if rng.random::<bool>() => {
+                    links_map.insert(l.innovation, *l);
+                }
+                None => {
+                    links_map.insert(l.innovation, *l);
+                }
+                _ => {}
+            }
+        }
+        let mut links: Vec<CppnLink> = links_map.into_values().collect();
+        links.sort_by_key(|l| l.innovation);
+
+        let next_innovation = links.iter().map(|l| l.innovation + 1).max().unwrap_or(0);
+        Cppn {
+            nodes,
+            links,
+            next_innovation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CppnMutationConfig {
+    pub weight_rate: f32,
+    pub sigma_weight: f32,
+    pub add_node_rate: f32,
+    pub add_link_rate: f32,
+    pub toggle_link_rate: f32,
+    pub activation_rate: f32,
+}
+
+pub const CPPN_MUTATION_CONFIG: CppnMutationConfig = CppnMutationConfig {
+    weight_rate: 0.8,    // time per child má change weight
+    sigma_weight: 0.5,
+    add_node_rate: 0.03, // structural growth, NEAT default ~0.03
+    add_link_rate: 0.05, // higher than node — more new connections than nodes
+    toggle_link_rate: 0.01,
+    activation_rate: 0.02,
+};
+
+// ─── End Sprint 105 CPPN scaffolding ─────────────────────────────────────────
+
 pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     drag: DRAG_COEFFICIENT,
     angular_drag: ANGULAR_DRAG,
@@ -6533,6 +6992,120 @@ mod tests {
             h.energy,
             moving.energy
         );
+    }
+
+    // ─── Sprint 105 CPPN tests ──────────────────────────────────────────
+
+    #[test]
+    fn cppn_random_has_correct_topology() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let c = Cppn::random(&mut rng);
+        assert_eq!(
+            c.nodes.iter().filter(|n| n.layer == 0).count(),
+            CPPN_INPUTS,
+            "CPPN_INPUTS input nodes at layer 0"
+        );
+        assert_eq!(
+            c.nodes.iter().filter(|n| n.layer == 2).count(),
+            CPPN_OUTPUTS,
+            "CPPN_OUTPUTS output nodes at layer 2"
+        );
+        assert_eq!(
+            c.nodes.iter().filter(|n| n.layer == 1).count(),
+            CPPN_INITIAL_HIDDEN,
+            "CPPN_INITIAL_HIDDEN hidden nodes at layer 1"
+        );
+        // Initial bipartite links: input × hidden + hidden × output.
+        let expected_links = CPPN_INPUTS * CPPN_INITIAL_HIDDEN
+            + CPPN_INITIAL_HIDDEN * CPPN_OUTPUTS;
+        assert_eq!(c.links.len(), expected_links);
+    }
+
+    #[test]
+    fn cppn_forward_deterministic() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let c = Cppn::random(&mut rng);
+        let inputs = [0.5, -0.3, 0.7, 0.1, -0.4, 0.0, 1.0];
+        let out1 = c.forward(inputs);
+        let out2 = c.forward(inputs);
+        assert_eq!(out1, out2, "deterministic forward");
+        // Tanh outputs must be in [-1, 1].
+        for o in out1.iter() {
+            assert!(o.is_finite() && (-1.0..=1.0).contains(o), "out {} oob", o);
+        }
+    }
+
+    #[test]
+    fn cppn_add_node_grows_topology() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let mut c = Cppn::random(&mut rng);
+        let n_pre = c.nodes.len();
+        let l_pre = c.links.len();
+        c.mutate_add_node(&mut rng);
+        assert_eq!(c.nodes.len(), n_pre + 1, "add_node adds 1 node");
+        assert_eq!(c.links.len(), l_pre + 2, "add_node adds 2 links");
+    }
+
+    #[test]
+    fn cppn_add_link_no_cycle() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let mut c = Cppn::random(&mut rng);
+        for _ in 0..50 {
+            c.mutate_add_link(&mut rng, 0.5);
+        }
+        for l in &c.links {
+            let from_layer = c
+                .nodes
+                .iter()
+                .find(|n| n.id == l.from)
+                .map(|n| n.layer)
+                .unwrap();
+            let to_layer = c
+                .nodes
+                .iter()
+                .find(|n| n.id == l.to)
+                .map(|n| n.layer)
+                .unwrap();
+            assert!(
+                from_layer < to_layer,
+                "no cycles allowed: from layer {} >= to layer {}",
+                from_layer,
+                to_layer
+            );
+        }
+    }
+
+    #[test]
+    fn cppn_crossover_preserves_matching_innovations() {
+        let mut rng = StdRng::seed_from_u64(19);
+        let a = Cppn::random(&mut rng);
+        let mut b = a.clone();
+        b.mutate_weight(&mut rng, 0.5);
+        let c = Cppn::crossover(&a, &b, &mut rng);
+        // All innovations from a (= same as b before mutation) should be in c.
+        for la in &a.links {
+            assert!(
+                c.links.iter().any(|lc| lc.innovation == la.innovation),
+                "innovation {} preserved",
+                la.innovation
+            );
+        }
+    }
+
+    #[test]
+    fn cppn_mutate_drives_diversity() {
+        let mut rng = StdRng::seed_from_u64(23);
+        let initial = Cppn::random(&mut rng);
+        let cfg = CppnMutationConfig {
+            weight_rate: 1.0,
+            sigma_weight: 0.5,
+            add_node_rate: 1.0,
+            add_link_rate: 1.0,
+            toggle_link_rate: 0.0,
+            activation_rate: 1.0,
+        };
+        let mutated = initial.mutate(&mut rng, &cfg);
+        assert!(mutated.nodes.len() > initial.nodes.len(), "topology grew");
     }
 
     #[test]
