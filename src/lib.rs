@@ -769,13 +769,14 @@ pub const HUNTER_INITIAL_ENERGY: f32 = 500.0;
 /// Energy threshold pro reprodukci. Při dosažení parent splituje energy 50/50
 /// se child + clone-with-mutate genome.
 ///
-/// Sprint 98: 700 → 600 v souvislosti se sexuální reprodukcí. Sex vyžaduje
+/// Sprint 98 tune 1: 700 → 500 (= HUNTER_INITIAL_ENERGY). Sex vyžaduje
 /// dva fertile hunters současně v MATING_RADIUS — vzácná událost při
-/// max_pop 50. Při threshold 700 (= initial 500 + 200 lovu) hunter zřídka
-/// strávil v fertile stavu dost času, aby potkal jiného fertile (smoke
-/// 70gen ukázal 0 births → pop crash). 600 = initial + 100, hunter dosáhne
-/// fertilního stavu po ~1-2 úspěšných lovech, fertility window je delší.
-pub const HUNTER_REPRODUCE_THRESHOLD: f32 = 600.0;
+/// max_pop 50. Při 700 dal smoke 70gen 0 births → pop crash; 600 dal
+/// 3 births za 300gen, taky kolaps. 500 = hunter je fertile od spawnu
+/// (cooldown 0), gate je pak jen prostorová proximity + cooldown po
+/// coupling. Re-fertility čeká jen na restore split-energy 250 → 500
+/// (~3-5 gen of hunting), což je rychlejší než dřívější 250 → 700.
+pub const HUNTER_REPRODUCE_THRESHOLD: f32 = 500.0;
 /// Cap pro hunter populace. Bez něj by predator boom (mnoho cells eaten)
 /// → exponenciální růst → prey extinction. 50 = 4× initial S71 count, dostatek
 /// pro arms race signal ale prevent runaway.
