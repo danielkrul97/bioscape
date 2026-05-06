@@ -1853,43 +1853,67 @@ fn hunters_lifecycle(
         }
     }
 
-    // Reproduce pass — eligible parents s energy ≥ threshold + cooldown 0.
-    // Cap respektuje MAX_POP — alive count + this-tick spawns ≤ cap.
+    // Sprint 98: sexual reproduction. Mirror headless logic — pair fertile
+    // entities přes prostorovou blízkost, každý pár → 1 mating child, oba
+    // rodiče zaplatí (halve + cooldown). Floor respawn nahoře pokrývá total
+    // extinction.
     let alive_count = alive.iter().filter(|(_, h)| h.energy > 0.0).count();
-    let mut budget = bioscape::HUNTER_MAX_POP.saturating_sub(alive_count);
+    let budget = bioscape::HUNTER_MAX_POP.saturating_sub(alive_count);
     if budget == 0 {
         return;
     }
-    for (entity, h) in &alive {
-        if budget == 0 {
-            break;
-        }
-        if h.energy < bioscape::HUNTER_REPRODUCE_THRESHOLD {
-            continue;
-        }
-        if h.reproduce_cooldown_ticks > 0 {
-            continue;
-        }
-        // Halve parent energy + reset cooldown via mut access.
+    let fertile: Vec<(Entity, [f32; 3])> = alive
+        .iter()
+        .filter(|(_, h)| {
+            h.energy >= bioscape::HUNTER_REPRODUCE_THRESHOLD
+                && h.reproduce_cooldown_ticks == 0
+        })
+        .map(|(e, h)| (*e, h.position))
+        .collect();
+    if fertile.len() < 2 {
+        return;
+    }
+    let mating_r2 = bioscape::HUNTER_MATING_RADIUS * bioscape::HUNTER_MATING_RADIUS;
+    let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
+    let lookup: FxHashMap<Entity, Hunter> =
+        alive.iter().map(|(e, h)| (*e, *h)).collect();
+    for &(ea, eb) in &matings {
+        let parent_a = match lookup.get(&ea) {
+            Some(p) => *p,
+            None => continue,
+        };
+        let parent_b = match lookup.get(&eb) {
+            Some(p) => *p,
+            None => continue,
+        };
+        // Halve both parents PŘED make_*_mating_child (energy semantics z cell
+        // mating: child.energy = a + b součet už halved values, takže celkem
+        // konzervovaná energy a + b post-mating).
+        let mut a_halved = parent_a;
+        let mut b_halved = parent_b;
+        a_halved.energy *= 0.5;
+        b_halved.energy *= 0.5;
         let id = next_hunter_id.0;
         next_hunter_id.0 += 1;
-        let child = bioscape::make_hunter_child(h, &mut rng, half, id, current_gen);
-        // Spawn child entity.
+        let child = bioscape::make_hunter_mating_child(
+            &a_halved,
+            &b_halved,
+            &mut rng,
+            half,
+            id,
+            current_gen,
+        );
         commands.spawn((
             HunterEntity(child),
             Mesh3d(hunter_mesh.0.clone()),
             MeshMaterial3d(hunter_material.0.clone()),
             Transform::from_xyz(child.position[0], child.position[1], child.position[2]),
         ));
-        // Update parent: split energy + reset cooldown. Use entity-targeted
-        // mutation via `commands.entity(...)` — direct &mut není dostupný (já
-        // držím snapshot). Workaround: insert new HunterEntity component s
-        // updated state.
-        let mut parent_after = *h;
-        parent_after.energy *= 0.5;
-        parent_after.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
-        commands.entity(*entity).insert(HunterEntity(parent_after));
-        budget -= 1;
+        // Update parent ECS components: halved energy + cooldown.
+        a_halved.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
+        b_halved.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
+        commands.entity(ea).insert(HunterEntity(a_halved));
+        commands.entity(eb).insert(HunterEntity(b_halved));
     }
 }
 

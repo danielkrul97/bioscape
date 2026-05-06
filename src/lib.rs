@@ -767,9 +767,15 @@ pub const MAX_HUNTER_BODY_SIZE: f32 = 2.5;
 /// chase cycle, který může trvat víc generation ticks bez kill.
 pub const HUNTER_INITIAL_ENERGY: f32 = 500.0;
 /// Energy threshold pro reprodukci. Při dosažení parent splituje energy 50/50
-/// se child + clone-with-mutate genome. 600 = 2× initial → predator musí
-/// úspěšně lovit ~1.5-2× initial-energy worth of prey aby reproduce.
-pub const HUNTER_REPRODUCE_THRESHOLD: f32 = 700.0;
+/// se child + clone-with-mutate genome.
+///
+/// Sprint 98: 700 → 600 v souvislosti se sexuální reprodukcí. Sex vyžaduje
+/// dva fertile hunters současně v MATING_RADIUS — vzácná událost při
+/// max_pop 50. Při threshold 700 (= initial 500 + 200 lovu) hunter zřídka
+/// strávil v fertile stavu dost času, aby potkal jiného fertile (smoke
+/// 70gen ukázal 0 births → pop crash). 600 = initial + 100, hunter dosáhne
+/// fertilního stavu po ~1-2 úspěšných lovech, fertility window je delší.
+pub const HUNTER_REPRODUCE_THRESHOLD: f32 = 600.0;
 /// Cap pro hunter populace. Bez něj by predator boom (mnoho cells eaten)
 /// → exponenciální růst → prey extinction. 50 = 4× initial S71 count, dostatek
 /// pro arms race signal ale prevent runaway.
@@ -803,6 +809,14 @@ pub const HUNTER_CARRION_DROP: usize = 2;
 /// Reproduce cooldown (ticks) po split. Brání instant re-reproduce před cell
 /// catch-up. ~1 generation = 600 ticks.
 pub const HUNTER_REPRODUCE_COOLDOWN_TICKS: u32 = 300;
+/// Sprint 98: maximální vzdálenost dvou fertile hunterů, aby se spárovali.
+/// Cells mají MATING_RADIUS = 200; hunteři jsou mnohem řidší (max 50 vs
+/// max 2500 cells) → density je řádově nižší, takže menší mating radius
+/// znamená, že se rodiče nepotkají. Density math: 12 hunterů v 207M unit³
+/// dává mean nearest-neighbor ≈ 160 — pod 200 by žádný pár nepřekonal
+/// gate, hunter populace by sjela floor respawn loop. 200 = parita s
+/// HUNTER_VISION_RADIUS, biologicky „vidí na partnera".
+pub const HUNTER_MATING_RADIUS: f32 = 200.0;
 /// Sprint 90: brain output[0] turn_yaw multiplier (rad/sec). Hunter má
 /// pevnou turn_rate (ne gene); cells mají gene-encoded turn_rate ∈ [1, 5].
 /// 3.0 je mid-cell-range. Sprint 91+ může přidat jako gene.
@@ -1274,6 +1288,9 @@ pub fn populate_hunter_brain_inputs(
 /// Sprint 89: asexual clone-with-mutate. Parent splituje energy 50/50
 /// se child, child dostává mutated genome + parent's lineage_id (lineage
 /// continuation). Caller sets cooldown + alloc hunter_id.
+///
+/// Sprint 98: solo cesta zachovaná pro floor respawn, ale primární repro
+/// path je teď sexuální (`make_hunter_mating_child`).
 pub fn make_hunter_child(
     parent: &Hunter,
     rng: &mut impl Rng,
@@ -1293,6 +1310,43 @@ pub fn make_hunter_child(
     // Spawn at parent position (later step + idle drift rozhází).
     child.position = parent.position;
     child.energy = parent.energy * 0.5;
+    child.reproduce_cooldown_ticks = HUNTER_REPRODUCE_COOLDOWN_TICKS;
+    child
+}
+
+/// Sprint 98: sexuální reprodukce hunterů — symetrická k `make_mating_child`
+/// pro buňky. Crossover obou rodičovských genomů (per-field 50/50 + brain
+/// crossover), pak mutace. Mirror cell semantiky: lineage = parent_a (single-
+/// parent inheritance), spawn position = midpoint, energy = a + b (caller
+/// halves oba pre-call), cooldown nastaven na child.
+///
+/// RNG draw order: crossover (gen-by-gen + Brain::crossover) → mutate →
+/// from_genome (3 position draws + 1 direction draw, hned overriden).
+/// Změna pořadí by porušila CSV reproducibility napříč seedy.
+pub fn make_hunter_mating_child(
+    parent_a: &Hunter,
+    parent_b: &Hunter,
+    rng: &mut impl Rng,
+    world_half: [f32; 3],
+    hunter_id: u64,
+    current_gen: u64,
+) -> Hunter {
+    let child_genome = HunterGenome::crossover(&parent_a.genome, &parent_b.genome, rng)
+        .mutate(rng, &HUNTER_MUTATION_CONFIG);
+    let mut child = Hunter::from_genome(
+        rng,
+        child_genome,
+        world_half,
+        hunter_id,
+        parent_a.lineage_id,
+        current_gen,
+    );
+    child.position = [
+        (parent_a.position[0] + parent_b.position[0]) * 0.5,
+        (parent_a.position[1] + parent_b.position[1]) * 0.5,
+        (parent_a.position[2] + parent_b.position[2]) * 0.5,
+    ];
+    child.energy = parent_a.energy + parent_b.energy;
     child.reproduce_cooldown_ticks = HUNTER_REPRODUCE_COOLDOWN_TICKS;
     child
 }
@@ -6108,6 +6162,101 @@ mod tests {
         assert_eq!(child.reproduce_cooldown_ticks, HUNTER_REPRODUCE_COOLDOWN_TICKS);
         // Child position = parent position.
         assert_eq!(child.position, parent.position);
+    }
+
+    #[test]
+    fn make_hunter_mating_child_sums_parent_energies() {
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
+        let half = [960.0, 540.0, 50.0];
+        let mut a = make_test_hunter([10.0, 20.0, 5.0], [0.0; 3]);
+        let mut b = make_test_hunter([30.0, 40.0, -5.0], [0.0; 3]);
+        a.energy = 200.0;
+        b.energy = 150.0;
+        a.lineage_id = 7;
+        b.lineage_id = 11;
+        let child = make_hunter_mating_child(&a, &b, &mut rng, half, 99, 12);
+        // Child energy = a.energy + b.energy (caller halves oba pre-call).
+        assert!((child.energy - 350.0).abs() < 1e-3, "child energy {}", child.energy);
+        // Lineage from parent_a (mirror cell semantics).
+        assert_eq!(child.lineage_id, 7);
+        assert_eq!(child.lineage_birth_gen, 12);
+        // Cooldown applied.
+        assert_eq!(child.reproduce_cooldown_ticks, HUNTER_REPRODUCE_COOLDOWN_TICKS);
+        // Position = midpoint.
+        assert!((child.position[0] - 20.0).abs() < 1e-3);
+        assert!((child.position[1] - 30.0).abs() < 1e-3);
+        assert!((child.position[2] - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn make_hunter_mating_child_genes_come_from_either_parent() {
+        let half = [960.0, 540.0, 50.0];
+        let a = HunterGenome {
+            vision_radius: 100.0,
+            vision_fov: 1.0,
+            max_speed: 200.0,
+            acceleration: 50.0,
+            attack_radius: 10.0,
+            damage_per_tick: 5.0,
+            body_size: 0.8,
+            color_hue: 0.0,
+            brain: dummy_brain(),
+        };
+        let b = HunterGenome {
+            vision_radius: 300.0,
+            vision_fov: 2.0,
+            max_speed: 400.0,
+            acceleration: 90.0,
+            attack_radius: 30.0,
+            damage_per_tick: 12.0,
+            body_size: 1.5,
+            color_hue: 0.5,
+            brain: dummy_brain(),
+        };
+        let mut h_a = make_test_hunter([0.0; 3], [0.0; 3]);
+        let mut h_b = make_test_hunter([0.0; 3], [0.0; 3]);
+        h_a.genome = a.clone();
+        h_b.genome = b.clone();
+        // Vary RNG seed; with crossover (50/50 per gene + zero-mutation cfg
+        // applied below) child fields must each match jednoho z rodičů.
+        for seed in 0u64..16 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let child = make_hunter_mating_child(&h_a, &h_b, &mut rng, half, seed, 0);
+            let g = &child.genome;
+            // Mutace narůstá hodnoty σ-měřítky; nemůžem testovat ==. Místo toho
+            // ověřujeme, že každé pole je blíž k jednomu z rodičů než ke druhému
+            // (po lehké mutaci mid-parent crossover by rozhodil pořadí).
+            let near = |child_v: f32, av: f32, bv: f32| -> bool {
+                (child_v - av).abs() < (av - bv).abs() * 0.5
+                    || (child_v - bv).abs() < (av - bv).abs() * 0.5
+            };
+            assert!(near(g.vision_radius, a.vision_radius, b.vision_radius));
+            assert!(near(g.max_speed, a.max_speed, b.max_speed));
+            assert!(near(g.attack_radius, a.attack_radius, b.attack_radius));
+            assert!(near(g.damage_per_tick, a.damage_per_tick, b.damage_per_tick));
+        }
+    }
+
+    #[test]
+    fn pair_fertile_hunters_respects_radius() {
+        let r = HUNTER_MATING_RADIUS;
+        let r2 = r * r;
+        let half = [960.0, 540.0, 50.0];
+        // 3 fertile hunters: a + b within radius (distance 50), c far (distance 500).
+        let fertile: Vec<(usize, [f32; 3])> = vec![
+            (0, [0.0, 0.0, 0.0]),
+            (1, [50.0, 0.0, 0.0]),
+            (2, [500.0, 0.0, 0.0]),
+        ];
+        let matings = pair_fertile(&fertile, r2, 10, half);
+        // Single pair (0,1); 2 paired with no one in range.
+        assert_eq!(matings.len(), 1);
+        let (a, b) = matings[0];
+        assert!(
+            (a == 0 && b == 1) || (a == 1 && b == 0),
+            "unexpected pair {:?}",
+            matings[0]
+        );
     }
 
     /// Sprint 89: helper pro test hunter setup. Default genome (S71-S84

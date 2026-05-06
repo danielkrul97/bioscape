@@ -1731,28 +1731,57 @@ impl World {
             self.hunter_births_gen += 1;
             return;
         }
-        // Reproduce pass — eligible parents s energy ≥ threshold + cooldown 0.
-        // Two-pass aby borrow checker dovolil: collect children, then push.
-        let mut budget = bioscape::HUNTER_MAX_POP.saturating_sub(self.hunters.len());
+        // Sprint 98: sexual reproduction. Pair fertile hunters via spatial
+        // proximity (mirror cell mating), each pair → 1 mating child, both
+        // parents pay (halve energy + cooldown). Birth rate ~50 % vs old
+        // asexual path; floor respawn nahoře pokrývá total extinction.
+        let budget = bioscape::HUNTER_MAX_POP.saturating_sub(self.hunters.len());
         if budget == 0 {
             return;
         }
-        let mut children: Vec<Hunter> = Vec::new();
-        for parent in self.hunters.iter_mut() {
-            if budget == 0 {
-                break;
-            }
-            if parent.energy < bioscape::HUNTER_REPRODUCE_THRESHOLD
-                || parent.reproduce_cooldown_ticks > 0
-            {
-                continue;
-            }
+        let fertile: Vec<(usize, [f32; 3])> = self
+            .hunters
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                h.energy >= bioscape::HUNTER_REPRODUCE_THRESHOLD
+                    && h.reproduce_cooldown_ticks == 0
+            })
+            .map(|(i, h)| (i, h.position))
+            .collect();
+        if fertile.len() < 2 {
+            return;
+        }
+        let mating_r2 = bioscape::HUNTER_MATING_RADIUS * bioscape::HUNTER_MATING_RADIUS;
+        let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
+        let mut children: Vec<Hunter> = Vec::with_capacity(matings.len());
+        for &(a_idx, b_idx) in &matings {
             let id = self.next_hunter_id;
             self.next_hunter_id += 1;
-            children.push(bioscape::make_hunter_child(parent, rng, WORLD_HALF, id, current_gen));
-            parent.energy *= 0.5;
-            parent.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
-            budget -= 1;
+            // Mirror cell mating energy semantics: halve oba rodiče PŘED
+            // voláním make_*_mating_child. Function sets `child.energy =
+            // parent_a.energy + parent_b.energy`, takže pre-halve dává
+            // child = 0.5(a+b) a parents 0.5a, 0.5b → energy konzervovaná.
+            let (lo, hi) = if a_idx < b_idx {
+                (a_idx, b_idx)
+            } else {
+                (b_idx, a_idx)
+            };
+            let (left, right) = self.hunters.split_at_mut(hi);
+            let parent_lo = &mut left[lo];
+            let parent_hi = &mut right[0];
+            let (parent_a, parent_b) = if a_idx < b_idx {
+                (parent_lo, parent_hi)
+            } else {
+                (parent_hi, parent_lo)
+            };
+            parent_a.energy *= 0.5;
+            parent_b.energy *= 0.5;
+            parent_a.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
+            parent_b.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
+            children.push(bioscape::make_hunter_mating_child(
+                parent_a, parent_b, rng, WORLD_HALF, id, current_gen,
+            ));
         }
         let n_children = children.len();
         self.hunters.extend(children);
