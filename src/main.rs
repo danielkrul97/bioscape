@@ -2355,7 +2355,7 @@ fn update_stats_overlay(
         let l = c.0.phenotype.body_length as f64;
         let w = c.0.phenotype.body_width as f64;
         let aspect = if w > 1e-6 { l / w } else { 0.0 };
-        let spk = c.0.phenotype.spike_length as f64;
+        let spk = c.0.phenotype.primary_spike_length() as f64;
         let e = c.0.energy as f64;
         spd_sum += s;
         spd_sumsq += s * s;

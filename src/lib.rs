@@ -3,7 +3,7 @@
 //! Keeping this layer free of Bevy types lets us drive the same world
 //! from a windowed renderer (`main.rs`) or a headless batch run later.
 
-use core::f32::consts::TAU;
+use core::f32::consts::{FRAC_PI_2, PI, TAU};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -400,6 +400,18 @@ pub const MIN_BODY_HEIGHT: f32 = 0.3;
 pub const MAX_BODY_HEIGHT: f32 = 4.0;
 pub const MIN_SPIKE_LENGTH: f32 = 0.0;
 pub const MAX_SPIKE_LENGTH: f32 = 2.0;
+/// Sprint 121: max počet spike na buňku. `Genome` i `Phenotype` drží
+/// `[Spike; SPIKE_SLOTS]` plus `spike_count: u8 ∈ [0, SPIKE_SLOTS]`. Aktivní
+/// sloty 0..spike_count, neaktivní zero-init. Fixed array (ne Vec) drží
+/// `Cell: Copy` pro Bevy par_iter snapshoty + GPU storage buffer s pevným
+/// layoutem.
+pub const SPIKE_SLOTS: usize = 5;
+pub const MIN_SPIKE_AZIMUTH: f32 = -PI;
+pub const MAX_SPIKE_AZIMUTH: f32 = PI;
+pub const MIN_SPIKE_ELEVATION: f32 = -FRAC_PI_2;
+pub const MAX_SPIKE_ELEVATION: f32 = FRAC_PI_2;
+pub const MIN_SPIKE_COMPLEXITY: f32 = 0.0;
+pub const MAX_SPIKE_COMPLEXITY: f32 = 1.0;
 /// Rychlost runtime morfingu — full brain output dává `MORPH_RATE` jednotek
 /// změny tvaru za sekundu.
 /// Sprint 26: 0.02/s = full-range body morph ~50 gen, pomalejší než životnost
@@ -438,6 +450,50 @@ pub const SPIKE_PREDATION_BONUS: f32 = 0.5;
 pub const SPIKE_DOT_THRESHOLD: f32 = 0.7;
 // Sprint 40 cleanup: `SPIKE_RENDER_THRESHOLD` removed — Sprint 36 dropped
 // custom spike shader, takže render-threshold const už není referencovaná.
+
+/// Sprint 123: complexity multiplikátor na attack bonus.
+/// `effective_attack = base × (1 + COMPLEXITY_ATTACK_GAIN × complexity)`.
+/// 0.5 = max +50 % bonus (complexity=1).
+pub const COMPLEXITY_ATTACK_GAIN: f32 = 0.5;
+/// Sprint 123: quadratic complexity multiplikátor na maintenance cost.
+/// `cost_factor = 1 + COMPLEXITY_COST_GAIN × complexity²`. 3.0 = complexity=1
+/// platí ×4, complexity=0.5 ×1.75. Quadratic záměrně — max-complexity je
+/// vzácný, sweet-spot kolem 0.4-0.6.
+pub const COMPLEXITY_COST_GAIN: f32 = 3.0;
+/// Sprint 122: half-angle (rad) per-spike eat grab cone u tipu spike.
+/// 0.3 rad ≈ 17°. Cell může jíst food bod, který spadne do tohoto kuželu
+/// (vrchol = tip spike, osa = spike direction, range ∝ length).
+pub const SPIKE_GRAB_HALF_ANGLE: f32 = 0.3;
+/// Sprint 123: complexity multiplikátor na grab cone half-angle.
+/// `effective_half_angle = SPIKE_GRAB_HALF_ANGLE × (1 + COMPLEXITY_GRAB_GAIN × complexity)`.
+/// 1.0 = complexity=1 dvojnásobí kužel (širší branching = větší reach).
+pub const COMPLEXITY_GRAB_GAIN: f32 = 1.0;
+/// Sprint 122: násobitel `effective_radius`, kterým se měří range spike
+/// grab cone od cell centra: `tip_distance = effective_radius + spike.length`.
+/// Šířka cone u tipu = `tip_distance × tan(half_angle)`.
+pub const SPIKE_GRAB_REACH_BONUS: f32 = 1.0;
+
+/// Sprint 121: jeden spike v multi-spike struktuře. `length` ∈ [MIN, MAX]
+/// (= dnešní spike_length), `azimuth_offset`/`elevation_offset` určují směr
+/// v body frame relative k forward (0,0 = frontální spike, dnešní default).
+/// `complexity` je continuous geometric shape parametr ∈ [0, 1] — Sprint 122
+/// drží na 0, Sprint 123 zapne attack/eat/cost vazby.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct Spike {
+    pub length: f32,
+    pub azimuth_offset: f32,
+    pub elevation_offset: f32,
+    pub complexity: f32,
+}
+
+impl Spike {
+    pub const ZERO: Spike = Spike {
+        length: 0.0,
+        azimuth_offset: 0.0,
+        elevation_offset: 0.0,
+        complexity: 0.0,
+    };
+}
 
 // Sprint 41: shell jako passive damage absorber. `shell_thickness` gen
 // modifikuje `damage_accum` před zápisem do brain inputu — `apply_shell_absorb`
@@ -2923,7 +2979,13 @@ pub struct Genome {
     pub body_width: f32,
     /// Sprint 34: 3-axis ellipsoid — vertikální rozměr.
     pub body_height: f32,
-    pub spike_length: f32,
+    /// Sprint 121: multi-spike. `spikes[0..spike_count]` aktivní, zbytek
+    /// zero-init. Pre-Sprint-121 single `spike_length` mapuje na
+    /// `spikes[0].length` se `spike_count = 1`.
+    #[serde(default = "default_spikes")]
+    pub spikes: [Spike; SPIKE_SLOTS],
+    #[serde(default = "default_spike_count")]
+    pub spike_count: u8,
     /// Sprint 41: shell jako passive damage absorber.
     pub shell_thickness: f32,
     /// Sprint 66: differential-adhesion CAM token (∈ 0..ADHESION_TYPE_COUNT).
@@ -2992,6 +3054,14 @@ fn default_vision_fov() -> f32 {
     INITIAL_VISION_FOV
 }
 
+fn default_spikes() -> [Spike; SPIKE_SLOTS] {
+    [Spike::ZERO; SPIKE_SLOTS]
+}
+
+fn default_spike_count() -> u8 {
+    1
+}
+
 impl Genome {
     pub fn random(rng: &mut impl Rng) -> Self {
         // Default tělo je izotropní koule (length == width == height). Mutace
@@ -3008,7 +3078,17 @@ impl Genome {
             body_length: body_size,
             body_width: body_size,
             body_height: body_size,
-            spike_length: rng.random_range(0.0..0.1),
+            spikes: {
+                let mut spikes = [Spike::ZERO; SPIKE_SLOTS];
+                spikes[0] = Spike {
+                    length: rng.random_range(0.0..0.1),
+                    azimuth_offset: 0.0,
+                    elevation_offset: 0.0,
+                    complexity: 0.0,
+                };
+                spikes
+            },
+            spike_count: 1,
             // Sprint 41: mírný počáteční mean, žádný extreme spawn — selekce
             // si shell vytáhne nahoru, pokud má smysl.
             shell_thickness: rng.random_range(0.0..0.2),
@@ -3079,8 +3159,14 @@ impl Genome {
                 .clamp(MIN_BODY_WIDTH, MAX_BODY_WIDTH),
             body_height: (self.body_height + gaussian(rng) * cfg.sigma_body_height)
                 .clamp(MIN_BODY_HEIGHT, MAX_BODY_HEIGHT),
-            spike_length: (self.spike_length + gaussian(rng) * cfg.sigma_spike_length)
-                .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH),
+            spikes: {
+                let mut spikes = self.spikes;
+                let s0 = &mut spikes[0];
+                s0.length = (s0.length + gaussian(rng) * cfg.sigma_spike_length)
+                    .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
+                spikes
+            },
+            spike_count: self.spike_count,
             shell_thickness: (self.shell_thickness + gaussian(rng) * cfg.sigma_shell)
                 .clamp(MIN_SHELL_THICKNESS, MAX_SHELL_THICKNESS),
             adhesion_type,
@@ -3146,7 +3232,26 @@ impl Genome {
             body_length: if rng.random::<bool>() { a.body_length } else { b.body_length },
             body_width: if rng.random::<bool>() { a.body_width } else { b.body_width },
             body_height: if rng.random::<bool>() { a.body_height } else { b.body_height },
-            spike_length: if rng.random::<bool>() { a.spike_length } else { b.spike_length },
+            spikes: {
+                let mut spikes = [Spike::ZERO; SPIKE_SLOTS];
+                spikes[0].length = if rng.random::<bool>() {
+                    a.spikes[0].length
+                } else {
+                    b.spikes[0].length
+                };
+                spikes
+            },
+            // Sprint 121: gen 0 ma uniformne spike_count = 1, pre-S122 zadny RNG
+            // draw — short-circuit pattern jako vision_fov v S82, drzi byte-
+            // identical CSV. Sprint 122 prejde na real bool crossover az s
+            // sigma_spike_count > 0.
+            spike_count: if a.spike_count == b.spike_count {
+                a.spike_count
+            } else if rng.random::<bool>() {
+                a.spike_count
+            } else {
+                b.spike_count
+            },
             shell_thickness: if rng.random::<bool>() { a.shell_thickness } else { b.shell_thickness },
             adhesion_type: if rng.random::<bool>() { a.adhesion_type } else { b.adhesion_type },
             bond_stiffness: if rng.random::<bool>() { a.bond_stiffness } else { b.bond_stiffness },
@@ -3233,7 +3338,15 @@ pub struct Phenotype {
     pub body_width: f32,
     /// Sprint 34: vertikální rozměr ellipsoidu.
     pub body_height: f32,
-    pub spike_length: f32,
+    /// Sprint 121: per-spike runtime stav. `length` je morphable přes brain
+    /// output[5] (Sprint 122 aggregate signal); `azimuth_offset`,
+    /// `elevation_offset`, `complexity` jsou snapshot z genomu (pure-genetic,
+    /// žádný runtime morph). `spike_count` je snapshot — discrete add/remove
+    /// se děje jen na reprodukci (mutace).
+    #[serde(default = "default_spikes")]
+    pub spikes: [Spike; SPIKE_SLOTS],
+    #[serde(default = "default_spike_count")]
+    pub spike_count: u8,
     /// Sprint 41: snapshot z genomu, runtime morph zatím neexistuje.
     pub shell_thickness: f32,
 }
@@ -3244,9 +3357,32 @@ impl Phenotype {
             body_length: genome.body_length,
             body_width: genome.body_width,
             body_height: genome.body_height,
-            spike_length: genome.spike_length,
+            spikes: genome.spikes,
+            spike_count: genome.spike_count,
             shell_thickness: genome.shell_thickness,
         }
+    }
+
+    /// Sprint 121: primary spike length (slot 0). Pre-S121 callers které
+    /// četly `phenotype.spike_length` čtou tohle.
+    pub fn primary_spike_length(&self) -> f32 {
+        if self.spike_count > 0 {
+            self.spikes[0].length
+        } else {
+            0.0
+        }
+    }
+
+    /// Sprint 121: sum length přes všechny aktivní spiky. V S121 (spike_count=1)
+    /// identické s `primary_spike_length`. Sprint 122+ začne divergovat.
+    pub fn total_spike_length(&self) -> f32 {
+        let n = self.spike_count.min(SPIKE_SLOTS as u8) as usize;
+        self.spikes[..n].iter().map(|s| s.length).sum()
+    }
+
+    pub fn active_spikes(&self) -> &[Spike] {
+        let n = self.spike_count.min(SPIKE_SLOTS as u8) as usize;
+        &self.spikes[..n]
     }
 
     /// Proxy pro circular-collision codepaths (eat radius, broad phase).
@@ -3291,19 +3427,44 @@ impl Phenotype {
         let new_len = (self.body_length + raw_dl).clamp(MIN_BODY_LENGTH, MAX_BODY_LENGTH);
         let new_wid = (self.body_width + raw_dw).clamp(MIN_BODY_WIDTH, MAX_BODY_WIDTH);
         let new_hgt = (self.body_height + raw_dh).clamp(MIN_BODY_HEIGHT, MAX_BODY_HEIGHT);
-        let new_spk = (self.spike_length + raw_ds).clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
 
         let actual_dl = (new_len - self.body_length).abs();
         let actual_dw = (new_wid - self.body_width).abs();
         let actual_dh = (new_hgt - self.body_height).abs();
-        let actual_ds = (new_spk - self.spike_length).abs();
 
         self.body_length = new_len;
         self.body_width = new_wid;
         self.body_height = new_hgt;
-        self.spike_length = new_spk;
+
+        // Sprint 121: morph[3] aggregate spike length signal — proporčně přes
+        // všechny aktivní spiky (per-spike rate ∝ length / sum_lengths). S121
+        // s spike_count=1 redukuje na pre-S121 single spike. S122 multi-spike
+        // smysluplně rozvrhuje delta.
+        let actual_ds = self.apply_spike_morph(raw_ds);
 
         actual_dl + actual_dw + actual_dh + actual_ds
+    }
+
+    fn apply_spike_morph(&mut self, raw_ds: f32) -> f32 {
+        let n = self.spike_count.min(SPIKE_SLOTS as u8) as usize;
+        if n == 0 || raw_ds == 0.0 {
+            return 0.0;
+        }
+        let sum_lengths: f32 = self.spikes[..n].iter().map(|s| s.length).sum();
+        let mut total_delta = 0.0;
+        for i in 0..n {
+            let weight = if sum_lengths > f32::EPSILON {
+                self.spikes[i].length / sum_lengths
+            } else {
+                1.0 / n as f32
+            };
+            let delta = raw_ds * weight;
+            let new_len = (self.spikes[i].length + delta)
+                .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
+            total_delta += (new_len - self.spikes[i].length).abs();
+            self.spikes[i].length = new_len;
+        }
+        total_delta
     }
 }
 
@@ -3645,7 +3806,14 @@ impl Cell {
         let aging_factor = 1.0 + AGE_DECAY_PER_SEC * age_sec;
         self.energy -=
             self.phenotype.volume() * physics.body_cost_factor * aging_factor * dt_eff;
-        self.energy -= self.phenotype.spike_length * SPIKE_COST_PER_SEC * dt_eff;
+        // Sprint 121: sum maintenance přes aktivní spiky. Sprint 123: per-spike
+        // quadratic complexity multiplier. S spike_count=1, complexity=0
+        // redukuje na pre-S121 single spike cost.
+        let mut spike_cost = 0.0;
+        for spike in self.phenotype.active_spikes() {
+            spike_cost += spike.length * spike_complexity_cost_factor(spike.complexity);
+        }
+        self.energy -= spike_cost * SPIKE_COST_PER_SEC * dt_eff;
         // Sprint 41: shell maintenance — defensive armor stojí víc než spike,
         // protože pokrývá celý povrch.
         self.energy -= self.phenotype.shell_thickness * SHELL_COST_PER_SEC * dt_eff;
@@ -3739,14 +3907,11 @@ impl Cell {
         self.velocity[2] += a * fwd[2] * dt;
     }
 
-    /// Bonus predation gain pokud má attacker spike a heading je zaměřený
-    /// na cíl (cosine > `SPIKE_DOT_THRESHOLD`). Vrací 0 jinak. Volá se z
-    /// predate cyklu v rendereru/headlessu nad rámec běžného size-ratio
-    /// gainu.
+    /// Bonus predation gain pokud má attacker aspoň jeden spike, který směřuje
+    /// na cíl (cosine > `SPIKE_DOT_THRESHOLD`). Sprint 121: iteruje všechny
+    /// aktivní spiky — každý kontribuuje vlastní cone test. S spike_count=1
+    /// a azimuth/elev=0 redukuje na pre-S121 single-spike behavior.
     pub fn spike_bonus_against(&self, target_pos: [f32; 3]) -> f32 {
-        if self.phenotype.spike_length <= 0.0 {
-            return 0.0;
-        }
         let dx = target_pos[0] - self.position[0];
         let dy = target_pos[1] - self.position[1];
         let dz = target_pos[2] - self.position[2];
@@ -3755,13 +3920,23 @@ impl Cell {
             return 0.0;
         }
         let dist = dist_sq.sqrt();
-        // Sprint 33: full 3D forward unit vector (yaw + pitch).
-        let [fx, fy, fz] = forward_vector(self.heading, self.pitch);
-        let cos_angle = (dx * fx + dy * fy + dz * fz) / dist;
-        if cos_angle < SPIKE_DOT_THRESHOLD {
-            return 0.0;
+        let to_target = [dx / dist, dy / dist, dz / dist];
+        let mut total = 0.0;
+        for spike in self.phenotype.active_spikes() {
+            if spike.length <= 0.0 {
+                continue;
+            }
+            let dir = spike_direction(self.heading, self.pitch, spike);
+            let cos_angle = dir[0] * to_target[0] + dir[1] * to_target[1] + dir[2] * to_target[2];
+            if cos_angle < SPIKE_DOT_THRESHOLD {
+                continue;
+            }
+            total += PREDATION_GAIN_PER_TICK
+                * spike.length
+                * spike_complexity_attack_factor(spike.complexity)
+                * SPIKE_PREDATION_BONUS;
         }
-        PREDATION_GAIN_PER_TICK * self.phenotype.spike_length * SPIKE_PREDATION_BONUS
+        total
     }
 
     /// Sprint 41: pure ellipsoidní acceptance test bez mutace. Semi-axes ∝
@@ -3932,6 +4107,39 @@ impl Food {
 pub fn forward_vector(yaw: f32, pitch: f32) -> [f32; 3] {
     let cos_p = pitch.cos();
     [yaw.cos() * cos_p, yaw.sin() * cos_p, pitch.sin()]
+}
+
+/// Sprint 121: směr spike v world frame. `azimuth_offset` přidá k yaw,
+/// `elevation_offset` přidá k pitch. Pre-S121 (azimuth=elevation=0) redukuje
+/// na `forward_vector` — single frontal spike.
+pub fn spike_direction(yaw: f32, pitch: f32, spike: &Spike) -> [f32; 3] {
+    forward_vector(yaw + spike.azimuth_offset, pitch + spike.elevation_offset)
+}
+
+/// Sprint 123: complexity multiplikátor na attack predation bonus.
+/// `1 + COMPLEXITY_ATTACK_GAIN × complexity`. S complexity=0 vrací 1.0
+/// (pre-S123 sémantika), s complexity=1 vrací 1 + COMPLEXITY_ATTACK_GAIN.
+#[inline]
+pub fn spike_complexity_attack_factor(complexity: f32) -> f32 {
+    1.0 + COMPLEXITY_ATTACK_GAIN * complexity.clamp(0.0, 1.0)
+}
+
+/// Sprint 123: complexity multiplikátor na maintenance cost. Quadratic —
+/// max-complexity (`1 + COMPLEXITY_COST_GAIN`) je výrazně dražší než
+/// střední (`1 + COMPLEXITY_COST_GAIN × 0.25`), aby selekce nesložila
+/// k degenerate max-complexity single-spike strategii.
+#[inline]
+pub fn spike_complexity_cost_factor(complexity: f32) -> f32 {
+    let c = complexity.clamp(0.0, 1.0);
+    1.0 + COMPLEXITY_COST_GAIN * c * c
+}
+
+/// Sprint 123: complexity multiplikátor na eat grab cone half-angle.
+/// `1 + COMPLEXITY_GRAB_GAIN × complexity` — větvený spike pokrývá širší
+/// kužel u tipu.
+#[inline]
+pub fn spike_complexity_grab_factor(complexity: f32) -> f32 {
+    1.0 + COMPLEXITY_GRAB_GAIN * complexity.clamp(0.0, 1.0)
 }
 
 /// Sprint 82: cost faktor pro směrový FOV. `theta` = half-angle kuželu kolem
@@ -5453,7 +5661,8 @@ mod tests {
             body_length: 1.0,
             body_width: 1.0,
             body_height: 1.0,
-            spike_length: 0.0,
+            spikes: [Spike::ZERO; SPIKE_SLOTS],
+            spike_count: 1,
             shell_thickness: 0.0,
             adhesion_type: 0,
             bond_stiffness: BOND_STIFFNESS,
@@ -5506,7 +5715,12 @@ mod tests {
             body_length: 1.1,
             body_width: 0.9,
             body_height: 1.0,
-            spike_length: 0.4,
+            spikes: {
+                let mut s = [Spike::ZERO; SPIKE_SLOTS];
+                s[0].length = 0.4;
+                s
+            },
+            spike_count: 1,
             shell_thickness: 0.0,
             adhesion_type: 0,
             bond_stiffness: BOND_STIFFNESS,
@@ -5531,7 +5745,8 @@ mod tests {
         assert_eq!(m.turn_rate, 2.5);
         assert_eq!(m.body_length, 1.1);
         assert_eq!(m.body_width, 0.9);
-        assert_eq!(m.spike_length, 0.4);
+        assert_eq!(m.spikes[0].length, 0.4);
+        assert_eq!(m.spike_count, 1);
         // Sprint 106: brain je derived z mutated CPPN. S sigma=0 v zero_cfg,
         // ale CPPN má vlastní mutation rates (CPPN_MUTATION_CONFIG) které
         // jsou non-zero — brain weights NEZACHOVANÉ identity. Test now
@@ -5575,7 +5790,9 @@ mod tests {
             assert!(m.turn_rate >= MIN_TURN_RATE);
             assert!((MIN_BODY_LENGTH..=MAX_BODY_LENGTH).contains(&m.body_length));
             assert!((MIN_BODY_WIDTH..=MAX_BODY_WIDTH).contains(&m.body_width));
-            assert!((MIN_SPIKE_LENGTH..=MAX_SPIKE_LENGTH).contains(&m.spike_length));
+            for spike in m.spikes.iter() {
+                assert!((MIN_SPIKE_LENGTH..=MAX_SPIKE_LENGTH).contains(&spike.length));
+            }
             assert!((MIN_VISION_FOV..=MAX_VISION_FOV).contains(&m.vision_fov));
             assert!((MIN_THERMAL_OPTIMUM..=MAX_THERMAL_OPTIMUM).contains(&m.thermal_optimum));
         }
@@ -6435,7 +6652,8 @@ mod tests {
             body_length: 0.5,
             body_width: 0.6,
             body_height: 0.7,
-            spike_length: 0.0,
+            spikes: [Spike::ZERO; SPIKE_SLOTS],
+            spike_count: 1,
             shell_thickness: 0.0,
             adhesion_type: 1,
             bond_stiffness: 2.0,
@@ -6455,7 +6673,12 @@ mod tests {
             body_length: 1.5,
             body_width: 1.4,
             body_height: 1.3,
-            spike_length: 0.8,
+            spikes: {
+                let mut s = [Spike::ZERO; SPIKE_SLOTS];
+                s[0].length = 0.8;
+                s
+            },
+            spike_count: 1,
             shell_thickness: 0.5,
             adhesion_type: 5,
             bond_stiffness: 8.0,
@@ -6475,7 +6698,7 @@ mod tests {
             assert!(c.turn_rate == 1.0 || c.turn_rate == 5.0);
             assert!(c.body_length == 0.5 || c.body_length == 1.5);
             assert!(c.body_width == 0.6 || c.body_width == 1.4);
-            assert!(c.spike_length == 0.0 || c.spike_length == 0.8);
+            assert!(c.spikes[0].length == 0.0 || c.spikes[0].length == 0.8);
             assert!(c.vision_fov == MIN_VISION_FOV || c.vision_fov == MAX_VISION_FOV);
             assert!(
                 c.thermal_optimum == MIN_THERMAL_OPTIMUM
@@ -6802,7 +7025,12 @@ mod tests {
             body_length: 1.5,
             body_width: 0.8,
             body_height: 1.0,
-            spike_length: 0.3,
+            spikes: {
+                let mut s = [Spike::ZERO; SPIKE_SLOTS];
+                s[0].length = 0.3;
+                s
+            },
+            spike_count: 1,
             shell_thickness: 0.0,
         };
         let delta = phen.apply_morph([0.0, 0.0, 0.0, 0.0], MORPH_RATE, 0.5);
@@ -6810,7 +7038,7 @@ mod tests {
         assert_eq!(phen.body_length, 1.5);
         assert_eq!(phen.body_width, 0.8);
         assert_eq!(phen.body_height, 1.0);
-        assert_eq!(phen.spike_length, 0.3);
+        assert_eq!(phen.spikes[0].length, 0.3);
     }
 
     #[test]
@@ -6819,7 +7047,12 @@ mod tests {
             body_length: MAX_BODY_LENGTH,
             body_width: MIN_BODY_WIDTH,
             body_height: MAX_BODY_HEIGHT,
-            spike_length: MAX_SPIKE_LENGTH,
+            spikes: {
+                let mut s = [Spike::ZERO; SPIKE_SLOTS];
+                s[0].length = MAX_SPIKE_LENGTH;
+                s
+            },
+            spike_count: 1,
             shell_thickness: 0.0,
         };
         // Strong positive signal on length, height & spike (already at max) → no change.
@@ -6829,7 +7062,7 @@ mod tests {
         assert_eq!(phen.body_length, MAX_BODY_LENGTH);
         assert_eq!(phen.body_width, MIN_BODY_WIDTH);
         assert_eq!(phen.body_height, MAX_BODY_HEIGHT);
-        assert_eq!(phen.spike_length, MAX_SPIKE_LENGTH);
+        assert_eq!(phen.spikes[0].length, MAX_SPIKE_LENGTH);
     }
 
     #[test]
@@ -6838,7 +7071,12 @@ mod tests {
             body_length: 1.0,
             body_width: 1.0,
             body_height: 1.0,
-            spike_length: 0.5,
+            spikes: {
+                let mut s = [Spike::ZERO; SPIKE_SLOTS];
+                s[0].length = 0.5;
+                s
+            },
+            spike_count: 1,
             shell_thickness: 0.0,
         };
         // signal × rate × dt = 0.8 × 1.0 × 1.0 = 0.8 podél každé osy.
@@ -6849,7 +7087,7 @@ mod tests {
         assert!((delta - 1.8).abs() < 1e-5, "got {}", delta);
         assert!((phen.body_length - 1.8).abs() < 1e-5);
         assert!((phen.body_width - MIN_BODY_WIDTH).abs() < 1e-5);
-        assert!((phen.spike_length - 1.3).abs() < 1e-5);
+        assert!((phen.spikes[0].length - 1.3).abs() < 1e-5);
     }
 
     #[test]
@@ -6858,7 +7096,8 @@ mod tests {
             body_length: 1.0,
             body_width: 1.0,
             body_height: 1.0,
-            spike_length: 0.0,
+            spikes: [Spike::ZERO; SPIKE_SLOTS],
+            spike_count: 1,
             shell_thickness: 0.0,
         };
         // |signal| < threshold → no change (filters random brain noise).
@@ -6875,7 +7114,7 @@ mod tests {
         assert_eq!(delta, 0.0);
         assert_eq!(phen.body_length, 1.0);
         assert_eq!(phen.body_width, 1.0);
-        assert_eq!(phen.spike_length, 0.0);
+        assert_eq!(phen.spikes[0].length, 0.0);
     }
 
     #[test]
@@ -6909,7 +7148,8 @@ mod tests {
                 body_length: 2.0,
                 body_width: 1.0,
                 body_height: 1.0,
-                spike_length: 0.0,
+                spikes: [Spike::ZERO; SPIKE_SLOTS],
+                spike_count: 1,
                 shell_thickness: 0.0,
             };
             c.velocity = vel;
@@ -6952,7 +7192,8 @@ mod tests {
         let mut cell = base_cell();
         cell.position = [0.0, 0.0, 0.0];
         cell.heading = 0.0; // pointing +x
-        cell.phenotype.spike_length = 1.0;
+        cell.phenotype.spikes[0].length = 1.0;
+        cell.phenotype.spike_count = 1;
 
         // Target přímo vepředu — bonus se aplikuje.
         let bonus_front = cell.spike_bonus_against([10.0, 0.0, 0.0]);
@@ -6971,7 +7212,8 @@ mod tests {
     fn spike_bonus_zero_when_no_spike() {
         let mut cell = base_cell();
         cell.heading = 0.0;
-        cell.phenotype.spike_length = 0.0;
+        cell.phenotype.spikes[0].length = 0.0;
+        cell.phenotype.spike_count = 1;
         let bonus = cell.spike_bonus_against([10.0, 0.0, 0.0]);
         assert_eq!(bonus, 0.0);
     }
@@ -7029,7 +7271,8 @@ mod tests {
     #[test]
     fn step_drains_energy_from_spike_maintenance() {
         let mut cell = base_cell();
-        cell.phenotype.spike_length = 0.5;
+        cell.phenotype.spikes[0].length = 0.5;
+        cell.phenotype.spike_count = 1;
         let physics = PhysicsConfig {
             drag: 0.0,
             angular_drag: 0.0,
@@ -7097,7 +7340,8 @@ mod tests {
             body_length: 2.0,
             body_width: 0.5,
             body_height: 0.5,
-            spike_length: 0.0,
+            spikes: [Spike::ZERO; SPIKE_SLOTS],
+            spike_count: 1,
             shell_thickness: 0.0,
         };
         // Forward at +14: inside ellipsoid (14/16 = 0.875).
@@ -7120,7 +7364,8 @@ mod tests {
             body_length: 2.0,
             body_width: 0.5,
             body_height: 1.5,
-            spike_length: 0.0,
+            spikes: [Spike::ZERO; SPIKE_SLOTS],
+            spike_count: 1,
             shell_thickness: 0.0,
         };
         assert!((phen.max_axis() - 2.0).abs() < 1e-6);

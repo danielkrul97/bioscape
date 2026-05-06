@@ -700,7 +700,7 @@ impl World {
             .iter()
             .map(|c| {
                 [
-                    c.phenotype.spike_length,
+                    c.phenotype.primary_spike_length(),
                     c.phenotype.shell_thickness,
                     c.genome.vision_radius,
                     c.last_outputs[6].max(0.0),
@@ -1627,7 +1627,7 @@ impl World {
                 }
                 let pos_i = cells[i].position;
                 let radius_a = cells[i].phenotype.effective_radius();
-                let spike = cells[i].phenotype.spike_length;
+                let spike = cells[i].phenotype.primary_spike_length();
                 let heading = cells[i].heading;
                 let search_r =
                     CELL_RADIUS * (radius_a + cells[i].phenotype.max_axis() * 2.0);
@@ -2735,7 +2735,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
         let wd = c.phenotype.body_width as f64;
         let hg = c.phenotype.body_height as f64;
         let aspect = if wd > 1e-6 { l / wd } else { 0.0 };
-        let spk = c.phenotype.spike_length as f64;
+        let spk = c.phenotype.primary_spike_length() as f64;
         spd_sum += s;
         spd_sumsq += s * s;
         vis_sum += v;

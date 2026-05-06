@@ -6272,7 +6272,7 @@ mod tests {
             .iter()
             .map(|c| {
                 [
-                    c.phenotype.spike_length,
+                    c.phenotype.primary_spike_length(),
                     c.phenotype.shell_thickness,
                     c.genome.vision_radius,
                     c.last_outputs[6],
