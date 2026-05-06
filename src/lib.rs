@@ -2582,25 +2582,60 @@ impl Brain {
 
     /// Same forward pass as `forward`, but also returns hidden activations
     /// (needed for Hebbian updates).
+    ///
+    /// Sprint 112: `wide::f32x8` přes 10 lanes (padded BRAIN_INPUTS 71→80) v
+    /// L1, 7 lanes (padded BRAIN_HIDDEN 50→56) v L2. Dead zone (h_n..BRAIN_HIDDEN)
+    /// padding zero → mul_add se zapíše jako akumulace přes celou pad šíři bez
+    /// větvení. `target-cpu=native` (Sprint 111) zapne FMA, takže jeden chunk
+    /// dot product je 1× vfmadd231ps.
     pub fn forward_with_state(
         &self,
         inputs: &[f32; BRAIN_INPUTS],
     ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
+        use wide::f32x8;
+        const L1_PAD: usize = ((BRAIN_INPUTS + 7) / 8) * 8;
+        const L1_LANES: usize = L1_PAD / 8;
+        const L2_PAD: usize = ((BRAIN_HIDDEN + 7) / 8) * 8;
+        const L2_LANES: usize = L2_PAD / 8;
         let h_n = self.hidden_n as usize;
+
+        let mut padded_inputs = [0.0_f32; L1_PAD];
+        padded_inputs[..BRAIN_INPUTS].copy_from_slice(inputs);
+        let mut input_lanes = [f32x8::ZERO; L1_LANES];
+        for (lane, chunk) in input_lanes.iter_mut().zip(padded_inputs.chunks_exact(8)) {
+            *lane = f32x8::new(chunk.try_into().unwrap());
+        }
+
         let mut hidden = [0.0_f32; BRAIN_HIDDEN];
+        let mut padded_w1_row = [0.0_f32; L1_PAD];
         for i in 0..h_n {
-            let mut sum = self.b1[i];
-            for (&w, &x) in self.w1[i].iter().zip(inputs.iter()) {
-                sum += w * x;
+            padded_w1_row[..BRAIN_INPUTS].copy_from_slice(&self.w1[i]);
+            let mut acc = f32x8::ZERO;
+            for (lane_idx, chunk) in padded_w1_row.chunks_exact(8).enumerate() {
+                let w = f32x8::new(chunk.try_into().unwrap());
+                acc = w.mul_add(input_lanes[lane_idx], acc);
             }
+            let sum = self.b1[i] + acc.reduce_add();
             hidden[i] = sum.tanh();
         }
+
+        let mut padded_hidden = [0.0_f32; L2_PAD];
+        padded_hidden[..BRAIN_HIDDEN].copy_from_slice(&hidden);
+        let mut hidden_lanes = [f32x8::ZERO; L2_LANES];
+        for (lane, chunk) in hidden_lanes.iter_mut().zip(padded_hidden.chunks_exact(8)) {
+            *lane = f32x8::new(chunk.try_into().unwrap());
+        }
+
         let mut out = [0.0_f32; BRAIN_OUTPUTS];
+        let mut padded_w2_row = [0.0_f32; L2_PAD];
         for ((o, row), &bias) in out.iter_mut().zip(self.w2.iter()).zip(self.b2.iter()) {
-            let mut sum = bias;
-            for j in 0..h_n {
-                sum += row[j] * hidden[j];
+            padded_w2_row[..BRAIN_HIDDEN].copy_from_slice(row);
+            let mut acc = f32x8::ZERO;
+            for (lane_idx, chunk) in padded_w2_row.chunks_exact(8).enumerate() {
+                let w = f32x8::new(chunk.try_into().unwrap());
+                acc = w.mul_add(hidden_lanes[lane_idx], acc);
             }
+            let sum = bias + acc.reduce_add();
             *o = sum.tanh();
         }
         (hidden, out)
