@@ -63,7 +63,14 @@ Rešerše vědeckého kontextu projektu (česky, srozumitelně i pro laika) je v
 
 ## Status
 
-95+ sprintů. Plná 3D simulace: ellipsoid morfologie (length × width × height + spike), 3D pohyb (yaw + pitch), gravitace s vztlakem, predace s attack-gate + gradient exposure podle počtu bondů, mating přes pheromone signaling, food clustering ve world map, hazard zóny, thermal field (vertikální gradient + diurnal/seasonal oscilace, per-cell `thermal_optimum` gen), multi-trophic food (plant / carrion / hunter-carrion + evoluční `carnivore_score`), recurrent brain (21 sensory + 32 recurrent vstupů × 16 hidden — NEAT-style růst k 32 storage — × 10 výstupů, Elman feedback), cluster-shared brain pooling přes bonded peers (proto-distributed cognition), persistentní spring bondy → tissue regime, evolving Hunter s vlastním brainem (biological arms race), bistabilní cell-state. Headless harness pro deterministické batch experimenty, 3D renderer s orbit kamerou (HDR + bloom + fog + procedurální bio-textury).
+120+ sprintů. Plná 3D simulace: ellipsoid morfologie (length × width × height + spike), 3D pohyb (yaw + pitch), gravitace s vztlakem, predace s attack-gate + gradient exposure podle počtu bondů, mating přes pheromone signaling, food clustering ve world map, hazard zóny, thermal field (vertikální gradient + diurnal/seasonal oscilace, per-cell `thermal_optimum` gen), multi-trophic food (plant / carrion / hunter-carrion + evoluční `carnivore_score`), recurrent brain (21 sensory + recurrent vstupy × NEAT-rostoucí hidden × 10 výstupů, Elman feedback), HyperNEAT CPPN templates, cluster-shared brain pooling přes bonded peers (proto-distributed cognition), persistentní spring bondy → tissue regime, evolving Hunter s vlastním brainem (biological arms race), bistabilní cell-state, periodické environmentální shocks (HazardPulse / ClimateShift / FoodCrash). Headless harness pro deterministické batch experimenty, 3D renderer s orbit kamerou (HDR + bloom + fog + procedurální bio-textury).
+
+**Performance decade 111–120** přinesla **~9× ticks/s @ 2 500 cells**
+přes target-cpu=native (S111), SIMD brain forward (S112, 2.1×), Bevy
+rayon paralelizaci (S113, 4.6× per fáze), SIMD field diffusion (S117,
+4×), plus PGO infrastructure (S119, opt-in). Aktuální baseline na
+i5-12400F (12 vláken, target-cpu=native, lto=fat): 1k cells = 2 994
+ticks/s, 2,5k = 1 408, 5k = 598. Detail: [`docs/sprints/111-120-perf.md`](docs/sprints/111-120-perf.md).
 
 Detailní stav po sprintech: [`docs/sprints/`](docs/sprints/).
 
