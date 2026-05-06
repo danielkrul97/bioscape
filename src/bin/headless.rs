@@ -440,6 +440,9 @@ impl World {
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
         timed!(resolve_hunter_collisions, self.resolve_hunter_collisions());
+        // Sprint 100: pool last_hidden napříč hunter packem před hunt fází —
+        // tak `populate_hunter_brain_inputs` čte pooled state.
+        bioscape::pool_bonded_hunter_hidden(&mut self.hunters);
         timed!(predate, self.predate());
         timed!(hunt, self.hunt(rng, dt));
         // Sprint 89: hunter death + reproduce + floor respawn po hunt phase.
@@ -1786,6 +1789,14 @@ impl World {
             {
                 continue;
             }
+            // Sprint 100: brain output[9] gate — oba hunteři musí mít
+            // bond_signal > BOND_FORM_THRESHOLD. Default INNATE_BOND_BIAS=2.5
+            // dává tanh(2.5) ≈ 0.99 → většina random brainů gate překročí.
+            if self.hunters[a_idx].last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
+                || self.hunters[b_idx].last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
+            {
+                continue;
+            }
             let already = self.hunters[a_idx]
                 .bonds
                 .iter()
@@ -1846,11 +1857,20 @@ impl World {
         let _ = rng; // Sprint 90: brain replaces idle drift, no rng needed in hunt.
         let cells_ref = &self.cells;
         let smell = &self.smell;
+        // Sprint 100: snapshot hunters pro pack sensing (same-type members
+        // ve vision). Mut iteration nesmí současně immutable-borrow self.hunters.
+        let hunters_snapshot = self.hunters.clone();
         let mut attacks: Vec<(usize, f32)> = Vec::new();
         for hunter in &mut self.hunters {
             // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain) +
             // step (kinematic). Replaces Sprint 89 seek-based step.
-            let sensors = bioscape::gather_hunter_sensors(hunter, cells_ref, smell, WORLD_HALF);
+            let sensors = bioscape::gather_hunter_sensors(
+                hunter,
+                cells_ref,
+                &hunters_snapshot,
+                smell,
+                WORLD_HALF,
+            );
             let target_idx_pre = nearest_attackable_cell(hunter, cells_ref, WORLD_HALF);
             let seek_target = target_idx_pre.map(|i| cells_ref[i].position);
             let inputs = bioscape::populate_hunter_brain_inputs(hunter, &sensors);

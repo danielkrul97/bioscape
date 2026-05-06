@@ -490,6 +490,7 @@ fn main() {
                     rebuild_cell_grid,
                     resolve_cell_collisions,
                     resolve_hunter_collisions,
+                    pool_bonded_hunter_hidden_system,
                     cell_predates_on_neighbor,
                     step_hunters,
                     hunters_lifecycle,
@@ -1752,10 +1753,18 @@ fn step_hunters(
     let dt = fixed_time.delta_secs();
     let cell_snapshot: Vec<(Entity, Cell)> = cells.iter().map(|(e, c)| (e, c.0)).collect();
     let cells_only: Vec<Cell> = cell_snapshot.iter().map(|(_, c)| *c).collect();
+    // Sprint 100: snapshot hunters pro pack sensing.
+    let hunters_snapshot: Vec<Hunter> = hunters.iter().map(|h| h.0).collect();
     let mut attacks: Vec<(Entity, f32)> = Vec::new();
     for mut h in &mut hunters {
         // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain).
-        let sensors = bioscape::gather_hunter_sensors(&h.0, &cells_only, &smell.0, WORLD_HALF);
+        let sensors = bioscape::gather_hunter_sensors(
+            &h.0,
+            &cells_only,
+            &hunters_snapshot,
+            &smell.0,
+            WORLD_HALF,
+        );
         let target_idx_pre = nearest_attackable_cell(&h.0, &cells_only, WORLD_HALF);
         let seek_target = target_idx_pre.map(|i| cells_only[i].position);
         let inputs = bioscape::populate_hunter_brain_inputs(&mut h.0, &sensors);
@@ -2467,6 +2476,24 @@ fn rebuild_cell_grid(
     diag.add_measurement(&DIAG_GRID_REBUILD, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
+/// Sprint 100: pool last_hidden napříč hunter packem (mirror headless
+/// `pool_bonded_hunter_hidden`). Snapshot all → call lib helper → write
+/// back via commands.entity().insert. ECS-flavored wrapper.
+fn pool_bonded_hunter_hidden_system(
+    hunters: Query<(Entity, &HunterEntity)>,
+    mut commands: Commands,
+) {
+    let mut state: Vec<(Entity, Hunter)> = hunters.iter().map(|(e, h)| (e, h.0)).collect();
+    if state.is_empty() {
+        return;
+    }
+    let mut hunters_only: Vec<Hunter> = state.iter().map(|(_, h)| *h).collect();
+    bioscape::pool_bonded_hunter_hidden(&mut hunters_only);
+    for ((entity, _), updated) in state.iter_mut().zip(hunters_only.iter()) {
+        commands.entity(*entity).insert(HunterEntity(*updated));
+    }
+}
+
 /// Sprint 99: hunter-hunter collision + adhesion + bond physics. Mirror
 /// headless `resolve_hunter_collisions` — O(N²) sequential pro N ≤ 50.
 /// Snapshot all hunters → compute deltas + bond formation/pruning →
@@ -2594,6 +2621,12 @@ fn resolve_hunter_collisions(
             continue;
         };
         if new_state[a_idx].1.genome.adhesion_type != new_state[b_idx].1.genome.adhesion_type {
+            continue;
+        }
+        // Sprint 100: brain output[9] gate.
+        if new_state[a_idx].1.last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
+            || new_state[b_idx].1.last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
+        {
             continue;
         }
         let already = new_state[a_idx]

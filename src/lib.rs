@@ -226,12 +226,14 @@ pub const THERMAL_OPTIMUM_PENALTY: f32 = 1.0;
 /// `STRENGTH × (1 - richness)`. Při richness=1 (rich zone) nikdy nezamítá,
 /// při richness=0 (poor zone) zamítá s pravděpodobností STRENGTH. Sprint 21
 /// v1–v5 zkoušel plnou sílu (`1 × (1 - richness)`) → extinkce gen 70–110.
-/// 0.3 je kompromis: poor zone má 70 % šanci spawnu (vs. plná = 0 %), takže
-/// food není ostře oddělená do biomů, jen mírný gradient. Plus value modulace
-/// `WORLD_MAP_FOOD_FLOOR/AMP` jako safety net (i food v poor zone má hodnotu
-/// ~85 % baselinu). MAX_SPAWN_ATTEMPTS retry budget zajišťuje, že clustering
-/// nikdy úplně nezablokuje spawn.
-pub const FOOD_REJECTION_STRENGTH: f32 = 0.3;
+/// Sprint 100: 0.3 → 0.6 — silnější spatial gradient. Poor zone má 40 % šanci
+/// spawnu per candidate (vs. 70 % před), což zostřuje hranici mezi rich a poor
+/// zonami a posiluje selekční signál pro spatial preference. Stále hluboko pod
+/// extinction threshold ze Sprintu 21 (1.0 = full reject v poor zone). Plus
+/// value modulace `WORLD_MAP_FOOD_FLOOR/AMP` jako safety net (i food v poor
+/// zone má hodnotu ~85 % baselinu). MAX_SPAWN_ATTEMPTS retry budget na uniform
+/// resample zajišťuje, že clustering nikdy úplně nezablokuje spawn.
+pub const FOOD_REJECTION_STRENGTH: f32 = 0.6;
 // Environmentální hazard layer: passive energy drain v "nebezpečných" zónách.
 // Zónová mapa jde z `WorldMap` noise — POSITIVNÍ korelace s food richness:
 // bohaté oblasti = nebezpečné (high reward, high risk), chudé = bezpečné.
@@ -1017,6 +1019,13 @@ pub struct Hunter {
     /// struct). Same-type adhesion gating + spring physics. Cluster
     /// představuje "wolf pack" — koordinovaná predace přijde v S101.
     pub bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
+    /// Sprint 100: pack-level pooled hidden (mirror Cell.pooled_hidden z S94).
+    /// Mean(self.last_hidden + bonded partners.last_hidden) per tick.
+    /// Solo hunteři: kopie self.last_hidden (nemění chování).
+    /// Bonded hunteři: shared recurrent state napříč packem → proto-distributed
+    /// cognition pro koordinovaný hon.
+    #[serde(default = "default_pooled_hidden")]
+    pub pooled_hidden: [f32; BRAIN_HIDDEN],
 }
 
 impl Hunter {
@@ -1076,6 +1085,9 @@ impl Hunter {
             last_outputs: [0.0; BRAIN_OUTPUTS],
             // Sprint 99: bondy se formují contact-based v hunter physics phase.
             bonds: [None; MAX_BONDS_PER_CELL],
+            // Sprint 100: pooled hidden init = zero, naplní se v
+            // `pool_bonded_hunter_hidden` před run_brain_act.
+            pooled_hidden: [0.0; BRAIN_HIDDEN],
         }
     }
 
@@ -1215,14 +1227,24 @@ pub struct HunterBrainSensors {
     /// Smell field gradient na hunter pozici. Cells emit smell when eating
     /// food → chemical clue pro nearby cell activity.
     pub smell_grad: [f32; 3],
+    /// Sprint 100: delta k nearest same-type hunteru ve vision (= pack member
+    /// candidate / kontakt k bondu). Brain získá schopnost aktivně hledat
+    /// nebo se vyhýbat packu.
+    pub nearest_pack_member: Option<[f32; 3]>,
+    /// Sprint 100: počet same-type hunters ve vision (pack density signal).
+    pub same_type_in_vision: u32,
 }
 
 /// Sprint 90: hunter sensor gather. Linear scan cells (n_hunters max 50,
 /// cell pop ~500 → 25k pair compares per tick × 50 hunters = 1.25M ops/tick
 /// — acceptable). Spatial grid by mohl optimalizovat při větších populacích.
+///
+/// Sprint 100: + sken jiných hunterů pro pack signalizaci. `other_hunters`
+/// je full slice (vč. self — funkce ho odfiltruje přes hunter.hunter_id).
 pub fn gather_hunter_sensors(
     hunter: &Hunter,
     cells: &[Cell],
+    other_hunters: &[Hunter],
     smell: &SmellField,
     world_half: [f32; 3],
 ) -> HunterBrainSensors {
@@ -1266,27 +1288,55 @@ pub fn gather_hunter_sensors(
         }
     }
     let smell_grad = smell.gradient_at(hunter.position, SMELL_SAMPLE_EPSILON);
+    // Sprint 100: pack scan — same-type hunteři ve vision range.
+    let mut nearest_pack: Option<([f32; 3], f32)> = None;
+    let mut same_type_count: u32 = 0;
+    let own_type = hunter.genome.adhesion_type;
+    let own_id = hunter.hunter_id;
+    for o in other_hunters {
+        if o.hunter_id == own_id {
+            continue;
+        }
+        if o.genome.adhesion_type != own_type {
+            continue;
+        }
+        let d = min_image_delta(hunter.position, o.position, world_half);
+        let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if d2 >= vision_r2 {
+            continue;
+        }
+        same_type_count += 1;
+        match nearest_pack {
+            None => nearest_pack = Some((d, d2)),
+            Some((_, bd2)) if d2 < bd2 => nearest_pack = Some((d, d2)),
+            _ => {}
+        }
+    }
     HunterBrainSensors {
         nearest_prey: best.map(|(d, _, _)| d),
         nearest_prey_size: best.map(|(_, _, s)| s).unwrap_or(0.0),
         neighbors_in_vision: count,
         smell_grad,
+        nearest_pack_member: nearest_pack.map(|(d, _)| d),
+        same_type_in_vision: same_type_count,
     }
 }
 
 /// Sprint 90: brain input vector pro hunter. Reuse cell's 21-slot layout
 /// s hunter semantics:
 ///   0,1,15: nearest_prey delta (= cell food slots)
-///   2,3,16: filler (cell uses cell-cell delta — not relevant pro predator)
+///   2,3,16: nearest_pack_member delta (Sprint 100: same-type hunter pull)
 ///   4: own_energy / HUNTER_REPRODUCE_THRESHOLD
 ///   5: own_speed / max_speed
 ///   6: prey_size_relative (prey/own — pre brain "small target" awareness)
 ///   7,8,17: smell_grad x/y/z
 ///   9,10,18: heading_x/y/z (forward vector)
-///   11-13,19,20: filler / repurpose later
-///   13: density_in_vision (count / DENSITY_NORM_COUNT)
+///   11: pack_size_norm (n_bonds / MAX_BONDS_PER_CELL — Sprint 100)
+///   12: pack_density_norm (same_type_in_vision / DENSITY_NORM_COUNT — Sprint 100)
+///   13: density_in_vision (count cells / DENSITY_NORM_COUNT)
 ///   14: filler (cell uses damage)
-///   21..52: recurrent (last_hidden)
+///   19, 20: filler
+///   21..52: recurrent — pooled_hidden (Sprint 100, S94 mirror)
 pub fn populate_hunter_brain_inputs(
     hunter: &mut Hunter,
     sensors: &HunterBrainSensors,
@@ -1304,6 +1354,12 @@ pub fn populate_hunter_brain_inputs(
         let own_size = hunter.genome.body_size.max(0.01);
         inputs[6] = (sensors.nearest_prey_size - own_size) / own_size;
     }
+    // Sprint 100: pack member delta — informuje brain o směru k pack mate.
+    if let Some(d) = sensors.nearest_pack_member {
+        inputs[2] = d[0] / vision_r;
+        inputs[3] = d[1] / vision_r;
+        inputs[16] = d[2] / vision_r;
+    }
     inputs[4] = energy_norm;
     inputs[5] = speed_norm;
     inputs[7] = (sensors.smell_grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
@@ -1313,10 +1369,56 @@ pub fn populate_hunter_brain_inputs(
     inputs[9] = fwd[0];
     inputs[10] = fwd[1];
     inputs[18] = fwd[2];
+    // Sprint 100: pack size / density signals.
+    let n_bonds = hunter.bonds.iter().filter(|b| b.is_some()).count() as f32;
+    inputs[11] = (n_bonds / MAX_BONDS_PER_CELL as f32).min(1.0);
+    inputs[12] = (sensors.same_type_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
     inputs[13] = (sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
+    // Sprint 100: pooled_hidden místo last_hidden — bonded hunteři sdílejí
+    // recurrent state. Solo hunter má pooled_hidden = self.last_hidden
+    // (gathered v `pool_bonded_hunter_hidden` před brain_act).
     inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
-        .copy_from_slice(&hunter.last_hidden[..BRAIN_RECURRENT]);
+        .copy_from_slice(&hunter.pooled_hidden[..BRAIN_RECURRENT]);
     inputs
+}
+
+/// Sprint 100: pool last_hidden napříč bonded hunter packem (mirror S94
+/// `pool_bonded_hidden` for cells). Pre-brain_act fáze. Solo hunter dostane
+/// kopii vlastního last_hidden — žádná change vs pre-S100 chování.
+pub fn pool_bonded_hunter_hidden(hunters: &mut [Hunter]) {
+    let n = hunters.len();
+    if n == 0 {
+        return;
+    }
+    let id_to_idx: rustc_hash::FxHashMap<u64, usize> = hunters
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.hunter_id, i))
+        .collect();
+    let snapshot: Vec<[f32; BRAIN_HIDDEN]> = hunters.iter().map(|h| h.last_hidden).collect();
+    let bonds_snapshot: Vec<[Option<Bond>; MAX_BONDS_PER_CELL]> =
+        hunters.iter().map(|h| h.bonds).collect();
+    for i in 0..n {
+        let mut sum = snapshot[i];
+        let mut count = 1usize;
+        for bond_opt in bonds_snapshot[i].iter() {
+            if let Some(bond) = bond_opt {
+                if let Some(&j) = id_to_idx.get(&bond.other_cell_id) {
+                    for k in 0..BRAIN_HIDDEN {
+                        sum[k] += snapshot[j][k];
+                    }
+                    count += 1;
+                }
+            }
+        }
+        if count > 1 {
+            let inv = 1.0 / count as f32;
+            for k in 0..BRAIN_HIDDEN {
+                sum[k] *= inv;
+            }
+        }
+        hunters[i].pooled_hidden = sum;
+    }
 }
 
 /// Sprint 89: asexual clone-with-mutate. Parent splituje energy 50/50
@@ -6333,6 +6435,7 @@ mod tests {
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
             bonds: [None; MAX_BONDS_PER_CELL],
+            pooled_hidden: [0.0; BRAIN_HIDDEN],
         }
     }
 
@@ -6521,6 +6624,8 @@ mod tests {
             nearest_prey_size: 1.5,
             neighbors_in_vision: 3,
             smell_grad: [0.0; 3],
+            nearest_pack_member: None,
+            same_type_in_vision: 0,
         };
         let inputs = populate_hunter_brain_inputs(&mut h, &sensors);
         // vision_radius = HUNTER_VISION_RADIUS = 200; prey_dx/200 = 0.5.
