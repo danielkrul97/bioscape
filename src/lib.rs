@@ -4564,38 +4564,110 @@ impl SmellField {
     /// Sprint 57: paralelizováno přes z-roviny — každá rovina čte své okolí
     /// (xy stencil + back/front z grid) a zapisuje pouze do své části scratch,
     /// takže žádný write conflict. Pro 12-core CPU + 16 rovin je load balanced.
+    ///
+    /// Sprint 117: SIMD inner loop přes `wide::f32x8`. Per row (k, j) si
+    /// pre-extract row offsets pro center/up/down/back/front (back/front s
+    /// Neumann fallback na current plane), pak SIMD chunks po 8 buňkách na
+    /// interior `i ∈ [1, nx-9]` (8 lanes × 7 chunks = 56 cells s nx=64).
+    /// Boundary cells `i=0` a `i ∈ [nx-7, nx-1]` (8 z 64) scalar fallback —
+    /// jediná místa, kde left/right wrap přes x-boundary. Sequential adds
+    /// `(((l+r)+u)+d)+b)+f` → bit-identical s pre-S117 scalar verzí (žádný
+    /// reduce_add); FP drift jen pokud nx<9.
     pub fn step(&mut self, diffusion: f32, decay_per_sec: f32, dt: f32) {
+        use wide::f32x8;
         let nx = self.resolution[0];
         let ny = self.resolution[1];
         let nz = self.resolution[2];
         let decay = (1.0 - decay_per_sec * dt).max(0.0);
         let plane = nx * ny;
         let grid = &self.grid;
+        let diffusion_v = f32x8::splat(diffusion);
+        let decay_v = f32x8::splat(decay);
+        let six_v = f32x8::splat(6.0);
+        // SIMD pokrývá `i ∈ [1, simd_end)`, kde simd_end je největší
+        // násobek 8 + 1 takový, že i+7 ≤ nx-2 (right read at i+8 ≤ nx-1).
+        // Pro nx=64: simd_end = 1 + 7*8 = 57 → chunky i = 1, 9, …, 49.
+        let simd_end = if nx >= 9 {
+            1 + ((nx - 9) / 8 + 1) * 8
+        } else {
+            1
+        };
         self.scratch
             .par_chunks_mut(plane)
             .enumerate()
             .for_each(|(k, scratch_plane)| {
+                let center_plane = k * plane;
+                let back_plane = if k > 0 { (k - 1) * plane } else { center_plane };
+                let front_plane = if k + 1 < nz {
+                    (k + 1) * plane
+                } else {
+                    center_plane
+                };
                 for j in 0..ny {
-                    for i in 0..nx {
-                        let idx_in_plane = j * nx + i;
-                        let idx = k * plane + idx_in_plane;
-                        let center = grid[idx];
-                        // Toroidal xy: wrap kolem indexů.
+                    let j_up = if j == 0 { ny - 1 } else { j - 1 };
+                    let j_down = if j + 1 == ny { 0 } else { j + 1 };
+                    let center_row = center_plane + j * nx;
+                    let up_row = center_plane + j_up * nx;
+                    let down_row = center_plane + j_down * nx;
+                    let back_row = back_plane + j * nx;
+                    let front_row = front_plane + j * nx;
+                    let scalar_cell = |i: usize| -> f32 {
                         let i_left = if i == 0 { nx - 1 } else { i - 1 };
                         let i_right = if i + 1 == nx { 0 } else { i + 1 };
-                        let j_up = if j == 0 { ny - 1 } else { j - 1 };
-                        let j_down = if j + 1 == ny { 0 } else { j + 1 };
-                        let left = grid[k * plane + j * nx + i_left];
-                        let right = grid[k * plane + j * nx + i_right];
-                        let up = grid[k * plane + j_up * nx + i];
-                        let down = grid[k * plane + j_down * nx + i];
-                        // z bounded (Neumann): u krajů fallback na center.
-                        let back = if k > 0 { grid[idx - plane] } else { center };
-                        let front = if k + 1 < nz { grid[idx + plane] } else { center };
+                        let center = grid[center_row + i];
+                        let left = grid[center_row + i_left];
+                        let right = grid[center_row + i_right];
+                        let up = grid[up_row + i];
+                        let down = grid[down_row + i];
+                        let back = grid[back_row + i];
+                        let front = grid[front_row + i];
                         let new = center
                             + diffusion
                                 * (left + right + up + down + back + front - 6.0 * center);
-                        scratch_plane[idx_in_plane] = new * decay;
+                        new * decay
+                    };
+                    scratch_plane[j * nx] = scalar_cell(0);
+                    let mut i = 1;
+                    while i < simd_end {
+                        let center = f32x8::new(
+                            grid[center_row + i..center_row + i + 8].try_into().unwrap(),
+                        );
+                        let left = f32x8::new(
+                            grid[center_row + i - 1..center_row + i + 7]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let right = f32x8::new(
+                            grid[center_row + i + 1..center_row + i + 9]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let up = f32x8::new(
+                            grid[up_row + i..up_row + i + 8].try_into().unwrap(),
+                        );
+                        let down = f32x8::new(
+                            grid[down_row + i..down_row + i + 8].try_into().unwrap(),
+                        );
+                        let back = f32x8::new(
+                            grid[back_row + i..back_row + i + 8].try_into().unwrap(),
+                        );
+                        let front = f32x8::new(
+                            grid[front_row + i..front_row + i + 8].try_into().unwrap(),
+                        );
+                        let mut acc = left + right;
+                        acc += up;
+                        acc += down;
+                        acc += back;
+                        acc += front;
+                        acc -= six_v * center;
+                        let new = (center + diffusion_v * acc) * decay_v;
+                        let arr: [f32; 8] = new.into();
+                        scratch_plane[j * nx + i..j * nx + i + 8].copy_from_slice(&arr);
+                        i += 8;
+                    }
+                    while i < nx {
+                        scratch_plane[j * nx + i] = scalar_cell(i);
+                        i += 1;
                     }
                 }
             });
