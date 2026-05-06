@@ -94,6 +94,7 @@ struct PhaseTimings {
     apply_food_gravity: f64,
     apply_hazards: f64,
     resolve_collisions: f64,
+    resolve_hunter_collisions: f64,
     predate: f64,
     hunt: f64,
     eat_food: f64,
@@ -153,6 +154,12 @@ struct World {
     /// Sprint 89: hunter lifecycle metrics per generation.
     hunter_births_gen: u64,
     hunter_deaths_gen: u64,
+    /// Sprint 99: hunter-hunter contact ticks (mirror cells `contact_progress`),
+    /// + bond formation/breaking counters. Persistent across ticks; rebuild
+    /// per `resolve_hunter_collisions` pass.
+    hunter_contact_progress: rustc_hash::FxHashMap<(u64, u64), u32>,
+    hunter_bonds_formed_gen: u64,
+    hunter_bonds_broken_gen: u64,
     mating_radius: f32,
     // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
     // může nastavit výš (potřeba pro bench při N > 1000).
@@ -277,6 +284,10 @@ impl World {
             next_hunter_id: HUNTER_TARGET_COUNT as u64,
             hunter_births_gen: 0,
             hunter_deaths_gen: 0,
+            // Sprint 99: hunter bond tracker + counters.
+            hunter_contact_progress: rustc_hash::FxHashMap::default(),
+            hunter_bonds_formed_gen: 0,
+            hunter_bonds_broken_gen: 0,
             mating_radius,
             max_population,
             share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
@@ -383,6 +394,9 @@ impl World {
             next_hunter_id: HUNTER_TARGET_COUNT as u64,
             hunter_births_gen: 0,
             hunter_deaths_gen: 0,
+            hunter_contact_progress: rustc_hash::FxHashMap::default(),
+            hunter_bonds_formed_gen: 0,
+            hunter_bonds_broken_gen: 0,
             mating_radius: chk.mating_radius,
             max_population: chk.max_population,
             share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
@@ -425,6 +439,7 @@ impl World {
         timed!(apply_food_gravity, self.apply_food_gravity(dt));
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
+        timed!(resolve_hunter_collisions, self.resolve_hunter_collisions());
         timed!(predate, self.predate());
         timed!(hunt, self.hunt(rng, dt));
         // Sprint 89: hunter death + reproduce + floor respawn po hunt phase.
@@ -1638,6 +1653,192 @@ impl World {
     ///   4. apply_energy_costs (vision + motion + body + attack upkeep).
     ///   5. Energy gain ∝ damage dealt (ENERGY_PER_DAMAGE).
     ///
+    /// Sprint 99: hunter-hunter physics — collision depenetration + adhesion
+    /// (same-type attractive, cross-type weak repulse) + spring bondy. Mirror
+    /// cell `resolve_collisions` strukturně, ale O(N²) pro N ≤ 50 hunterů
+    /// (žádný spatial grid, sequential, kompaktní). Bond formation gated jen
+    /// na contact ≥ BOND_FORM_TICKS + same adhesion_type + free slot —
+    /// brain output[9] gate odložen na S100.
+    fn resolve_hunter_collisions(&mut self) {
+        let n = self.hunters.len();
+        if n < 2 {
+            return;
+        }
+        let hunter_radius = |h: &Hunter| h.genome.body_size * CELL_RADIUS;
+        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
+            .hunters
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.hunter_id, i))
+            .collect();
+
+        let mut pos_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+        let mut vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+        let mut in_contact_pairs: rustc_hash::FxHashSet<(u64, u64)> =
+            rustc_hash::FxHashSet::default();
+
+        // Phase 1: per-pair forces (pos depenetrace + adhesion + bondy).
+        for i in 0..n {
+            let pos_i = self.hunters[i].position;
+            let vel_i = self.hunters[i].velocity;
+            let radius_i = hunter_radius(&self.hunters[i]);
+            let type_i = self.hunters[i].genome.adhesion_type;
+            let id_i = self.hunters[i].hunter_id;
+
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let pos_j = self.hunters[j].position;
+                let radius_j = hunter_radius(&self.hunters[j]);
+                let pair_r = radius_i + radius_j;
+                let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
+                let d = d2.sqrt();
+                let in_contact = d2 < pair_r * pair_r && d2 > 0.0;
+                if in_contact {
+                    let overlap = pair_r - d;
+                    let nx = d_vec[0] / d;
+                    let ny = d_vec[1] / d;
+                    let nz = d_vec[2] / d;
+                    pos_deltas[i][0] -= nx * overlap * 0.5;
+                    pos_deltas[i][1] -= ny * overlap * 0.5;
+                    pos_deltas[i][2] -= nz * overlap * 0.5;
+                    let id_j = self.hunters[j].hunter_id;
+                    let pair = if id_i < id_j { (id_i, id_j) } else { (id_j, id_i) };
+                    in_contact_pairs.insert(pair);
+                } else if d > 0.0 {
+                    let type_j = self.hunters[j].genome.adhesion_type;
+                    let same_type = type_i == type_j;
+                    let dv = bioscape::adhesion_velocity_delta(d_vec, d, pair_r, same_type);
+                    vel_deltas[i][0] += dv[0];
+                    vel_deltas[i][1] += dv[1];
+                    vel_deltas[i][2] += dv[2];
+                }
+            }
+
+            // Apply own bond spring forces.
+            for bond_opt in self.hunters[i].bonds.iter() {
+                if let Some(bond) = bond_opt {
+                    if let Some(&j_idx) = id_to_idx.get(&bond.other_cell_id) {
+                        let pos_j = self.hunters[j_idx].position;
+                        let vel_j = self.hunters[j_idx].velocity;
+                        let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                        let dist = (d_vec[0] * d_vec[0]
+                            + d_vec[1] * d_vec[1]
+                            + d_vec[2] * d_vec[2])
+                            .sqrt();
+                        let (dv, _broken) =
+                            bioscape::bond_velocity_delta(bond, d_vec, dist, vel_i, vel_j);
+                        vel_deltas[i][0] += dv[0];
+                        vel_deltas[i][1] += dv[1];
+                        vel_deltas[i][2] += dv[2];
+                    }
+                }
+            }
+        }
+
+        // Phase 2: apply position + velocity deltas.
+        for ((h, pd), vd) in self
+            .hunters
+            .iter_mut()
+            .zip(pos_deltas.iter())
+            .zip(vel_deltas.iter())
+        {
+            h.position[0] += pd[0];
+            h.position[1] += pd[1];
+            h.position[2] += pd[2];
+            h.velocity[0] += vd[0];
+            h.velocity[1] += vd[1];
+            h.velocity[2] += vd[2];
+        }
+
+        // Phase 3: contact tracker update (increment for active pairs, decay
+        // for stale; drop pairs that decayed k 0).
+        let mut new_progress: rustc_hash::FxHashMap<(u64, u64), u32> =
+            rustc_hash::FxHashMap::default();
+        for &pair in &in_contact_pairs {
+            let prev = self.hunter_contact_progress.get(&pair).copied().unwrap_or(0);
+            new_progress.insert(pair, prev.saturating_add(1));
+        }
+        for (&pair, &val) in self.hunter_contact_progress.iter() {
+            if !in_contact_pairs.contains(&pair) && val > 1 {
+                new_progress.insert(pair, val - 1);
+            }
+        }
+        self.hunter_contact_progress = new_progress;
+
+        // Phase 4: bond formation. Gating: contact ≥ BOND_FORM_TICKS, same
+        // adhesion_type, neither already bonded to the other, oba mají free slot.
+        let candidates: Vec<(u64, u64)> = self
+            .hunter_contact_progress
+            .iter()
+            .filter(|(_, &t)| t >= BOND_FORM_TICKS)
+            .map(|(&pair, _)| pair)
+            .collect();
+        for (id_a, id_b) in candidates {
+            let (Some(&a_idx), Some(&b_idx)) = (id_to_idx.get(&id_a), id_to_idx.get(&id_b))
+            else {
+                continue;
+            };
+            if self.hunters[a_idx].genome.adhesion_type
+                != self.hunters[b_idx].genome.adhesion_type
+            {
+                continue;
+            }
+            let already = self.hunters[a_idx]
+                .bonds
+                .iter()
+                .any(|b| b.as_ref().map_or(false, |bb| bb.other_cell_id == id_b));
+            if already {
+                continue;
+            }
+            let slot_a = self.hunters[a_idx].bonds.iter().position(|b| b.is_none());
+            let slot_b = self.hunters[b_idx].bonds.iter().position(|b| b.is_none());
+            if let (Some(sa), Some(sb)) = (slot_a, slot_b) {
+                let pos_a = self.hunters[a_idx].position;
+                let pos_b = self.hunters[b_idx].position;
+                let d_vec = bioscape::min_image_delta(pos_b, pos_a, WORLD_HALF);
+                let dist =
+                    (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
+                let rest = dist * BOND_REST_LENGTH_SLACK;
+                let bond_a = Bond {
+                    other_cell_id: id_b,
+                    rest_length: rest,
+                    stiffness: bioscape::BOND_STIFFNESS,
+                    damping: bioscape::BOND_DAMPING,
+                    age_ticks: 0,
+                };
+                let bond_b = Bond {
+                    other_cell_id: id_a,
+                    rest_length: rest,
+                    stiffness: bioscape::BOND_STIFFNESS,
+                    damping: bioscape::BOND_DAMPING,
+                    age_ticks: 0,
+                };
+                self.hunters[a_idx].bonds[sa] = Some(bond_a);
+                self.hunters[b_idx].bonds[sb] = Some(bond_b);
+                self.hunter_bonds_formed_gen += 1;
+            }
+        }
+
+        // Phase 5: bond pruning — drop dangling (target dead), increment age.
+        let mut broken = 0u64;
+        for hunter in self.hunters.iter_mut() {
+            for bond_opt in hunter.bonds.iter_mut() {
+                if let Some(bond) = bond_opt {
+                    if !id_to_idx.contains_key(&bond.other_cell_id) {
+                        *bond_opt = None;
+                        broken += 1;
+                    } else {
+                        bond.age_ticks = bond.age_ticks.saturating_add(1);
+                    }
+                }
+            }
+        }
+        self.hunter_bonds_broken_gen += broken;
+    }
+
     /// Two-pass kvůli borrow checkeru: pass 1 sbírá (cell_idx, damage) do
     /// scratch Vec během iterace `&mut self.hunters`, pass 2 apply mutace na
     /// `self.cells` po uvolnění hunter borrow.
@@ -2218,9 +2419,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // 3 cell_state 0 (Sprint 80) + 2 vision_fov 0 (Sprint 83) +
         // 1 thermal 0 (Sprint 85) + 2 thermal_optimum 0 (Sprint 87) +
         // 7 hunter genome 0 (Sprint 89) + 2 diet/exposure 0 (Sprint 93).
+        // Sprint 99: + 2 hunter bond means + 2 hunter bond formed/broken counters.
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{}",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2234,6 +2436,8 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
             world.hunters.len(),
             world.hunter_births_gen,
             world.hunter_deaths_gen,
+            world.hunter_bonds_formed_gen,
+            world.hunter_bonds_broken_gen,
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -2337,6 +2541,8 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let (gain_chem_m, gain_chem_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_CHEMISTRY);
     let (gain_def_m, gain_def_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_DEFENSIVE);
     let n_hunters = world.hunters.len();
+    let mut h_bond_count_sum: u64 = 0;
+    let mut h_bonded_count: u64 = 0;
     if n_hunters > 0 {
         for h in &world.hunters {
             h_spd_sum += h.genome.max_speed as f64;
@@ -2344,6 +2550,12 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
             h_fov_sum += h.genome.vision_fov as f64;
             h_dmg_sum += h.genome.damage_per_tick as f64;
             h_size_sum += h.genome.body_size as f64;
+            // Sprint 99: hunter bond count
+            let nb = h.bonds.iter().filter(|b| b.is_some()).count() as u64;
+            h_bond_count_sum += nb;
+            if nb > 0 {
+                h_bonded_count += 1;
+            }
         }
     }
     let nhf = n_hunters as f64;
@@ -2352,6 +2564,16 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let h_fov_m = if n_hunters > 0 { h_fov_sum / nhf } else { 0.0 };
     let h_dmg_m = if n_hunters > 0 { h_dmg_sum / nhf } else { 0.0 };
     let h_size_m = if n_hunters > 0 { h_size_sum / nhf } else { 0.0 };
+    let h_bond_n_m = if n_hunters > 0 {
+        h_bond_count_sum as f64 / nhf
+    } else {
+        0.0
+    };
+    let h_bond_active_f = if n_hunters > 0 {
+        h_bonded_count as f64 / nhf
+    } else {
+        0.0
+    };
     let current_gen = world.clock.generation;
     for c in &world.cells {
         let s = c.genome.max_speed as f64;
@@ -2561,7 +2783,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let immune_f = immune_cells as f64 / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}",
         world.clock.generation,
         n,
         spd_m,
@@ -2642,6 +2864,11 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         gain_vis_d,
         gain_chem_d,
         gain_def_d,
+        // Sprint 99 hunter bond stats.
+        h_bond_n_m,
+        h_bond_active_f,
+        world.hunter_bonds_formed_gen,
+        world.hunter_bonds_broken_gen,
     )
 }
 
@@ -2844,7 +3071,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();
@@ -2926,6 +3153,9 @@ fn main() {
             // Sprint 89: hunter lifecycle counters.
             world.hunter_births_gen = 0;
             world.hunter_deaths_gen = 0;
+            // Sprint 99: hunter bond counters.
+            world.hunter_bonds_formed_gen = 0;
+            world.hunter_bonds_broken_gen = 0;
         }
         if world.cells.is_empty() {
             eprintln!("extinction at gen {}", world.clock.generation);

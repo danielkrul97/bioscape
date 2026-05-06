@@ -844,6 +844,12 @@ pub struct HunterGenome {
     pub damage_per_tick: f32,
     pub body_size: f32,
     pub color_hue: f32,
+    /// Sprint 99: cadherin-like recognition pro hunter-hunter bondy. 8 typů
+    /// (parita s cells). Same-type hunteři se přitahují adhesion forcou +
+    /// formují persistent bondy při kontaktu. Cross-type repulze. Žádný
+    /// hunter-cell bond — adhesion pool je per-druhový (cell vs hunter
+    /// bondy oddělené).
+    pub adhesion_type: u8,
     /// Sprint 90: behavioral controller. Reuse cell `Brain` struct (BRAIN_INPUTS
     /// = 53, BRAIN_HIDDEN = 32, BRAIN_OUTPUTS = 10) — slot semantics
     /// re-mapped pro hunter v `populate_hunter_brain_inputs` (slot 0/1/15
@@ -870,6 +876,7 @@ impl HunterGenome {
             damage_per_tick: rng.random_range(4.0..12.0),
             body_size: rng.random_range(0.8..1.6),
             color_hue: rng.random_range(0.0..HUE_RANGE),
+            adhesion_type: rng.random_range(0..ADHESION_TYPE_COUNT),
             // Sprint 90: brain init s INNATE_THRUST_BIAS = 2.0 (z Brain::random).
             // Random brains startují s positive thrust → forward motion. Selekce
             // tuneuje turn/pitch outputs k ko-ordinovanému chase behavior.
@@ -895,6 +902,19 @@ impl HunterGenome {
                 .clamp(MIN_HUNTER_BODY_SIZE, MAX_HUNTER_BODY_SIZE),
             color_hue: (self.color_hue + gaussian(rng) * cfg.sigma_color_hue)
                 .rem_euclid(HUE_RANGE),
+            // Sprint 99: occasional flip pro selekci na cluster-friendly types.
+            adhesion_type: if cfg.adhesion_flip_rate > 0.0
+                && ADHESION_TYPE_COUNT > 1
+                && rng.random::<f32>() < cfg.adhesion_flip_rate
+            {
+                let mut t = rng.random_range(0..ADHESION_TYPE_COUNT - 1);
+                if t >= self.adhesion_type {
+                    t += 1;
+                }
+                t
+            } else {
+                self.adhesion_type
+            },
             brain: self.brain.mutate(rng, cfg.sigma_brain),
         }
     }
@@ -913,6 +933,7 @@ impl HunterGenome {
             },
             body_size: if rng.random::<bool>() { a.body_size } else { b.body_size },
             color_hue: if rng.random::<bool>() { a.color_hue } else { b.color_hue },
+            adhesion_type: if rng.random::<bool>() { a.adhesion_type } else { b.adhesion_type },
             brain: Brain::crossover(&a.brain, &b.brain, rng),
         }
     }
@@ -932,6 +953,9 @@ pub struct HunterMutationConfig {
     /// `sigma_brain = 0.2` — brain landscape je velký, drift je naturally
     /// slow přes 2058 weights/cell.
     pub sigma_brain: f32,
+    /// Sprint 99: per-child probability flipu adhesion_type (na jiný typ
+    /// uniformně). Mirror cell `ADHESION_MUTATION_RATE`.
+    pub adhesion_flip_rate: f32,
 }
 
 /// Sprint 89: hunter mutation rates. Vyšší než cell `MUTATION_CONFIG` (sigma
@@ -948,6 +972,7 @@ pub const HUNTER_MUTATION_CONFIG: HunterMutationConfig = HunterMutationConfig {
     sigma_body_size: 0.06,        // 3.0 % of [0.5, 2.5]
     sigma_color_hue: 5.0,         // 1.4 % HUE_RANGE — slow drift, lineage tracking
     sigma_brain: 0.2,             // Sprint 90 — match cell sigma_brain
+    adhesion_flip_rate: ADHESION_MUTATION_RATE, // Sprint 99 — parita s cells
 };
 
 /// Sprint 71: non-evolving environmental predator (Sprint 89 → evolving).
@@ -986,6 +1011,12 @@ pub struct Hunter {
     pub last_inputs: [f32; BRAIN_INPUTS],
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
+    /// Sprint 99: persistent spring bondy mezi hunters (mirror Cell.bonds).
+    /// `Bond.other_cell_id` here stores the other hunter's `hunter_id`
+    /// (sémanticky `other_hunter_id`; field reused k zachování single Bond
+    /// struct). Same-type adhesion gating + spring physics. Cluster
+    /// představuje "wolf pack" — koordinovaná predace přijde v S101.
+    pub bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
 }
 
 impl Hunter {
@@ -1043,6 +1074,8 @@ impl Hunter {
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
+            // Sprint 99: bondy se formují contact-based v hunter physics phase.
+            bonds: [None; MAX_BONDS_PER_CELL],
         }
     }
 
@@ -6076,6 +6109,7 @@ mod tests {
             sigma_body_size: 10.0,
             sigma_color_hue: 1000.0,
             sigma_brain: 100.0,
+            adhesion_flip_rate: 0.0,
         };
         for _ in 0..500 {
             let m = g.mutate(&mut rng, &cfg);
@@ -6106,6 +6140,7 @@ mod tests {
             damage_per_tick: MIN_HUNTER_DAMAGE,
             body_size: MIN_HUNTER_BODY_SIZE,
             color_hue: 10.0,
+            adhesion_type: 0,
             brain: dummy_brain(),
         };
         let b = HunterGenome {
@@ -6117,6 +6152,7 @@ mod tests {
             damage_per_tick: MAX_HUNTER_DAMAGE,
             body_size: MAX_HUNTER_BODY_SIZE,
             color_hue: 200.0,
+            adhesion_type: 5,
             brain: dummy_brain(),
         };
         for _ in 0..100 {
@@ -6124,6 +6160,7 @@ mod tests {
             assert!(c.vision_radius == a.vision_radius || c.vision_radius == b.vision_radius);
             assert!(c.max_speed == a.max_speed || c.max_speed == b.max_speed);
             assert!(c.damage_per_tick == a.damage_per_tick || c.damage_per_tick == b.damage_per_tick);
+            assert!(c.adhesion_type == a.adhesion_type || c.adhesion_type == b.adhesion_type);
         }
     }
 
@@ -6201,6 +6238,7 @@ mod tests {
             damage_per_tick: 5.0,
             body_size: 0.8,
             color_hue: 0.0,
+            adhesion_type: 0,
             brain: dummy_brain(),
         };
         let b = HunterGenome {
@@ -6212,6 +6250,7 @@ mod tests {
             damage_per_tick: 12.0,
             body_size: 1.5,
             color_hue: 0.5,
+            adhesion_type: 3,
             brain: dummy_brain(),
         };
         let mut h_a = make_test_hunter([0.0; 3], [0.0; 3]);
@@ -6273,6 +6312,7 @@ mod tests {
             damage_per_tick: HUNTER_DAMAGE_PER_TICK,
             body_size: 1.0,
             color_hue: 0.0,
+            adhesion_type: 0,
             brain: dummy_brain(),
         };
         Hunter {
@@ -6292,6 +6332,7 @@ mod tests {
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
+            bonds: [None; MAX_BONDS_PER_CELL],
         }
     }
 

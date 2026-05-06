@@ -212,6 +212,11 @@ impl Default for NextHunterId {
 #[derive(Resource, Default)]
 struct ContactProgress(FxHashMap<(u64, u64), u32>);
 
+/// Sprint 99: hunter-hunter contact tracker (mirror cells). Survives
+/// across ticks — bond formation gates na BOND_FORM_TICKS consecutive.
+#[derive(Resource, Default)]
+struct HunterContactProgress(FxHashMap<(u64, u64), u32>);
+
 /// Sprint 52: GPU compute state pro renderer. Drží persistent CellsGpu +
 /// BrainGpu/HebbianGpu/BrownianGpu na shared GpuContext. Insert se v `setup`
 /// pokud GpuContext::new uspěje; pokud selže, Resource zůstává `None` a
@@ -457,6 +462,7 @@ fn main() {
         .init_resource::<NextCellId>()
         .init_resource::<NextHunterId>()
         .init_resource::<ContactProgress>()
+        .init_resource::<HunterContactProgress>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
         .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay, rebuild_cell_grid).chain())
@@ -483,6 +489,7 @@ fn main() {
                     apply_environmental_hazards,
                     rebuild_cell_grid,
                     resolve_cell_collisions,
+                    resolve_hunter_collisions,
                     cell_predates_on_neighbor,
                     step_hunters,
                     hunters_lifecycle,
@@ -2458,6 +2465,188 @@ fn rebuild_cell_grid(
             .map(|(e, c)| (e, c.0.position, c.0.phenotype.effective_radius())),
     );
     diag.add_measurement(&DIAG_GRID_REBUILD, || t.elapsed().as_secs_f64() * 1000.0);
+}
+
+/// Sprint 99: hunter-hunter collision + adhesion + bond physics. Mirror
+/// headless `resolve_hunter_collisions` — O(N²) sequential pro N ≤ 50.
+/// Snapshot all hunters → compute deltas + bond formation/pruning →
+/// write back via `commands.entity().insert()`.
+fn resolve_hunter_collisions(
+    hunters: Query<(Entity, &HunterEntity)>,
+    mut contact: ResMut<HunterContactProgress>,
+    mut commands: Commands,
+) {
+    let alive: Vec<(Entity, Hunter)> = hunters.iter().map(|(e, h)| (e, h.0)).collect();
+    let n = alive.len();
+    if n < 2 {
+        return;
+    }
+    let hunter_radius = |h: &Hunter| h.genome.body_size * CELL_RADIUS;
+    let id_to_pos: FxHashMap<u64, usize> = alive
+        .iter()
+        .enumerate()
+        .map(|(i, (_, h))| (h.hunter_id, i))
+        .collect();
+
+    let mut pos_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let mut vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let mut in_contact_pairs: FxHashSet<(u64, u64)> = FxHashSet::default();
+
+    for i in 0..n {
+        let (_, hunter_i) = &alive[i];
+        let pos_i = hunter_i.position;
+        let vel_i = hunter_i.velocity;
+        let radius_i = hunter_radius(hunter_i);
+        let type_i = hunter_i.genome.adhesion_type;
+        let id_i = hunter_i.hunter_id;
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let (_, hunter_j) = &alive[j];
+            let pos_j = hunter_j.position;
+            let radius_j = hunter_radius(hunter_j);
+            let pair_r = radius_i + radius_j;
+            let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+            let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
+            let d = d2.sqrt();
+            let in_contact = d2 < pair_r * pair_r && d2 > 0.0;
+            if in_contact {
+                let overlap = pair_r - d;
+                let nx = d_vec[0] / d;
+                let ny = d_vec[1] / d;
+                let nz = d_vec[2] / d;
+                pos_deltas[i][0] -= nx * overlap * 0.5;
+                pos_deltas[i][1] -= ny * overlap * 0.5;
+                pos_deltas[i][2] -= nz * overlap * 0.5;
+                let id_j = hunter_j.hunter_id;
+                let pair = if id_i < id_j { (id_i, id_j) } else { (id_j, id_i) };
+                in_contact_pairs.insert(pair);
+            } else if d > 0.0 {
+                let type_j = hunter_j.genome.adhesion_type;
+                let same_type = type_i == type_j;
+                let dv = bioscape::adhesion_velocity_delta(d_vec, d, pair_r, same_type);
+                vel_deltas[i][0] += dv[0];
+                vel_deltas[i][1] += dv[1];
+                vel_deltas[i][2] += dv[2];
+            }
+        }
+        // Apply bond spring forces.
+        for bond_opt in hunter_i.bonds.iter() {
+            if let Some(bond) = bond_opt {
+                if let Some(&j_idx) = id_to_pos.get(&bond.other_cell_id) {
+                    let (_, hunter_j) = &alive[j_idx];
+                    let pos_j = hunter_j.position;
+                    let vel_j = hunter_j.velocity;
+                    let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                    let dist = (d_vec[0] * d_vec[0]
+                        + d_vec[1] * d_vec[1]
+                        + d_vec[2] * d_vec[2])
+                        .sqrt();
+                    let (dv, _broken) =
+                        bioscape::bond_velocity_delta(bond, d_vec, dist, vel_i, vel_j);
+                    vel_deltas[i][0] += dv[0];
+                    vel_deltas[i][1] += dv[1];
+                    vel_deltas[i][2] += dv[2];
+                }
+            }
+        }
+    }
+
+    // Contact tracker update (mirror headless).
+    let mut new_progress: FxHashMap<(u64, u64), u32> = FxHashMap::default();
+    for &pair in &in_contact_pairs {
+        let prev = contact.0.get(&pair).copied().unwrap_or(0);
+        new_progress.insert(pair, prev.saturating_add(1));
+    }
+    for (&pair, &val) in contact.0.iter() {
+        if !in_contact_pairs.contains(&pair) && val > 1 {
+            new_progress.insert(pair, val - 1);
+        }
+    }
+    contact.0 = new_progress;
+
+    // Build mutable snapshot pro deltas + bond updates.
+    let mut new_state: Vec<(Entity, Hunter)> = alive.clone();
+    for ((entity_pair, pd), vd) in new_state
+        .iter_mut()
+        .zip(pos_deltas.iter())
+        .zip(vel_deltas.iter())
+    {
+        let h = &mut entity_pair.1;
+        h.position[0] += pd[0];
+        h.position[1] += pd[1];
+        h.position[2] += pd[2];
+        h.velocity[0] += vd[0];
+        h.velocity[1] += vd[1];
+        h.velocity[2] += vd[2];
+    }
+
+    // Bond formation.
+    let candidates: Vec<(u64, u64)> = contact
+        .0
+        .iter()
+        .filter(|(_, &t)| t >= bioscape::BOND_FORM_TICKS)
+        .map(|(&pair, _)| pair)
+        .collect();
+    for (id_a, id_b) in candidates {
+        let (Some(&a_idx), Some(&b_idx)) = (id_to_pos.get(&id_a), id_to_pos.get(&id_b)) else {
+            continue;
+        };
+        if new_state[a_idx].1.genome.adhesion_type != new_state[b_idx].1.genome.adhesion_type {
+            continue;
+        }
+        let already = new_state[a_idx]
+            .1
+            .bonds
+            .iter()
+            .any(|b| b.as_ref().map_or(false, |bb| bb.other_cell_id == id_b));
+        if already {
+            continue;
+        }
+        let slot_a = new_state[a_idx].1.bonds.iter().position(|b| b.is_none());
+        let slot_b = new_state[b_idx].1.bonds.iter().position(|b| b.is_none());
+        if let (Some(sa), Some(sb)) = (slot_a, slot_b) {
+            let pos_a = new_state[a_idx].1.position;
+            let pos_b = new_state[b_idx].1.position;
+            let d_vec = bioscape::min_image_delta(pos_b, pos_a, WORLD_HALF);
+            let dist =
+                (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
+            let rest = dist * bioscape::BOND_REST_LENGTH_SLACK;
+            new_state[a_idx].1.bonds[sa] = Some(Bond {
+                other_cell_id: id_b,
+                rest_length: rest,
+                stiffness: bioscape::BOND_STIFFNESS,
+                damping: bioscape::BOND_DAMPING,
+                age_ticks: 0,
+            });
+            new_state[b_idx].1.bonds[sb] = Some(Bond {
+                other_cell_id: id_a,
+                rest_length: rest,
+                stiffness: bioscape::BOND_STIFFNESS,
+                damping: bioscape::BOND_DAMPING,
+                age_ticks: 0,
+            });
+        }
+    }
+
+    // Pruning + age increment.
+    for (_, hunter) in new_state.iter_mut() {
+        for bond_opt in hunter.bonds.iter_mut() {
+            if let Some(bond) = bond_opt {
+                if !id_to_pos.contains_key(&bond.other_cell_id) {
+                    *bond_opt = None;
+                } else {
+                    bond.age_ticks = bond.age_ticks.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    // Writeback ECS state.
+    for (entity, h) in new_state {
+        commands.entity(entity).insert(HunterEntity(h));
+    }
 }
 
 fn rebuild_food_grid(
