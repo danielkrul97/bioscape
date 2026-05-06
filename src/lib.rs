@@ -323,6 +323,19 @@ pub const SMELL_NORMALIZATION_GAIN: f32 = 0.5;
 
 pub const LEARNING_RATE: f32 = 0.005;
 
+/// Half-extents simulačního světa (toroidal). Sdíleno mezi rendererem
+/// (`src/main.rs`) a headlessem (`src/bin/headless.rs`) — single source
+/// of truth, jinak by sim tiše divergoval při změně jen na jedné straně.
+///
+/// Sprint 53: WORLD_HALF[2] expanded z=2 → z=20. SmellField + WorldMap +
+/// Pheromone jsou plně 3D (volumetric grid + 7-point Jacobi diffusion + 3D
+/// gradient). Cells získávají vertikální environmental sensing (smell_grad_z,
+/// pheromone_grad_z přes inputs[17,19]).
+///
+/// Sprint 64: z=20 → z=50 expansion + MAX_POPULATION 1000 → 2500
+/// (proportional volumetric scaling, cells/unit³ ≈ 1.2e-5).
+pub const WORLD_HALF: [f32; 3] = [960.0, 540.0, 50.0];
+
 pub const WORLD_MAP_RES: usize = 64;
 /// Sprint 53: WorldMap z-axis resolution.
 pub const WORLD_MAP_RES_Z: usize = 16;

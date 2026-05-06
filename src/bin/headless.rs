@@ -22,9 +22,9 @@ use bioscape::{
     PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON,
     PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
     SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_MAP_BASE_RES,
-    WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES,
-    WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_HALF,
+    WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
+    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 #[cfg(feature = "gpu")]
 use bioscape::{
@@ -46,21 +46,6 @@ use std::env;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
-
-// Headless has no window — fixed extent so seeds reproduce identically across
-// machines. Sim parameters live in `bioscape`.
-// Sprint 53: WORLD_HALF[2] expanded z=2 → z=20. SmellField + WorldMap +
-// Pheromone jsou plně 3D (volumetric grid + 7-point Jacobi diffusion + 3D
-// gradient). Cells získávají vertikální environmental sensing (smell_grad_z,
-// pheromone_grad_z přes inputs[17,19]).
-//
-// Sprint 64: z=20 → z=50 expansion. Pre-Sprint-53 initial smoke s z=50
-// extinktoval gen 30 kvůli food sparsity (food count škáloval lineárně,
-// ale ne s volume), Sprint 53 přidal volumetric food scaling (`z_factor =
-// z_extent / 4`). Při z=50: z_factor=25 → ~20000 food vs ~8000 pro z=20.
-// Plus Sprint 64 MAX_POPULATION 1000 → 2500 zachovává cell density per
-// volume (cells/unit³ = 1.2e-5, same jako pre-bump).
-const WORLD_HALF: [f32; 3] = [960.0, 540.0, 50.0];
 
 /// Sprint 48: versioned binary header pro checkpoint files.
 /// Sprint 66 bump: Cell rozšířen o `cell_id` + `bonds`, BRAIN_OUTPUTS 9→10.
@@ -2206,7 +2191,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // 7 hunter genome 0 (Sprint 89) + 2 diet/exposure 0 (Sprint 93).
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2294,23 +2279,34 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     // Sprint 93: per-cell diet + defense diagnostics.
     let mut carnivore_sum = 0.0_f64;
     let mut exposure_sum = 0.0_f64;
-    // Sprint 97: per-category sensor_gain means. Specialization signal —
-    // pokud cluster cells off-loadují roli, kategoriální mean se rozjede
-    // (vision drop u defenders, vision spike u scouts apod.).
+    // Sprint 97: per-category sensor_gain means + stddev. Specialization
+    // signal — high stddev (bimodální distribuce) = role differentiation
+    // mezi cells. Low stddev s drift v meanu = uniform shift, pokles bez
+    // specializace. Mean alone nerozliší tyto dva režimy.
     let mut gain_sum = [0.0_f64; bioscape::N_SENSOR_CATEGORIES];
+    let mut gain_sumsq = [0.0_f64; bioscape::N_SENSOR_CATEGORIES];
     for c in &world.cells {
         carnivore_sum += c.genome.carnivore_score as f64;
         exposure_sum += bioscape::cell_exposure(c.n_bonds()) as f64;
         for k in 0..bioscape::N_SENSOR_CATEGORIES {
-            gain_sum[k] += c.genome.sensor_gains[k] as f64;
+            let g = c.genome.sensor_gains[k] as f64;
+            gain_sum[k] += g;
+            gain_sumsq[k] += g * g;
         }
     }
     let cell_count = world.cells.len();
     let carnivore_m = if cell_count > 0 { carnivore_sum / cell_count as f64 } else { 0.0 };
     let exposure_m = if cell_count > 0 { exposure_sum / cell_count as f64 } else { 0.0 };
-    let gain_vis_m = if cell_count > 0 { gain_sum[bioscape::SENSOR_CATEGORY_VISION] / cell_count as f64 } else { 0.0 };
-    let gain_chem_m = if cell_count > 0 { gain_sum[bioscape::SENSOR_CATEGORY_CHEMISTRY] / cell_count as f64 } else { 0.0 };
-    let gain_def_m = if cell_count > 0 { gain_sum[bioscape::SENSOR_CATEGORY_DEFENSIVE] / cell_count as f64 } else { 0.0 };
+    let gain_mean_dev = |k: usize| -> (f64, f64) {
+        if cell_count == 0 { return (0.0, 0.0); }
+        let n = cell_count as f64;
+        let m = gain_sum[k] / n;
+        let var = (gain_sumsq[k] / n - m * m).max(0.0);
+        (m, var.sqrt())
+    };
+    let (gain_vis_m, gain_vis_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_VISION);
+    let (gain_chem_m, gain_chem_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_CHEMISTRY);
+    let (gain_def_m, gain_def_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_DEFENSIVE);
     let n_hunters = world.hunters.len();
     if n_hunters > 0 {
         for h in &world.hunters {
@@ -2536,7 +2532,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
     let immune_f = immune_cells as f64 / nf;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -2610,10 +2606,13 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // Sprint 93 diet + defense diagnostics.
         carnivore_m,
         exposure_m,
-        // Sprint 97 sensor_gain category means.
+        // Sprint 97 sensor_gain category means + stddev.
         gain_vis_m,
         gain_chem_m,
         gain_def_m,
+        gain_vis_d,
+        gain_chem_d,
+        gain_def_d,
     )
 }
 
@@ -2816,7 +2815,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();

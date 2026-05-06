@@ -12,7 +12,9 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, Extent3d, TextureDimension, TextureFormat};
 use bevy::shader::ShaderRef;
 use bevy::render::view::Hdr;
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use std::time::Instant;
+use std::path::PathBuf;
 
 const DIAG_CELL_COUNT: DiagnosticPath = DiagnosticPath::const_new("sim/cell_count");
 const DIAG_FOOD_COUNT: DiagnosticPath = DiagnosticPath::const_new("sim/food_count");
@@ -45,7 +47,7 @@ use bioscape::{
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
     SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, THERMAL_NOISE, TICKS_PER_GENERATION,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, THERMAL_NOISE, TICKS_PER_GENERATION, WORLD_HALF,
     WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
     WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
@@ -70,10 +72,6 @@ const FOOD_RADIUS: f32 = 1.0;
 const DEATH_FADE_TICKS: u32 = 30;
 const GRID_CELL_SIZE: f32 = 100.0;
 const CAMERA_ZOOM_STEP: f32 = 0.1;
-// Sprint 53: WORLD_HALF[2] expanded z=2 → z=20. Volumetric environment.
-// Sprint 64: z=20 → z=50. Plus MAX_POPULATION 1000 → 2500 (proportional
-// volumetric scaling — viz lib.rs comment).
-const SIMULATION_HALF: [f32; 3] = [960.0, 540.0, 50.0];
 // Sprint 36: orbit Camera3d s ORTHOGRAPHIC projection. Distance je fixní;
 // "zoom" modifikuje ortho scale (= world units per pixel), takže větší zoom
 // out neudělá black void kolem scény (na rozdíl od perspective). Cells stále
@@ -384,6 +382,25 @@ fn main() {
     // overhead). `add_measurement` v existujících systémech zůstává unconditional
     // — pokud diag není registrovaný, je no-op.
     let want_diag = std::env::args().any(|a| a == "--diag");
+    // Sprint 97 follow-up: in-process screencast (Bevy `Screenshot` API).
+    // CLI: `--screencast=<dir>[,fps,duration_secs]` — fps default 1, duration
+    // default 300s (= 5 min). PNG sequence; assemble s ffmpeg ven.
+    // Důvod: ffmpeg x11grab + xfce4-screenshooter vrátily black frame přes
+    // NVIDIA proprietary driver compositor — Bevy in-process capture čte
+    // přímo z own swap-chain a nezávisí na external grabber.
+    let screencast_cfg = std::env::args()
+        .find_map(|a| a.strip_prefix("--screencast=").map(String::from))
+        .map(|spec| {
+            let parts: Vec<&str> = spec.split(',').collect();
+            ScreencastConfig {
+                dir: PathBuf::from(parts[0]),
+                interval_secs: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.0_f32),
+                duration_secs: parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(300.0_f32),
+                started_at: None,
+                last_capture: 0.0,
+                frame_idx: 0,
+            }
+        });
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -497,9 +514,61 @@ fn main() {
                 toggle_world_map_overlay,
                 update_stats_overlay,
                 report_frame_diagnostics,
+                screencast_capture,
             ),
-        )
-        .run();
+        );
+    if let Some(cfg) = screencast_cfg {
+        let _ = std::fs::create_dir_all(&cfg.dir);
+        eprintln!(
+            "screencast: dir={:?} interval={}s duration={}s",
+            cfg.dir, cfg.interval_secs, cfg.duration_secs
+        );
+        app.insert_resource(cfg);
+    }
+    app.run();
+}
+
+#[derive(Resource, Clone)]
+struct ScreencastConfig {
+    dir: PathBuf,
+    interval_secs: f32,
+    duration_secs: f32,
+    started_at: Option<f32>,
+    last_capture: f32,
+    frame_idx: u32,
+}
+
+fn screencast_capture(
+    mut commands: Commands,
+    time: Res<Time<Real>>,
+    cfg: Option<ResMut<ScreencastConfig>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    // Sprint 97 follow-up: `Time<Real>` (wall clock), ne `Time<Virtual>` —
+    // virtual má 50ms max_delta cap, takže pod heavy sim load by virtual
+    // čas běžel 20× pomaleji než wall a 5min screencast by trval >1h.
+    let Some(mut cfg) = cfg else { return; };
+    let elapsed = time.elapsed_secs();
+    if cfg.started_at.is_none() {
+        cfg.started_at = Some(elapsed);
+        cfg.last_capture = elapsed - cfg.interval_secs;
+    }
+    let started = cfg.started_at.unwrap();
+    let dt_since_start = elapsed - started;
+    if dt_since_start >= cfg.duration_secs {
+        eprintln!("screencast: done, captured {} frames", cfg.frame_idx);
+        exit.write(AppExit::Success);
+        return;
+    }
+    if elapsed - cfg.last_capture < cfg.interval_secs {
+        return;
+    }
+    let path = cfg.dir.join(format!("cap_{:05}.png", cfg.frame_idx));
+    commands
+        .spawn(Screenshot::primary_window())
+        .observe(save_to_disk(path));
+    cfg.frame_idx += 1;
+    cfg.last_capture = elapsed;
 }
 
 fn setup(
@@ -512,7 +581,7 @@ fn setup(
     mut window: Single<&mut Window>,
 ) {
     window.set_maximized(true);
-    let half = SIMULATION_HALF;
+    let half = WORLD_HALF;
     let extent = WorldExtent {
         half_x: half[0],
         half_y: half[1],
@@ -1231,8 +1300,8 @@ fn cells_brain_act(
         let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
         let mut nearest_food: Option<[f32; 3]> = None;
         let mut best_food_d2 = f32::MAX;
-        food_grid.0.for_each_in_radius_toroidal(pos, vision_r, SIMULATION_HALF, |_, fp, _| {
-            let d = bioscape::min_image_delta(pos, fp, SIMULATION_HALF);
+        food_grid.0.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_, fp, _| {
+            let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if d2 > vr2 || d2 >= best_food_d2 {
                 return;
@@ -1248,11 +1317,11 @@ fn cells_brain_act(
         let mut neighbors_in_vision: u32 = 0;
         cell_grid
             .0
-            .for_each_in_radius_toroidal(pos, vision_r, SIMULATION_HALF, |other, other_pos, other_radius| {
+            .for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |other, other_pos, other_radius| {
                 if other == entity {
                     return;
                 }
-                let d = bioscape::min_image_delta(pos, other_pos, SIMULATION_HALF);
+                let d = bioscape::min_image_delta(pos, other_pos, WORLD_HALF);
                 let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                 if d2 > vr2 {
                     return;
@@ -1269,7 +1338,7 @@ fn cells_brain_act(
         let pos_xyz = [pos[0], pos[1], pos[2]];
         let smell_grad = smell.0.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
         let pheromone_grad = pheromone.0.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
-        let temperature_local = bioscape::temperature_at_z(pos[2], SIMULATION_HALF, tick, gen);
+        let temperature_local = bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
         let sensors = bioscape::BrainSensors {
             nearest_food,
             nearest_cell,
@@ -1367,6 +1436,7 @@ fn apply_cell_morph(time: Res<Time>, mut cells: Query<&mut CellEntity, Without<D
 
 fn spawn_food(
     foods: Query<(), With<FoodEntity>>,
+    cells: Query<&CellEntity, Without<Dying>>,
     extent: Res<WorldExtent>,
     factor: Res<FoodDensityFactor>,
     cell_grid: Res<CellGrid>,
@@ -1403,13 +1473,21 @@ fn spawn_food(
             cell_grid.0.for_each_in_radius_toroidal(
                 candidate.position,
                 broad_r,
-                SIMULATION_HALF,
-                |_, cell_pos, radius| {
+                WORLD_HALF,
+                |entity, cell_pos, _radius| {
                     if blocked {
                         return;
                     }
-                    let exclusion = EAT_RADIUS * radius;
-                    let d = bioscape::min_image_delta(candidate.position, cell_pos, SIMULATION_HALF);
+                    // Match headless: exclusion uses ellipsoid's max_axis, not
+                    // effective_radius. Elongated cells extend past their sphere
+                    // approximation along the long axis, so a sphere-radius
+                    // exclusion would let food spawn inside the ellipsoid.
+                    let max_axis = cells
+                        .get(entity)
+                        .map(|c| c.0.phenotype.max_axis())
+                        .unwrap_or(MAX_BODY_LENGTH);
+                    let exclusion = EAT_RADIUS * max_axis;
+                    let d = bioscape::min_image_delta(candidate.position, cell_pos, WORLD_HALF);
                     if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < exclusion * exclusion {
                         blocked = true;
                     }
@@ -1494,13 +1572,13 @@ fn cell_eats_food(
             food_grid_ref.for_each_in_radius_toroidal(
                 *pos,
                 eat_r,
-                SIMULATION_HALF,
+                WORLD_HALF,
                 |food_e, food_pos, food_kind| {
                     if ate.is_some() {
                         return;
                     }
                     // Sprint 54: ghost food s min-imaged position pro toroidal eat_test.
-                    let md = bioscape::min_image_delta(*pos, food_pos, SIMULATION_HALF);
+                    let md = bioscape::min_image_delta(*pos, food_pos, WORLD_HALF);
                     let ghost_pos = [pos[0] + md[0], pos[1] + md[1], food_pos[2]];
                     if bioscape::eat_test_pose(*pos, *heading, *pitch, *dims, ghost_pos, EAT_RADIUS) {
                         // Sprint 92: food value = base_value(kind) × multiplier × value_factor
@@ -1670,18 +1748,18 @@ fn step_hunters(
     let mut attacks: Vec<(Entity, f32)> = Vec::new();
     for mut h in &mut hunters {
         // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain).
-        let sensors = bioscape::gather_hunter_sensors(&h.0, &cells_only, &smell.0, SIMULATION_HALF);
-        let target_idx_pre = nearest_attackable_cell(&h.0, &cells_only, SIMULATION_HALF);
+        let sensors = bioscape::gather_hunter_sensors(&h.0, &cells_only, &smell.0, WORLD_HALF);
+        let target_idx_pre = nearest_attackable_cell(&h.0, &cells_only, WORLD_HALF);
         let seek_target = target_idx_pre.map(|i| cells_only[i].position);
         let inputs = bioscape::populate_hunter_brain_inputs(&mut h.0, &sensors);
         let (hidden, outputs) = h.0.genome.brain.forward_with_state(&inputs);
         h.0.last_inputs = inputs;
         h.0.last_hidden = hidden;
         h.0.last_outputs = outputs;
-        h.0.apply_brain_motor(&outputs, seek_target, dt, SIMULATION_HALF);
-        h.0.step(dt, SIMULATION_HALF);
+        h.0.apply_brain_motor(&outputs, seek_target, dt, WORLD_HALF);
+        h.0.step(dt, WORLD_HALF);
         // Attack check (post-step pozice).
-        let target_idx = nearest_attackable_cell(&h.0, &cells_only, SIMULATION_HALF);
+        let target_idx = nearest_attackable_cell(&h.0, &cells_only, WORLD_HALF);
         let attack_r = h.0.genome.attack_radius;
         let attack_r2 = attack_r * attack_r;
         let damage = h.0.genome.damage_per_tick;
@@ -1690,7 +1768,7 @@ fn step_hunters(
             let d = bioscape::min_image_delta(
                 h.0.position,
                 cells_only[i].position,
-                SIMULATION_HALF,
+                WORLD_HALF,
             );
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if d2 < attack_r2 {
@@ -1839,8 +1917,8 @@ fn draw_bond_gizmos(
             Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]),
         );
     }
-    let half_x = SIMULATION_HALF[0];
-    let half_y = SIMULATION_HALF[1];
+    let half_x = WORLD_HALF[0];
+    let half_y = WORLD_HALF[1];
     for cell in &cells {
         let start = Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]);
         let hue = adhesion_hue(cell.0.genome.adhesion_type);
@@ -2223,7 +2301,7 @@ fn cell_reproduces_on_threshold(
         .map(|(e, c)| (e, c.0.position))
         .collect();
     let mating_r2 = MATING_RADIUS * MATING_RADIUS;
-    let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, SIMULATION_HALF);
+    let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
 
     // Sprint 52: před crossover sync parent brains z GPU (post-Hebbian je
     // canonical). Pokud GPU available; jinak no-op (CPU brain je canonical).
@@ -2407,12 +2485,12 @@ fn cell_predates_on_neighbor(
             grid_ref.for_each_in_radius_toroidal(
                 *pos,
                 HERD_RADIUS,
-                SIMULATION_HALF,
+                WORLD_HALF,
                 |other, other_pos, _| {
                     if other == *entity {
                         return;
                     }
-                    let d = bioscape::min_image_delta(*pos, other_pos, SIMULATION_HALF);
+                    let d = bioscape::min_image_delta(*pos, other_pos, WORLD_HALF);
                     if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < herd_r2 {
                         count += 1;
                     }
@@ -2439,7 +2517,7 @@ fn cell_predates_on_neighbor(
         let broad_r = CELL_RADIUS * (radius_a + BROAD_PHASE_SIZE_BUDGET);
 
         grid.0
-            .for_each_in_radius_toroidal(pos_a, broad_r, SIMULATION_HALF, |entity_b, pos_b, radius_b| {
+            .for_each_in_radius_toroidal(pos_a, broad_r, WORLD_HALF, |entity_b, pos_b, radius_b| {
                 if entity_b == entity_a {
                     return;
                 }
@@ -2450,7 +2528,7 @@ fn cell_predates_on_neighbor(
                 let pair_r2 = pair_r * pair_r;
                 // Sprint 54: min-image delta a→b. Spike bonus volá `spike_bonus_against`
                 // s pos_b — pro toroidal upravíme target pos do min-image frame.
-                let d = bioscape::min_image_delta(pos_a, pos_b, SIMULATION_HALF);
+                let d = bioscape::min_image_delta(pos_a, pos_b, WORLD_HALF);
                 let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                 if d2 >= pair_r2 {
                     return;
@@ -2540,7 +2618,7 @@ fn resolve_cell_collisions(
             grid_ref.for_each_in_radius_toroidal(
                 pos_a,
                 broad_r,
-                SIMULATION_HALF,
+                WORLD_HALF,
                 |entity_b, pos_b, radius_b| {
                     if entity_b == entity_a {
                         return;
@@ -2550,7 +2628,7 @@ fn resolve_cell_collisions(
                     };
                     let pair_r = CELL_RADIUS * (radius_a + radius_b);
                     let pair_r2 = pair_r * pair_r;
-                    let d_vec = bioscape::min_image_delta(pos_b, pos_a, SIMULATION_HALF);
+                    let d_vec = bioscape::min_image_delta(pos_b, pos_a, WORLD_HALF);
                     let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
                     let d = d2.sqrt();
                     let in_contact = d2 < pair_r2 && d2 > 0.0;
@@ -2597,7 +2675,7 @@ fn resolve_cell_collisions(
                         let pos_j = snapshot[j_idx].position;
                         let vel_j = snapshot[j_idx].velocity;
                         let d_vec =
-                            bioscape::min_image_delta(pos_j, pos_a, SIMULATION_HALF);
+                            bioscape::min_image_delta(pos_j, pos_a, WORLD_HALF);
                         let dist =
                             (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2])
                                 .sqrt();
@@ -2655,7 +2733,7 @@ fn resolve_cell_collisions(
                 cell.0.bonds[slot] = None;
                 continue;
             };
-            let d_vec = bioscape::min_image_delta(pos_j, pos_i, SIMULATION_HALF);
+            let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
             let d = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
             if d > bond.rest_length * bioscape::BOND_BREAK_FACTOR || d <= f32::EPSILON {
                 cell.0.bonds[slot] = None;
@@ -2716,7 +2794,7 @@ fn resolve_cell_collisions(
         let (Some(sa_slot), Some(sb_slot)) = (slot_a, slot_b) else { continue };
         let pos_a = ca.0.position;
         let pos_b = cb.0.position;
-        let d_vec = bioscape::min_image_delta(pos_b, pos_a, SIMULATION_HALF);
+        let d_vec = bioscape::min_image_delta(pos_b, pos_a, WORLD_HALF);
         let dist =
             (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
         let rest = dist * BOND_REST_LENGTH_SLACK;
