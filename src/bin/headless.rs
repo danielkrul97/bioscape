@@ -2506,9 +2506,12 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         // 1 thermal 0 (Sprint 85) + 2 thermal_optimum 0 (Sprint 87) +
         // 7 hunter genome 0 (Sprint 89) + 2 diet/exposure 0 (Sprint 93).
         // Sprint 99: + 2 hunter bond means + 2 hunter bond formed/broken counters.
+        // Sprint 111: i v empty-pop branch reportujeme aktuální shock stav,
+        // protože shocky existují nezávisle na živé populaci.
+        let (shock_active, shock_hazard_max) = shock_summary(world);
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,1.000,0,0.000,0.000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2524,6 +2527,8 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
             world.hunter_deaths_gen,
             world.hunter_bonds_formed_gen,
             world.hunter_bonds_broken_gen,
+            shock_active,
+            shock_hazard_max,
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -2896,9 +2901,15 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         0.0
     };
     let immune_f = immune_cells as f64 / nf;
+    // Sprint 111: shock observability + diversity metrics (Shannon attack
+    // entropy, brain w1 frobenius std).
+    let (shock_active, shock_hazard_max) = shock_summary(world);
+    let lineage_count = lineages.len();
+    let behavioral_entropy_attack = attack_entropy(&world.cells);
+    let weight_diversity_w1_norm = w1_frobenius_std(&world.cells);
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},0.000,1.000,{},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -2986,7 +2997,127 @@ fn write_stats<W: Write>(w: &mut W, world: &World) -> std::io::Result<()> {
         world.hunter_bonds_broken_gen,
         // Sprint 107: CPPN speciation distance.
         cppn_compat_m,
+        // Sprint 111: shock state + diversity metrics. climate_offset (0.0)
+        // a food_factor (1.0) jsou placeholdery do S112/S113.
+        shock_active,
+        shock_hazard_max,
+        lineage_count,
+        behavioral_entropy_attack,
+        weight_diversity_w1_norm,
     )
+}
+
+/// Sprint 111: aktivní shock summary pro CSV. Vrací `(count, hazard_intensity_max)`,
+/// kde max je `intensity * shock_ramp_factor(event, gen)` přes všechny aktivní
+/// `HazardPulse` eventy. Bez aktivních eventů nebo žádný HazardPulse → `(0, 0.0)`.
+fn shock_summary(world: &World) -> (u32, f64) {
+    let gen = world.clock.generation;
+    let tick = world.clock.tick;
+    let mut count: u32 = 0;
+    let mut hazard_max: f64 = 0.0;
+    for event in world.events.active(gen, tick) {
+        count += 1;
+        if matches!(event.kind, bioscape::ShockKind::HazardPulse) {
+            let factor = bioscape::shock_ramp_factor(event, gen);
+            let intensity = (event.intensity * factor) as f64;
+            if intensity > hazard_max {
+                hazard_max = intensity;
+            }
+        }
+    }
+    (count, hazard_max)
+}
+
+/// Sprint 111: Shannon entropy histogramu `cell.last_outputs[6]` (attack signal).
+/// 8 bins na intervalu [-1, 1], hodnoty mimo se clampují. Empty population → 0.0.
+fn attack_entropy(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    const BINS: usize = 8;
+    let mut hist = [0_u64; BINS];
+    for c in cells {
+        let v = c.last_outputs[6].clamp(-1.0, 1.0);
+        let mut idx = ((v + 1.0) * 0.5 * BINS as f32) as usize;
+        if idx >= BINS {
+            idx = BINS - 1;
+        }
+        hist[idx] += 1;
+    }
+    let total = cells.len() as f64;
+    let mut h = 0.0_f64;
+    for &count in hist.iter() {
+        if count == 0 {
+            continue;
+        }
+        let p = count as f64 / total;
+        h -= p * p.log2();
+    }
+    h
+}
+
+/// Sprint 111: zapíše scheduled shock events do sidecar CSV vedle hlavního
+/// out_path (`events_seed{seed}.csv`). Caller už ověřil, že `events` není prázdný.
+fn write_events_sidecar(
+    out_path: &Path,
+    seed: u64,
+    events: &EventCalendar,
+) -> std::io::Result<()> {
+    let dir = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let sidecar = dir.join(format!("events_seed{}.csv", seed));
+    let file = std::fs::File::create(&sidecar)?;
+    let mut w = BufWriter::new(file);
+    writeln!(w, "start_gen,duration_gen,kind,intensity,center_x,center_y,radius")?;
+    for e in &events.events {
+        let kind = match e.kind {
+            bioscape::ShockKind::HazardPulse => "hazard_pulse",
+            bioscape::ShockKind::ClimateShift => "climate_shift",
+            bioscape::ShockKind::FoodCrash => "food_crash",
+        };
+        let cx = e
+            .center_xy
+            .map(|c| format!("{:.2}", c[0]))
+            .unwrap_or_default();
+        let cy = e
+            .center_xy
+            .map(|c| format!("{:.2}", c[1]))
+            .unwrap_or_default();
+        let r = e
+            .radius
+            .map(|r| format!("{:.2}", r))
+            .unwrap_or_default();
+        writeln!(
+            w,
+            "{},{},{},{:.3},{},{},{}",
+            e.start_gen, e.duration_gen, kind, e.intensity, cx, cy, r
+        )?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Sprint 111: per-cell brain w1 Frobenius norm, pak std přes všechny cells.
+/// `std = sqrt(mean((x_i - mean)²))`. Empty population → 0.0.
+fn w1_frobenius_std(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    let norms: Vec<f64> = cells
+        .iter()
+        .map(|c| {
+            let mut sumsq = 0.0_f64;
+            for row in c.genome.brain.w1.iter() {
+                for &w in row.iter() {
+                    sumsq += (w as f64) * (w as f64);
+                }
+            }
+            sumsq.sqrt()
+        })
+        .collect();
+    let n = norms.len() as f64;
+    let mean = norms.iter().sum::<f64>() / n;
+    let var = norms.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
+    var.sqrt()
 }
 
 fn main() {
@@ -3092,6 +3223,13 @@ fn main() {
         ShockScheduleConfig::default()
     };
     let events = EventCalendar::generate(seed, &shock_cfg, max_gens);
+    // Sprint 111: pokud kalendář není prázdný, dump sidecar `events_seed{seed}.csv`
+    // vedle hlavního CSV. Žádný file pokud `events` empty (žádný error).
+    if !events.events.is_empty() {
+        if let Err(e) = write_events_sidecar(Path::new(&out_path), seed, &events) {
+            eprintln!("events sidecar: write failed ({e})");
+        }
+    }
     let mut world = if let Some(path) = load_path.as_ref() {
         match World::load_checkpoint(Path::new(path)) {
             Ok(mut w) => {
@@ -3238,7 +3376,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm"
     )
     .unwrap();
     write_stats(&mut log, &world).unwrap();
