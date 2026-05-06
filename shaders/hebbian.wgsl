@@ -11,14 +11,14 @@
 // Dead zone neurons (hidden_n..BRAIN_HIDDEN) bezpečně self-bound: mají
 // last_hidden = 0, takže `lr × h_val × x = 0`, weights nemodifikují.
 
-const BRAIN_INPUTS: u32 = 53u;       // Sprint 87: 21 sensory + 32 recurrent
-const BRAIN_HIDDEN: u32 = 32u;
+const BRAIN_INPUTS: u32 = 71u;       // Sprint 103: 21 sensory + 50 recurrent
+const BRAIN_HIDDEN: u32 = 50u;
 const BRAIN_OUTPUTS: u32 = 10u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 1696u;        // Sprint 87: BRAIN_HIDDEN * BRAIN_INPUTS = 32*53
-const W2_OFFSET: u32 = 1728u;
-const B2_OFFSET: u32 = 2048u;
-const WEIGHTS_PER_CELL: u32 = 2058u;
+const B1_OFFSET: u32 = 3550u;        // Sprint 103: BRAIN_HIDDEN * BRAIN_INPUTS = 50*71
+const W2_OFFSET: u32 = 3600u;
+const B2_OFFSET: u32 = 4100u;
+const WEIGHTS_PER_CELL: u32 = 4110u;
 
 struct HebbianParams {
     num_cells: u32,

@@ -15,14 +15,14 @@
 // hidden / output. Pre-Sprint-80 cells (hidden_n=16) produkují identický
 // výstup pre a post bump.
 
-const BRAIN_INPUTS: u32 = 53u;       // Sprint 87: 21 sensory + 32 recurrent (slot 20 = thermal_local)
-const BRAIN_HIDDEN: u32 = 32u;       // Sprint 80: 16 → 32 storage cap
+const BRAIN_INPUTS: u32 = 71u;       // Sprint 103: 21 sensory + 50 recurrent
+const BRAIN_HIDDEN: u32 = 50u;       // Sprint 103: 32 → 50 storage cap
 const BRAIN_OUTPUTS: u32 = 10u;      // Sprint 66: +1 (bond signal output[9])
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 1696u;        // Sprint 87: BRAIN_HIDDEN * BRAIN_INPUTS = 32*53
-const W2_OFFSET: u32 = 1728u;        // B1 + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 2048u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN = 1728+10*32
-const WEIGHTS_PER_CELL: u32 = 2058u; // B2 + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 3550u;        // Sprint 103: BRAIN_HIDDEN * BRAIN_INPUTS = 50*71
+const W2_OFFSET: u32 = 3600u;        // B1 + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 4100u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN = 3600+10*50
+const WEIGHTS_PER_CELL: u32 = 4110u; // B2 + BRAIN_OUTPUTS
 
 struct Params {
     num_cells: u32,

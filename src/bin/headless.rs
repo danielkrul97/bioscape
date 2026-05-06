@@ -15,7 +15,7 @@ use bioscape::{
     COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
     DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
     GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
-    HERD_RADIUS, HUNTER_TARGET_COUNT,
+    HERD_RADIUS, HUNTER_GRID_CELL_SIZE, HUNTER_TARGET_COUNT,
     INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
     MATING_RADIUS, MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
     PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
@@ -52,8 +52,10 @@ use std::time::Instant;
 /// Sprint 68 bump: Genome rozšířen o `bond_stiffness` + `bond_damping`,
 /// Bond rozšířen o `stiffness` + `damping`. Starší V1/V2 už nelze
 /// deserializovat — load vrací error.
+/// Sprint 103 bump: BRAIN_HIDDEN 32→50, BRAIN_INPUTS 53→71. Brain weight
+/// arrays resize → V3 savefiles incompatible.
 const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
-const CHECKPOINT_VERSION: u32 = 3;
+const CHECKPOINT_VERSION: u32 = 4;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -1857,9 +1859,22 @@ impl World {
         let _ = rng; // Sprint 90: brain replaces idle drift, no rng needed in hunt.
         let cells_ref = &self.cells;
         let smell = &self.smell;
-        // Sprint 100: snapshot hunters pro pack sensing (same-type members
-        // ve vision). Mut iteration nesmí současně immutable-borrow self.hunters.
-        let hunters_snapshot = self.hunters.clone();
+        // Sprint 102: cell spatial grid (1× per tick) + minimální hunter
+        // snapshot (id, pos, adhesion_type) pro pack sensing. Nahrazuje
+        // O(H·N) brute force scan + per-tick deep clone celého `self.hunters`.
+        let mut hunter_cell_grid: SpatialGrid<usize, ()> =
+            SpatialGrid::new(HUNTER_GRID_CELL_SIZE);
+        hunter_cell_grid.rebuild(
+            self.cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.position, ())),
+        );
+        let hunters_snapshot: Vec<bioscape::HunterSnapshotMin> = self
+            .hunters
+            .iter()
+            .map(bioscape::HunterSnapshotMin::from_hunter)
+            .collect();
         let mut attacks: Vec<(usize, f32)> = Vec::new();
         // Sprint 101: pack kill share. Při damage_dealt > 0 collected (partner_id,
         // share_amount) — apply na partnery až po mut iter loop.
@@ -1870,11 +1885,13 @@ impl World {
             let sensors = bioscape::gather_hunter_sensors(
                 hunter,
                 cells_ref,
+                &hunter_cell_grid,
                 &hunters_snapshot,
                 smell,
                 WORLD_HALF,
             );
-            let target_idx_pre = nearest_attackable_cell(hunter, cells_ref, WORLD_HALF);
+            let target_idx_pre =
+                nearest_attackable_cell(hunter, cells_ref, &hunter_cell_grid, WORLD_HALF);
             let seek_target = target_idx_pre.map(|i| cells_ref[i].position);
             let inputs = bioscape::populate_hunter_brain_inputs(hunter, &sensors);
             let (hidden, outputs) = hunter.genome.brain.forward_with_state(&inputs);
@@ -1884,7 +1901,8 @@ impl World {
             hunter.apply_brain_motor(&outputs, seek_target, dt, WORLD_HALF);
             hunter.step(dt, WORLD_HALF);
             // Attack check (post-step pozice).
-            let target_idx = nearest_attackable_cell(hunter, cells_ref, WORLD_HALF);
+            let target_idx =
+                nearest_attackable_cell(hunter, cells_ref, &hunter_cell_grid, WORLD_HALF);
             let attack_r = hunter.genome.attack_radius;
             let attack_r2 = attack_r * attack_r;
             let damage = hunter.genome.damage_per_tick;

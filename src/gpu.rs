@@ -80,11 +80,13 @@ const _: () = assert!(W1_OFFSET == 0);
 // 1696, B2 = 1696+10*32 = 2016, WEIGHTS_PER_CELL = 2016+10 = 2026.
 // Sprint 87 (BRAIN_INPUTS_SENSORY 20 → 21, BRAIN_INPUTS 52 → 53): B1 = 32*53 =
 // 1696, W2 = 1696+32 = 1728, B2 = 1728+10*32 = 2048, WEIGHTS_PER_CELL = 2048+10
-// = 2058. Pre-Sprint-80: B1=576, W2=592, B2=752, WEIGHTS_PER_CELL=762.
-const _: () = assert!(B1_OFFSET == 1696);
-const _: () = assert!(W2_OFFSET == 1728);
-const _: () = assert!(B2_OFFSET == 2048);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 2058);
+// = 2058.
+// Sprint 103 (HIDDEN 32 → 50): B1 = 50*71 = 3550, W2 = 3550+50 = 3600,
+// B2 = 3600+10*50 = 4100, WEIGHTS_PER_CELL = 4100+10 = 4110.
+const _: () = assert!(B1_OFFSET == 3550);
+const _: () = assert!(W2_OFFSET == 3600);
+const _: () = assert!(B2_OFFSET == 4100);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4110);
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]

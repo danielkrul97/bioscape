@@ -66,11 +66,20 @@ pub const BRAIN_INPUTS_SENSORY: usize = 21;
 // nepřispívá do forward passu (zero × x = 0).
 // Memory: brain.w1 z 16×36 = 576 floats na 32×52 = 1664 (2.9×).
 // Per cell brain footprint ~8 KB; 2500 cells = ~20 MB total. Acceptable.
-pub const BRAIN_HIDDEN: usize = 32;
+//
+// Sprint 103 (HyperNEAT decade prep): 32 → 50 storage. BRAIN_INPUTS shift
+// 53 → 71. w1 z 32×53=1696 → 50×71=3550 floats (2.1×). Per cell brain
+// ~16 KB → 2500 cells = ~41 MB. Forward 4050 ops/cell × 2500 × 60Hz =
+// 600M ops/sec single-core, viable. Storage prostor pro NEAT add_neuron
+// (S104) + HyperNEAT CPPN-derived weights (S106).
+pub const BRAIN_HIDDEN: usize = 50;
 /// Initial active hidden count při spawn. Cell s `hidden_n = BRAIN_HIDDEN_DEFAULT`
 /// reprodukuje pre-Sprint-80 behavior byte-identical (dead zone weights = 0,
 /// nepřispívá). Structural mutace později rozhojnou na ≤ `BRAIN_HIDDEN`.
-pub const BRAIN_HIDDEN_DEFAULT: usize = 16;
+///
+/// Sprint 103: 16 → 25 (~50 % storage). Větší startovní kapacita pro
+/// post-S103 brain landscape; add_neuron mutace pak roste k 50.
+pub const BRAIN_HIDDEN_DEFAULT: usize = 25;
 /// Floor pro budoucí remove_neuron mutaci. Pod 4 neurony brain nedělá nic
 /// užitečného (sensory→hidden kompresor potřebuje minimum kapacity).
 pub const BRAIN_HIDDEN_MIN: usize = 4;
@@ -136,7 +145,11 @@ pub const INITIAL_CELLS: usize = 200;
 /// Sprint 64: 1000 → 2500 (proportional s z=20 → z=50 expansion). Cells
 /// density per volume zachovaná: pre-Sprint-64 1.2e-5 cells/unit³, post:
 /// stejně. CPU paralelní cesta drží > 60 FPS (Sprint 63 5k = 870 ticks/s).
-pub const MAX_POPULATION: usize = 2500;
+///
+/// Sprint 100: 2500 → 5000 (proportional s z=50 → z=100 expansion). Density
+/// 1.2e-5 cells/unit³ zachovaná. 5k testováno v S63 benchmarku jako
+/// 870 ticks/s na CPU paralelní cestě.
+pub const MAX_POPULATION: usize = 5000;
 
 pub const CELL_RADIUS: f32 = 5.0;
 pub const EAT_RADIUS: f32 = 8.0;
@@ -336,7 +349,13 @@ pub const LEARNING_RATE: f32 = 0.005;
 ///
 /// Sprint 64: z=20 → z=50 expansion + MAX_POPULATION 1000 → 2500
 /// (proportional volumetric scaling, cells/unit³ ≈ 1.2e-5).
-pub const WORLD_HALF: [f32; 3] = [960.0, 540.0, 50.0];
+///
+/// Sprint 100: z=50 → z=100 expansion + MAX_POPULATION 2500 → 5000
+/// (drží density 1.2e-5 cells/unit³). Grid resolutions (`*_GRID_RES_Z=16`)
+/// nezměněné — cell_size_z naroste 6.25 → 12.5, stále jemnější než xy
+/// (cell_size_x=30, cell_size_y≈17), takže thin-world aspect rationale
+/// ze S53 platí dál. Food count auto-scaluje přes `food_target` z_factor.
+pub const WORLD_HALF: [f32; 3] = [960.0, 540.0, 100.0];
 
 pub const WORLD_MAP_RES: usize = 64;
 /// Sprint 53: WorldMap z-axis resolution.
@@ -1018,6 +1037,7 @@ pub struct Hunter {
     /// Sprint 90: brain I/O state pro recurrent kanál + diagnostics.
     #[serde(with = "serde_arr_inputs")]
     pub last_inputs: [f32; BRAIN_INPUTS],
+    #[serde(with = "serde_arr_hidden")]
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
     /// Sprint 99: persistent spring bondy mezi hunters (mirror Cell.bonds).
@@ -1031,7 +1051,7 @@ pub struct Hunter {
     /// Solo hunteři: kopie self.last_hidden (nemění chování).
     /// Bonded hunteři: shared recurrent state napříč packem → proto-distributed
     /// cognition pro koordinovaný hon.
-    #[serde(default = "default_pooled_hidden")]
+    #[serde(default = "default_pooled_hidden", with = "serde_arr_hidden")]
     pub pooled_hidden: [f32; BRAIN_HIDDEN],
 }
 
@@ -1242,16 +1262,38 @@ pub struct HunterBrainSensors {
     pub same_type_in_vision: u32,
 }
 
-/// Sprint 90: hunter sensor gather. Linear scan cells (n_hunters max 50,
-/// cell pop ~500 → 25k pair compares per tick × 50 hunters = 1.25M ops/tick
-/// — acceptable). Spatial grid by mohl optimalizovat při větších populacích.
-///
-/// Sprint 100: + sken jiných hunterů pro pack signalizaci. `other_hunters`
-/// je full slice (vč. self — funkce ho odfiltruje přes hunter.hunter_id).
+/// Minimální snapshot huntera pro pack-sense scan v `gather_hunter_sensors`.
+/// Drží jen pozici, hunter_id a adhesion_type — to jediné, co same-type
+/// vision check potřebuje. Nahrazuje per-tick deep clone celého `Hunter`
+/// (genome + brain weights + bondy + recurrent state) na ~24-byte Copy.
+#[derive(Debug, Clone, Copy)]
+pub struct HunterSnapshotMin {
+    pub hunter_id: u64,
+    pub position: [f32; 3],
+    pub adhesion_type: u8,
+}
+
+impl HunterSnapshotMin {
+    pub fn from_hunter(h: &Hunter) -> Self {
+        Self {
+            hunter_id: h.hunter_id,
+            position: h.position,
+            adhesion_type: h.genome.adhesion_type,
+        }
+    }
+}
+
+/// Sprint 102: hunter sensor gather na spatial gridu. `cell_grid` musí být
+/// rebuilded přes `cells.iter().enumerate().map(|(i, c)| (i, c.position, ()))`
+/// caller-side — funkce iteruje jen 3³ buckets v okolí huntera, narrow-phase
+/// distance + cone test. `other_hunters` zůstává brute force (n ≤ ~50 — H²
+/// je zanedbatelný), ale typ je `HunterSnapshotMin` místo `&[Hunter]` ⇒
+/// caller ušetří deep clone.
 pub fn gather_hunter_sensors(
     hunter: &Hunter,
     cells: &[Cell],
-    other_hunters: &[Hunter],
+    cell_grid: &SpatialGrid<usize, ()>,
+    other_hunters: &[HunterSnapshotMin],
     smell: &SmellField,
     world_half: [f32; 3],
 ) -> HunterBrainSensors {
@@ -1274,28 +1316,39 @@ pub fn gather_hunter_sensors(
     };
     let mut best: Option<([f32; 3], f32, f32)> = None; // (delta, d2, prey_size)
     let mut count: u32 = 0;
-    for c in cells {
-        if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
-            continue;
-        }
-        let d = min_image_delta(hunter.position, c.position, world_half);
-        let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-        if d2 >= vision_r2 {
-            continue;
-        }
-        if cone_active && !fov_cone_accept(d, d2, forward, cos_fov) {
-            continue;
-        }
-        count += 1;
-        let prey_size = c.phenotype.effective_radius();
-        match best {
-            None => best = Some((d, d2, prey_size)),
-            Some((_, bd2, _)) if d2 < bd2 => best = Some((d, d2, prey_size)),
-            _ => {}
-        }
-    }
+    cell_grid.for_each_in_radius_toroidal(
+        hunter.position,
+        vision_r,
+        world_half,
+        |idx, ghost_pos, ()| {
+            let c = &cells[idx];
+            if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
+                return;
+            }
+            let d = [
+                ghost_pos[0] - hunter.position[0],
+                ghost_pos[1] - hunter.position[1],
+                ghost_pos[2] - hunter.position[2],
+            ];
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if d2 >= vision_r2 {
+                return;
+            }
+            if cone_active && !fov_cone_accept(d, d2, forward, cos_fov) {
+                return;
+            }
+            count += 1;
+            let prey_size = c.phenotype.effective_radius();
+            match best {
+                None => best = Some((d, d2, prey_size)),
+                Some((_, bd2, _)) if d2 < bd2 => best = Some((d, d2, prey_size)),
+                _ => {}
+            }
+        },
+    );
     let smell_grad = smell.gradient_at(hunter.position, SMELL_SAMPLE_EPSILON);
-    // Sprint 100: pack scan — same-type hunteři ve vision range.
+    // Sprint 100: pack scan — same-type hunteři ve vision range. H² brute
+    // force OK: HUNTER_TARGET_COUNT je low (~12), grid by tu nebyl výhra.
     let mut nearest_pack: Option<([f32; 3], f32)> = None;
     let mut same_type_count: u32 = 0;
     let own_type = hunter.genome.adhesion_type;
@@ -1304,7 +1357,7 @@ pub fn gather_hunter_sensors(
         if o.hunter_id == own_id {
             continue;
         }
-        if o.genome.adhesion_type != own_type {
+        if o.adhesion_type != own_type {
             continue;
         }
         let d = min_image_delta(hunter.position, o.position, world_half);
@@ -1510,6 +1563,7 @@ pub fn make_hunter_mating_child(
 pub fn nearest_attackable_cell(
     hunter: &Hunter,
     cells: &[Cell],
+    cell_grid: &SpatialGrid<usize, ()>,
     world_half: [f32; 3],
 ) -> Option<usize> {
     let vision_r = hunter.genome.vision_radius;
@@ -1530,27 +1584,38 @@ pub fn nearest_attackable_cell(
         [0.0; 3]
     };
     let mut best: Option<(usize, f32)> = None;
-    for (i, c) in cells.iter().enumerate() {
-        if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
-            continue;
-        }
-        // Sprint 84: vector from hunter to cell (= c.position − hunter.pos).
-        // Pre-Sprint-84 byl `d` drženo jako hunter_pos − c.position (jen pro d²
-        // distance, kde znaménko nehraje); cone filter potřebuje směr.
-        let d = min_image_delta(hunter.position, c.position, world_half);
-        let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-        if d2 >= vision_r2 {
-            continue;
-        }
-        if cone_active && !fov_cone_accept(d, d2, forward, cos_fov) {
-            continue;
-        }
-        match best {
-            None => best = Some((i, d2)),
-            Some((_, bd2)) if d2 < bd2 => best = Some((i, d2)),
-            _ => {}
-        }
-    }
+    cell_grid.for_each_in_radius_toroidal(
+        hunter.position,
+        vision_r,
+        world_half,
+        |idx, ghost_pos, ()| {
+            let c = &cells[idx];
+            if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
+                return;
+            }
+            // Sprint 84: vector from hunter to cell (= c.position − hunter.pos).
+            // Pre-Sprint-84 byl `d` drženo jako hunter_pos − c.position (jen pro d²
+            // distance, kde znaménko nehraje); cone filter potřebuje směr.
+            // Sprint 102: ghost_pos je už toroidálně min-image pozice (grid wrapped).
+            let d = [
+                ghost_pos[0] - hunter.position[0],
+                ghost_pos[1] - hunter.position[1],
+                ghost_pos[2] - hunter.position[2],
+            ];
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if d2 >= vision_r2 {
+                return;
+            }
+            if cone_active && !fov_cone_accept(d, d2, forward, cos_fov) {
+                return;
+            }
+            match best {
+                None => best = Some((idx, d2)),
+                Some((_, bd2)) if d2 < bd2 => best = Some((idx, d2)),
+                _ => {}
+            }
+        },
+    );
     best.map(|(i, _)| i)
 }
 
@@ -1611,6 +1676,7 @@ pub struct Brain {
     pub hidden_n: u32,
     #[serde(with = "serde_arrays_w1")]
     pub w1: [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN],
+    #[serde(with = "serde_arr_hidden")]
     pub b1: [f32; BRAIN_HIDDEN],
     #[serde(with = "serde_arrays_w2")]
     pub w2: [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
@@ -1689,6 +1755,27 @@ mod serde_arr_inputs {
             return Err(serde::de::Error::custom("inputs length mismatch"));
         }
         let mut a = [0.0_f32; BRAIN_INPUTS];
+        a.copy_from_slice(&v);
+        Ok(a)
+    }
+}
+
+// Sprint 103: BRAIN_HIDDEN > 32 → serde's native `[T; N]` impl nepokrývá.
+// Wrapper sloučí pole do Vec<f32> na serializaci, resp. roundtripuje zpět.
+pub mod serde_arr_hidden {
+    use super::BRAIN_HIDDEN;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(a: &[f32; BRAIN_HIDDEN], s: S) -> Result<S::Ok, S::Error> {
+        a.as_slice().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[f32; BRAIN_HIDDEN], D::Error> {
+        let v: Vec<f32> = Vec::deserialize(d)?;
+        if v.len() != BRAIN_HIDDEN {
+            return Err(serde::de::Error::custom("hidden length mismatch"));
+        }
+        let mut a = [0.0_f32; BRAIN_HIDDEN];
         a.copy_from_slice(&v);
         Ok(a)
     }
@@ -2369,6 +2456,7 @@ pub struct Cell {
     // read these to credit-assign on reward events (myopic, 1-tick window).
     #[serde(with = "serde_arr_inputs")]
     pub last_inputs: [f32; BRAIN_INPUTS],
+    #[serde(with = "serde_arr_hidden")]
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
     /// Sprint 94: cluster-shared brain. Pre-tick mean `last_hidden` přes
@@ -2379,7 +2467,7 @@ pub struct Cell {
     /// average over cluster → bigger effective context window.
     /// `serde(default)` returns zeros pro backward-compat (= same as fresh
     /// cell s žádnou prior activity, behavior matches pre-Sprint-94).
-    #[serde(default = "default_pooled_hidden")]
+    #[serde(default = "default_pooled_hidden", with = "serde_arr_hidden")]
     pub pooled_hidden: [f32; BRAIN_HIDDEN],
     /// Sprint 30: nedobrovolný energy drain akumulovaný v aktuálním ticku
     /// (predation + hazard). Brain ho čte v dalším ticku jako input[14]
@@ -3896,6 +3984,13 @@ impl<Id: Copy + Eq + Hash, P: Copy> SpatialGrid<Id, P> {
 /// (50). Větší = méně buckets, víc kandidátů per query; menší = víc buckets,
 /// méně kandidátů. Renderer v `main.rs` má svůj vlastní knob.
 pub const GRID_CELL_SIZE: f32 = 64.0;
+
+/// Sprint 102: hunter cell-grid bucket size. Hunter vision_radius je řádově
+/// větší než typická cell-cell interakce (100–400 vs ~20), takže `GRID_CELL_SIZE
+/// = 64` by dělalo r_cells = 5–7 → 1300+ HashMap lookupů per query a grid
+/// by byl pomalejší než brute force při běžné populaci. 200 odpovídá median
+/// hunter vision → r_cells = 1–2 → 27–125 lookupů.
+pub const HUNTER_GRID_CELL_SIZE: f32 = 200.0;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SimClock {
@@ -6408,6 +6503,12 @@ mod tests {
         );
     }
 
+    fn build_test_cell_grid(cells: &[Cell]) -> SpatialGrid<usize, ()> {
+        let mut g: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE);
+        g.rebuild(cells.iter().enumerate().map(|(i, c)| (i, c.position, ())));
+        g
+    }
+
     /// Sprint 89: helper pro test hunter setup. Default genome (S71-S84
     /// const-equivalent middle ranges), full energy, no cooldown.
     /// Sprint 90: + dummy brain (zero weights), heading 0, pitch 0.
@@ -6460,7 +6561,8 @@ mod tests {
         cells.push(c1);
         // Sprint 84: idle hunter (velocity 0) → cone filter disabled, omni.
         let h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
-        let pick = nearest_attackable_cell(&h, &cells, half);
+        let grid = build_test_cell_grid(&cells);
+        let pick = nearest_attackable_cell(&h, &cells, &grid, half);
         assert_eq!(pick, Some(1));
     }
 
@@ -6487,7 +6589,8 @@ mod tests {
         c1.position = [60.0, 0.0, 0.0];
         cells.push(c1);
         let h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
-        let pick = nearest_attackable_cell(&h, &cells, half);
+        let grid = build_test_cell_grid(&cells);
+        let pick = nearest_attackable_cell(&h, &cells, &grid, half);
         assert_eq!(pick, Some(1));
     }
 
@@ -6508,7 +6611,8 @@ mod tests {
         }
         let cells = vec![c];
         let h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
-        assert!(nearest_attackable_cell(&h, &cells, half).is_none());
+        let grid = build_test_cell_grid(&cells);
+        assert!(nearest_attackable_cell(&h, &cells, &grid, half).is_none());
     }
 
     #[test]
@@ -6520,12 +6624,13 @@ mod tests {
         let mut behind = Cell::random(&mut rng, half, 0, 0, 0);
         behind.position = [-50.0, 0.0, 0.0];
         let cells = vec![behind];
+        let grid = build_test_cell_grid(&cells);
         // Hunter moving +X; target behind → cone reject.
         let active_h = make_test_hunter([0.0, 0.0, 0.0], [50.0, 0.0, 0.0]);
-        assert!(nearest_attackable_cell(&active_h, &cells, half).is_none());
+        assert!(nearest_attackable_cell(&active_h, &cells, &grid, half).is_none());
         // Idle hunter (velocity 0) → cone disabled → target nalezen.
         let idle_h = make_test_hunter([0.0, 0.0, 0.0], [0.0; 3]);
-        assert!(nearest_attackable_cell(&idle_h, &cells, half).is_some());
+        assert!(nearest_attackable_cell(&idle_h, &cells, &grid, half).is_some());
     }
 
     #[test]
@@ -6537,7 +6642,8 @@ mod tests {
         front.position = [50.0, 0.0, 0.0];
         let cells = vec![front];
         let h = make_test_hunter([0.0, 0.0, 0.0], [50.0, 0.0, 0.0]);
-        let pick = nearest_attackable_cell(&h, &cells, half);
+        let grid = build_test_cell_grid(&cells);
+        let pick = nearest_attackable_cell(&h, &cells, &grid, half);
         assert_eq!(pick, Some(0));
     }
 
@@ -6550,7 +6656,8 @@ mod tests {
         side.position = [0.0, 50.0, 0.0];
         let cells = vec![side];
         let h = make_test_hunter([0.0, 0.0, 0.0], [50.0, 0.0, 0.0]);
-        let pick = nearest_attackable_cell(&h, &cells, half);
+        let grid = build_test_cell_grid(&cells);
+        let pick = nearest_attackable_cell(&h, &cells, &grid, half);
         assert!(pick.is_none());
     }
 
