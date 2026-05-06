@@ -40,7 +40,7 @@ use bioscape::{
     CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, DILUTION_K, EAT_RADIUS,
     FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE, GENERATIONS_PER_EPOCH, HAZARD_AMP,
     HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS,
-    HUNTER_TARGET_COUNT, INITIAL_CELLS, LEARNING_RATE,
+    HUNTER_GRID_CELL_SIZE, HUNTER_TARGET_COUNT, INITIAL_CELLS, LEARNING_RATE,
     MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH,
     MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
     PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
@@ -1753,8 +1753,20 @@ fn step_hunters(
     let dt = fixed_time.delta_secs();
     let cell_snapshot: Vec<(Entity, Cell)> = cells.iter().map(|(e, c)| (e, c.0)).collect();
     let cells_only: Vec<Cell> = cell_snapshot.iter().map(|(_, c)| *c).collect();
-    // Sprint 100: snapshot hunters pro pack sensing.
-    let hunters_snapshot: Vec<Hunter> = hunters.iter().map(|(_, h)| h.0).collect();
+    // Sprint 102: cell spatial grid (1× per tick) + minimální hunter snapshot
+    // (id, pos, adhesion_type) — nahrazuje O(H·N) brute force scan v
+    // gather_hunter_sensors / nearest_attackable_cell + deep clone hunterů.
+    let mut hunter_cell_grid: SpatialGrid<usize, ()> = SpatialGrid::new(HUNTER_GRID_CELL_SIZE);
+    hunter_cell_grid.rebuild(
+        cells_only
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.position, ())),
+    );
+    let hunters_snapshot: Vec<bioscape::HunterSnapshotMin> = hunters
+        .iter()
+        .map(|(_, h)| bioscape::HunterSnapshotMin::from_hunter(&h.0))
+        .collect();
     let mut attacks: Vec<(Entity, f32)> = Vec::new();
     // Sprint 101: pack kill share (id, energy) — apply post-loop.
     let mut pack_shares: Vec<(u64, f32)> = Vec::new();
@@ -1763,11 +1775,13 @@ fn step_hunters(
         let sensors = bioscape::gather_hunter_sensors(
             &h.0,
             &cells_only,
+            &hunter_cell_grid,
             &hunters_snapshot,
             &smell.0,
             WORLD_HALF,
         );
-        let target_idx_pre = nearest_attackable_cell(&h.0, &cells_only, WORLD_HALF);
+        let target_idx_pre =
+            nearest_attackable_cell(&h.0, &cells_only, &hunter_cell_grid, WORLD_HALF);
         let seek_target = target_idx_pre.map(|i| cells_only[i].position);
         let inputs = bioscape::populate_hunter_brain_inputs(&mut h.0, &sensors);
         let (hidden, outputs) = h.0.genome.brain.forward_with_state(&inputs);
@@ -1777,7 +1791,8 @@ fn step_hunters(
         h.0.apply_brain_motor(&outputs, seek_target, dt, WORLD_HALF);
         h.0.step(dt, WORLD_HALF);
         // Attack check (post-step pozice).
-        let target_idx = nearest_attackable_cell(&h.0, &cells_only, WORLD_HALF);
+        let target_idx =
+            nearest_attackable_cell(&h.0, &cells_only, &hunter_cell_grid, WORLD_HALF);
         let attack_r = h.0.genome.attack_radius;
         let attack_r2 = attack_r * attack_r;
         let damage = h.0.genome.damage_per_tick;

@@ -154,7 +154,7 @@ pub const INITIAL_CELLS: usize = 200;
 /// Sprint 100: 2500 → 5000 (proportional s z=50 → z=100 expansion). Density
 /// 1.2e-5 cells/unit³ zachovaná. 5k testováno v S63 benchmarku jako
 /// 870 ticks/s na CPU paralelní cestě.
-pub const MAX_POPULATION: usize = 5000;
+pub const MAX_POPULATION: usize = 1500;
 
 pub const CELL_RADIUS: f32 = 5.0;
 pub const EAT_RADIUS: f32 = 8.0;
@@ -2150,6 +2150,58 @@ impl Cppn {
             out.mutate_activation(rng);
         }
         out
+    }
+
+    /// Sprint 107: NEAT compatibility distance metric. Speciation gate.
+    ///   δ(a, b) = c1 × E/N + c2 × D/N + c3 × W̄
+    /// kde:
+    ///   E = excess gene count (innovations beyond max in other parent)
+    ///   D = disjoint gene count (within range, not matching)
+    ///   N = max(genome size) — normalizace
+    ///   W̄ = average |weight diff| pro matching genes
+    /// Constants follow classical NEAT defaults.
+    pub fn compatibility_distance(a: &Cppn, b: &Cppn) -> f32 {
+        const C_EXCESS: f32 = 1.0;
+        const C_DISJOINT: f32 = 1.0;
+        const C_WEIGHT: f32 = 0.4;
+        let max_inv_a = a.iter_links().map(|l| l.innovation).max().unwrap_or(0);
+        let max_inv_b = b.iter_links().map(|l| l.innovation).max().unwrap_or(0);
+        let cutoff = max_inv_a.min(max_inv_b);
+        let mut excess: u32 = 0;
+        let mut disjoint: u32 = 0;
+        let mut weight_diff_sum: f32 = 0.0;
+        let mut matching: u32 = 0;
+        let a_links: rustc_hash::FxHashMap<u32, &CppnLink> =
+            a.iter_links().map(|l| (l.innovation, l)).collect();
+        let b_links: rustc_hash::FxHashMap<u32, &CppnLink> =
+            b.iter_links().map(|l| (l.innovation, l)).collect();
+        for (inv, la) in a_links.iter() {
+            if let Some(lb) = b_links.get(inv) {
+                weight_diff_sum += (la.weight - lb.weight).abs();
+                matching += 1;
+            } else if *inv > cutoff {
+                excess += 1;
+            } else {
+                disjoint += 1;
+            }
+        }
+        for inv in b_links.keys() {
+            if a_links.contains_key(inv) {
+                continue;
+            }
+            if *inv > cutoff {
+                excess += 1;
+            } else {
+                disjoint += 1;
+            }
+        }
+        let n = (a.num_links.max(b.num_links) as f32).max(1.0);
+        let w_avg = if matching > 0 {
+            weight_diff_sum / matching as f32
+        } else {
+            0.0
+        };
+        C_EXCESS * (excess as f32) / n + C_DISJOINT * (disjoint as f32) / n + C_WEIGHT * w_avg
     }
 
     /// Crossover: align matching innovations + nodes by id. Random pick na
@@ -7279,6 +7331,34 @@ mod tests {
                 la.innovation
             );
         }
+    }
+
+    #[test]
+    fn cppn_compatibility_distance_self_zero() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let c = Cppn::random(&mut rng);
+        let d = Cppn::compatibility_distance(&c, &c);
+        assert!(d < 1e-3, "self-distance ≈ 0, got {}", d);
+    }
+
+    #[test]
+    fn cppn_compatibility_distance_grows_with_mutation() {
+        let mut rng = StdRng::seed_from_u64(37);
+        let a = Cppn::random(&mut rng);
+        let mut b = a;
+        // Heavy mutation pushuje distance výš
+        for _ in 0..20 {
+            b.mutate_weight(&mut rng, 1.0);
+            b.mutate_add_node(&mut rng);
+        }
+        let d_self = Cppn::compatibility_distance(&a, &a);
+        let d_far = Cppn::compatibility_distance(&a, &b);
+        assert!(
+            d_far > d_self + 0.05,
+            "mutation grows distance: self={:.3}, mutated={:.3}",
+            d_self,
+            d_far
+        );
     }
 
     #[test]
