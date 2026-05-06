@@ -4905,6 +4905,232 @@ impl SimClock {
     }
 }
 
+/// Sprint 108: seed-namespace pro shock RNG. Hash s world seedem zajišťuje
+/// nezávislý stream — měnit shock plán nezmění RNG cellí logiky.
+pub const SHOCK_SCHEDULE_SALT: u64 = 0xCAFE_F00D;
+
+/// Sprint 108: počet ShockKind variant. Drží sync s `ShockKind` enum size.
+/// Pokud přidáš variant, bumpni a uprav `ShockScheduleConfig.type_weights`.
+pub const SHOCK_KIND_COUNT: usize = 3;
+
+/// Sprint 108: typy environmentálních shocků. Diskretní eventy s rampou
+/// (ne smooth cykly) — drží selekční tlak v dlouhých runech.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ShockKind {
+    HazardPulse,
+    ClimateShift,
+    FoodCrash,
+}
+
+/// Sprint 108: jeden shock event v kalendáři. Aktivní v generačním okně
+/// `[start_gen, start_gen + duration_gen)`; rampa řízená `ramp_gens`.
+/// `center_xy`/`radius` `None` znamená globální dosah.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ShockEvent {
+    pub kind: ShockKind,
+    pub start_gen: u64,
+    pub duration_gen: u32,
+    pub ramp_gens: u32,
+    pub intensity: f32,
+    pub center_xy: Option<[f32; 2]>,
+    pub radius: Option<f32>,
+}
+
+/// Sprint 108: parametry plánovače shocků. `mean_gens_between == 0`
+/// znamená no-op (default) — kalendář bude prázdný a integrace v Sprint 109+
+/// nemá efekt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShockScheduleConfig {
+    pub mean_gens_between: u32,
+    pub type_weights: [f32; SHOCK_KIND_COUNT],
+    pub intensity_min: f32,
+    pub intensity_max: f32,
+    pub duration_min_gens: u32,
+    pub duration_max_gens: u32,
+    pub ramp_gens: u32,
+    pub spatial_global_prob: f32,
+    pub spatial_radius_min_frac: f32,
+    pub spatial_radius_max_frac: f32,
+}
+
+impl Default for ShockScheduleConfig {
+    fn default() -> Self {
+        Self {
+            mean_gens_between: 0,
+            type_weights: [1.0, 1.0, 1.0],
+            intensity_min: 0.3,
+            intensity_max: 1.0,
+            duration_min_gens: 5,
+            duration_max_gens: 15,
+            ramp_gens: 2,
+            spatial_global_prob: 0.5,
+            spatial_radius_min_frac: 0.2,
+            spatial_radius_max_frac: 0.6,
+        }
+    }
+}
+
+/// Sprint 108: deterministicky vygenerovaný kalendář shocků pro celý run.
+/// Drží i `seed`, ze kterého byl odvozen — pro reproducibility checks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EventCalendar {
+    pub events: Vec<ShockEvent>,
+    pub seed: u64,
+}
+
+impl EventCalendar {
+    /// Pokud `cfg.mean_gens_between == 0`, vrací prázdný kalendář (no-op).
+    /// Jinak deterministicky generuje sekvenci shocků až do `max_gens`
+    /// přes Poisson-like inter-arrival times s mean `mean_gens_between`.
+    /// Použije `StdRng::seed_from_u64(seed ^ SHOCK_SCHEDULE_SALT)`.
+    /// Eventy jsou setříděné vzestupně podle `start_gen`.
+    pub fn generate(seed: u64, cfg: &ShockScheduleConfig, max_gens: u64) -> Self {
+        let mut calendar = Self {
+            events: Vec::new(),
+            seed,
+        };
+        if cfg.mean_gens_between == 0 || max_gens == 0 {
+            return calendar;
+        }
+        let mut rng = StdRng::seed_from_u64(seed ^ SHOCK_SCHEDULE_SALT);
+        let mean = cfg.mean_gens_between as f32;
+        let intensity_lo = cfg.intensity_min.min(cfg.intensity_max);
+        let intensity_hi = cfg.intensity_min.max(cfg.intensity_max);
+        let duration_lo = cfg.duration_min_gens.min(cfg.duration_max_gens);
+        let duration_hi = cfg.duration_min_gens.max(cfg.duration_max_gens);
+        let radius_lo = cfg
+            .spatial_radius_min_frac
+            .min(cfg.spatial_radius_max_frac)
+            .max(0.0);
+        let radius_hi = cfg
+            .spatial_radius_min_frac
+            .max(cfg.spatial_radius_max_frac)
+            .max(radius_lo);
+        let world_half_xy = WORLD_HALF[0];
+
+        let mut next_start: u64 = 0;
+        loop {
+            let u: f32 = rng.random::<f32>().max(f32::MIN_POSITIVE);
+            let gap_f = (mean * -u.ln()).max(1.0);
+            let gap = gap_f as u64;
+            let gap = gap.max(1);
+            next_start = next_start.saturating_add(gap);
+            if next_start >= max_gens {
+                break;
+            }
+
+            let kind = pick_shock_kind(&mut rng, &cfg.type_weights);
+            let intensity = if intensity_hi > intensity_lo {
+                rng.random_range(intensity_lo..=intensity_hi)
+            } else {
+                intensity_lo
+            };
+            let duration_gen = if duration_hi > duration_lo {
+                rng.random_range(duration_lo..=duration_hi)
+            } else {
+                duration_lo
+            };
+
+            let global_roll: f32 = rng.random();
+            let (center_xy, radius) = if global_roll < cfg.spatial_global_prob {
+                (None, None)
+            } else {
+                let cx = rng.random_range(-1.0_f32..=1.0) * world_half_xy;
+                let cy = rng.random_range(-1.0_f32..=1.0) * world_half_xy;
+                let frac = if radius_hi > radius_lo {
+                    rng.random_range(radius_lo..=radius_hi)
+                } else {
+                    radius_lo
+                };
+                let r = (frac * world_half_xy).max(0.0);
+                (Some([cx, cy]), Some(r))
+            };
+
+            calendar.events.push(ShockEvent {
+                kind,
+                start_gen: next_start,
+                duration_gen,
+                ramp_gens: cfg.ramp_gens,
+                intensity,
+                center_xy,
+                radius,
+            });
+        }
+
+        calendar.events.sort_by_key(|e| e.start_gen);
+        calendar
+    }
+
+    /// Sprint 108: shock je aktivní v generačním okně `[start, start + duration)`.
+    /// `tick` je ignorován — rampa pracuje v gen units, aby byla nezávislá na
+    /// `FIXED_TIMESTEP_HZ`. Signature ho drží pro budoucí tick-level shocks.
+    pub fn active(&self, generation: u64, _tick: u64) -> impl Iterator<Item = &ShockEvent> {
+        self.events.iter().filter(move |e| {
+            let end = e.start_gen.saturating_add(e.duration_gen as u64);
+            generation >= e.start_gen && generation < end
+        })
+    }
+}
+
+fn pick_shock_kind(rng: &mut StdRng, weights: &[f32; SHOCK_KIND_COUNT]) -> ShockKind {
+    let total: f32 = weights.iter().map(|w| w.max(0.0)).sum();
+    if total <= 0.0 {
+        return ShockKind::HazardPulse;
+    }
+    let mut roll = rng.random::<f32>() * total;
+    for (i, &w) in weights.iter().enumerate() {
+        let w = w.max(0.0);
+        if roll < w {
+            return match i {
+                0 => ShockKind::HazardPulse,
+                1 => ShockKind::ClimateShift,
+                _ => ShockKind::FoodCrash,
+            };
+        }
+        roll -= w;
+    }
+    ShockKind::FoodCrash
+}
+
+/// Sprint 108: trapezoid (nebo triangle pokud `duration <= 2 * ramp_gens`)
+/// envelope shocku. Outside `[start, start + duration)` vrací 0.0; uvnitř
+/// 0..=1. Rampa v gen units, ne v sekundách — `FIXED_TIMESTEP_HZ` ji nemění.
+pub fn shock_ramp_factor(event: &ShockEvent, generation: u64) -> f32 {
+    let duration = event.duration_gen as u64;
+    if duration == 0 || generation < event.start_gen {
+        return 0.0;
+    }
+    let end = event.start_gen + duration;
+    if generation >= end {
+        return 0.0;
+    }
+    let local = generation - event.start_gen;
+    let ramp = event.ramp_gens as u64;
+
+    if duration <= ramp.saturating_mul(2) || ramp == 0 {
+        let half = duration as f32 / 2.0;
+        if half <= 0.0 {
+            return 0.0;
+        }
+        let dist_from_mid = (local as f32 + 0.5 - half).abs();
+        let f = 1.0 - (dist_from_mid / half);
+        return f.clamp(0.0, 1.0);
+    }
+
+    let plateau_start = ramp;
+    let plateau_end = duration - ramp;
+    if local < plateau_start {
+        let f = (local as f32 + 0.5) / ramp as f32;
+        f.clamp(0.0, 1.0)
+    } else if local < plateau_end {
+        1.0
+    } else {
+        let into_down = local - plateau_end;
+        let f = 1.0 - (into_down as f32 + 0.5) / ramp as f32;
+        f.clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7757,5 +7983,161 @@ mod tests {
         let v = adhesion_velocity_delta(d_vec, d, pair_r, true);
         // Pull from i toward j přes wrap = +x (i is at +950, j wraps to +970).
         assert!(v[0] > 0.0, "expected wrap-aware pull, got {:?}", v);
+    }
+
+    fn shock_cfg_active() -> ShockScheduleConfig {
+        ShockScheduleConfig {
+            mean_gens_between: 20,
+            type_weights: [1.0, 1.0, 1.0],
+            intensity_min: 0.3,
+            intensity_max: 1.0,
+            duration_min_gens: 5,
+            duration_max_gens: 15,
+            ramp_gens: 2,
+            spatial_global_prob: 0.5,
+            spatial_radius_min_frac: 0.2,
+            spatial_radius_max_frac: 0.6,
+        }
+    }
+
+    #[test]
+    fn event_calendar_default_is_empty() {
+        let cfg = ShockScheduleConfig::default();
+        let cal = EventCalendar::generate(123, &cfg, 1000);
+        assert!(cal.events.is_empty());
+        assert_eq!(cal.seed, 123);
+    }
+
+    #[test]
+    fn event_calendar_is_deterministic_for_seed() {
+        let cfg = shock_cfg_active();
+        let a = EventCalendar::generate(42, &cfg, 500);
+        let b = EventCalendar::generate(42, &cfg, 500);
+        assert_eq!(a.events.len(), b.events.len());
+        assert!(!a.events.is_empty(), "active cfg must produce events");
+        for (ea, eb) in a.events.iter().zip(b.events.iter()) {
+            assert_eq!(ea.kind, eb.kind);
+            assert_eq!(ea.start_gen, eb.start_gen);
+            assert_eq!(ea.duration_gen, eb.duration_gen);
+            assert_eq!(ea.ramp_gens, eb.ramp_gens);
+            assert!((ea.intensity - eb.intensity).abs() < 1e-6);
+            assert_eq!(ea.center_xy.is_some(), eb.center_xy.is_some());
+            assert_eq!(ea.radius.is_some(), eb.radius.is_some());
+        }
+    }
+
+    #[test]
+    fn event_calendar_different_seeds_differ() {
+        let cfg = shock_cfg_active();
+        let a = EventCalendar::generate(42, &cfg, 1000);
+        let b = EventCalendar::generate(43, &cfg, 1000);
+        // Drobný risk shody, ale s mean=20 a 1000 gens je to >>50 eventů —
+        // collision pravděpodobnost zanedbatelná.
+        let identical = a.events.len() == b.events.len()
+            && a.events
+                .iter()
+                .zip(b.events.iter())
+                .all(|(x, y)| x.start_gen == y.start_gen && x.kind == y.kind);
+        assert!(!identical, "different seeds should produce different schedules");
+    }
+
+    #[test]
+    fn event_calendar_respects_max_gens() {
+        let cfg = shock_cfg_active();
+        let max_gens = 500;
+        let cal = EventCalendar::generate(7, &cfg, max_gens);
+        for e in &cal.events {
+            assert!(e.start_gen < max_gens, "start_gen {} >= max {}", e.start_gen, max_gens);
+        }
+    }
+
+    #[test]
+    fn event_calendar_events_sorted() {
+        let cfg = shock_cfg_active();
+        let cal = EventCalendar::generate(11, &cfg, 1000);
+        for w in cal.events.windows(2) {
+            assert!(w[0].start_gen <= w[1].start_gen);
+        }
+    }
+
+    #[test]
+    fn shock_ramp_factor_trapezoid() {
+        let trap = ShockEvent {
+            kind: ShockKind::HazardPulse,
+            start_gen: 100,
+            duration_gen: 10,
+            ramp_gens: 2,
+            intensity: 1.0,
+            center_xy: None,
+            radius: None,
+        };
+        assert_eq!(shock_ramp_factor(&trap, 99), 0.0);
+        assert_eq!(shock_ramp_factor(&trap, 110), 0.0);
+        // Mid plateau (gen 104..=107) musí být 1.0.
+        assert!((shock_ramp_factor(&trap, 105) - 1.0).abs() < 1e-6);
+        // První gen rampy: monotonně rostoucí, < 1.
+        let f0 = shock_ramp_factor(&trap, 100);
+        let f1 = shock_ramp_factor(&trap, 101);
+        assert!(f0 > 0.0 && f0 < 1.0);
+        assert!(f1 > f0);
+        // Poslední gen rampy: < 1, > 0.
+        let f_end = shock_ramp_factor(&trap, 109);
+        assert!(f_end > 0.0 && f_end < 1.0);
+
+        // Triangle case: duration <= 2 * ramp.
+        let tri = ShockEvent {
+            kind: ShockKind::HazardPulse,
+            start_gen: 0,
+            duration_gen: 4,
+            ramp_gens: 3,
+            intensity: 1.0,
+            center_xy: None,
+            radius: None,
+        };
+        assert_eq!(shock_ramp_factor(&tri, 4), 0.0);
+        let peaks: Vec<f32> = (0..4).map(|g| shock_ramp_factor(&tri, g)).collect();
+        let max_peak = peaks.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(max_peak > 0.0 && max_peak <= 1.0);
+        // Triangle musí mít jeden inner peak — okraje nižší než střed.
+        assert!(peaks[0] < max_peak);
+        assert!(peaks[3] < max_peak);
+    }
+
+    #[test]
+    fn event_calendar_intensity_in_range() {
+        let cfg = shock_cfg_active();
+        let cal = EventCalendar::generate(99, &cfg, 1000);
+        assert!(!cal.events.is_empty());
+        for e in &cal.events {
+            assert!(
+                e.intensity >= cfg.intensity_min - 1e-6
+                    && e.intensity <= cfg.intensity_max + 1e-6,
+                "intensity {} out of range",
+                e.intensity
+            );
+            assert!(e.duration_gen >= cfg.duration_min_gens);
+            assert!(e.duration_gen <= cfg.duration_max_gens);
+        }
+    }
+
+    #[test]
+    fn event_calendar_global_vs_spatial_split() {
+        let cfg = shock_cfg_active();
+        let cal = EventCalendar::generate(2024, &cfg, 4000);
+        assert!(
+            cal.events.len() >= 20,
+            "need enough events for split test, got {}",
+            cal.events.len()
+        );
+        let global = cal.events.iter().filter(|e| e.center_xy.is_none()).count();
+        let spatial = cal.events.iter().filter(|e| e.center_xy.is_some()).count();
+        assert!(global > 0, "expected at least one global event");
+        assert!(spatial > 0, "expected at least one spatial event");
+        for e in cal.events.iter().filter(|e| e.radius.is_some()) {
+            let r = e.radius.unwrap();
+            let lo = cfg.spatial_radius_min_frac * WORLD_HALF[0];
+            let hi = cfg.spatial_radius_max_frac * WORLD_HALF[0];
+            assert!(r >= lo - 1e-3 && r <= hi + 1e-3, "radius {} out of range", r);
+        }
     }
 }
