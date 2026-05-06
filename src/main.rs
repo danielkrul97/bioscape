@@ -1745,7 +1745,7 @@ fn sync_transforms(
 /// apply_brain_motor → step (kinematic). Brain learns chase tactics over
 /// generations; INNATE_THRUST_BIAS dává initial forward motion.
 fn step_hunters(
-    mut hunters: Query<&mut HunterEntity>,
+    mut hunters: Query<(Entity, &mut HunterEntity)>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     smell: Res<SmellResource>,
     fixed_time: Res<Time<Fixed>>,
@@ -1754,9 +1754,11 @@ fn step_hunters(
     let cell_snapshot: Vec<(Entity, Cell)> = cells.iter().map(|(e, c)| (e, c.0)).collect();
     let cells_only: Vec<Cell> = cell_snapshot.iter().map(|(_, c)| *c).collect();
     // Sprint 100: snapshot hunters pro pack sensing.
-    let hunters_snapshot: Vec<Hunter> = hunters.iter().map(|h| h.0).collect();
+    let hunters_snapshot: Vec<Hunter> = hunters.iter().map(|(_, h)| h.0).collect();
     let mut attacks: Vec<(Entity, f32)> = Vec::new();
-    for mut h in &mut hunters {
+    // Sprint 101: pack kill share (id, energy) — apply post-loop.
+    let mut pack_shares: Vec<(u64, f32)> = Vec::new();
+    for (_, mut h) in &mut hunters {
         // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain).
         let sensors = bioscape::gather_hunter_sensors(
             &h.0,
@@ -1795,10 +1797,33 @@ fn step_hunters(
                 let damage_dealt = damage * exposure * dt;
                 attacks.push((cell_snapshot[i].0, damage_dealt));
                 gain = damage_dealt * bioscape::HUNTER_ENERGY_PER_DAMAGE;
+                // Sprint 101: pack share queue.
+                for bond_opt in h.0.bonds.iter() {
+                    if let Some(bond) = bond_opt {
+                        pack_shares.push((
+                            bond.other_cell_id,
+                            gain * bioscape::HUNTER_BOND_KILL_SHARE_FRAC,
+                        ));
+                    }
+                }
             }
         }
         h.0.apply_energy_costs(dt);
         h.0.energy += gain;
+    }
+    // Sprint 101: distribute pack shares.
+    if !pack_shares.is_empty() {
+        let id_to_entity: FxHashMap<u64, Entity> = hunters
+            .iter()
+            .map(|(e, h)| (h.0.hunter_id, e))
+            .collect();
+        for (id, energy) in pack_shares {
+            if let Some(&entity) = id_to_entity.get(&id) {
+                if let Ok((_, mut h)) = hunters.get_mut(entity) {
+                    h.0.energy += energy;
+                }
+            }
+        }
     }
     for (entity, damage) in attacks {
         if let Ok((_, mut cell)) = cells.get_mut(entity) {

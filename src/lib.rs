@@ -812,6 +812,13 @@ pub const HUNTER_CARRION_DROP: usize = 2;
 /// Reproduce cooldown (ticks) po split. Brání instant re-reproduce před cell
 /// catch-up. ~1 generation = 600 ticks.
 pub const HUNTER_REPRODUCE_COOLDOWN_TICKS: u32 = 300;
+/// Sprint 101: pack hunting payoff. Když bonded hunter zabije cell, každý
+/// jeho bonded partner dostane `gain × FRAC` extra energy (free reward, no
+/// energy conservation — modeluje "pack feed dynamic"). Mirror cells
+/// `BOND_FOOD_SHARE_FRAC` semantiky. 0.5 dává pack-of-6 ~3.5× total payoff
+/// vs solo (1 + 5×0.5 = 3.5), dostatek aby selekce favorizovala pack vs solo.
+pub const HUNTER_BOND_KILL_SHARE_FRAC: f32 = 0.5;
+
 /// Sprint 98: maximální vzdálenost dvou fertile hunterů, aby se spárovali.
 /// Cells mají MATING_RADIUS = 200; hunteři jsou mnohem řidší (max 50 vs
 /// max 2500 cells) → density je řádově nižší, takže menší mating radius

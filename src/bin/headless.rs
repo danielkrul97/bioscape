@@ -1861,6 +1861,9 @@ impl World {
         // ve vision). Mut iteration nesmí současně immutable-borrow self.hunters.
         let hunters_snapshot = self.hunters.clone();
         let mut attacks: Vec<(usize, f32)> = Vec::new();
+        // Sprint 101: pack kill share. Při damage_dealt > 0 collected (partner_id,
+        // share_amount) — apply na partnery až po mut iter loop.
+        let mut pack_shares: Vec<(u64, f32)> = Vec::new();
         for hunter in &mut self.hunters {
             // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain) +
             // step (kinematic). Replaces Sprint 89 seek-based step.
@@ -1900,10 +1903,33 @@ impl World {
                     let damage_dealt = damage * exposure * dt;
                     attacks.push((i, damage_dealt));
                     gain = damage_dealt * bioscape::HUNTER_ENERGY_PER_DAMAGE;
+                    // Sprint 101: queue share pro každého bonded partnera.
+                    for bond_opt in hunter.bonds.iter() {
+                        if let Some(bond) = bond_opt {
+                            pack_shares.push((
+                                bond.other_cell_id,
+                                gain * bioscape::HUNTER_BOND_KILL_SHARE_FRAC,
+                            ));
+                        }
+                    }
                 }
             }
             hunter.apply_energy_costs(dt);
             hunter.energy += gain;
+        }
+        // Sprint 101: distribute pack shares post-loop.
+        if !pack_shares.is_empty() {
+            let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
+                .hunters
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (h.hunter_id, i))
+                .collect();
+            for (id, energy) in pack_shares {
+                if let Some(&i) = id_to_idx.get(&id) {
+                    self.hunters[i].energy += energy;
+                }
+            }
         }
         self.hunter_attacks_gen += attacks.len() as u64;
         for (i, damage) in attacks {
