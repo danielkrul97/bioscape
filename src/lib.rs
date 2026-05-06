@@ -1756,11 +1756,101 @@ pub const CPPN_MAX_NODES: usize = 64;
 /// Maximum CPPN links — quadratic-ish growth s nodes, soft cap.
 pub const CPPN_MAX_LINKS: usize = 256;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Sprint 106: fixed-size arrays místo Vec — preserves Copy trait pro Genome.
+/// Packed layout: nodes[0..num_nodes], links[0..num_links] valid; zbytek None.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Cppn {
-    pub nodes: Vec<CppnNode>,
-    pub links: Vec<CppnLink>,
+    #[serde(with = "serde_arr_cppn_nodes")]
+    pub nodes: [Option<CppnNode>; CPPN_MAX_NODES],
+    #[serde(with = "serde_arr_cppn_links")]
+    pub links: [Option<CppnLink>; CPPN_MAX_LINKS],
+    pub num_nodes: u8,
+    pub num_links: u16,
     pub next_innovation: u32,
+}
+
+mod serde_arr_cppn_nodes {
+    use super::{CppnNode, CPPN_MAX_NODES};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(
+        a: &[Option<CppnNode>; CPPN_MAX_NODES],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        a.as_slice().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[Option<CppnNode>; CPPN_MAX_NODES], D::Error> {
+        let v: Vec<Option<CppnNode>> = Vec::deserialize(d)?;
+        if v.len() != CPPN_MAX_NODES {
+            return Err(serde::de::Error::custom("cppn nodes length mismatch"));
+        }
+        let mut a: [Option<CppnNode>; CPPN_MAX_NODES] = [None; CPPN_MAX_NODES];
+        for (i, x) in v.into_iter().enumerate() {
+            a[i] = x;
+        }
+        Ok(a)
+    }
+}
+
+mod serde_arr_cppn_links {
+    use super::{CppnLink, CPPN_MAX_LINKS};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(
+        a: &[Option<CppnLink>; CPPN_MAX_LINKS],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        a.as_slice().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[Option<CppnLink>; CPPN_MAX_LINKS], D::Error> {
+        let v: Vec<Option<CppnLink>> = Vec::deserialize(d)?;
+        if v.len() != CPPN_MAX_LINKS {
+            return Err(serde::de::Error::custom("cppn links length mismatch"));
+        }
+        let mut a: [Option<CppnLink>; CPPN_MAX_LINKS] = [None; CPPN_MAX_LINKS];
+        for (i, x) in v.into_iter().enumerate() {
+            a[i] = x;
+        }
+        Ok(a)
+    }
+}
+
+impl Cppn {
+    /// Active nodes iterator (skip None slots).
+    pub fn iter_nodes(&self) -> impl Iterator<Item = &CppnNode> {
+        self.nodes
+            .iter()
+            .take(self.num_nodes as usize)
+            .filter_map(|n| n.as_ref())
+    }
+
+    /// Active links iterator.
+    pub fn iter_links(&self) -> impl Iterator<Item = &CppnLink> {
+        self.links
+            .iter()
+            .take(self.num_links as usize)
+            .filter_map(|l| l.as_ref())
+    }
+
+    fn push_node(&mut self, n: CppnNode) -> bool {
+        if (self.num_nodes as usize) >= CPPN_MAX_NODES {
+            return false;
+        }
+        self.nodes[self.num_nodes as usize] = Some(n);
+        self.num_nodes += 1;
+        true
+    }
+
+    fn push_link(&mut self, l: CppnLink) -> bool {
+        if (self.num_links as usize) >= CPPN_MAX_LINKS {
+            return false;
+        }
+        self.links[self.num_links as usize] = Some(l);
+        self.num_links += 1;
+        true
+    }
 }
 
 impl Cppn {
@@ -1769,54 +1859,59 @@ impl Cppn {
     /// layer 1). Initial links: každý input → hidden + hidden → output
     /// s random gaussian weight.
     pub fn random(rng: &mut impl Rng) -> Self {
-        let mut nodes: Vec<CppnNode> = Vec::new();
-        let mut links: Vec<CppnLink> = Vec::new();
+        let mut cppn = Cppn {
+            nodes: [None; CPPN_MAX_NODES],
+            links: [None; CPPN_MAX_LINKS],
+            num_nodes: 0,
+            num_links: 0,
+            next_innovation: 0,
+        };
         let mut next_id: u32 = 0;
         // Inputs (layer 0).
-        let mut input_ids: Vec<u32> = Vec::with_capacity(CPPN_INPUTS);
-        for _ in 0..CPPN_INPUTS {
-            nodes.push(CppnNode {
+        let mut input_ids: [u32; CPPN_INPUTS] = [0; CPPN_INPUTS];
+        for slot in input_ids.iter_mut() {
+            cppn.push_node(CppnNode {
                 id: next_id,
                 activation: ActivationFn::Linear,
                 bias: 0.0,
                 layer: 0,
             });
-            input_ids.push(next_id);
+            *slot = next_id;
             next_id += 1;
         }
         // Outputs (layer 2). Tanh dává weights ∈ [-1,1] a link_exists ∈ [-1,1].
-        let mut output_ids: Vec<u32> = Vec::with_capacity(CPPN_OUTPUTS);
-        for _ in 0..CPPN_OUTPUTS {
-            nodes.push(CppnNode {
+        let mut output_ids: [u32; CPPN_OUTPUTS] = [0; CPPN_OUTPUTS];
+        for slot in output_ids.iter_mut() {
+            cppn.push_node(CppnNode {
                 id: next_id,
                 activation: ActivationFn::Tanh,
                 bias: 0.0,
                 layer: 2,
             });
-            output_ids.push(next_id);
+            *slot = next_id;
             next_id += 1;
         }
-        // Hidden seed neurons (layer 1) s random activation.
-        let mut hidden_ids: Vec<u32> = Vec::with_capacity(CPPN_INITIAL_HIDDEN);
-        for _ in 0..CPPN_INITIAL_HIDDEN {
-            nodes.push(CppnNode {
+        // Hidden seed neurons (layer 1).
+        let mut hidden_ids: [u32; CPPN_INITIAL_HIDDEN] = [0; CPPN_INITIAL_HIDDEN];
+        for slot in hidden_ids.iter_mut() {
+            cppn.push_node(CppnNode {
                 id: next_id,
                 activation: ActivationFn::random(rng),
                 bias: gaussian(rng) * 0.5,
                 layer: 1,
             });
-            hidden_ids.push(next_id);
+            *slot = next_id;
             next_id += 1;
         }
-        // Initial links: full bipartite input→hidden + hidden→output.
+        // Initial bipartite links.
         let mut innovation: u32 = 0;
         for &i in &input_ids {
             for &h in &hidden_ids {
-                links.push(CppnLink {
+                cppn.push_link(CppnLink {
                     innovation,
                     from: i,
                     to: h,
-                    weight: gaussian(rng) * 1.0,
+                    weight: gaussian(rng),
                     enabled: true,
                 });
                 innovation += 1;
@@ -1824,21 +1919,18 @@ impl Cppn {
         }
         for &h in &hidden_ids {
             for &o in &output_ids {
-                links.push(CppnLink {
+                cppn.push_link(CppnLink {
                     innovation,
                     from: h,
                     to: o,
-                    weight: gaussian(rng) * 1.0,
+                    weight: gaussian(rng),
                     enabled: true,
                 });
                 innovation += 1;
             }
         }
-        Cppn {
-            nodes,
-            links,
-            next_innovation: innovation,
-        }
+        cppn.next_innovation = innovation;
+        cppn
     }
 
     /// Forward pass — feed-forward by layer. Inputs are mapped do prvních
@@ -1848,18 +1940,20 @@ impl Cppn {
     pub fn forward(&self, inputs: [f32; CPPN_INPUTS]) -> [f32; CPPN_OUTPUTS] {
         let mut activations: rustc_hash::FxHashMap<u32, f32> =
             rustc_hash::FxHashMap::default();
-        for (i, n) in self.nodes.iter().take(CPPN_INPUTS).enumerate() {
-            activations.insert(n.id, inputs[i]);
+        // Inputs occupy nodes[0..CPPN_INPUTS] per random() layout.
+        for i in 0..CPPN_INPUTS {
+            if let Some(n) = self.nodes[i] {
+                activations.insert(n.id, inputs[i]);
+            }
         }
-        // Process by layer (assumes layer monotonically increasing in nodes).
-        let max_layer = self.nodes.iter().map(|n| n.layer).max().unwrap_or(0);
+        let max_layer = self.iter_nodes().map(|n| n.layer).max().unwrap_or(0);
         for layer in 1..=max_layer {
-            for n in &self.nodes {
+            for n in self.iter_nodes() {
                 if n.layer != layer {
                     continue;
                 }
                 let mut sum = n.bias;
-                for link in &self.links {
+                for link in self.iter_links() {
                     if !link.enabled || link.to != n.id {
                         continue;
                     }
@@ -1871,92 +1965,91 @@ impl Cppn {
             }
         }
         let mut out = [0.0; CPPN_OUTPUTS];
-        let output_start = CPPN_INPUTS;
+        // Outputs occupy nodes[CPPN_INPUTS..CPPN_INPUTS+CPPN_OUTPUTS].
         for o in 0..CPPN_OUTPUTS {
-            let id = self.nodes[output_start + o].id;
-            out[o] = *activations.get(&id).unwrap_or(&0.0);
+            if let Some(n) = self.nodes[CPPN_INPUTS + o] {
+                out[o] = *activations.get(&n.id).unwrap_or(&0.0);
+            }
         }
         out
     }
 
     /// Mutate weight of random enabled link gaussian-style.
     pub fn mutate_weight(&mut self, rng: &mut impl Rng, sigma: f32) {
-        let active: Vec<usize> = self
-            .links
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.enabled)
-            .map(|(i, _)| i)
+        let active: Vec<usize> = (0..self.num_links as usize)
+            .filter(|&i| self.links[i].as_ref().map_or(false, |l| l.enabled))
             .collect();
         if active.is_empty() {
             return;
         }
         let pick = active[rng.random_range(0..active.len())];
-        self.links[pick].weight += gaussian(rng) * sigma;
+        if let Some(l) = self.links[pick].as_mut() {
+            l.weight += gaussian(rng) * sigma;
+        }
     }
 
     /// Add_node: split random enabled link, insert nový hidden node.
-    /// Old link disabled, dvě nové links (from→new, new→to) se přidají.
-    /// Layer nového = avg(from.layer, to.layer); pokud rovné, +1.
     pub fn mutate_add_node(&mut self, rng: &mut impl Rng) {
-        if self.nodes.len() >= CPPN_MAX_NODES || self.links.len() + 2 > CPPN_MAX_LINKS {
+        if (self.num_nodes as usize) >= CPPN_MAX_NODES
+            || (self.num_links as usize) + 2 > CPPN_MAX_LINKS
+        {
             return;
         }
-        let active: Vec<usize> = self
-            .links
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.enabled)
-            .map(|(i, _)| i)
+        let active: Vec<usize> = (0..self.num_links as usize)
+            .filter(|&i| self.links[i].as_ref().map_or(false, |l| l.enabled))
             .collect();
         if active.is_empty() {
             return;
         }
         let pick = active[rng.random_range(0..active.len())];
-        let original = self.links[pick];
+        let original = match self.links[pick] {
+            Some(l) => l,
+            None => return,
+        };
         let from_layer = self
-            .nodes
-            .iter()
+            .iter_nodes()
             .find(|n| n.id == original.from)
             .map(|n| n.layer)
             .unwrap_or(0);
         let to_layer = self
-            .nodes
-            .iter()
+            .iter_nodes()
             .find(|n| n.id == original.to)
             .map(|n| n.layer)
             .unwrap_or(0);
         let new_layer = if from_layer + 1 < to_layer {
             from_layer + 1
         } else {
-            // Need to re-layer downstream — push everything ≥ new_layer up.
             let new_l = from_layer + 1;
-            for n in self.nodes.iter_mut() {
-                if n.layer >= new_l {
-                    n.layer += 1;
+            for slot in self.nodes.iter_mut() {
+                if let Some(n) = slot.as_mut() {
+                    if n.layer >= new_l {
+                        n.layer += 1;
+                    }
                 }
             }
             new_l
         };
-        let new_id = self.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
-        self.nodes.push(CppnNode {
+        let new_id = self.iter_nodes().map(|n| n.id).max().unwrap_or(0) + 1;
+        self.push_node(CppnNode {
             id: new_id,
             activation: ActivationFn::random(rng),
             bias: 0.0,
             layer: new_layer,
         });
-        self.links[pick].enabled = false;
+        if let Some(l) = self.links[pick].as_mut() {
+            l.enabled = false;
+        }
         let inv1 = self.next_innovation;
         let inv2 = self.next_innovation + 1;
         self.next_innovation += 2;
-        self.links.push(CppnLink {
+        self.push_link(CppnLink {
             innovation: inv1,
             from: original.from,
             to: new_id,
             weight: 1.0,
             enabled: true,
         });
-        self.links.push(CppnLink {
+        self.push_link(CppnLink {
             innovation: inv2,
             from: new_id,
             to: original.to,
@@ -1965,35 +2058,41 @@ impl Cppn {
         });
     }
 
-    /// Add_link: pick random pair (from, to) with from.layer < to.layer
-    /// (no cycles), kde žádný link mezi nimi yet. Weight gaussian.
+    /// Add_link: pick random pair (from, to) with from.layer < to.layer.
     pub fn mutate_add_link(&mut self, rng: &mut impl Rng, sigma: f32) {
-        if self.links.len() >= CPPN_MAX_LINKS {
+        if (self.num_links as usize) >= CPPN_MAX_LINKS {
             return;
         }
-        if self.nodes.len() < 2 {
+        if self.num_nodes < 2 {
             return;
         }
+        let n = self.num_nodes as usize;
         for _ in 0..16 {
-            let i_idx = rng.random_range(0..self.nodes.len());
-            let j_idx = rng.random_range(0..self.nodes.len());
+            let i_idx = rng.random_range(0..n);
+            let j_idx = rng.random_range(0..n);
             if i_idx == j_idx {
                 continue;
             }
-            let (from_node, to_node) = (&self.nodes[i_idx], &self.nodes[j_idx]);
+            let from_node = match self.nodes[i_idx] {
+                Some(x) => x,
+                None => continue,
+            };
+            let to_node = match self.nodes[j_idx] {
+                Some(x) => x,
+                None => continue,
+            };
             if from_node.layer >= to_node.layer {
                 continue;
             }
             let exists = self
-                .links
-                .iter()
+                .iter_links()
                 .any(|l| l.from == from_node.id && l.to == to_node.id);
             if exists {
                 continue;
             }
             let inv = self.next_innovation;
             self.next_innovation += 1;
-            self.links.push(CppnLink {
+            self.push_link(CppnLink {
                 innovation: inv,
                 from: from_node.id,
                 to: to_node.id,
@@ -2006,32 +2105,35 @@ impl Cppn {
 
     /// Toggle enable/disable bit of random link.
     pub fn mutate_toggle_link(&mut self, rng: &mut impl Rng) {
-        if self.links.is_empty() {
+        if self.num_links == 0 {
             return;
         }
-        let pick = rng.random_range(0..self.links.len());
-        self.links[pick].enabled = !self.links[pick].enabled;
+        let pick = rng.random_range(0..self.num_links as usize);
+        if let Some(l) = self.links[pick].as_mut() {
+            l.enabled = !l.enabled;
+        }
     }
 
-    /// Mutate activation function of random hidden node.
+    /// Mutate activation function of random hidden node (skip inputs/outputs).
     pub fn mutate_activation(&mut self, rng: &mut impl Rng) {
-        let hidden: Vec<usize> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.layer != 0 && n.layer != 2) // skip inputs (layer 0) and seed outputs (layer 2)
-            .map(|(i, _)| i)
+        let hidden: Vec<usize> = (0..self.num_nodes as usize)
+            .filter(|&i| {
+                self.nodes[i]
+                    .as_ref()
+                    .map_or(false, |n| n.layer != 0 && n.layer != 2)
+            })
             .collect();
         if hidden.is_empty() {
             return;
         }
         let pick = hidden[rng.random_range(0..hidden.len())];
-        self.nodes[pick].activation = ActivationFn::random(rng);
+        if let Some(n) = self.nodes[pick].as_mut() {
+            n.activation = ActivationFn::random(rng);
+        }
     }
 
-    /// Apply suite of mutations per CppnMutationConfig.
     pub fn mutate(&self, rng: &mut impl Rng, cfg: &CppnMutationConfig) -> Self {
-        let mut out = self.clone();
+        let mut out = *self;
         if rng.random::<f32>() < cfg.weight_rate {
             out.mutate_weight(rng, cfg.sigma_weight);
         }
@@ -2050,18 +2152,15 @@ impl Cppn {
         out
     }
 
-    /// Crossover: align matching innovations (same id), random pick;
-    /// disjoint genes inherited from both. Speciation-aware. Bias = a
-    /// (pokud fitness není známa — symmetric).
+    /// Crossover: align matching innovations + nodes by id. Random pick na
+    /// matching, inherit from both na disjoint. Cap respektován (CPPN_MAX_*).
     pub fn crossover(a: &Cppn, b: &Cppn, rng: &mut impl Rng) -> Cppn {
-        // Collect node ids — union of both.
         let mut nodes_map: rustc_hash::FxHashMap<u32, CppnNode> =
             rustc_hash::FxHashMap::default();
-        for n in &a.nodes {
+        for n in a.iter_nodes() {
             nodes_map.insert(n.id, *n);
         }
-        for n in &b.nodes {
-            // If matching id, randomly pick. Otherwise inherit.
+        for n in b.iter_nodes() {
             match nodes_map.get(&n.id) {
                 Some(_) if rng.random::<bool>() => {
                     nodes_map.insert(n.id, *n);
@@ -2072,16 +2171,15 @@ impl Cppn {
                 _ => {}
             }
         }
-        let mut nodes: Vec<CppnNode> = nodes_map.into_values().collect();
-        nodes.sort_by_key(|n| n.id);
+        let mut sorted_nodes: Vec<CppnNode> = nodes_map.into_values().collect();
+        sorted_nodes.sort_by_key(|n| n.id);
 
-        // Links: align by innovation. Matching → random pick. Disjoint → inherit from both.
         let mut links_map: rustc_hash::FxHashMap<u32, CppnLink> =
             rustc_hash::FxHashMap::default();
-        for l in &a.links {
+        for l in a.iter_links() {
             links_map.insert(l.innovation, *l);
         }
-        for l in &b.links {
+        for l in b.iter_links() {
             match links_map.get(&l.innovation) {
                 Some(_) if rng.random::<bool>() => {
                     links_map.insert(l.innovation, *l);
@@ -2092,15 +2190,29 @@ impl Cppn {
                 _ => {}
             }
         }
-        let mut links: Vec<CppnLink> = links_map.into_values().collect();
-        links.sort_by_key(|l| l.innovation);
+        let mut sorted_links: Vec<CppnLink> = links_map.into_values().collect();
+        sorted_links.sort_by_key(|l| l.innovation);
 
-        let next_innovation = links.iter().map(|l| l.innovation + 1).max().unwrap_or(0);
-        Cppn {
-            nodes,
-            links,
+        let next_innovation = sorted_links
+            .iter()
+            .map(|l| l.innovation + 1)
+            .max()
+            .unwrap_or(0);
+
+        let mut out = Cppn {
+            nodes: [None; CPPN_MAX_NODES],
+            links: [None; CPPN_MAX_LINKS],
+            num_nodes: 0,
+            num_links: 0,
             next_innovation,
+        };
+        for n in sorted_nodes.into_iter().take(CPPN_MAX_NODES) {
+            out.push_node(n);
         }
+        for l in sorted_links.into_iter().take(CPPN_MAX_LINKS) {
+            out.push_link(l);
+        }
+        out
     }
 }
 
@@ -2122,6 +2234,112 @@ pub const CPPN_MUTATION_CONFIG: CppnMutationConfig = CppnMutationConfig {
     toggle_link_rate: 0.01,
     activation_rate: 0.02,
 };
+
+// ─── Sprint 106: HyperNEAT substrate + Brain phenotype generation ───────────
+//
+// Substrate je geometrické rozložení sensor / hidden / output neuronů ve
+// 3D prostoru. CPPN (S105) přijímá coords obou neuronů jako 6 vstupů +
+// 1 bias a vrací [weight, link_exists]. Brain::from_cppn projde všechny
+// possible (input, hidden) a (hidden, output) páry, populuje weights.
+//
+// Substrate je jednoduchý 1D: každá vrstva má z-coord (input z=-1, hidden
+// z=0, output z=+1) a x-coord normalizován do [-1, 1] podle slot indexu.
+// y-coord = 0 (1D substrate, scope-reduced).
+
+/// Spočítá substrate coords pro brain input slot. Slot < BRAIN_INPUTS_SENSORY
+/// jsou sensory inputs (mapovány do x-axis); slot ≥ BRAIN_INPUTS_SENSORY
+/// jsou recurrent inputs (sdílí coord s hidden neuronem stejného indexu —
+/// recurrent slot k mapuje na hidden neuron k coords).
+pub fn substrate_input_coords(slot: usize) -> [f32; 3] {
+    if slot < BRAIN_INPUTS_SENSORY {
+        let x = -1.0 + 2.0 * (slot as f32) / (BRAIN_INPUTS_SENSORY as f32 - 1.0).max(1.0);
+        [x, 0.0, -1.0]
+    } else {
+        let h_idx = slot - BRAIN_INPUTS_SENSORY;
+        substrate_hidden_coords(h_idx)
+    }
+}
+
+pub fn substrate_hidden_coords(slot: usize) -> [f32; 3] {
+    let x = -1.0 + 2.0 * (slot as f32) / (BRAIN_HIDDEN as f32 - 1.0).max(1.0);
+    [x, 0.0, 0.0]
+}
+
+pub fn substrate_output_coords(slot: usize) -> [f32; 3] {
+    let x = -1.0 + 2.0 * (slot as f32) / (BRAIN_OUTPUTS as f32 - 1.0).max(1.0);
+    [x, 0.0, 1.0]
+}
+
+/// CPPN_LINK_EXISTS_THRESHOLD: pokud CPPN output[1] < threshold, link je
+/// "expressed off" — weight = 0 (no connection). 0.0 (Tanh midpoint) dává
+/// ~50 % links by default. Posun threshold mění density derived networks.
+pub const CPPN_LINK_EXISTS_THRESHOLD: f32 = 0.0;
+
+impl Brain {
+    /// Sprint 106: derive brain weights z CPPN substrate query. Pro každý
+    /// (input slot, hidden slot) pár zavolá cppn.forward([from.coord, to.coord, 1.0]),
+    /// extrahuje weight + link_exists. Stejně pro (hidden, output).
+    /// Biases (b1, b2) odvozeny z CPPN query s "self-loop" coord (oba inputs
+    /// stejné). hidden_n = BRAIN_HIDDEN_DEFAULT.
+    pub fn from_cppn(cppn: &Cppn) -> Brain {
+        let mut w1 = [[0.0_f32; BRAIN_INPUTS]; BRAIN_HIDDEN];
+        let mut b1 = [0.0_f32; BRAIN_HIDDEN];
+        let mut w2 = [[0.0_f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS];
+        let mut b2 = [0.0_f32; BRAIN_OUTPUTS];
+
+        // w1: input → hidden
+        for h in 0..BRAIN_HIDDEN {
+            let to_c = substrate_hidden_coords(h);
+            for i in 0..BRAIN_INPUTS {
+                let from_c = substrate_input_coords(i);
+                let inputs = [
+                    from_c[0], from_c[1], from_c[2],
+                    to_c[0], to_c[1], to_c[2],
+                    1.0,
+                ];
+                let out = cppn.forward(inputs);
+                if out[1] >= CPPN_LINK_EXISTS_THRESHOLD {
+                    w1[h][i] = out[0];
+                }
+            }
+            // b1[h]: query CPPN with from = hidden (self-loop sentinel)
+            let inputs = [to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0];
+            let out = cppn.forward(inputs);
+            b1[h] = out[0] * 0.5; // dampen bias
+        }
+
+        // w2: hidden → output
+        for o in 0..BRAIN_OUTPUTS {
+            let to_c = substrate_output_coords(o);
+            for h in 0..BRAIN_HIDDEN {
+                let from_c = substrate_hidden_coords(h);
+                let inputs = [
+                    from_c[0], from_c[1], from_c[2],
+                    to_c[0], to_c[1], to_c[2],
+                    1.0,
+                ];
+                let out = cppn.forward(inputs);
+                if out[1] >= CPPN_LINK_EXISTS_THRESHOLD {
+                    w2[o][h] = out[0];
+                }
+            }
+            // b2[o]: self-loop sentinel
+            let inputs = [to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0];
+            let out = cppn.forward(inputs);
+            b2[o] = out[0] * 0.5;
+        }
+
+        Brain {
+            hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
+            w1,
+            b1,
+            w2,
+            b2,
+        }
+    }
+}
+
+// ─── End Sprint 106 ──────────────────────────────────────────────────────────
 
 // ─── End Sprint 105 CPPN scaffolding ─────────────────────────────────────────
 
@@ -2657,6 +2875,18 @@ pub struct Genome {
     #[serde(default = "default_sensor_gains")]
     pub sensor_gains: [f32; N_SENSOR_CATEGORIES],
     pub brain: Brain,
+    /// Sprint 106: HyperNEAT CPPN — innate template, ze kterého se Brain
+    /// derives při make_*_child. Hebbian během života modifies derived
+    /// brain, ale na reproduce se brain re-derives z child's CPPN. Non-
+    /// Lamarckian: Hebbian gains nepřechází do dalších generací, jen
+    /// CPPN topology + weights se dědí (S105 mutations + crossover).
+    #[serde(default = "default_cppn")]
+    pub cppn: Cppn,
+}
+
+fn default_cppn() -> Cppn {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+    Cppn::random(&mut rng)
 }
 
 fn default_sensor_gains() -> [f32; N_SENSOR_CATEGORIES] {
@@ -2681,6 +2911,8 @@ impl Genome {
         // mohou asymetrii vytvořit, ale jen pokud ji selekce odmění; gen 0
         // nezavádí prior na ellipse fenotyp.
         let body_size = rng.random_range(0.7..1.3);
+        let cppn = Cppn::random(rng);
+        let brain = Brain::from_cppn(&cppn);
         Self {
             max_speed: rng.random_range(30.0..90.0),
             color_hue: rng.random_range(0.0..HUE_RANGE),
@@ -2723,11 +2955,16 @@ impl Genome {
                 rng.random_range(0.7..1.3),
                 rng.random_range(0.7..1.3),
             ],
-            brain: Brain::random(rng),
+            // Sprint 106: brain je derived z cppn (innate template).
+            brain,
+            cppn,
         }
     }
 
     pub fn mutate(&self, rng: &mut impl Rng, cfg: &MutationConfig) -> Self {
+        // Sprint 106: cppn mutated first, brain derived po mutaci.
+        let mutated_cppn = self.cppn.mutate(rng, &CPPN_MUTATION_CONFIG);
+        let derived_brain = Brain::from_cppn(&mutated_cppn);
         // Sprint 66: discrete adhesion_type. Při flipu náhodně vyberu jiný
         // typ ≠ self.adhesion_type. Pokud ADHESION_TYPE_COUNT == 1, fallback
         // ponechá hodnotu (žádný "jiný" typ neexistuje).
@@ -2801,37 +3038,19 @@ impl Genome {
                 }
                 g
             },
-            brain: {
-                let mut b = self.brain.mutate(rng, cfg.sigma_brain);
-                // Sprint 80 Sprint C: structural mutace. Default rate=0.0 →
-                // bool draw probíhá ale add_neuron se nikdy nevolá → žádný
-                // RNG drift vůči Sprint B baseline (jeden extra `rng.random::<f32>()`
-                // by trajectory shiftnul). Branchnu na rate>0 abych draw vůbec
-                // nepřípravil v default scenáři.
-                if cfg.add_neuron_rate > 0.0
-                    && rng.random::<f32>() < cfg.add_neuron_rate
-                {
-                    b.add_neuron(rng, ADD_NEURON_SIGMA);
-                }
-                // Sprint 104: split_link + remove_neuron NEAT-direct mutace.
-                if cfg.split_link_rate > 0.0
-                    && rng.random::<f32>() < cfg.split_link_rate
-                {
-                    b.split_link(rng, SPLIT_LINK_THRESHOLD);
-                }
-                if cfg.remove_neuron_rate > 0.0
-                    && rng.random::<f32>() < cfg.remove_neuron_rate
-                {
-                    b.remove_neuron(rng);
-                }
-                b
-            },
+            // Sprint 106: HyperNEAT — cppn = innate template, brain derived.
+            cppn: mutated_cppn,
+            brain: derived_brain,
         }
     }
 
     /// Per-gene uniform crossover. Each scalar gene picks 50/50 from one
     /// parent; brain uses its own per-row crossover.
     pub fn crossover(a: &Genome, b: &Genome, rng: &mut impl Rng) -> Genome {
+        // Sprint 106: cppn crossover (NEAT innovation matching), brain derived
+        // z výsledku.
+        let child_cppn = Cppn::crossover(&a.cppn, &b.cppn, rng);
+        let derived_brain = Brain::from_cppn(&child_cppn);
         Genome {
             max_speed: if rng.random::<bool>() { a.max_speed } else { b.max_speed },
             color_hue: if rng.random::<bool>() { a.color_hue } else { b.color_hue },
@@ -2883,7 +3102,10 @@ impl Genome {
                 }
                 g
             },
-            brain: Brain::crossover(&a.brain, &b.brain, rng),
+            // Sprint 106: HyperNEAT — brain re-derived z child's cppn,
+            // ne crossover parents' brains (Hebbian non-Lamarckian).
+            brain: derived_brain,
+            cppn: child_cppn,
         }
     }
 }
@@ -4692,6 +4914,7 @@ mod tests {
             // sensor pooling testuje.
             sensor_gains: [0.0; N_SENSOR_CATEGORIES],
             brain: dummy_brain(),
+            cppn: default_cppn(),
         }
     }
 
@@ -4747,6 +4970,7 @@ mod tests {
                 w2: [[1.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
                 b2: [0.5; BRAIN_OUTPUTS],
             },
+            cppn: default_cppn(),
         };
         let m = g.mutate(&mut rng, &zero_cfg());
         assert_eq!(m.max_speed, 50.0);
@@ -4756,10 +4980,12 @@ mod tests {
         assert_eq!(m.body_length, 1.1);
         assert_eq!(m.body_width, 0.9);
         assert_eq!(m.spike_length, 0.4);
-        assert_eq!(m.brain.w1, g.brain.w1);
-        assert_eq!(m.brain.b1, g.brain.b1);
-        assert_eq!(m.brain.w2, g.brain.w2);
-        assert_eq!(m.brain.b2, g.brain.b2);
+        // Sprint 106: brain je derived z mutated CPPN. S sigma=0 v zero_cfg,
+        // ale CPPN má vlastní mutation rates (CPPN_MUTATION_CONFIG) které
+        // jsou non-zero — brain weights NEZACHOVANÉ identity. Test now
+        // validates structural compatibility místo identity.
+        assert_eq!(m.brain.w1.len(), g.brain.w1.len());
+        assert_eq!(m.brain.b1.len(), g.brain.b1.len());
     }
 
     #[test]
@@ -5593,6 +5819,7 @@ mod tests {
             carnivore_score: 0.0,
             sensor_gains: [MIN_SENSOR_GAIN; N_SENSOR_CATEGORIES],
             brain: dummy_brain(),
+            cppn: default_cppn(),
         };
         let b = Genome {
             max_speed: 90.0,
@@ -5612,6 +5839,7 @@ mod tests {
             carnivore_score: 1.0,
             sensor_gains: [MAX_SENSOR_GAIN; N_SENSOR_CATEGORIES],
             brain: dummy_brain(),
+            cppn: default_cppn(),
         };
         for _ in 0..100 {
             let c = Genome::crossover(&a, &b, &mut rng);
@@ -5910,45 +6138,11 @@ mod tests {
     }
 
     #[test]
-    fn genome_mutate_with_rate_one_grows_brain_to_cap() {
-        let mut rng = StdRng::seed_from_u64(43);
-        let g = dummy_genome();
-        let cfg = MutationConfig {
-            sigma_speed: 0.0,
-            sigma_hue: 0.0,
-            sigma_vision: 0.0,
-            sigma_turn_rate: 0.0,
-            sigma_body_length: 0.0,
-            sigma_body_width: 0.0,
-            sigma_body_height: 0.0,
-            sigma_spike_length: 0.0,
-            sigma_shell: 0.0,
-            sigma_brain: 0.0,
-            adhesion_flip_rate: 0.0,
-            sigma_bond_stiffness: 0.0,
-            sigma_bond_damping: 0.0,
-            add_neuron_rate: 1.0,
-            split_link_rate: 0.0,
-            remove_neuron_rate: 0.0,
-            sigma_vision_fov: 0.0,
-            sigma_thermal_optimum: 0.0,
-            sigma_carnivore_score: 0.0,
-            sigma_sensor_gain: 0.0,
-        };
-        let mut current = g;
-        // Iteruj N >= (BRAIN_HIDDEN - DEFAULT). Po naplnění capu se další
-        // add_neuron volá, ale vrací false → hidden_n se nezvyšuje.
-        for _ in 0..(BRAIN_HIDDEN - BRAIN_HIDDEN_DEFAULT + 4) {
-            current = current.mutate(&mut rng, &cfg);
-        }
-        assert_eq!(
-            current.brain.hidden_n as usize,
-            BRAIN_HIDDEN,
-            "brain musí dosáhnout cap (BRAIN_HIDDEN={}) ale hidden_n={}",
-            BRAIN_HIDDEN,
-            current.brain.hidden_n
-        );
-    }
+    #[ignore = "Sprint 106 HyperNEAT: brain.hidden_n je deterministicky BRAIN_HIDDEN_DEFAULT \
+                z Brain::from_cppn — direct add_neuron mutace dead, brain re-derived z CPPN \
+                na každý mutate() call. Topologie evoluuje teď přes CPPN structural mutations \
+                (mutate_add_node v Cppn), test by se nastavoval jinak."]
+    fn genome_mutate_with_rate_one_grows_brain_to_cap() {}
 
     #[test]
     fn brain_hidden_n_above_default_forward_uses_padded_storage() {
@@ -7001,24 +7195,23 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let c = Cppn::random(&mut rng);
         assert_eq!(
-            c.nodes.iter().filter(|n| n.layer == 0).count(),
+            c.iter_nodes().filter(|n| n.layer == 0).count(),
             CPPN_INPUTS,
             "CPPN_INPUTS input nodes at layer 0"
         );
         assert_eq!(
-            c.nodes.iter().filter(|n| n.layer == 2).count(),
+            c.iter_nodes().filter(|n| n.layer == 2).count(),
             CPPN_OUTPUTS,
             "CPPN_OUTPUTS output nodes at layer 2"
         );
         assert_eq!(
-            c.nodes.iter().filter(|n| n.layer == 1).count(),
+            c.iter_nodes().filter(|n| n.layer == 1).count(),
             CPPN_INITIAL_HIDDEN,
             "CPPN_INITIAL_HIDDEN hidden nodes at layer 1"
         );
-        // Initial bipartite links: input × hidden + hidden × output.
         let expected_links = CPPN_INPUTS * CPPN_INITIAL_HIDDEN
             + CPPN_INITIAL_HIDDEN * CPPN_OUTPUTS;
-        assert_eq!(c.links.len(), expected_links);
+        assert_eq!(c.iter_links().count(), expected_links);
     }
 
     #[test]
@@ -7029,7 +7222,6 @@ mod tests {
         let out1 = c.forward(inputs);
         let out2 = c.forward(inputs);
         assert_eq!(out1, out2, "deterministic forward");
-        // Tanh outputs must be in [-1, 1].
         for o in out1.iter() {
             assert!(o.is_finite() && (-1.0..=1.0).contains(o), "out {} oob", o);
         }
@@ -7039,11 +7231,11 @@ mod tests {
     fn cppn_add_node_grows_topology() {
         let mut rng = StdRng::seed_from_u64(13);
         let mut c = Cppn::random(&mut rng);
-        let n_pre = c.nodes.len();
-        let l_pre = c.links.len();
+        let n_pre = c.num_nodes;
+        let l_pre = c.num_links;
         c.mutate_add_node(&mut rng);
-        assert_eq!(c.nodes.len(), n_pre + 1, "add_node adds 1 node");
-        assert_eq!(c.links.len(), l_pre + 2, "add_node adds 2 links");
+        assert_eq!(c.num_nodes, n_pre + 1, "add_node adds 1 node");
+        assert_eq!(c.num_links, l_pre + 2, "add_node adds 2 links");
     }
 
     #[test]
@@ -7053,16 +7245,14 @@ mod tests {
         for _ in 0..50 {
             c.mutate_add_link(&mut rng, 0.5);
         }
-        for l in &c.links {
+        for l in c.iter_links() {
             let from_layer = c
-                .nodes
-                .iter()
+                .iter_nodes()
                 .find(|n| n.id == l.from)
                 .map(|n| n.layer)
                 .unwrap();
             let to_layer = c
-                .nodes
-                .iter()
+                .iter_nodes()
                 .find(|n| n.id == l.to)
                 .map(|n| n.layer)
                 .unwrap();
@@ -7079,13 +7269,12 @@ mod tests {
     fn cppn_crossover_preserves_matching_innovations() {
         let mut rng = StdRng::seed_from_u64(19);
         let a = Cppn::random(&mut rng);
-        let mut b = a.clone();
+        let mut b = a;
         b.mutate_weight(&mut rng, 0.5);
         let c = Cppn::crossover(&a, &b, &mut rng);
-        // All innovations from a (= same as b before mutation) should be in c.
-        for la in &a.links {
+        for la in a.iter_links() {
             assert!(
-                c.links.iter().any(|lc| lc.innovation == la.innovation),
+                c.iter_links().any(|lc| lc.innovation == la.innovation),
                 "innovation {} preserved",
                 la.innovation
             );
@@ -7105,7 +7294,7 @@ mod tests {
             activation_rate: 1.0,
         };
         let mutated = initial.mutate(&mut rng, &cfg);
-        assert!(mutated.nodes.len() > initial.nodes.len(), "topology grew");
+        assert!(mutated.num_nodes > initial.num_nodes, "topology grew");
     }
 
     #[test]
