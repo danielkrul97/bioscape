@@ -5131,6 +5131,56 @@ pub fn shock_ramp_factor(event: &ShockEvent, generation: u64) -> f32 {
     }
 }
 
+/// Sprint 110: max bonus k drainu při peak intensity. drain_factor = 1.0 +
+/// intensity × ramp × HAZARD_PULSE_MAX_MULTIPLIER_BONUS. Při intensity=1 a
+/// peak ramp = 1.0 → drain × 2.0.
+pub const HAZARD_PULSE_MAX_MULTIPLIER_BONUS: f32 = 1.0;
+
+/// Sprint 110: multiplikátor hazard drainu na pozici `pos` při dané `(gen, tick)`.
+/// Default 1.0 (žádný HazardPulse aktivní). Pro každý active HazardPulse:
+/// `1.0 + intensity × ramp_factor × spatial_mask × HAZARD_PULSE_MAX_MULTIPLIER_BONUS`.
+/// Multiplicative compound přes všechny aktivní pulsy. Spatial mask je
+/// smoothstep falloff od center v xy (z se ignoruje — hazard je vertikálně
+/// uniformní), toroidal-aware přes `min_image_delta`. Pure fn, deterministic.
+pub fn hazard_shock_multiplier(
+    pos: [f32; 3],
+    events: &[ShockEvent],
+    generation: u64,
+    tick: u64,
+    world_half: [f32; 3],
+) -> f32 {
+    let _ = tick;
+    let mut multiplier = 1.0_f32;
+    for event in events {
+        if event.kind != ShockKind::HazardPulse {
+            continue;
+        }
+        let ramp = shock_ramp_factor(event, generation);
+        if ramp <= 0.0 {
+            continue;
+        }
+        let mask = match (event.center_xy, event.radius) {
+            (Some(center), Some(radius)) if radius > 0.0 => {
+                let center3 = [center[0], center[1], pos[2]];
+                let d_vec = min_image_delta(center3, pos, world_half);
+                let dist_xy = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1]).sqrt();
+                if dist_xy >= radius {
+                    0.0
+                } else {
+                    let t = (1.0 - dist_xy / radius).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                }
+            }
+            _ => 1.0,
+        };
+        if mask <= 0.0 {
+            continue;
+        }
+        multiplier *= 1.0 + event.intensity * ramp * mask * HAZARD_PULSE_MAX_MULTIPLIER_BONUS;
+    }
+    multiplier
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8139,5 +8189,89 @@ mod tests {
             let hi = cfg.spatial_radius_max_frac * WORLD_HALF[0];
             assert!(r >= lo - 1e-3 && r <= hi + 1e-3, "radius {} out of range", r);
         }
+    }
+
+    #[test]
+    fn hazard_multiplier_default_one() {
+        let pos = [0.0, 0.0, 0.0];
+        let m = hazard_shock_multiplier(pos, &[], 50, 0, WORLD_HALF);
+        assert!((m - 1.0).abs() < 1e-6, "empty events must give 1.0, got {}", m);
+    }
+
+    #[test]
+    fn hazard_multiplier_global_pulse_doubles_at_peak() {
+        let event = ShockEvent {
+            kind: ShockKind::HazardPulse,
+            start_gen: 100,
+            duration_gen: 10,
+            ramp_gens: 2,
+            intensity: 1.0,
+            center_xy: None,
+            radius: None,
+        };
+        let pos = [123.0, -45.0, 7.0];
+        // Plateau (gen 102..=107) → ramp = 1.0, mask = 1.0 → 1 + 1 * 1 * 1 * 1 = 2.0.
+        let m = hazard_shock_multiplier(pos, &[event], 105, 0, WORLD_HALF);
+        assert!((m - 2.0).abs() < 1e-5, "global peak must give 2.0, got {}", m);
+        // Pre-start: no contribution.
+        let m_before = hazard_shock_multiplier(pos, &[event], 99, 0, WORLD_HALF);
+        assert!((m_before - 1.0).abs() < 1e-6);
+        // Post-end: no contribution.
+        let m_after = hazard_shock_multiplier(pos, &[event], 110, 0, WORLD_HALF);
+        assert!((m_after - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hazard_multiplier_spatial_mask_falls_off() {
+        let center = [0.0, 0.0];
+        let radius = 100.0;
+        let event = ShockEvent {
+            kind: ShockKind::HazardPulse,
+            start_gen: 0,
+            duration_gen: 10,
+            ramp_gens: 2,
+            intensity: 1.0,
+            center_xy: Some(center),
+            radius: Some(radius),
+        };
+        let gen = 5;
+        // Plateau, ramp = 1.0.
+        // Center → mask = 1.0 → multiplier = 2.0.
+        let m_center = hazard_shock_multiplier([0.0, 0.0, 0.0], &[event], gen, 0, WORLD_HALF);
+        assert!((m_center - 2.0).abs() < 1e-5, "center must be 2.0, got {}", m_center);
+        // At edge (dist = radius) → mask = 0 → multiplier = 1.0.
+        let m_edge = hazard_shock_multiplier([radius, 0.0, 0.0], &[event], gen, 0, WORLD_HALF);
+        assert!((m_edge - 1.0).abs() < 1e-5, "edge must be 1.0, got {}", m_edge);
+        // Beyond radius → mask = 0.
+        let m_outside = hazard_shock_multiplier(
+            [radius * 1.5, 0.0, 0.0],
+            &[event],
+            gen,
+            0,
+            WORLD_HALF,
+        );
+        assert!((m_outside - 1.0).abs() < 1e-5, "outside must be 1.0, got {}", m_outside);
+        // Mid-radius → strictly between 1.0 and 2.0 (smoothstep monotone).
+        let m_mid = hazard_shock_multiplier(
+            [radius * 0.5, 0.0, 0.0],
+            &[event],
+            gen,
+            0,
+            WORLD_HALF,
+        );
+        assert!(
+            m_mid > 1.0 && m_mid < 2.0,
+            "mid must be in (1, 2), got {}",
+            m_mid
+        );
+        // Smoothstep monotone: closer point → higher multiplier.
+        let m_near = hazard_shock_multiplier(
+            [radius * 0.25, 0.0, 0.0],
+            &[event],
+            gen,
+            0,
+            WORLD_HALF,
+        );
+        assert!(m_near > m_mid, "near {} should exceed mid {}", m_near, m_mid);
     }
 }

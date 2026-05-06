@@ -219,11 +219,10 @@ struct ContactProgress(FxHashMap<(u64, u64), u32>);
 struct HunterContactProgress(FxHashMap<(u64, u64), u32>);
 
 /// Sprint 109: deterministicky vygenerovaný kalendář environmentálních shocků
-/// pro celý běh rendereru. Default empty — sim systémy ho zatím nečtou,
-/// integrace efektů přijde v Sprintu 110+. Init z env varu
-/// `BIOSCAPE_SHOCKS_MEAN_GENS` (parse u32); ignoruje ho při unset / `0`.
+/// pro celý běh rendereru. Default empty (no-op). Sprint 110+ integruje efekty
+/// per shock kind. Init z env varu `BIOSCAPE_SHOCKS_MEAN_GENS` (parse u32);
+/// ignoruje ho při unset / `0`.
 #[derive(Resource, Default)]
-#[allow(dead_code)]
 struct EventCalendarResource(EventCalendar);
 
 /// Sprint 52: GPU compute state pro renderer. Drží persistent CellsGpu +
@@ -1167,14 +1166,26 @@ fn apply_food_gravity(
 fn apply_environmental_hazards(
     time: Res<Time>,
     world_map: Res<WorldMapResource>,
+    clock: Res<Clock>,
+    events: Res<EventCalendarResource>,
     mut cells: Query<&mut CellEntity, Without<Dying>>,
 ) {
     let dt = time.delta_secs();
+    let gen = clock.0.generation;
+    let tick = clock.0.tick;
+    let event_slice = &events.0.events;
     for mut cell in &mut cells {
         let noise = world_map
             .0
             .sample([cell.0.position[0], cell.0.position[1], cell.0.position[2]]);
-        let drain = hazard_drain(noise) * dt;
+        let shock_mult = bioscape::hazard_shock_multiplier(
+            cell.0.position,
+            event_slice,
+            gen,
+            tick,
+            WORLD_HALF,
+        );
+        let drain = hazard_drain(noise) * dt * shock_mult;
         cell.0.energy -= drain;
         cell.0.damage_accum += drain;
     }

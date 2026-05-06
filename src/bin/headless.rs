@@ -1206,11 +1206,22 @@ impl World {
     fn apply_hazards(&mut self, dt: f32) {
         // Sprint 57: ~14 us sekvenčně vs ~27 us paralelně — work per cell je
         // jen map.sample + 2× scalar update, rayon overhead převáží.
+        // Sprint 110: HazardPulse shocks násobí drain (default 1.0 = no-op).
+        let gen = self.clock.generation;
+        let tick = self.clock.tick;
+        let events = &self.events.events;
         for cell in &mut self.cells {
             let noise = self
                 .map
                 .sample([cell.position[0], cell.position[1], cell.position[2]]);
-            let drain = hazard_drain(noise) * dt;
+            let shock_mult = bioscape::hazard_shock_multiplier(
+                cell.position,
+                events,
+                gen,
+                tick,
+                WORLD_HALF,
+            );
+            let drain = hazard_drain(noise) * dt * shock_mult;
             cell.energy -= drain;
             cell.damage_accum += drain;
         }
