@@ -1096,8 +1096,11 @@ fn step_cells(
     // Sprint 112: per-cell ClimateShift offset (default 0.0 → step_with_climate
     // je byte-identical s step). Computed inline před step aby nebyl rebuild
     // celé Cell::step signature potřeba.
-    let event_slice = &events.0.events;
-    for mut cell in &mut cells {
+    // Sprint 113: par_iter_mut — Cell::step_with_climate je čistě self-mutating,
+    // climate_shock_offset jen čte event_slice (sdílený &). Bevy TaskPool
+    // work-stealing pokrývá heterogenní workload (climate offset vs. step).
+    let event_slice = events.0.events.as_slice();
+    cells.par_iter_mut().for_each(|mut cell| {
         let climate_offset = bioscape::climate_shock_offset(
             event_slice,
             gen,
@@ -1106,7 +1109,7 @@ fn step_cells(
         );
         cell.0
             .step_with_climate(dt, half, tick, gen, &PHYSICS_CONFIG, climate_offset);
-    }
+    });
 }
 
 /// Sprint 42: Brownův pohyb — gaussian perturbation na velocity.
@@ -1153,10 +1156,14 @@ fn apply_brownian_motion(
     }
 
     let _ = slot_map;
-    let mut rng = rand::rng();
-    for (_, mut cell) in &mut cells {
+    // Sprint 113: par_iter_mut s thread-local rand::rng() v každém workeru.
+    // RNG sequence se mění (dříve sériový draw 0..N, teď interleaved per-worker),
+    // CPU fallback path se v plné release konfiguraci stejně používá jen bez
+    // GPU buildu — drift v stochastice je expected.
+    cells.par_iter_mut().for_each(|(_, mut cell)| {
+        let mut rng = rand::rng();
         cell.0.apply_brownian(&mut rng, dt, half_z);
-    }
+    });
     diag.add_measurement(&DIAG_BROWNIAN, || t_total.elapsed().as_secs_f64() * 1000.0);
 }
 
@@ -1190,10 +1197,12 @@ fn apply_environmental_hazards(
     let dt = time.delta_secs();
     let gen = clock.0.generation;
     let tick = clock.0.tick;
-    let event_slice = &events.0.events;
-    for mut cell in &mut cells {
-        let noise = world_map
-            .0
+    // Sprint 113: par_iter_mut — sample/shock_multiplier čistě read-only;
+    // mutace pouze cell.energy/damage_accum, žádný cross-cell state.
+    let event_slice = events.0.events.as_slice();
+    let world_map_ref = &world_map.0;
+    cells.par_iter_mut().for_each(|mut cell| {
+        let noise = world_map_ref
             .sample([cell.0.position[0], cell.0.position[1], cell.0.position[2]]);
         let shock_mult = bioscape::hazard_shock_multiplier(
             cell.0.position,
@@ -1205,7 +1214,7 @@ fn apply_environmental_hazards(
         let drain = hazard_drain(noise) * dt * shock_mult;
         cell.0.energy -= drain;
         cell.0.damage_accum += drain;
-    }
+    });
 }
 
 fn update_smell_field(
@@ -1477,9 +1486,13 @@ fn cells_brain_act(
     }
 
     // CPU fallback (no GPU available or feature disabled).
+    // Sprint 113: par_iter_mut — pool_bonded_sensors + forward_with_state jen
+    // čtou (`&self`); jediná mutace je self-cell (last_inputs/hidden/outputs +
+    // apply_brain_motor). id_to_inputs HashMap se sdílí immutable přes Send+Sync.
     let _ = slot_map;
-    for (_entity, mut cell) in &mut cells {
-        let own = id_to_inputs
+    let id_to_inputs_ref = &id_to_inputs;
+    cells.par_iter_mut().for_each(|(_entity, mut cell)| {
+        let own = id_to_inputs_ref
             .get(&cell.0.cell_id)
             .copied()
             .unwrap_or([0.0; BRAIN_INPUTS]);
@@ -1487,22 +1500,22 @@ fn cells_brain_act(
             if partner_id == cell.0.cell_id {
                 return None;
             }
-            id_to_inputs.get(&partner_id).copied()
+            id_to_inputs_ref.get(&partner_id).copied()
         });
         let (hidden, outputs) = cell.0.genome.brain.forward_with_state(&inputs);
         cell.0.last_inputs = inputs;
         cell.0.last_hidden = hidden;
         cell.0.last_outputs = outputs;
         cell.0.apply_brain_motor(&outputs, dt);
-    }
+    });
     diag.add_measurement(&DIAG_BRAIN_ACT, || _t_total.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn apply_cell_morph(time: Res<Time>, mut cells: Query<&mut CellEntity, Without<Dying>>) {
     let dt = time.delta_secs();
-    for mut cell in &mut cells {
+    cells.par_iter_mut().for_each(|mut cell| {
         cell.0.apply_morph(dt);
-    }
+    });
 }
 
 fn spawn_food(
@@ -1776,7 +1789,7 @@ fn sync_transforms(
     mut diag: Diagnostics,
 ) {
     let t = Instant::now();
-    for (cell, mut transform) in &mut cells {
+    cells.par_iter_mut().for_each(|(cell, mut transform)| {
         transform.translation.x = cell.0.position[0];
         transform.translation.y = cell.0.position[1];
         transform.translation.z = cell.0.position[2];
@@ -1788,7 +1801,7 @@ fn sync_transforms(
         {
             transform.scale = target_scale;
         }
-    }
+    });
     diag.add_measurement(&DIAG_SYNC_TRANSFORMS, || t.elapsed().as_secs_f64() * 1000.0);
 }
 

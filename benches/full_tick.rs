@@ -16,6 +16,7 @@ use criterion::{
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rayon::prelude::*;
 use std::time::Duration;
 
 const WORLD_HALF: [f32; 3] = [960.0, 540.0, 50.0];
@@ -77,30 +78,42 @@ impl BenchWorld {
         self.pheromone
             .step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
 
-        let mut acc = 0.0_f32;
-        for (cell, brain) in self.cells.iter_mut().zip(self.brains.iter_mut()) {
-            let smell_grad = self.smell.gradient_at(cell.position, 4.0);
-            let pheromone_grad = self.pheromone.gradient_at(cell.position, 4.0);
-            let sensors = BrainSensors {
-                nearest_food: None,
-                nearest_cell: None,
-                neighbors_in_vision: 0,
-                smell_grad,
-                pheromone_grad,
-                temperature_local: 17.0,
-            };
-            let inputs = populate_brain_inputs(cell, &sensors, cell.genome.vision_radius);
-            let (_h, outputs) = brain.forward_with_state(&inputs);
-            cell.angular_velocity = outputs[0];
-            cell.pitch_velocity = outputs[7];
-            let speed = cell.genome.max_speed * outputs[1].clamp(-1.0, 1.0);
-            let fwd = forward_vector(cell.heading, cell.pitch);
-            cell.velocity[0] = fwd[0] * speed;
-            cell.velocity[1] = fwd[1] * speed;
-            cell.velocity[2] = fwd[2] * speed;
-            cell.step(dt, WORLD_HALF, self.tick, 0, &self.physics);
-            acc += outputs[0];
-        }
+        // Sprint 113: rayon par_iter přes (cell, brain). Closure capturuje
+        // jen `&self.smell`, `&self.pheromone`, `&self.physics` (read-only) +
+        // pre-extracted `tick` (Copy). `acc` je sum reduction — bez mutexu,
+        // pořadí součtu je non-deterministic mezi worker threads.
+        let tick = self.tick;
+        let smell = &self.smell;
+        let pheromone = &self.pheromone;
+        let physics = &self.physics;
+        let acc: f32 = self
+            .cells
+            .par_iter_mut()
+            .zip(self.brains.par_iter_mut())
+            .map(|(cell, brain)| {
+                let smell_grad = smell.gradient_at(cell.position, 4.0);
+                let pheromone_grad = pheromone.gradient_at(cell.position, 4.0);
+                let sensors = BrainSensors {
+                    nearest_food: None,
+                    nearest_cell: None,
+                    neighbors_in_vision: 0,
+                    smell_grad,
+                    pheromone_grad,
+                    temperature_local: 17.0,
+                };
+                let inputs = populate_brain_inputs(cell, &sensors, cell.genome.vision_radius);
+                let (_h, outputs) = brain.forward_with_state(&inputs);
+                cell.angular_velocity = outputs[0];
+                cell.pitch_velocity = outputs[7];
+                let speed = cell.genome.max_speed * outputs[1].clamp(-1.0, 1.0);
+                let fwd = forward_vector(cell.heading, cell.pitch);
+                cell.velocity[0] = fwd[0] * speed;
+                cell.velocity[1] = fwd[1] * speed;
+                cell.velocity[2] = fwd[2] * speed;
+                cell.step(dt, WORLD_HALF, tick, 0, physics);
+                outputs[0]
+            })
+            .sum();
         let sample = self.map.sample(self.cells[0].position);
         self.tick += 1;
         acc + sample
