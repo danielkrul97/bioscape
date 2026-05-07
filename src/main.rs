@@ -50,7 +50,7 @@ use bioscape::{
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
     SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, THERMAL_NOISE, TICKS_PER_GENERATION, WORLD_HALF,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_HALF,
     WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
     WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
@@ -237,6 +237,9 @@ struct GpuBrainState {
     cells: CellsGpu,
     brain: BrainGpu,
     hebbian: HebbianGpu,
+    /// Sprint 129: brownian dispatch dropped, GPU resource kept resident
+    /// to avoid setup churn. Field unused — CPU path is now canonical.
+    #[allow(dead_code)]
     brownian: BrownianGpu,
 }
 
@@ -782,14 +785,17 @@ fn setup(
     }
 
     // Sprint 52: GPU compute init. Při failu fallback na CPU (Resource None).
+    //
+    // Sprint 132: opt-in. Diag (post-S130/131) ukázal `brain_gpu_rt_ms` ≈ 8.5 ms
+    // a `smell_field_ms` + `pheromone_field_ms` ≈ 1.8 ms — tj. ~10 ms / tick je
+    // čisté `Maintain::Wait` blokování CPU vlákna na GPU completionu. Per-S112
+    // SIMD CPU brain forward batch_seq/1500 < 1 ms (with par_iter ~150 µs);
+    // per-S117 SIMD CPU smell/pheromone step ~0.18 ms. CPU SIMD path je tedy
+    // 5–10× rychlejší než GPU s readback overheadem. Default = off; opt-in
+    // přes `BIOSCAPE_GPU_BRAIN=1` pro benchmark srovnání.
     #[cfg(feature = "gpu")]
-    {
-        // Capacity = MAX_POPULATION + slack pro birth ticks (Dying entities
-        // už slot drží do despawn — ale po Sprint 52 pattern se uvolňují
-        // ihned na cell_dies; slack pokrývá race window).
+    if std::env::var("BIOSCAPE_GPU_BRAIN").as_deref() == Ok("1") {
         let cap = MAX_POPULATION + 64;
-        // Sprint 59: FieldGpu sources capacity. Per-tick deposit count =
-        // foods (smell) + cells (pheromone). Upper bound přes density cycle peak.
         let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
         let field_sources_cap = (initial_food_target + cap) * 2;
         let world_half = extent.as_array();
@@ -823,16 +829,18 @@ fn setup(
         match init() {
             Ok((brain_state, field_state)) => {
                 info!(
-                    "renderer-gpu: persistent brain weights + Hebbian + Brownian + Field (cap {} cells, {} field sources)",
+                    "renderer-gpu: persistent brain weights + Hebbian + Field (opt-in via BIOSCAPE_GPU_BRAIN=1, cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
                 commands.insert_resource(brain_state);
                 commands.insert_resource(field_state);
             }
             Err(e) => {
-                warn!("renderer-gpu: init failed ({}); falling back to CPU compute", e);
+                warn!("renderer-gpu: init failed ({}); CPU compute path active", e);
             }
         }
+    } else {
+        info!("renderer: CPU compute path (S132 default; SIMD brain + field, no GPU sync stall)");
     }
     commands.insert_resource(slot_map);
     let _ = initial_cells;
@@ -1138,49 +1146,19 @@ fn step_cells(
 fn apply_brownian_motion(
     time: Res<Time>,
     extent: Res<WorldExtent>,
-    slot_map: Res<CellSlotMap>,
-    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
-    mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
     mut diag: Diagnostics,
 ) {
+    // Sprint 129: vždy CPU rayon path. GPU brownian (xoshiro128++ per-cell)
+    // měla compute < 30 µs, ale upload+download s `Maintain::Wait` přidávalo
+    // ~0.8 ms / tick = 96 % phase costu. CPU `apply_brownian` (Box-Muller
+    // gaussian) přes par_iter_mut běží subdolarní; thread-local `rand::rng()`
+    // dá jiný RNG stream než xoshiro, drift je acceptable (consistent
+    // s S113 stochastic-reorder konvencí).
     let t_total = Instant::now();
     let dt = time.delta_secs();
     let half_z = extent.as_array()[2];
-
-    #[cfg(feature = "gpu")]
-    if let Some(gpu) = gpu_state {
-        let n = slot_map.len();
-        if n == 0 {
-            diag.add_measurement(&DIAG_BROWNIAN, || t_total.elapsed().as_secs_f64() * 1000.0);
-            return;
-        }
-        let mut velocities_by_slot: Vec<[f32; 3]> = vec![[0.0; 3]; n];
-        for (entity, cell) in cells.iter() {
-            if let Some(slot) = slot_map.slot_of(entity) {
-                velocities_by_slot[slot] = cell.0.velocity;
-            }
-        }
-        let t_gpu = Instant::now();
-        gpu.cells.upload_velocities(&velocities_by_slot);
-        gpu.brownian
-            .compute_persistent(&gpu.cells, n, THERMAL_NOISE, dt, half_z > 0.0);
-        let new_vels = gpu.cells.download_velocities(n);
-        diag.add_measurement(&DIAG_BROWNIAN_GPU_RT, || t_gpu.elapsed().as_secs_f64() * 1000.0);
-        for (entity, mut cell) in &mut cells {
-            if let Some(slot) = slot_map.slot_of(entity) {
-                cell.0.velocity = new_vels[slot];
-            }
-        }
-        diag.add_measurement(&DIAG_BROWNIAN, || t_total.elapsed().as_secs_f64() * 1000.0);
-        return;
-    }
-
-    let _ = slot_map;
-    // Sprint 113: par_iter_mut s thread-local rand::rng() v každém workeru.
-    // RNG sequence se mění (dříve sériový draw 0..N, teď interleaved per-worker),
-    // CPU fallback path se v plné release konfiguraci stejně používá jen bez
-    // GPU buildu — drift v stochastice je expected.
-    cells.par_iter_mut().for_each(|(_, mut cell)| {
+    cells.par_iter_mut().for_each(|mut cell| {
         let mut rng = rand::rng();
         cell.0.apply_brownian(&mut rng, dt, half_z);
     });
@@ -1189,6 +1167,10 @@ fn apply_brownian_motion(
 
 /// Sprint 38: gravity drift na food. Aktualizuje Food.position[2] + sync
 /// Transform.translation.z aby viditelně klesalo k dnu.
+///
+/// Sprint 131: 2-pass — par_iter_mut na gravity + transform sync (31k+ entities
+/// per tick = bulk of cost), pak sériový age_step + despawn (Commands buffer
+/// není Sync; sequential pass jen čte position[2] do age_step).
 fn apply_food_gravity(
     time: Res<Time>,
     extent: Res<WorldExtent>,
@@ -1197,10 +1179,11 @@ fn apply_food_gravity(
 ) {
     let dt = time.delta_secs();
     let half_z = extent.as_array()[2];
-    for (entity, mut food, mut transform) in &mut foods {
+    foods.par_iter_mut().for_each(|(_entity, mut food, mut transform)| {
         food.0.apply_gravity(dt, half_z);
         transform.translation.z = food.0.position[2];
-        // Sprint 42: increment age + despawn expired (value_factor ≤ 0).
+    });
+    for (entity, mut food, _transform) in &mut foods {
         if !food.0.age_step() {
             commands.entity(entity).despawn();
         }
@@ -1418,23 +1401,31 @@ fn cells_brain_act(
     let tick = clock.0.tick;
     let gen = clock.0.generation;
 
-    // Sprint 52: helper closure pro per-cell sensor gather + populate_brain_inputs.
-    // Reused jak v CPU tak GPU path. Takes &mut Cell + Entity, vrací inputs[36].
+    // Sprint 130: par_iter_mut sensor gather (Bevy QueryParIter::for_each).
+    // Pre-S130 sériový for-loop přes cells trval ~6.5 ms / tick (gather hits
+    // cell_grid + food_grid radius queries — drahé per-cell). Captures jsou
+    // všechny &Sync (food_grid, cell_grid, smell, pheromone). Per-cell scratch
+    // pad: zapíšeme post-gain inputs do `cell.last_inputs`, použijeme jako
+    // canonical source pro pool_bonded_sensors / GPU upload v následujícím
+    // sequential pass — last_inputs se stejně přepisují na konci brain_act,
+    // takže scratch use je behavior-neutral.
     let coop_positions: Vec<[f32; 3]> = coop_foods.0.iter().map(|c| c.position).collect();
-    let gather = |entity: Entity, cell: &mut Cell| -> [f32; BRAIN_INPUTS] {
-        let pos = cell.position;
-        let vision_r = cell.genome.vision_radius;
+    let coop_positions_ref = &coop_positions;
+    let food_grid_ref = &food_grid.0;
+    let cell_grid_ref = &cell_grid.0;
+    let smell_ref = &smell.0;
+    let pheromone_ref = &pheromone.fields;
+    cells.par_iter_mut().for_each(|(entity, mut cell)| {
+        let pos = cell.0.position;
+        let vision_r = cell.0.genome.vision_radius;
         let vr2 = vision_r * vision_r;
-        // Sprint 83: precomputed cone parametry. `skip_cone` short-circuit pro
-        // full-sphere FOV (cos(π) ≈ −1, jakýkoliv kandidát uvnitř radia by
-        // procházel) — vyhne se per-callback sqrt.
-        let fov = cell.genome.vision_fov;
+        let fov = cell.0.genome.vision_fov;
         let skip_cone = fov >= bioscape::MAX_VISION_FOV;
         let cos_fov = fov.cos();
-        let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
+        let fwd = bioscape::forward_vector(cell.0.heading, cell.0.pitch);
         let mut nearest_food: Option<[f32; 3]> = None;
         let mut best_food_d2 = f32::MAX;
-        food_grid.0.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_, fp, _| {
+        food_grid_ref.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_, fp, _| {
             let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if d2 > vr2 || d2 >= best_food_d2 {
@@ -1446,8 +1437,7 @@ fn cells_brain_act(
             best_food_d2 = d2;
             nearest_food = Some(d);
         });
-        // Sprint 128: coop food candidates do same nearest_food selection.
-        for cp in coop_positions.iter() {
+        for cp in coop_positions_ref.iter() {
             let d = bioscape::min_image_delta(pos, *cp, WORLD_HALF);
             let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if d2 > vr2 || d2 >= best_food_d2 {
@@ -1462,9 +1452,11 @@ fn cells_brain_act(
         let mut nearest_cell: Option<([f32; 3], f32)> = None;
         let mut best_cell_d2 = f32::MAX;
         let mut neighbors_in_vision: u32 = 0;
-        cell_grid
-            .0
-            .for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |other, other_pos, other_radius| {
+        cell_grid_ref.for_each_in_radius_toroidal(
+            pos,
+            vision_r,
+            WORLD_HALF,
+            |other, other_pos, other_radius| {
                 if other == entity {
                     return;
                 }
@@ -1481,12 +1473,14 @@ fn cells_brain_act(
                     best_cell_d2 = d2;
                     nearest_cell = Some((d, other_radius));
                 }
-            });
+            },
+        );
         let pos_xyz = [pos[0], pos[1], pos[2]];
-        let smell_grad = smell.0.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
+        let smell_grad = smell_ref.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
         let mut pheromone_grads = [[0.0_f32; 3]; N_PHEROMONE_CHANNELS];
         for ch in 0..N_PHEROMONE_CHANNELS {
-            pheromone_grads[ch] = pheromone.fields[ch].gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+            pheromone_grads[ch] =
+                pheromone_ref[ch].gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
         }
         let temperature_local = bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
         let sensors = bioscape::BrainSensors {
@@ -1497,19 +1491,17 @@ fn cells_brain_act(
             pheromone_grads,
             temperature_local,
         };
-        cell.apply_shell_absorb(dt);
-        bioscape::populate_brain_inputs(cell, &sensors, vision_r)
-    };
+        cell.0.apply_shell_absorb(dt);
+        let mut inputs = bioscape::populate_brain_inputs(&mut cell.0, &sensors, vision_r);
+        bioscape::apply_sensor_gains(&mut inputs, &cell.0.genome.sensor_gains);
+        cell.0.last_inputs = inputs;
+    });
 
-    // Sprint 97: dvojfázový pipeline pro cluster sensor pooling.
-    // Phase 1: gather + apply per-cell sensor gains, ulož do id-keyed mapy.
-    // Phase 2: pool max-magnitude přes bond network + brain forward.
+    // Phase 2: serial HashMap build z post-gain inputs uložených v cell.last_inputs.
     let mut id_to_inputs: rustc_hash::FxHashMap<u64, [f32; BRAIN_INPUTS]> =
         rustc_hash::FxHashMap::default();
-    for (entity, mut cell) in &mut cells {
-        let mut inputs = gather(entity, &mut cell.0);
-        bioscape::apply_sensor_gains(&mut inputs, &cell.0.genome.sensor_gains);
-        id_to_inputs.insert(cell.0.cell_id, inputs);
+    for (_entity, cell) in cells.iter() {
+        id_to_inputs.insert(cell.0.cell_id, cell.0.last_inputs);
     }
 
     #[cfg(feature = "gpu")]

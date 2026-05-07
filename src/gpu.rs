@@ -1471,8 +1471,7 @@ impl FieldGpu {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
         let data = slice.get_mapped_range();
-        let bits: &[u32] = bytemuck::cast_slice(&data);
-        let result: Vec<f32> = bits.iter().map(|&b| f32::from_bits(b)).collect();
+        let result: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
         drop(data);
         self.grid_readback.unmap();
         result
