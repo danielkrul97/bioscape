@@ -2155,9 +2155,23 @@ fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>)
         0.0
     };
 
+    // Asymetrický step: nad 1× ±1 (1, 2, 3, …, 1000), pod 1× půlení/zdvojení
+    // (1, 0.5, 0.25, …, 0.0625). Floor 1/16 dává ~4 ticks/s (z 60 Hz fixed
+    // timestepu) — užitečné pro pozorování single-tick eventů (Hebbian update,
+    // bond resolution, predation hit) bez fully-paused stop.
     let new_speed = match (preset, delta) {
         (Some(p), _) => Some(p),
-        (None, d) if d != 0.0 => Some((time.relative_speed() + d).clamp(1.0, 1000.0)),
+        (None, d) if d != 0.0 => {
+            let s = time.relative_speed();
+            let next = if d > 0.0 {
+                if s >= 1.0 { s + 1.0 } else { s * 2.0 }
+            } else if s > 1.0 {
+                s - 1.0
+            } else {
+                s * 0.5
+            };
+            Some(next.clamp(0.0625, 1000.0))
+        }
         _ => None,
     };
 
