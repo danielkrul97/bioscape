@@ -270,11 +270,13 @@ Bevy ECS používá `Query<&mut Cell>`, headless `Vec<Cell>`. Lift musí mít ob
 
 1. `cargo build --features gpu`
 2. `cargo build --no-default-features` (bez GPU)
-3. `cargo test --features gpu`
+3. `cargo test --features gpu` — **primární signál**, 176 testů deterministicky pokrývá sim core
 4. `cargo test --no-default-features`
-5. Smoke headless: seed=0, 30 gen, max_pop=200 → `diff` CSV s baseline (Fáze 0). **Bit-identické nebo abort.**
-6. Totéž seed=42.
-7. (Každé 3 fáze) `cargo bench` → drift > 5 % značí regrese inlinování.
+5. Smoke headless: seed=0, 30 gen, max_pop=200 → musí doběhnout bez crash, sane final pop
+6. Totéž seed=42
+7. (Každé 3 fáze) `cargo bench` → drift > 5 % značí regrese inlinování
+
+**Pozn.:** CSV výstup není byte-deterministický napříč běhy (S113 konvence — `rand::rng()` thread-local + par_iter ordering). Bit-for-bit diff není validní signál; primární verifikace je test suite.
 
 ## Rizika
 
