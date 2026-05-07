@@ -186,6 +186,53 @@ impl Default for FoodGrid {
     }
 }
 
+/// Persistent cell_id ↔ Entity ↔ position lookup. Build raz/tick v
+/// `rebuild_cell_entity_lookups` před brain_act fází; consume v
+/// resolve_cell_collisions, cell_eats_food, draw_bond_gizmos, pool_bonded_*.
+/// Pre-fix: 6+ systémů buildovalo vlastní `FxHashMap` per tick.
+#[derive(Resource, Default)]
+struct CellEntityLookups {
+    id_to_entity: FxHashMap<u64, Entity>,
+    id_to_position: FxHashMap<u64, [f32; 3]>,
+    entity_to_idx: FxHashMap<Entity, usize>,
+    /// Vec indexed by `entity_to_idx[Entity]` — drží position pro O(1) lookup
+    /// v collision phase 2.
+    positions_by_idx: Vec<[f32; 3]>,
+}
+
+impl CellEntityLookups {
+    fn rebuild<'a>(
+        &mut self,
+        iter: impl Iterator<Item = (Entity, u64, [f32; 3])>,
+    ) {
+        self.id_to_entity.clear();
+        self.id_to_position.clear();
+        self.entity_to_idx.clear();
+        self.positions_by_idx.clear();
+        for (entity, cell_id, pos) in iter {
+            let idx = self.positions_by_idx.len();
+            self.positions_by_idx.push(pos);
+            self.id_to_entity.insert(cell_id, entity);
+            self.id_to_position.insert(cell_id, pos);
+            self.entity_to_idx.insert(entity, idx);
+        }
+    }
+}
+
+/// Sprint 102 mirror: persistent spatial grid pro hunter pack sensing
+/// (`gather_hunter_sensors`, `nearest_attackable_cell`). Větší cell size než
+/// `CellGrid` — typický hunter vision_radius je ~200, takže `r_cells` zůstane
+/// 1–2 → 27–125 bucket lookups vs ~1300 při `GRID_CELL_SIZE = 100`.
+/// Pre-fix: fresh `SpatialGrid::new()` per `step_hunters` tick.
+#[derive(Resource)]
+struct HunterCellGrid(SpatialGrid<usize, ()>);
+
+impl Default for HunterCellGrid {
+    fn default() -> Self {
+        Self(SpatialGrid::new(HUNTER_GRID_CELL_SIZE))
+    }
+}
+
 /// Sprint 66: monotonic counter pro Cell.cell_id přidělování. Initial pop
 /// uses ids 0..INITIAL_CELLS, takže start = INITIAL_CELLS. Children z
 /// reproduce čerpají odsud.
@@ -508,6 +555,8 @@ pub fn run() {
         .insert_resource(EventCalendarResource(event_calendar))
         .init_resource::<CellGrid>()
         .init_resource::<FoodGrid>()
+        .init_resource::<HunterCellGrid>()
+        .init_resource::<CellEntityLookups>()
         .init_resource::<FoodDensityFactor>()
         .init_resource::<NextCellId>()
         .init_resource::<NextHunterId>()
@@ -525,6 +574,7 @@ pub fn run() {
                     advance_clock,
                     update_food_density_cycle,
                     rebuild_food_grid,
+                    rebuild_cell_entity_lookups,
                     update_smell_field,
                     update_pheromone_field,
                     pool_bonded_hidden_cells,
@@ -1359,16 +1409,18 @@ fn emit_pheromones(
 /// `cells_brain_act` v `FixedUpdate` chain.
 fn pool_bonded_hidden_cells(
     mut cells: Query<&mut CellEntity, Without<Dying>>,
+    mut id_to_hidden_scratch: Local<FxHashMap<u64, [f32; bioscape::BRAIN_HIDDEN]>>,
 ) {
-    let snapshot: Vec<(u64, [f32; bioscape::BRAIN_HIDDEN])> = cells
-        .iter()
-        .map(|c| (c.0.cell_id, c.0.last_hidden))
-        .collect();
-    if snapshot.is_empty() {
+    // R-#7: persistent Local scratch — pre-fix `Vec` snapshot + fresh
+    // FxHashMap collect per tick. Direct insert eliminuje intermediate Vec.
+    id_to_hidden_scratch.clear();
+    for c in cells.iter() {
+        id_to_hidden_scratch.insert(c.0.cell_id, c.0.last_hidden);
+    }
+    if id_to_hidden_scratch.is_empty() {
         return;
     }
-    let id_to_hidden: rustc_hash::FxHashMap<u64, [f32; bioscape::BRAIN_HIDDEN]> =
-        snapshot.into_iter().collect();
+    let id_to_hidden = &*id_to_hidden_scratch;
     for mut cell in &mut cells {
         let pooled = bioscape::pool_bonded_hidden(&cell.0, |partner_id| {
             if partner_id == cell.0.cell_id {
@@ -1392,6 +1444,9 @@ fn cells_brain_act(
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut diag: Diagnostics,
+    mut coop_positions_scratch: Local<Vec<[f32; 3]>>,
+    mut id_to_inputs_scratch: Local<FxHashMap<u64, [f32; BRAIN_INPUTS]>>,
+    #[cfg(feature = "gpu")] mut inputs_by_slot_scratch: Local<Vec<[f32; BRAIN_INPUTS]>>,
 ) {
     let _t_total = Instant::now();
     let dt = time.delta_secs();
@@ -1410,8 +1465,9 @@ fn cells_brain_act(
     // canonical source pro pool_bonded_sensors / GPU upload v následujícím
     // sequential pass — last_inputs se stejně přepisují na konci brain_act,
     // takže scratch use je behavior-neutral.
-    let coop_positions: Vec<[f32; 3]> = coop_foods.0.iter().map(|c| c.position).collect();
-    let coop_positions_ref = &coop_positions;
+    coop_positions_scratch.clear();
+    coop_positions_scratch.extend(coop_foods.0.iter().map(|c| c.position));
+    let coop_positions_ref = coop_positions_scratch.as_slice();
     let food_grid_ref = &food_grid.0;
     let cell_grid_ref = &cell_grid.0;
     let smell_ref = &smell.0;
@@ -1499,11 +1555,12 @@ fn cells_brain_act(
     });
 
     // Phase 2: serial HashMap build z post-gain inputs uložených v cell.last_inputs.
-    let mut id_to_inputs: rustc_hash::FxHashMap<u64, [f32; BRAIN_INPUTS]> =
-        rustc_hash::FxHashMap::default();
+    // Persistent Local scratch — pre-fix `FxHashMap::default()` per tick.
+    id_to_inputs_scratch.clear();
     for (_entity, cell) in cells.iter() {
-        id_to_inputs.insert(cell.0.cell_id, cell.0.last_inputs);
+        id_to_inputs_scratch.insert(cell.0.cell_id, cell.0.last_inputs);
     }
+    let id_to_inputs = &*id_to_inputs_scratch;
 
     #[cfg(feature = "gpu")]
     if let Some(gpu) = gpu_state {
@@ -1514,7 +1571,11 @@ fn cells_brain_act(
         }
         // Build inputs vec indexed by slot. Iterate alive query, look up slot,
         // place inputs at slot index. Slots jsou dense 0..n.
-        let mut inputs_by_slot: Vec<[f32; BRAIN_INPUTS]> = vec![[0.0; BRAIN_INPUTS]; n];
+        // Persistent Local scratch — pre-fix `vec![[0.0; INPUTS]; n]` (~640 KB
+        // pro n=2000) per tick.
+        inputs_by_slot_scratch.clear();
+        inputs_by_slot_scratch.resize(n, [0.0; BRAIN_INPUTS]);
+        let inputs_by_slot = &mut *inputs_by_slot_scratch;
         for (entity, cell) in cells.iter() {
             let Some(slot) = slot_map.slot_of(entity) else {
                 continue;
@@ -1685,12 +1746,16 @@ fn update_coop_food(
     mut coop: ResMut<CoopFoodResource>,
     cells: Query<&CellEntity, Without<Dying>>,
     clock: Res<Clock>,
+    mut cell_snapshot_scratch: Local<Vec<(u64, [f32; 3])>>,
 ) {
     if coop.0.is_empty() {
         return;
     }
     let r2 = bioscape::COOP_FOOD_ARRIVAL_RADIUS * bioscape::COOP_FOOD_ARRIVAL_RADIUS;
-    let cell_snapshot: Vec<(u64, [f32; 3])> = cells.iter().map(|c| (c.0.cell_id, c.0.position)).collect();
+    // R-#12: persistent Local snapshot — pre-fix fresh `Vec` collect per tick.
+    cell_snapshot_scratch.clear();
+    cell_snapshot_scratch.extend(cells.iter().map(|c| (c.0.cell_id, c.0.position)));
+    let cell_snapshot = cell_snapshot_scratch.as_slice();
     for c in coop.0.iter_mut() {
         if c.triggered {
             continue;
@@ -1730,9 +1795,16 @@ fn cell_eats_food(
     food_grid: Res<FoodGrid>,
     world_map: Res<WorldMapResource>,
     slot_map: Res<CellSlotMap>,
+    lookups: Res<CellEntityLookups>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut commands: Commands,
     mut diag: Diagnostics,
+    mut snapshot_scratch: Local<Vec<(Entity, [f32; 3], f32, [f32; 3], f32, f32)>>,
+    mut cell_carnivore_scratch: Local<FxHashMap<Entity, f32>>,
+    mut candidates_scratch: Local<Vec<Option<(Entity, f32)>>>,
+    mut eaten_scratch: Local<FxHashSet<Entity>>,
+    mut share_deltas_scratch: Local<Vec<(Entity, f32)>>,
+    mut rewards_scratch: Local<Vec<f32>>,
 ) {
     let t_total = Instant::now();
 
@@ -1743,39 +1815,41 @@ fn cell_eats_food(
     #[cfg(not(feature = "gpu"))]
     let use_gpu_hebbian = false;
 
-    let mut rewards: Vec<f32> = if use_gpu_hebbian {
-        vec![0.0; slot_map.len()]
-    } else {
-        Vec::new()
-    };
+    rewards_scratch.clear();
+    if use_gpu_hebbian {
+        rewards_scratch.resize(slot_map.len(), 0.0);
+    }
+    let rewards = &mut *rewards_scratch;
 
     // Sprint 58: 3-pass refactor (mirror Sprint 57 headless eat_food).
     // Pass 1 (par): per-cell candidate selection. Snapshot s pose data pro
     // toroidal-aware eat_test_pose (lib helper bez `&Cell`).
-    let snapshot: Vec<(Entity, [f32; 3], f32, [f32; 3], f32, f32)> = cells
-        .iter()
-        .map(|(e, c)| {
-            (
-                e,
-                c.0.position,
-                c.0.phenotype.max_axis(),
-                [
-                    c.0.phenotype.body_length,
-                    c.0.phenotype.body_width,
-                    c.0.phenotype.body_height,
-                ],
-                c.0.heading,
-                c.0.pitch,
-            )
-        })
-        .collect();
+    // R-#13: Local scratch pro snapshot/cell_carnivore/candidates — pre-fix
+    // 3 fresh allocs per tick.
+    snapshot_scratch.clear();
+    snapshot_scratch.extend(cells.iter().map(|(e, c)| {
+        (
+            e,
+            c.0.position,
+            c.0.phenotype.max_axis(),
+            [
+                c.0.phenotype.body_length,
+                c.0.phenotype.body_width,
+                c.0.phenotype.body_height,
+            ],
+            c.0.heading,
+            c.0.pitch,
+        )
+    }));
+    let snapshot = snapshot_scratch.as_slice();
     let food_grid_ref = &food_grid.0;
     // Sprint 92: snapshot s carnivore_score per cell pro food efficiency lookup.
-    let cell_carnivore: std::collections::HashMap<Entity, f32> = cells
-        .iter()
-        .map(|(e, c)| (e, c.0.genome.carnivore_score))
-        .collect();
-    let candidates: Vec<Option<(Entity, f32)>> = snapshot
+    // FxHashMap (fixed seed) místo std SipHash — par_iter dělá ~N lookupů/tick.
+    cell_carnivore_scratch.clear();
+    cell_carnivore_scratch.extend(cells.iter().map(|(e, c)| (e, c.0.genome.carnivore_score)));
+    let cell_carnivore = &*cell_carnivore_scratch;
+    candidates_scratch.clear();
+    snapshot
         .par_iter()
         .map(|(entity, pos, max_axis, dims, heading, pitch)| {
             let eat_r = EAT_RADIUS * *max_axis;
@@ -1814,21 +1888,22 @@ fn cell_eats_food(
             );
             ate
         })
-        .collect();
+        .collect_into_vec(&mut candidates_scratch);
+    let candidates = candidates_scratch.as_slice();
 
-    // Sprint 78: cell_id → entity map pro food share lookup. Cells layout
-    // se v eat_food fázi nemění, takže build-once je bezpečný.
-    let id_to_entity: FxHashMap<u64, Entity> = cells
-        .iter()
-        .map(|(e, c)| (c.0.cell_id, e))
-        .collect();
+    // R-#2: id_to_entity z persistent CellEntityLookups (built v
+    // `rebuild_cell_entity_lookups` na začátku ticku). Cells layout je stable
+    // od tady přes celé eat_food.
+    let id_to_entity = &lookups.id_to_entity;
 
     // Pass 2 (sequential): resolve race + apply energy + Hebbian. First-cell-wins
     // per food entity (matches pre-Sprint-58 ordering).
     // Sprint 78: cluster food share. Sebráno do share_deltas Vec během iterace,
     // aplikováno post-loop kvůli simultaneous mutable borrow.
-    let mut eaten: FxHashSet<Entity> = FxHashSet::default();
-    let mut share_deltas: Vec<(Entity, f32)> = Vec::new();
+    eaten_scratch.clear();
+    share_deltas_scratch.clear();
+    let eaten = &mut *eaten_scratch;
+    let share_deltas = &mut *share_deltas_scratch;
     for ((entity, _, _, _, _, _), opt) in snapshot.iter().zip(candidates.iter()) {
         if let Some((food_e, value)) = opt {
             if eaten.contains(food_e) {
@@ -1889,14 +1964,14 @@ fn cell_eats_food(
     }
 
     // Sprint 78: aplikuj food share delty (po Pass 2 main loop).
-    for (e, delta) in share_deltas {
+    for &(e, delta) in share_deltas.iter() {
         if let Ok((_, mut cell)) = cells.get_mut(e) {
             cell.0.energy += delta;
         }
     }
 
     // Pass 3: main-thread Commands flush (despawn nelze v par_iter).
-    for food_e in &eaten {
+    for food_e in eaten.iter() {
         commands.entity(*food_e).despawn();
     }
 
@@ -1953,39 +2028,58 @@ fn step_hunters(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     smell: Res<SmellResource>,
     fixed_time: Res<Time<Fixed>>,
+    mut hunter_cell_grid: ResMut<HunterCellGrid>,
+    mut entities_scratch: Local<Vec<Entity>>,
+    mut cells_scratch: Local<Vec<Cell>>,
+    mut hunters_snapshot_scratch: Local<Vec<bioscape::HunterSnapshotMin>>,
+    mut attacks_scratch: Local<Vec<(Entity, f32)>>,
+    mut pack_shares_scratch: Local<Vec<(u64, f32)>>,
 ) {
     let dt = fixed_time.delta_secs();
-    let cell_snapshot: Vec<(Entity, Cell)> = cells.iter().map(|(e, c)| (e, c.0)).collect();
-    let cells_only: Vec<Cell> = cell_snapshot.iter().map(|(_, c)| *c).collect();
-    // Sprint 102: cell spatial grid (1× per tick) + minimální hunter snapshot
-    // (id, pos, adhesion_type) — nahrazuje O(H·N) brute force scan v
-    // gather_hunter_sensors / nearest_attackable_cell + deep clone hunterů.
-    let mut hunter_cell_grid: SpatialGrid<usize, ()> = SpatialGrid::new(HUNTER_GRID_CELL_SIZE);
-    hunter_cell_grid.rebuild(
+    // R-#8: single iter() do dvou paralelních scratchů (entity + cell). Pre-fix
+    // double collect (`cell_snapshot` + odvozený `cells_only`) byl redundantní.
+    entities_scratch.clear();
+    cells_scratch.clear();
+    for (e, c) in cells.iter() {
+        entities_scratch.push(e);
+        cells_scratch.push(c.0);
+    }
+    let cells_only = cells_scratch.as_slice();
+    let cell_entities = entities_scratch.as_slice();
+    // R-#3: persistent HunterCellGrid Resource — pre-fix `SpatialGrid::new()`
+    // per tick. `rebuild` zachová bucket Vec capacity přes ticky.
+    hunter_cell_grid.0.rebuild(
         cells_only
             .iter()
             .enumerate()
             .map(|(i, c)| (i, c.position, ())),
     );
-    let hunters_snapshot: Vec<bioscape::HunterSnapshotMin> = hunters
-        .iter()
-        .map(|(_, h)| bioscape::HunterSnapshotMin::from_hunter(&h.0))
-        .collect();
-    let mut attacks: Vec<(Entity, f32)> = Vec::new();
-    // Sprint 101: pack kill share (id, energy) — apply post-loop.
-    let mut pack_shares: Vec<(u64, f32)> = Vec::new();
+    let hunter_cell_grid_ref = &hunter_cell_grid.0;
+    // R-#9: persistent hunter snapshot scratch.
+    hunters_snapshot_scratch.clear();
+    hunters_snapshot_scratch.extend(
+        hunters
+            .iter()
+            .map(|(_, h)| bioscape::HunterSnapshotMin::from_hunter(&h.0)),
+    );
+    let hunters_snapshot = hunters_snapshot_scratch.as_slice();
+    // Persistent attack/pack_share scratchy.
+    attacks_scratch.clear();
+    pack_shares_scratch.clear();
+    let attacks = &mut *attacks_scratch;
+    let pack_shares = &mut *pack_shares_scratch;
     for (_, mut h) in &mut hunters {
         // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain).
         let sensors = bioscape::gather_hunter_sensors(
             &h.0,
-            &cells_only,
-            &hunter_cell_grid,
-            &hunters_snapshot,
+            cells_only,
+            hunter_cell_grid_ref,
+            hunters_snapshot,
             &smell.0,
             WORLD_HALF,
         );
         let target_idx_pre =
-            nearest_attackable_cell(&h.0, &cells_only, &hunter_cell_grid, WORLD_HALF);
+            nearest_attackable_cell(&h.0, cells_only, hunter_cell_grid_ref, WORLD_HALF);
         let seek_target = target_idx_pre.map(|i| cells_only[i].position);
         let inputs = bioscape::populate_hunter_brain_inputs(&mut h.0, &sensors);
         let (hidden, outputs) = h.0.genome.brain.forward_with_state(&inputs);
@@ -1996,7 +2090,7 @@ fn step_hunters(
         h.0.step(dt, WORLD_HALF);
         // Attack check (post-step pozice).
         let target_idx =
-            nearest_attackable_cell(&h.0, &cells_only, &hunter_cell_grid, WORLD_HALF);
+            nearest_attackable_cell(&h.0, cells_only, hunter_cell_grid_ref, WORLD_HALF);
         let attack_r = h.0.genome.attack_radius;
         let attack_r2 = attack_r * attack_r;
         let damage = h.0.genome.damage_per_tick;
@@ -2014,7 +2108,7 @@ fn step_hunters(
                 // damage, deeply interior cells take 0.
                 let exposure = bioscape::cell_exposure(cells_only[i].n_bonds());
                 let damage_dealt = damage * exposure * dt;
-                attacks.push((cell_snapshot[i].0, damage_dealt));
+                attacks.push((cell_entities[i], damage_dealt));
                 gain = damage_dealt * bioscape::HUNTER_ENERGY_PER_DAMAGE;
                 // Sprint 101: pack share queue.
                 for bond_opt in h.0.bonds.iter() {
@@ -2036,7 +2130,7 @@ fn step_hunters(
             .iter()
             .map(|(e, h)| (h.0.hunter_id, e))
             .collect();
-        for (id, energy) in pack_shares {
+        for &(id, energy) in pack_shares.iter() {
             if let Some(&entity) = id_to_entity.get(&id) {
                 if let Ok((_, mut h)) = hunters.get_mut(entity) {
                     h.0.energy += energy;
@@ -2044,7 +2138,7 @@ fn step_hunters(
             }
         }
     }
-    for (entity, damage) in attacks {
+    for &(entity, damage) in attacks.iter() {
         if let Ok((_, mut cell)) = cells.get_mut(entity) {
             cell.0.energy -= damage;
             cell.0.damage_accum += damage;
@@ -2194,8 +2288,11 @@ fn sync_hunter_transforms(mut hunters: Query<(&HunterEntity, &mut Transform)>) {
 fn draw_bond_gizmos(
     cells: Query<&CellEntity, Without<Dying>>,
     mut gizmos: Gizmos,
+    mut id_to_pos: Local<FxHashMap<u64, Vec3>>,
 ) {
-    let mut id_to_pos: FxHashMap<u64, Vec3> = FxHashMap::default();
+    // R-#14: per-frame system (Update schedule, ~60+ Hz). Pre-fix
+    // `FxHashMap::default()` per frame; persistent Local zachová capacity.
+    id_to_pos.clear();
     for cell in &cells {
         id_to_pos.insert(
             cell.0.cell_id,
@@ -2477,6 +2574,7 @@ fn update_stats_overlay(
     cells: Query<&CellEntity, Without<Dying>>,
     foods: Query<(), With<FoodEntity>>,
     text: Single<&mut Text, With<StatsText>>,
+    mut lineages_scratch: Local<FxHashSet<u64>>,
 ) {
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
@@ -2501,7 +2599,9 @@ fn update_stats_overlay(
     let mut spk_sum = 0.0_f64;
     let mut spk_max = 0.0_f64;
     let mut e_sum = 0.0_f64;
-    let mut lineages: FxHashSet<u64> = FxHashSet::default();
+    // R-#15: per-frame Update system. Persistent Local set zachová capacity.
+    lineages_scratch.clear();
+    let lineages = &mut *lineages_scratch;
     let mut oldest_age: u64 = 0;
     let current_gen = clock.0.generation;
     for c in &cells {
@@ -2597,6 +2697,7 @@ fn cell_reproduces_on_threshold(
     mut next_cell_id: ResMut<NextCellId>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     mut commands: Commands,
+    mut fertile_scratch: Local<Vec<(Entity, [f32; 3])>>,
 ) {
     let current_pop = cells.iter().count();
     if current_pop >= MAX_POPULATION {
@@ -2604,17 +2705,21 @@ fn cell_reproduces_on_threshold(
     }
     let budget = MAX_POPULATION - current_pop;
 
-    let fertile: Vec<(Entity, [f32; 3])> = cells
-        .iter()
-        .filter(|(_, c)| {
-            c.0.energy >= REPRODUCE_THRESHOLD
-                && c.0.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
-                && c.0.reproduce_cooldown_ticks == 0
-        })
-        .map(|(e, c)| (e, c.0.position))
-        .collect();
+    // R-#11: persistent Local fertile snapshot.
+    fertile_scratch.clear();
+    fertile_scratch.extend(
+        cells
+            .iter()
+            .filter(|(_, c)| {
+                c.0.energy >= REPRODUCE_THRESHOLD
+                    && c.0.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
+                    && c.0.reproduce_cooldown_ticks == 0
+            })
+            .map(|(e, c)| (e, c.0.position)),
+    );
+    let fertile = fertile_scratch.as_slice();
     let mating_r2 = MATING_RADIUS * MATING_RADIUS;
-    let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
+    let matings = bioscape::pair_fertile(fertile, mating_r2, budget, WORLD_HALF);
 
     // Sprint 52: před crossover sync parent brains z GPU (post-Hebbian je
     // canonical). Pokud GPU available; jinak no-op (CPU brain je canonical).
@@ -2756,14 +2861,22 @@ fn rebuild_cell_grid(
 fn pool_bonded_hunter_hidden_system(
     hunters: Query<(Entity, &HunterEntity)>,
     mut commands: Commands,
+    mut entities_scratch: Local<Vec<Entity>>,
+    mut hunters_only_scratch: Local<Vec<Hunter>>,
 ) {
-    let mut state: Vec<(Entity, Hunter)> = hunters.iter().map(|(e, h)| (e, h.0)).collect();
-    if state.is_empty() {
+    // R-#10: collapse double snapshot na single iter() do dvou paralelních
+    // scratchů. Pre-fix `state` + odvozený `hunters_only` byly redundantní.
+    entities_scratch.clear();
+    hunters_only_scratch.clear();
+    for (e, h) in hunters.iter() {
+        entities_scratch.push(e);
+        hunters_only_scratch.push(h.0);
+    }
+    if hunters_only_scratch.is_empty() {
         return;
     }
-    let mut hunters_only: Vec<Hunter> = state.iter().map(|(_, h)| *h).collect();
-    bioscape::pool_bonded_hunter_hidden(&mut hunters_only);
-    for ((entity, _), updated) in state.iter_mut().zip(hunters_only.iter()) {
+    bioscape::pool_bonded_hunter_hidden(&mut hunters_only_scratch);
+    for (entity, updated) in entities_scratch.iter().zip(hunters_only_scratch.iter()) {
         commands.entity(*entity).insert(HunterEntity(*updated));
     }
 }
@@ -2776,22 +2889,36 @@ fn resolve_hunter_collisions(
     hunters: Query<(Entity, &HunterEntity)>,
     mut contact: ResMut<HunterContactProgress>,
     mut commands: Commands,
+    mut alive_scratch: Local<Vec<(Entity, Hunter)>>,
+    mut id_to_pos_scratch: Local<FxHashMap<u64, usize>>,
+    mut pos_deltas_scratch: Local<Vec<[f32; 3]>>,
+    mut vel_deltas_scratch: Local<Vec<[f32; 3]>>,
+    mut in_contact_pairs_scratch: Local<FxHashSet<(u64, u64)>>,
+    mut new_progress_scratch: Local<FxHashMap<(u64, u64), u32>>,
 ) {
-    let alive: Vec<(Entity, Hunter)> = hunters.iter().map(|(e, h)| (e, h.0)).collect();
+    // R-#9: persistent Local scratchy. Pre-fix: 6 fresh allocs per tick.
+    alive_scratch.clear();
+    alive_scratch.extend(hunters.iter().map(|(e, h)| (e, h.0)));
+    let alive = alive_scratch.as_slice();
     let n = alive.len();
     if n < 2 {
         return;
     }
     let hunter_radius = |h: &Hunter| h.genome.body_size * CELL_RADIUS;
-    let id_to_pos: FxHashMap<u64, usize> = alive
-        .iter()
-        .enumerate()
-        .map(|(i, (_, h))| (h.hunter_id, i))
-        .collect();
+    id_to_pos_scratch.clear();
+    for (i, (_, h)) in alive.iter().enumerate() {
+        id_to_pos_scratch.insert(h.hunter_id, i);
+    }
+    let id_to_pos = &*id_to_pos_scratch;
 
-    let mut pos_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
-    let mut vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
-    let mut in_contact_pairs: FxHashSet<(u64, u64)> = FxHashSet::default();
+    pos_deltas_scratch.clear();
+    pos_deltas_scratch.resize(n, [0.0; 3]);
+    vel_deltas_scratch.clear();
+    vel_deltas_scratch.resize(n, [0.0; 3]);
+    in_contact_pairs_scratch.clear();
+    let pos_deltas = &mut *pos_deltas_scratch;
+    let vel_deltas = &mut *vel_deltas_scratch;
+    let in_contact_pairs = &mut *in_contact_pairs_scratch;
 
     for i in 0..n {
         let (_, hunter_i) = &alive[i];
@@ -2854,25 +2981,25 @@ fn resolve_hunter_collisions(
         }
     }
 
-    // Contact tracker update (mirror headless).
-    let mut new_progress: FxHashMap<(u64, u64), u32> = FxHashMap::default();
-    for &pair in &in_contact_pairs {
+    // Contact tracker update (mirror headless). Reuse new_progress_scratch
+    // přes std::mem::swap — pre-fix byla `FxHashMap::default()` per tick.
+    new_progress_scratch.clear();
+    for &pair in in_contact_pairs.iter() {
         let prev = contact.0.get(&pair).copied().unwrap_or(0);
-        new_progress.insert(pair, prev.saturating_add(1));
+        new_progress_scratch.insert(pair, prev.saturating_add(1));
     }
     for (&pair, &val) in contact.0.iter() {
         if !in_contact_pairs.contains(&pair) && val > 1 {
-            new_progress.insert(pair, val - 1);
+            new_progress_scratch.insert(pair, val - 1);
         }
     }
-    contact.0 = new_progress;
+    std::mem::swap(&mut contact.0, &mut *new_progress_scratch);
 
-    // Build mutable snapshot pro deltas + bond updates.
-    let mut new_state: Vec<(Entity, Hunter)> = alive.clone();
-    for ((entity_pair, pd), vd) in new_state
+    // R-#9: dropped `alive.clone()` — mutuj alive_scratch in-place.
+    for ((entity_pair, pd), vd) in alive_scratch
         .iter_mut()
-        .zip(pos_deltas.iter())
-        .zip(vel_deltas.iter())
+        .zip(pos_deltas_scratch.iter())
+        .zip(vel_deltas_scratch.iter())
     {
         let h = &mut entity_pair.1;
         h.position[0] += pd[0];
@@ -2883,27 +3010,33 @@ fn resolve_hunter_collisions(
         h.velocity[2] += vd[2];
     }
 
-    // Bond formation.
-    let candidates: Vec<(u64, u64)> = contact
+    // Bond formation — kandidáti se filtrují přímo do iteration; ad-hoc snapshot
+    // do Vec by byl jen zbytečná indirection.
+    for (&(id_a, id_b), _) in contact
         .0
         .iter()
         .filter(|(_, &t)| t >= bioscape::BOND_FORM_TICKS)
-        .map(|(&pair, _)| pair)
-        .collect();
-    for (id_a, id_b) in candidates {
-        let (Some(&a_idx), Some(&b_idx)) = (id_to_pos.get(&id_a), id_to_pos.get(&id_b)) else {
+        .map(|(p, t)| (p, t))
+        .collect::<Vec<_>>()
+        .iter()
+    {
+        let (Some(&a_idx), Some(&b_idx)) =
+            (id_to_pos.get(&id_a), id_to_pos.get(&id_b))
+        else {
             continue;
         };
-        if new_state[a_idx].1.genome.adhesion_type != new_state[b_idx].1.genome.adhesion_type {
-            continue;
-        }
-        // Sprint 100: brain output[9] gate.
-        if new_state[a_idx].1.last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
-            || new_state[b_idx].1.last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
+        if alive_scratch[a_idx].1.genome.adhesion_type
+            != alive_scratch[b_idx].1.genome.adhesion_type
         {
             continue;
         }
-        let already = new_state[a_idx]
+        // Sprint 100: brain output[9] gate.
+        if alive_scratch[a_idx].1.last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
+            || alive_scratch[b_idx].1.last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
+        {
+            continue;
+        }
+        let already = alive_scratch[a_idx]
             .1
             .bonds
             .iter()
@@ -2911,23 +3044,31 @@ fn resolve_hunter_collisions(
         if already {
             continue;
         }
-        let slot_a = new_state[a_idx].1.bonds.iter().position(|b| b.is_none());
-        let slot_b = new_state[b_idx].1.bonds.iter().position(|b| b.is_none());
+        let slot_a = alive_scratch[a_idx]
+            .1
+            .bonds
+            .iter()
+            .position(|b| b.is_none());
+        let slot_b = alive_scratch[b_idx]
+            .1
+            .bonds
+            .iter()
+            .position(|b| b.is_none());
         if let (Some(sa), Some(sb)) = (slot_a, slot_b) {
-            let pos_a = new_state[a_idx].1.position;
-            let pos_b = new_state[b_idx].1.position;
+            let pos_a = alive_scratch[a_idx].1.position;
+            let pos_b = alive_scratch[b_idx].1.position;
             let d_vec = bioscape::min_image_delta(pos_b, pos_a, WORLD_HALF);
             let dist =
                 (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
             let rest = dist * bioscape::BOND_REST_LENGTH_SLACK;
-            new_state[a_idx].1.bonds[sa] = Some(Bond {
+            alive_scratch[a_idx].1.bonds[sa] = Some(Bond {
                 other_cell_id: id_b,
                 rest_length: rest,
                 stiffness: bioscape::BOND_STIFFNESS,
                 damping: bioscape::BOND_DAMPING,
                 age_ticks: 0,
             });
-            new_state[b_idx].1.bonds[sb] = Some(Bond {
+            alive_scratch[b_idx].1.bonds[sb] = Some(Bond {
                 other_cell_id: id_a,
                 rest_length: rest,
                 stiffness: bioscape::BOND_STIFFNESS,
@@ -2938,7 +3079,7 @@ fn resolve_hunter_collisions(
     }
 
     // Pruning + age increment.
-    for (_, hunter) in new_state.iter_mut() {
+    for (_, hunter) in alive_scratch.iter_mut() {
         for bond_opt in hunter.bonds.iter_mut() {
             if let Some(bond) = bond_opt {
                 if !id_to_pos.contains_key(&bond.other_cell_id) {
@@ -2951,8 +3092,8 @@ fn resolve_hunter_collisions(
     }
 
     // Writeback ECS state.
-    for (entity, h) in new_state {
-        commands.entity(entity).insert(HunterEntity(h));
+    for (entity, h) in alive_scratch.iter() {
+        commands.entity(*entity).insert(HunterEntity(*h));
     }
 }
 
@@ -2963,6 +3104,18 @@ fn rebuild_food_grid(
     grid.0.rebuild(foods.iter().map(|(e, f)| (e, f.0.position, f.0.kind)));
 }
 
+/// R-#2: build `id_to_entity` raz/tick. Cells layout (entity sady) je stable
+/// uvnitř ticku až do reproduce/die_and_drop_carrion na konci, takže jediný
+/// rebuild stačí. Konzumuje `cell_eats_food`; další systémy jako
+/// `resolve_cell_collisions` mají vlastní snapshot-based `entity_to_idx`
+/// (potřebují snapshot order indexing) a zůstávají na Local<FxHashMap>.
+fn rebuild_cell_entity_lookups(
+    mut lookups: ResMut<CellEntityLookups>,
+    cells: Query<(Entity, &CellEntity), Without<Dying>>,
+) {
+    lookups.rebuild(cells.iter().map(|(e, c)| (e, c.0.cell_id, c.0.position)));
+}
+
 // Generous broad-phase upper bound on "other" effective_radius — captures
 // candidates even when neighbors are oversized. Narrow-phase uses pair sum.
 const BROAD_PHASE_SIZE_BUDGET: f32 = 3.0;
@@ -2971,34 +3124,36 @@ fn cell_predates_on_neighbor(
     grid: Res<CellGrid>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut diag: Diagnostics,
+    mut energy_changes_scratch: Local<FxHashMap<Entity, f32>>,
+    mut damage_changes_scratch: Local<FxHashMap<Entity, f32>>,
+    mut snapshot_scratch: Local<Vec<(Entity, [f32; 3])>>,
+    mut bond_counts_scratch: Local<FxHashMap<Entity, u32>>,
+    mut herd_counts_vec_scratch: Local<Vec<u32>>,
+    mut herd_counts_scratch: Local<FxHashMap<Entity, u32>>,
 ) {
     let t_total = Instant::now();
-    // Sprint 58: HashMap → FxHashMap (5-10× rychlejší hash than SipHash).
-    // Predate je hot path s 3 entity-keyed mapami × n insertů × n lookupů.
-    let mut energy_changes: FxHashMap<Entity, f32> = FxHashMap::default();
-    // Sprint 30: nedobrovolný drain do brain damage signálu (input[14]).
-    // Voluntární cost (movement, morph, attack) sem nepatří, jen predation.
-    let mut damage_changes: FxHashMap<Entity, f32> = FxHashMap::default();
+    // R-#5: persistent scratchy. Pre-fix: 6 fresh allocs per tick. Sprint 58
+    // používal HashMap → FxHashMap (fixed seed); reuse navíc eliminuje alloc.
+    energy_changes_scratch.clear();
+    damage_changes_scratch.clear();
+    let energy_changes = &mut *energy_changes_scratch;
+    let damage_changes = &mut *damage_changes_scratch;
 
     // Sprint 29 selfish-herd: pre-compute herd count per cell (počet sousedů
-    // ve `HERD_RADIUS`). V predaci níže se gain násobí 1/(1 + K × herd_count_prey)
-    // — kořist obklopena hejnem dává predátorovi menší odměnu.
-    // Sprint 58: snapshot + rayon par compute. Snapshot drží jen entity+pos,
-    // herd query je read-only přes grid Res. Indexed Vec<u32> result.
+    // ve `HERD_RADIUS`). Snapshot + bond_counts plněny single-pass přes
+    // cells.iter() místo dvou nezávislých walků.
     let herd_r2 = HERD_RADIUS * HERD_RADIUS;
-    let snapshot: Vec<(Entity, [f32; 3])> = cells
-        .iter()
-        .map(|(e, c)| (e, c.0.position))
-        .collect();
-    // Sprint 69: per-cell bond count pro bond_defense_factor lookup v
-    // grid callback. Sebrané jednorázově ze stejného iter() — kompatibilní
-    // s rayon herd_counts pre-pass.
-    let bond_counts: FxHashMap<Entity, u32> = cells
-        .iter()
-        .map(|(e, c)| (e, c.0.n_bonds()))
-        .collect();
+    snapshot_scratch.clear();
+    bond_counts_scratch.clear();
+    for (e, c) in cells.iter() {
+        snapshot_scratch.push((e, c.0.position));
+        bond_counts_scratch.insert(e, c.0.n_bonds());
+    }
+    let snapshot = snapshot_scratch.as_slice();
+    let bond_counts = &*bond_counts_scratch;
     let grid_ref = &grid.0;
-    let herd_counts_vec: Vec<u32> = snapshot
+    herd_counts_vec_scratch.clear();
+    snapshot
         .par_iter()
         .map(|(entity, pos)| {
             let mut count: u32 = 0;
@@ -3018,12 +3173,13 @@ fn cell_predates_on_neighbor(
             );
             count
         })
-        .collect();
-    let herd_counts: FxHashMap<Entity, u32> = snapshot
-        .iter()
-        .zip(herd_counts_vec.iter())
-        .map(|((e, _), c)| (*e, *c))
-        .collect();
+        .collect_into_vec(&mut herd_counts_vec_scratch);
+    let herd_counts_vec = herd_counts_vec_scratch.as_slice();
+    herd_counts_scratch.clear();
+    for ((e, _), c) in snapshot.iter().zip(herd_counts_vec.iter()) {
+        herd_counts_scratch.insert(*e, *c);
+    }
+    let herd_counts = &*herd_counts_scratch;
 
     for (entity_a, cell_a) in &cells {
         // Sprint 27: attack je opt-in přes brain output[6]. Bez aktivního
@@ -3071,14 +3227,14 @@ fn cell_predates_on_neighbor(
             });
     }
 
-    for (entity, delta) in energy_changes {
-        if let Ok((_, mut cell)) = cells.get_mut(entity) {
-            cell.0.energy += delta;
+    for (entity, delta) in energy_changes.iter() {
+        if let Ok((_, mut cell)) = cells.get_mut(*entity) {
+            cell.0.energy += *delta;
         }
     }
-    for (entity, delta) in damage_changes {
-        if let Ok((_, mut cell)) = cells.get_mut(entity) {
-            cell.0.damage_accum += delta;
+    for (entity, delta) in damage_changes.iter() {
+        if let Ok((_, mut cell)) = cells.get_mut(*entity) {
+            cell.0.damage_accum += *delta;
         }
     }
     diag.add_measurement(&DIAG_PREDATION, || t_total.elapsed().as_secs_f64() * 1000.0);
@@ -3089,16 +3245,24 @@ fn resolve_cell_collisions(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut contact_progress: ResMut<ContactProgress>,
     mut diag: Diagnostics,
+    mut snapshot_scratch: Local<Vec<SnapEntry>>,
+    mut entity_to_idx_scratch: Local<FxHashMap<Entity, usize>>,
+    mut id_to_idx_scratch: Local<FxHashMap<u64, usize>>,
+    mut results_scratch: Local<Vec<(Entity, [f32; 3], [f32; 3], Vec<u64>)>>,
+    mut seen_pairs_scratch: Local<FxHashSet<(u64, u64)>>,
+    mut positions_scratch: Local<FxHashMap<u64, [f32; 3]>>,
+    mut candidates_scratch: Local<Vec<(u64, u64)>>,
 ) {
     let t_total = Instant::now();
-    // Sprint 58: snapshot + rayon par compute deltas.
-    // Sprint 65: 3D position delta + inelastic velocity damping.
-    // Sprint 66: differential adhesion + persistent spring bonds + contact
-    // tick tracker pro hybrid bond formation. Snapshot rozšířen o cell_id,
-    // adhesion_type, bonds.
-    let snapshot: Vec<SnapEntry> = cells
-        .iter()
-        .map(|(e, c)| SnapEntry {
+    // R-#6: persistent Local scratchy. Pre-fix: 7 fresh allocs (snapshot,
+    // entity_to_idx, id_to_idx, results+per-cell Vec<u64>, seen_pairs,
+    // positions, candidates) per tick. Reuse zachová capacity.
+    snapshot_scratch.clear();
+    entity_to_idx_scratch.clear();
+    id_to_idx_scratch.clear();
+    for (e, c) in cells.iter() {
+        let idx = snapshot_scratch.len();
+        snapshot_scratch.push(SnapEntry {
             entity: e,
             cell_id: c.0.cell_id,
             position: c.0.position,
@@ -3106,22 +3270,21 @@ fn resolve_cell_collisions(
             radius: c.0.phenotype.effective_radius(),
             adhesion_type: c.0.genome.adhesion_type,
             bonds: c.0.bonds,
-        })
-        .collect();
-    // O(1) lookups pro Phase 1 hot loop.
-    let entity_to_idx: FxHashMap<Entity, usize> = snapshot
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.entity, i))
-        .collect();
-    let id_to_idx: FxHashMap<u64, usize> = snapshot
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.cell_id, i))
-        .collect();
+        });
+        entity_to_idx_scratch.insert(e, idx);
+        id_to_idx_scratch.insert(c.0.cell_id, idx);
+    }
+    let snapshot = snapshot_scratch.as_slice();
+    let entity_to_idx = &*entity_to_idx_scratch;
+    let id_to_idx = &*id_to_idx_scratch;
     let grid_ref = &grid.0;
     // Phase 1 (parallel): per-cell delta + vel_delta + collected contacts.
-    let results: Vec<(Entity, [f32; 3], [f32; 3], Vec<u64>)> = snapshot
+    // Inner Vec<u64> per cell — drop persisted approach kvůli rayon
+    // collect_into_vec: existing inner Vecs se znovu použijí jen pokud délka
+    // results == n a indexy se zachovají. Reuse outer scratch je primary win;
+    // inner Vec capacity přežije přes ticky.
+    results_scratch.clear();
+    snapshot
         .par_iter()
         .map(|s_a| {
             let entity_a = s_a.entity;
@@ -3209,13 +3372,15 @@ fn resolve_cell_collisions(
             }
             (entity_a, delta, vel_delta, local_contacts)
         })
-        .collect();
+        .collect_into_vec(&mut results_scratch);
+    let results = results_scratch.as_slice();
 
     // Phase 2 (sequential): apply deltas + bond age/prune + contact tracker
     // + bond formation.
     let dt = 1.0 / FIXED_TIMESTEP_HZ;
-    let mut seen_pairs: FxHashSet<(u64, u64)> = FxHashSet::default();
-    for (entity, delta, vel_delta, contacts) in &results {
+    seen_pairs_scratch.clear();
+    let seen_pairs = &mut *seen_pairs_scratch;
+    for (entity, delta, vel_delta, contacts) in results {
         let Ok((_, mut cell)) = cells.get_mut(*entity) else {
             continue;
         };
@@ -3234,10 +3399,11 @@ fn resolve_cell_collisions(
         }
     }
     // Bond pruning + maintenance — re-snapshot positions po Phase 2.
-    let positions: FxHashMap<u64, [f32; 3]> = cells
-        .iter()
-        .map(|(_, c)| (c.0.cell_id, c.0.position))
-        .collect();
+    positions_scratch.clear();
+    for (_, c) in cells.iter() {
+        positions_scratch.insert(c.0.cell_id, c.0.position);
+    }
+    let positions = &*positions_scratch;
     for (_, mut cell) in cells.iter_mut() {
         let outputs_9 = cell.0.last_outputs[9];
         let explicit_break = outputs_9 < BOND_BREAK_THRESHOLD;
@@ -3280,12 +3446,13 @@ fn resolve_cell_collisions(
         }
     });
     // Bond formation — kandidáti, kteří dosáhli BOND_FORM_TICKS thresholdu.
-    let candidates: Vec<(u64, u64)> = contact_progress
-        .0
-        .iter()
-        .filter_map(|(&pair, &ticks)| if ticks >= BOND_FORM_TICKS { Some(pair) } else { None })
-        .collect();
-    for (id_a, id_b) in candidates {
+    candidates_scratch.clear();
+    for (&pair, &ticks) in contact_progress.0.iter() {
+        if ticks >= BOND_FORM_TICKS {
+            candidates_scratch.push(pair);
+        }
+    }
+    for &(id_a, id_b) in candidates_scratch.iter() {
         let Some(&i_a) = id_to_idx.get(&id_a) else { continue };
         let Some(&i_b) = id_to_idx.get(&id_b) else { continue };
         let sa = &snapshot[i_a];
