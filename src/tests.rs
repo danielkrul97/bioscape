@@ -1,3 +1,6 @@
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
 use super::*;
 
 #[test]

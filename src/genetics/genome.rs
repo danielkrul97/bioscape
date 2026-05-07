@@ -1,6 +1,6 @@
 use core::f32::consts::TAU;
 
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::*;
