@@ -256,28 +256,35 @@ impl CellsGpu {
     }
 
     /// Sprint 63: combined batch readback po brain_act + step pipeline.
-    /// Mirror `download_brain_motor_batch` ale rozšířen o position/age/cooldown/
-    /// energy. Single Wait barrier pro all 9 buffers.
-    #[allow(clippy::type_complexity)]
-    pub fn download_full_batch(
+    /// Single Wait barrier pro all 9 buffers, výsledek se zapisuje do volajícím
+    /// poskytnutých scratch Vec slotů (clear+extend pattern). Pre-fix path
+    /// alokovala 9 fresh Vec na výstupu — nyní 0 alloc/free per call při
+    /// stable capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn download_full_batch_into(
         &self,
         n: usize,
-    ) -> (
-        Vec<[f32; BRAIN_HIDDEN]>,
-        Vec<[f32; BRAIN_OUTPUTS]>,
-        Vec<[f32; 3]>,  // velocities
-        Vec<f32>,        // angular velocities
-        Vec<f32>,        // pitch velocities
-        Vec<[f32; 3]>,  // positions
-        Vec<u32>,        // ages
-        Vec<u32>,        // cooldowns
-        Vec<f32>,        // energies
+        hidden_out: &mut Vec<[f32; BRAIN_HIDDEN]>,
+        outputs_out: &mut Vec<[f32; BRAIN_OUTPUTS]>,
+        velocities_out: &mut Vec<[f32; 3]>,
+        angular_out: &mut Vec<f32>,
+        pitch_out: &mut Vec<f32>,
+        positions_out: &mut Vec<[f32; 3]>,
+        ages_out: &mut Vec<u32>,
+        cooldowns_out: &mut Vec<u32>,
+        energies_out: &mut Vec<f32>,
     ) {
+        hidden_out.clear();
+        outputs_out.clear();
+        velocities_out.clear();
+        angular_out.clear();
+        pitch_out.clear();
+        positions_out.clear();
+        ages_out.clear();
+        cooldowns_out.clear();
+        energies_out.clear();
         if n == 0 {
-            return (
-                Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-                Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            );
+            return;
         }
         assert!(n <= self.capacity);
         let h_bytes = (n * BRAIN_HIDDEN * 4) as u64;
@@ -333,31 +340,25 @@ impl CellsGpu {
         let age_u: &[u32] = bytemuck::cast_slice(&age_data);
         let cd_u: &[u32] = bytemuck::cast_slice(&cd_data);
         let e_f: &[f32] = bytemuck::cast_slice(&e_data);
-        let hidden: Vec<[f32; BRAIN_HIDDEN]> = (0..n)
-            .map(|i| {
-                let mut a = [0.0_f32; BRAIN_HIDDEN];
-                a.copy_from_slice(&h_f[i * BRAIN_HIDDEN..(i + 1) * BRAIN_HIDDEN]);
-                a
-            })
-            .collect();
-        let outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
-            .map(|i| {
-                let mut a = [0.0_f32; BRAIN_OUTPUTS];
-                a.copy_from_slice(&o_f[i * BRAIN_OUTPUTS..(i + 1) * BRAIN_OUTPUTS]);
-                a
-            })
-            .collect();
-        let velocities: Vec<[f32; 3]> = (0..n)
-            .map(|i| [v_f[i * 3], v_f[i * 3 + 1], v_f[i * 3 + 2]])
-            .collect();
-        let angular: Vec<f32> = a_f[..n].to_vec();
-        let pitch_vels: Vec<f32> = p_f[..n].to_vec();
-        let positions: Vec<[f32; 3]> = (0..n)
-            .map(|i| [pos_f[i * 3], pos_f[i * 3 + 1], pos_f[i * 3 + 2]])
-            .collect();
-        let ages: Vec<u32> = age_u[..n].to_vec();
-        let cooldowns: Vec<u32> = cd_u[..n].to_vec();
-        let energies: Vec<f32> = e_f[..n].to_vec();
+        hidden_out.reserve(n);
+        outputs_out.reserve(n);
+        velocities_out.reserve(n);
+        positions_out.reserve(n);
+        for i in 0..n {
+            let mut h = [0.0_f32; BRAIN_HIDDEN];
+            h.copy_from_slice(&h_f[i * BRAIN_HIDDEN..(i + 1) * BRAIN_HIDDEN]);
+            hidden_out.push(h);
+            let mut o = [0.0_f32; BRAIN_OUTPUTS];
+            o.copy_from_slice(&o_f[i * BRAIN_OUTPUTS..(i + 1) * BRAIN_OUTPUTS]);
+            outputs_out.push(o);
+            velocities_out.push([v_f[i * 3], v_f[i * 3 + 1], v_f[i * 3 + 2]]);
+            positions_out.push([pos_f[i * 3], pos_f[i * 3 + 1], pos_f[i * 3 + 2]]);
+        }
+        angular_out.extend_from_slice(&a_f[..n]);
+        pitch_out.extend_from_slice(&p_f[..n]);
+        ages_out.extend_from_slice(&age_u[..n]);
+        cooldowns_out.extend_from_slice(&cd_u[..n]);
+        energies_out.extend_from_slice(&e_f[..n]);
         drop(h_data); drop(o_data); drop(v_data); drop(a_data); drop(p_data);
         drop(pos_data); drop(age_data); drop(cd_data); drop(e_data);
         self.last_hidden_rb.unmap();
@@ -369,7 +370,6 @@ impl CellsGpu {
         self.age_rb.unmap();
         self.cooldown_rb.unmap();
         self.energy_rb.unmap();
-        (hidden, outputs, velocities, angular, pitch_vels, positions, ages, cooldowns, energies)
     }
 
     /// Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim init +

@@ -15,6 +15,11 @@ pub fn reject_food_for_richness(rng: &mut impl Rng, richness: f32) -> bool {
 /// Sprint 40: greedy O(N²) párování fertile cells na základě 3D distance.
 /// Generic přes Idx (usize v headless, Entity v main) — helper dedupuje
 /// pairing logiku, která byla pre-refactor identická v obou binárkách.
+///
+/// Used `std::HashSet` (SipHash, randomized seed) → `FxHashSet` (fixed seed,
+/// 5–10× rychlejší hot ops). Iteration order výsledných párů zachován —
+/// outer loop indexuje `fertile` přímo, paired set se používá jen na
+/// `contains()`, takže RNG/CSV reproducibility intact.
 pub fn pair_fertile<I>(
     fertile: &[(I, [f32; 3])],
     mating_r2: f32,
@@ -24,9 +29,12 @@ pub fn pair_fertile<I>(
 where
     I: Copy + Eq + std::hash::Hash,
 {
-    use std::collections::HashSet;
-    let mut paired: HashSet<I> = HashSet::new();
-    let mut matings: Vec<(I, I)> = Vec::new();
+    let mut paired: rustc_hash::FxHashSet<I> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(
+            fertile.len(),
+            rustc_hash::FxBuildHasher::default(),
+        );
+    let mut matings: Vec<(I, I)> = Vec::with_capacity(budget.min(fertile.len() / 2));
     for i in 0..fertile.len() {
         if matings.len() >= budget {
             break;

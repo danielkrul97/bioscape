@@ -12,7 +12,7 @@ use bioscape::{
     WORLD_MAP_RES_Z,
 };
 use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -124,24 +124,26 @@ impl BenchWorld {
 
 fn bench_full_tick(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_tick");
+    let dt = 1.0 / 60.0;
     for &n in &[1000usize, 2500, 5000] {
         group.throughput(Throughput::Elements(TICKS_PER_MEASUREMENT * n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    let mut world = BenchWorld::new(n);
-                    let dt = 1.0 / 60.0;
-                    let start = std::time::Instant::now();
+            // `iter_batched` jasně odděluje setup (`BenchWorld::new`) a měřenou
+            // smyčku — Criterion volá setup raz per iter, čas se měří jen
+            // přes routine. Pre-fix `iter_custom` měl ekvivalentní bracketing
+            // ale ručně; iter_batched je idiomatičtější + lépe spolupracuje
+            // s Criterion warmup/sample logic.
+            b.iter_batched(
+                || BenchWorld::new(n),
+                |mut world| {
                     let mut sink = 0.0_f32;
                     for _ in 0..TICKS_PER_MEASUREMENT {
                         sink += world.tick(dt);
                     }
-                    total += start.elapsed();
                     black_box(sink);
-                }
-                total
-            })
+                },
+                BatchSize::PerIteration,
+            );
         });
     }
     group.finish();
@@ -149,8 +151,12 @@ fn bench_full_tick(c: &mut Criterion) {
 
 criterion_group! {
     name = full_tick;
+    // Sample size 30 (3× původní 10) zlepší stabilitu odhadu bez zhoršení
+    // wallclock — měření je pořád ohraničeno `measurement_time`, takže víc
+    // samples = kratší per-sample, ale stabilnější mean/variance.
     config = Criterion::default()
-        .sample_size(10)
+        .sample_size(30)
+        .warm_up_time(Duration::from_secs(3))
         .measurement_time(Duration::from_secs(20));
     targets = bench_full_tick
 }

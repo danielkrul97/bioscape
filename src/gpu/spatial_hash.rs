@@ -47,7 +47,9 @@ pub struct SpatialHashGpu {
     offsets_readback: wgpu::Buffer,
     sorted_readback: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    positions_packed: Vec<f32>,
+    /// Persistent zero-buffer pro counts reset. Pre-fix: `vec![0u8; N*4]` per
+    /// dispatch (32 KB alloc/free per spatial hash rebuild × 2 grids per tick).
+    counts_zero: Vec<u8>,
 }
 
 impl SpatialHashGpu {
@@ -199,7 +201,7 @@ impl SpatialHashGpu {
             offsets_readback,
             sorted_readback,
             bind_group,
-            positions_packed: Vec::new(),
+            counts_zero: vec![0u8; GPU_HASH_NUM_BUCKETS * 4],
         })
     }
 
@@ -335,21 +337,14 @@ impl SpatialHashGpu {
         }
         self.ensure_capacity(n);
 
-        // Reset counts to 0 (rebuild expects fresh state).
-        self.queue.write_buffer(
-            &self.counts_buf,
-            0,
-            &vec![0u8; GPU_HASH_NUM_BUCKETS * 4],
-        );
+        // Reset counts to 0 (rebuild expects fresh state). Persistent
+        // counts_zero buffer — pre-fix alokoval čerstvě 32 KB / dispatch.
+        self.queue
+            .write_buffer(&self.counts_buf, 0, &self.counts_zero);
 
-        self.positions_packed.clear();
-        self.positions_packed.reserve(n * 3);
-        for p in positions {
-            self.positions_packed.push(p[0]);
-            self.positions_packed.push(p[1]);
-            self.positions_packed.push(p[2]);
-        }
-
+        // Direct cast `&[[f32; 3]]` → `&[f32]` přes bytemuck — `[f32;3]` má
+        // identický layout, takže positions_packed kopie odpadá. Necháváme
+        // pole ve struktu (potenciální fallback), ale nevyplňujeme.
         let params = HashParams {
             num_cells: n as u32,
             cell_size: self.cell_size,
@@ -361,7 +356,7 @@ impl SpatialHashGpu {
         self.queue.write_buffer(
             &self.positions_buf,
             0,
-            bytemuck::cast_slice(&self.positions_packed),
+            bytemuck::cast_slice(positions),
         );
 
         let mut encoder = self
@@ -441,20 +436,9 @@ impl SpatialHashGpu {
         }
         self.ensure_capacity(n);
 
-        self.queue.write_buffer(
-            &self.counts_buf,
-            0,
-            &vec![0u8; GPU_HASH_NUM_BUCKETS * 4],
-        );
-
-        self.positions_packed.clear();
-        self.positions_packed.reserve(n * 3);
-        for p in positions {
-            self.positions_packed.push(p[0]);
-            self.positions_packed.push(p[1]);
-            self.positions_packed.push(p[2]);
-        }
-
+        // Persistent counts_zero + bytemuck cast_slice direct — viz `rebuild`.
+        self.queue
+            .write_buffer(&self.counts_buf, 0, &self.counts_zero);
         let params = HashParams {
             num_cells: n as u32,
             cell_size: self.cell_size,
@@ -466,7 +450,7 @@ impl SpatialHashGpu {
         self.queue.write_buffer(
             &self.positions_buf,
             0,
-            bytemuck::cast_slice(&self.positions_packed),
+            bytemuck::cast_slice(positions),
         );
 
         let mut encoder = self

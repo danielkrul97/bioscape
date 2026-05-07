@@ -31,6 +31,8 @@ mod csv;
 mod world;
 
 use csv::*;
+#[cfg(feature = "gpu")]
+use world::GpuFullScratch;
 use world::*;
 
 fn main() {
@@ -253,6 +255,7 @@ fn main() {
                 populate,
                 motor,
                 step,
+                scratch: GpuFullScratch::default(),
             })
         };
         match init() {

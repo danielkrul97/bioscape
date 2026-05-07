@@ -148,6 +148,35 @@ pub struct World {
     pub energy_deltas_scratch: Vec<f32>,
     pub damage_deltas_scratch: Vec<f32>,
     pub eaten_scratch: Vec<bool>,
+    /// Persistent cell_id → idx scratch. Built once at the start of each tick
+    /// (`rebuild_id_to_idx`) and consumed by pool_bonded_hidden, brain_act,
+    /// resolve_collisions, eat_food, hunt pack_shares. Avoids 4–5 fresh
+    /// FxHashMap allocations per tick.
+    pub id_to_idx_scratch: rustc_hash::FxHashMap<u64, usize>,
+    /// Persistent contact-list scratch — outer index = cell idx, inner Vec
+    /// drží `cell_id_j` (>i, dedupe). Pre-fix: `Vec<Vec<u64>>` collected per
+    /// tick → 1+N alloc/tick. Persistent reuse zachová capacity inner Vecs.
+    pub contact_lists_scratch: Vec<Vec<u64>>,
+    /// Phase 2 scratch — pozice po Phase-1 apply. Pre-fix: fresh
+    /// `Vec<[f32;3]>` per tick.
+    pub positions_snapshot_scratch: Vec<[f32; 3]>,
+    /// Phase 2 scratch — set párů viděných v aktuálním ticku. Pre-fix: fresh
+    /// FxHashSet per tick.
+    pub seen_pairs_scratch: rustc_hash::FxHashSet<(u64, u64)>,
+    /// Phase 2 scratch — bond-formation candidate pairs. Pre-fix: fresh Vec
+    /// collected per tick.
+    pub bond_candidates_scratch: Vec<(u64, u64)>,
+    /// Sprint 102: hunter cell grid. Pre-fix `let mut g = SpatialGrid::new()`
+    /// uvnitř `hunt()` per tick → fresh FxHashMap allocation. Persistent reuse
+    /// zachová bucket Vec capacities.
+    pub hunter_cell_grid_scratch: SpatialGrid<usize, ()>,
+    /// Hunters snapshot pro hunt sensor pack — minimální projekce
+    /// `HunterSnapshotMin` per hunter. Pre-fix: fresh Vec collected per tick.
+    pub hunter_snapshot_scratch: Vec<bioscape::HunterSnapshotMin>,
+    /// Hunt fáze: per-tick attack events `(victim_idx, damage)` + pack shares
+    /// `(partner_id, energy)`. Krátké, ale per-tick.
+    pub hunt_attacks_scratch: Vec<(usize, f32)>,
+    pub hunt_pack_shares_scratch: Vec<(u64, f32)>,
     pub births_gen: u64,
     pub deaths_gen: u64,
     pub fertile_ticks_gen: u64,
@@ -209,6 +238,74 @@ pub struct World {
     pub gpu_full: Option<GpuFullState>,
 }
 
+/// Persistent scratch arrays pro `brain_act_gpu_full` cell-metadata snapshots.
+/// Pre-fix path měla 17 fresh `Vec::collect()` per tick (positions×2, eff_radii,
+/// vision_radii, food_positions, energies, headings, pitches, damage_accums,
+/// max_speeds, velocities, angular_vels, pitch_vels, turn_rates, ages,
+/// cooldowns, body_dims, aux). Persistent scratch zachovává kapacitu napříč
+/// ticky → 0 alloc/free v hot loop (bar capacity grow při pop spike).
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+pub struct GpuFullScratch {
+    pub positions: Vec<[f32; 3]>,
+    pub eff_radii: Vec<f32>,
+    pub vision_radii: Vec<f32>,
+    pub food_positions: Vec<[f32; 3]>,
+    pub energies: Vec<f32>,
+    pub headings: Vec<f32>,
+    pub pitches: Vec<f32>,
+    pub damage_accums: Vec<f32>,
+    pub max_speeds: Vec<f32>,
+    pub velocities: Vec<[f32; 3]>,
+    pub angular_vels: Vec<f32>,
+    pub pitch_vels: Vec<f32>,
+    pub turn_rates: Vec<f32>,
+    pub ages: Vec<u32>,
+    pub cooldowns: Vec<u32>,
+    pub body_dims: Vec<[f32; 3]>,
+    pub aux: Vec<[f32; 4]>,
+    // Downstream readback scratch — vyplňuje `download_full_batch` na konci
+    // brain_act pipeline. Pre-fix: 9 fresh Vec collect/to_vec per tick.
+    pub dl_hiddens: Vec<[f32; BRAIN_HIDDEN]>,
+    pub dl_outputs: Vec<[f32; BRAIN_OUTPUTS]>,
+    pub dl_velocities: Vec<[f32; 3]>,
+    pub dl_angular: Vec<f32>,
+    pub dl_pitch: Vec<f32>,
+    pub dl_positions: Vec<[f32; 3]>,
+    pub dl_ages: Vec<u32>,
+    pub dl_cooldowns: Vec<u32>,
+    pub dl_energies: Vec<f32>,
+}
+
+#[cfg(feature = "gpu")]
+impl GpuFullScratch {
+    fn clear_and_reserve(&mut self, n: usize, food_n: usize) {
+        macro_rules! cr {
+            ($v:expr, $cap:expr) => {{
+                $v.clear();
+                $v.reserve($cap);
+            }};
+        }
+        cr!(self.positions, n);
+        cr!(self.eff_radii, n);
+        cr!(self.vision_radii, n);
+        cr!(self.food_positions, food_n);
+        cr!(self.energies, n);
+        cr!(self.headings, n);
+        cr!(self.pitches, n);
+        cr!(self.damage_accums, n);
+        cr!(self.max_speeds, n);
+        cr!(self.velocities, n);
+        cr!(self.angular_vels, n);
+        cr!(self.pitch_vels, n);
+        cr!(self.turn_rates, n);
+        cr!(self.ages, n);
+        cr!(self.cooldowns, n);
+        cr!(self.body_dims, n);
+        cr!(self.aux, n);
+    }
+}
+
 #[cfg(feature = "gpu")]
 pub struct GpuFullState {
     pub cells: CellsGpu,
@@ -238,6 +335,8 @@ pub struct GpuFullState {
     /// Sprint 63: step on GPU (kinematics + drag + energy + bounce).
     /// Fused do brain_act batch readback. Skip CPU `step` fáze v `--gpu-full`.
     pub step: StepGpu,
+    /// Persistent CPU snapshots — reused per tick, zachovává kapacitu.
+    pub scratch: GpuFullScratch,
 }
 
 impl World {
@@ -300,6 +399,15 @@ impl World {
             energy_deltas_scratch: Vec::new(),
             damage_deltas_scratch: Vec::new(),
             eaten_scratch: Vec::new(),
+            id_to_idx_scratch: rustc_hash::FxHashMap::default(),
+            contact_lists_scratch: Vec::new(),
+            positions_snapshot_scratch: Vec::new(),
+            seen_pairs_scratch: rustc_hash::FxHashSet::default(),
+            bond_candidates_scratch: Vec::new(),
+            hunter_cell_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
+            hunter_snapshot_scratch: Vec::new(),
+            hunt_attacks_scratch: Vec::new(),
+            hunt_pack_shares_scratch: Vec::new(),
             births_gen: 0,
             deaths_gen: 0,
             fertile_ticks_gen: 0,
@@ -428,6 +536,15 @@ impl World {
             energy_deltas_scratch: Vec::new(),
             damage_deltas_scratch: Vec::new(),
             eaten_scratch: Vec::new(),
+            id_to_idx_scratch: rustc_hash::FxHashMap::default(),
+            contact_lists_scratch: Vec::new(),
+            positions_snapshot_scratch: Vec::new(),
+            seen_pairs_scratch: rustc_hash::FxHashSet::default(),
+            bond_candidates_scratch: Vec::new(),
+            hunter_cell_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
+            hunter_snapshot_scratch: Vec::new(),
+            hunt_attacks_scratch: Vec::new(),
+            hunt_pack_shares_scratch: Vec::new(),
             births_gen: chk.births_gen,
             deaths_gen: chk.deaths_gen,
             fertile_ticks_gen: chk.fertile_ticks_gen,
@@ -469,6 +586,17 @@ impl World {
         })
     }
 
+    /// Rebuild persistent `id_to_idx_scratch` from current `cells` order.
+    /// Cell layout je stable v rámci fází 3–17 (před `reproduce` / `die_*`),
+    /// takže build raz per tick stačí. `clear()` zachovává hashmap kapacity.
+    fn rebuild_id_to_idx(&mut self) {
+        self.id_to_idx_scratch.clear();
+        self.id_to_idx_scratch.reserve(self.cells.len());
+        for (i, c) in self.cells.iter().enumerate() {
+            self.id_to_idx_scratch.insert(c.cell_id, i);
+        }
+    }
+
     pub fn tick(&mut self, rng: &mut impl Rng) -> Option<u64> {
         let dt = 1.0 / FIXED_TIMESTEP_HZ;
         let transitions = self.clock.advance();
@@ -495,6 +623,11 @@ impl World {
 
         timed!(update_smell, self.update_smell(dt));
         timed!(update_pheromone, self.update_pheromone(dt));
+        // Persistent cell_id → idx — built once per tick, consumed v pool_bonded_hidden,
+        // brain_act, resolve_collisions, eat_food, hunt. Cell layout je stable
+        // od tady přes eat_food; reproduce/die_and_drop_carrion na konci ticku
+        // mapu invalidují, ale ta se rebuilduje další tick.
+        self.rebuild_id_to_idx();
         // Sprint 94: pool last_hidden across bond network → cluster cells share
         // recurrent state. Must run before brain_act (which reads pooled_hidden).
         self.pool_bonded_hidden();
@@ -785,74 +918,70 @@ impl World {
         for cell in &mut self.cells {
             cell.apply_shell_absorb(dt);
         }
-        let positions: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
-        let eff_radii: Vec<f32> = self
-            .cells
-            .iter()
-            .map(|c| c.phenotype.effective_radius())
-            .collect();
-        let vision_radii: Vec<f32> = self.cells.iter().map(|c| c.genome.vision_radius).collect();
-        // Sprint 128: coop foods se shoda do same sensor pool jako regular food.
-        // GPU sensor shader dělá nearest_food selection napříč single array,
-        // takže injekce na konec stačí (pozice se needitují).
-        let mut food_positions: Vec<[f32; 3]> = self.foods.iter().map(|f| f.position).collect();
-        food_positions.extend(self.coop_foods.iter().map(|c| c.position));
 
-        // Per-cell metadata pro populate_inputs + motor + step shaders.
-        let energies: Vec<f32> = self.cells.iter().map(|c| c.energy).collect();
-        let headings: Vec<f32> = self.cells.iter().map(|c| c.heading).collect();
-        let pitches: Vec<f32> = self.cells.iter().map(|c| c.pitch).collect();
-        let damage_accums: Vec<f32> = self.cells.iter().map(|c| c.damage_accum).collect();
-        let max_speeds: Vec<f32> = self.cells.iter().map(|c| c.genome.max_speed).collect();
-        let velocities: Vec<[f32; 3]> = self.cells.iter().map(|c| c.velocity).collect();
-        // Sprint 62: motor čte angular_velocity + pitch_velocity. Upload current
-        // state — motor shader mutuje a download_brain_motor_batch sync zpět.
-        let angular_vels: Vec<f32> = self.cells.iter().map(|c| c.angular_velocity).collect();
-        let pitch_vels: Vec<f32> = self.cells.iter().map(|c| c.pitch_velocity).collect();
-        // Sprint 62: turn_rate per-tick upload (lazy approach) — reproduce
-        // mění turn_rate u nových childů, takže pre-tick refresh je safer
-        // než per-event sparse update. ~4 KB/tick negligible.
-        let turn_rates: Vec<f32> = self.cells.iter().map(|c| c.genome.turn_rate).collect();
-        // Sprint 63: step shader needs position/age/cooldown/body_dims/aux.
-        // Apply_morph CPU has run earlier this tick → phenotype bytes current.
-        let positions_for_step: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
-        let ages: Vec<u32> = self.cells.iter().map(|c| c.age as u32).collect();
-        let cooldowns: Vec<u32> = self
-            .cells
-            .iter()
-            .map(|c| c.reproduce_cooldown_ticks)
-            .collect();
-        let body_dims: Vec<[f32; 3]> = self
-            .cells
-            .iter()
-            .map(|c| {
-                [
-                    c.phenotype.body_length,
-                    c.phenotype.body_width,
-                    c.phenotype.body_height,
-                ]
-            })
-            .collect();
-        // Sprint 63: aux = [spike_length, shell_thickness, vision_radius, attack_strength].
-        // Attack je per-tick z `cell.last_outputs[6].max(0.0)` — populated po
-        // brain forward (Sprint 62 phase 6). Tady CPU snapshot dává přístup
-        // k *předchozí* tick last_outputs (1-tick delay shell_absorb-like).
-        // To matchne lib `Cell::apply_energy_costs` semantiku (čte předchozí
-        // post-brain attack signal).
-        let aux: Vec<[f32; 4]> = self
-            .cells
-            .iter()
-            .map(|c| {
-                [
-                    c.phenotype.total_spike_cost_factor(),
-                    c.phenotype.shell_thickness,
-                    c.genome.vision_radius,
-                    c.last_outputs[6].max(0.0),
-                ]
-            })
-            .collect();
-
+        // Persistent scratch fill — single pass přes cells, zachovaná kapacita
+        // mezi ticky. Pre-fix: 17× `iter().map().collect()` → 17 alloc/tick.
+        let food_n = self.foods.len() + self.coop_foods.len();
         let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
+        let s = &mut gpu.scratch;
+        s.clear_and_reserve(n, food_n);
+        for cell in self.cells.iter() {
+            s.positions.push(cell.position);
+            s.eff_radii.push(cell.phenotype.effective_radius());
+            s.vision_radii.push(cell.genome.vision_radius);
+            s.energies.push(cell.energy);
+            s.headings.push(cell.heading);
+            s.pitches.push(cell.pitch);
+            s.damage_accums.push(cell.damage_accum);
+            s.max_speeds.push(cell.genome.max_speed);
+            s.velocities.push(cell.velocity);
+            s.angular_vels.push(cell.angular_velocity);
+            s.pitch_vels.push(cell.pitch_velocity);
+            s.turn_rates.push(cell.genome.turn_rate);
+            s.ages.push(cell.age as u32);
+            s.cooldowns.push(cell.reproduce_cooldown_ticks);
+            s.body_dims.push([
+                cell.phenotype.body_length,
+                cell.phenotype.body_width,
+                cell.phenotype.body_height,
+            ]);
+            // aux = [spike_length, shell_thickness, vision_radius, attack_strength].
+            // Sprint 63: attack je předchozí tick last_outputs[6] (1-tick delay).
+            s.aux.push([
+                cell.phenotype.total_spike_cost_factor(),
+                cell.phenotype.shell_thickness,
+                cell.genome.vision_radius,
+                cell.last_outputs[6].max(0.0),
+            ]);
+        }
+        // Sprint 128: foods + coop_foods do single sensor pool.
+        for food in self.foods.iter() {
+            s.food_positions.push(food.position);
+        }
+        for coop in self.coop_foods.iter() {
+            s.food_positions.push(coop.position);
+        }
+
+        // Aliases pro zbytek funkce (immutable views — zachovávají původní
+        // názvy proměnných, takže downstream kód zůstane beze změny).
+        let positions = s.positions.as_slice();
+        let eff_radii = s.eff_radii.as_slice();
+        let vision_radii = s.vision_radii.as_slice();
+        let food_positions = s.food_positions.as_slice();
+        let energies = s.energies.as_slice();
+        let headings = s.headings.as_slice();
+        let pitches = s.pitches.as_slice();
+        let damage_accums = s.damage_accums.as_slice();
+        let max_speeds = s.max_speeds.as_slice();
+        let velocities = s.velocities.as_slice();
+        let angular_vels = s.angular_vels.as_slice();
+        let pitch_vels = s.pitch_vels.as_slice();
+        let turn_rates = s.turn_rates.as_slice();
+        let positions_for_step = positions;
+        let ages = s.ages.as_slice();
+        let cooldowns = s.cooldowns.as_slice();
+        let body_dims = s.body_dims.as_slice();
+        let aux = s.aux.as_slice();
 
         // Phase 2: upload cell metadata + velocities + angular/pitch velocities.
         gpu.cells.upload_metadata(
@@ -985,23 +1114,33 @@ impl World {
         gpu.step.dispatch_with_cells(&gpu.cells, n, step_params);
 
         // Phase 10: single batch readback (Sprint 63: 9 buffers fused do
-        // jednoho Wait barrier). Hidden + outputs pro Hebbian/predate/emit;
-        // velocity + ang_vel + pitch_vel + position + age + cooldown + energy
-        // pro CPU phases (eat_food, predate, collisions, reproduce, hazards).
-        let (
-            hiddens,
-            outputs,
-            new_vels,
-            new_ang,
-            new_pitch,
-            new_pos,
-            new_ages,
-            new_cooldowns,
-            new_energies,
-        ) = gpu.cells.download_full_batch(n);
+        // jednoho Wait barrier). Pre-fix path 9 fresh Vec collect/to_vec —
+        // teď přepíše persistent scratch sloty, 0 alloc/free při stable cap.
+        gpu.cells.download_full_batch_into(
+            n,
+            &mut gpu.scratch.dl_hiddens,
+            &mut gpu.scratch.dl_outputs,
+            &mut gpu.scratch.dl_velocities,
+            &mut gpu.scratch.dl_angular,
+            &mut gpu.scratch.dl_pitch,
+            &mut gpu.scratch.dl_positions,
+            &mut gpu.scratch.dl_ages,
+            &mut gpu.scratch.dl_cooldowns,
+            &mut gpu.scratch.dl_energies,
+        );
 
         // Phase 11: CPU writeback. NO apply_brain_motor + NO Cell::step CPU
         // (oba byly GPU-side). damage_accum reset (mirror populate_inputs).
+        let dl = &gpu.scratch;
+        let hiddens = &dl.dl_hiddens;
+        let outputs = &dl.dl_outputs;
+        let new_vels = &dl.dl_velocities;
+        let new_ang = &dl.dl_angular;
+        let new_pitch = &dl.dl_pitch;
+        let new_pos = &dl.dl_positions;
+        let new_ages = &dl.dl_ages;
+        let new_cooldowns = &dl.dl_cooldowns;
+        let new_energies = &dl.dl_energies;
         self.cells
             .par_iter_mut()
             .enumerate()
@@ -1142,12 +1281,7 @@ impl World {
 
         // Sprint 97: Phase 1b: pool max-magnitude přes bond network. Provede se
         // PŘED GPU uploadem aby brain forward už dostal pooled inputs.
-        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.cell_id, i))
-            .collect();
+        let id_to_idx = &self.id_to_idx_scratch;
         let pooled_inputs: Vec<[f32; BRAIN_INPUTS]> = self
             .cells
             .par_iter()
@@ -1200,13 +1334,8 @@ impl World {
         if self.cells.is_empty() {
             return;
         }
-        // Build cell_id → idx map once per tick.
-        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.cell_id, i))
-            .collect();
+        // Reuse persistent id_to_idx_scratch (built v `tick`).
+        let id_to_idx = &self.id_to_idx_scratch;
         // Snapshot last_hidden array — read-only během compute, write-only
         // do pooled_hidden, no aliasing issues.
         let snapshot: Vec<[f32; BRAIN_HIDDEN]> =
@@ -1339,12 +1468,7 @@ impl World {
             })
             .collect();
 
-        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.cell_id, i))
-            .collect();
+        let id_to_idx = &self.id_to_idx_scratch;
 
         self.cells
             .par_iter_mut()
@@ -1456,17 +1580,21 @@ impl World {
                 .enumerate()
                 .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
         );
-        // Sprint 66: cell_id → idx map pro O(1) bond lookup.
-        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.cell_id, i))
-            .collect();
+        // Sprint 66: cell_id → idx map pro O(1) bond lookup. Reuse persistent
+        // scratch built v `tick` start.
+        let id_to_idx = &self.id_to_idx_scratch;
         self.deltas_scratch.clear();
         self.deltas_scratch.resize(n, [0.0, 0.0, 0.0]);
         self.velocity_deltas_scratch.clear();
         self.velocity_deltas_scratch.resize(n, [0.0, 0.0, 0.0]);
+        // P1-#6: persistent contact_lists. Resize a clear inner Vecs (zachová
+        // capacity), pak par_iter_mut zip — žádné fresh `Vec<Vec<u64>>` per tick.
+        if self.contact_lists_scratch.len() < n {
+            self.contact_lists_scratch.resize_with(n, Vec::new);
+        }
+        for inner in self.contact_lists_scratch.iter_mut().take(n) {
+            inner.clear();
+        }
 
         let cell_grid = &self.cell_grid;
         let cells = &self.cells;
@@ -1475,11 +1603,12 @@ impl World {
         // Pro jistotu používáme effective_radius_i × CELL_RADIUS × 2 × FACTOR.
         // Per-i collected contact pairs: (other_cell_id, currently_in_contact).
         // Phase 2 sequentially merges do contact_progress.
-        let contact_lists: Vec<Vec<u64>> = (0..n)
-            .into_par_iter()
-            .zip(self.deltas_scratch.par_iter_mut())
+        self.deltas_scratch
+            .par_iter_mut()
             .zip(self.velocity_deltas_scratch.par_iter_mut())
-            .map(|((i, delta), vel_delta)| {
+            .zip(self.contact_lists_scratch.par_iter_mut().take(n))
+            .enumerate()
+            .for_each(|(i, ((delta, vel_delta), local_contacts))| {
                 let pos_i = cells[i].position;
                 let vel_i = cells[i].velocity;
                 let radius_i = cells[i].phenotype.effective_radius();
@@ -1489,7 +1618,6 @@ impl World {
                     CELL_RADIUS * (radius_i + cells[i].phenotype.max_axis() * 2.0)
                         * ADHESION_RANGE_FACTOR;
                 let search_r = collision_r.max(adhesion_r);
-                let mut local_contacts: Vec<u64> = Vec::new();
                 let cell_id_i = cells[i].cell_id;
                 cell_grid.for_each_in_radius_toroidal(
                     pos_i,
@@ -1572,9 +1700,7 @@ impl World {
                         }
                     }
                 }
-                local_contacts
-            })
-            .collect();
+            });
 
         // Phase 2: sequential apply position/velocity deltas + contact tracker
         // update + bond pruning + bond formation. Vše drží borrow checker happy
@@ -1601,8 +1727,11 @@ impl World {
         //  3. distance > rest × BREAK_FACTOR → drop (overstretch).
         //  4. jinak inkrement age + accumulate per-cell bond count pro maintenance.
         let mut bonds_broken_this_tick: u64 = 0;
-        let positions_snapshot: Vec<[f32; 3]> =
-            self.cells.iter().map(|c| c.position).collect();
+        // P1-#7: persistent positions snapshot scratch.
+        self.positions_snapshot_scratch.clear();
+        self.positions_snapshot_scratch
+            .extend(self.cells.iter().map(|c| c.position));
+        let positions_snapshot = self.positions_snapshot_scratch.as_slice();
         for i in 0..self.cells.len() {
             let outputs_9 = self.cells[i].last_outputs[9];
             let explicit_break = outputs_9 < BOND_BREAK_THRESHOLD;
@@ -1642,21 +1771,22 @@ impl World {
         // contact pairs. Increment for new contacts; decrement-or-prune for
         // pairs not seen this tick. Then attempt bond formation pro kandidáty
         // ≥ BOND_FORM_TICKS, kteří mají match adhesion_type + oba bond_active.
-        let mut seen_pairs: rustc_hash::FxHashSet<(u64, u64)> =
-            rustc_hash::FxHashSet::default();
+        // P1-#7: reuse persistent seen_pairs / bond_candidates scratch.
+        self.seen_pairs_scratch.clear();
         // Accumulate per-pair "i side bond_active" flag — both sides must be true.
         // Cell i shipped (other_id, bond_active_i); for cell j we look it up
         // separately by checking cells[id_to_idx[j]].last_outputs[9].
-        for (i, contacts) in contact_lists.iter().enumerate() {
+        for (i, contacts) in self.contact_lists_scratch.iter().take(n).enumerate() {
             let cell_id_i = self.cells[i].cell_id;
-            for &other_id in contacts {
+            for &other_id in contacts.iter() {
                 let key = (cell_id_i, other_id);
-                seen_pairs.insert(key);
+                self.seen_pairs_scratch.insert(key);
                 let entry = self.contact_progress.entry(key).or_insert(0);
                 *entry = entry.saturating_add(1);
             }
         }
         // Decay / prune unseen pairs. Použijeme retain s decrementing.
+        let seen_pairs = &self.seen_pairs_scratch;
         self.contact_progress.retain(|key, ticks| {
             if seen_pairs.contains(key) {
                 true
@@ -1673,18 +1803,15 @@ impl World {
         // Kontrola: same adhesion_type, oba bond_active, oba mají volný slot.
         // Při úspěchu: zápis bondu na obou stranách + cost na obě cells.
         let mut bonds_formed_this_tick: u64 = 0;
-        let candidates: Vec<(u64, u64)> = self
-            .contact_progress
-            .iter()
-            .filter_map(|(&(a, b), &ticks)| {
-                if ticks >= BOND_FORM_TICKS {
-                    Some((a, b))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for (id_a, id_b) in candidates {
+        self.bond_candidates_scratch.clear();
+        for (&(a, b), &ticks) in self.contact_progress.iter() {
+            if ticks >= BOND_FORM_TICKS {
+                self.bond_candidates_scratch.push((a, b));
+            }
+        }
+        // Take to drop borrow on self before mutating cells inside the loop.
+        let candidates = std::mem::take(&mut self.bond_candidates_scratch);
+        for (id_a, id_b) in candidates.iter().copied() {
             let Some(&i_a) = id_to_idx.get(&id_a) else { continue };
             let Some(&i_b) = id_to_idx.get(&id_b) else { continue };
             if i_a == i_b {
@@ -1756,6 +1883,10 @@ impl World {
             // Reset progress entry — nepokouší se znova ihned formovat.
             self.contact_progress.remove(&(id_a, id_b));
         }
+        // Vrať buffer zpět (put-back) aby kapacita persistovala přes ticky.
+        let mut candidates = candidates;
+        candidates.clear();
+        self.bond_candidates_scratch = candidates;
         self.bonds_formed_gen += bonds_formed_this_tick;
         self.bonds_broken_gen += bonds_broken_this_tick;
     }
@@ -2082,28 +2213,31 @@ impl World {
     /// `self.cells` po uvolnění hunter borrow.
     fn hunt(&mut self, rng: &mut impl Rng, dt: f32) {
         let _ = rng; // Sprint 90: brain replaces idle drift, no rng needed in hunt.
-        let cells_ref = &self.cells;
-        let smell = &self.smell;
-        // Sprint 102: cell spatial grid (1× per tick) + minimální hunter
-        // snapshot (id, pos, adhesion_type) pro pack sensing. Nahrazuje
-        // O(H·N) brute force scan + per-tick deep clone celého `self.hunters`.
-        let mut hunter_cell_grid: SpatialGrid<usize, ()> =
-            SpatialGrid::new(HUNTER_GRID_CELL_SIZE);
-        hunter_cell_grid.rebuild(
+        // Sprint 102: cell spatial grid + minimální hunter snapshot.
+        // P1-#10: persistent hunter_cell_grid + hunter_snapshot scratch reuse —
+        // pre-fix: fresh `SpatialGrid::new()` + fresh `Vec` collected per tick.
+        self.hunter_cell_grid_scratch.rebuild(
             self.cells
                 .iter()
                 .enumerate()
                 .map(|(i, c)| (i, c.position, ())),
         );
-        let hunters_snapshot: Vec<bioscape::HunterSnapshotMin> = self
-            .hunters
-            .iter()
-            .map(bioscape::HunterSnapshotMin::from_hunter)
-            .collect();
-        let mut attacks: Vec<(usize, f32)> = Vec::new();
+        self.hunter_snapshot_scratch.clear();
+        self.hunter_snapshot_scratch.extend(
+            self.hunters
+                .iter()
+                .map(bioscape::HunterSnapshotMin::from_hunter),
+        );
+        self.hunt_attacks_scratch.clear();
+        self.hunt_pack_shares_scratch.clear();
+        let cells_ref = &self.cells;
+        let smell = &self.smell;
+        let hunter_cell_grid = &self.hunter_cell_grid_scratch;
+        let hunters_snapshot = self.hunter_snapshot_scratch.as_slice();
+        let attacks = &mut self.hunt_attacks_scratch;
         // Sprint 101: pack kill share. Při damage_dealt > 0 collected (partner_id,
         // share_amount) — apply na partnery až po mut iter loop.
-        let mut pack_shares: Vec<(u64, f32)> = Vec::new();
+        let pack_shares = &mut self.hunt_pack_shares_scratch;
         for hunter in &mut self.hunters {
             // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain) +
             // step (kinematic). Replaces Sprint 89 seek-based step.
@@ -2160,7 +2294,10 @@ impl World {
             hunter.apply_energy_costs(dt);
             hunter.energy += gain;
         }
-        // Sprint 101: distribute pack shares post-loop.
+        // Sprint 101: distribute pack shares post-loop. (Hunter-side mapping;
+        // cell-level id_to_idx_scratch je různá doména, takže standalone build
+        // — typicky N ≤ 50, scratch jen ad-hoc.)
+        let n_attacks = attacks.len() as u64;
         if !pack_shares.is_empty() {
             let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
                 .hunters
@@ -2168,14 +2305,14 @@ impl World {
                 .enumerate()
                 .map(|(i, h)| (h.hunter_id, i))
                 .collect();
-            for (id, energy) in pack_shares {
+            for &(id, energy) in self.hunt_pack_shares_scratch.iter() {
                 if let Some(&i) = id_to_idx.get(&id) {
                     self.hunters[i].energy += energy;
                 }
             }
         }
-        self.hunter_attacks_gen += attacks.len() as u64;
-        for (i, damage) in attacks {
+        self.hunter_attacks_gen += n_attacks;
+        for &(i, damage) in self.hunt_attacks_scratch.iter() {
             let cell = &mut self.cells[i];
             cell.energy -= damage;
             cell.damage_accum += damage;
@@ -2293,15 +2430,9 @@ impl World {
         self.eaten_scratch.clear();
         self.eaten_scratch.resize(self.foods.len(), false);
 
-        // Sprint 78: cell_id → idx map pro food share lookup. Cells layout
-        // se v eat_food nezmění (no spawn/despawn mid-fáze), takže build-once
-        // je bezpečný.
-        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.cell_id, i))
-            .collect();
+        // Sprint 78: cell_id → idx map pro food share lookup. Reuse persistent
+        // scratch (built v `tick` start, cells layout v eat_food beze změny).
+        let id_to_idx = &self.id_to_idx_scratch;
 
         #[cfg(feature = "gpu")]
         let use_gpu_hebbian = self.gpu_full.is_some();
