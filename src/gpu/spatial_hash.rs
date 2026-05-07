@@ -1,0 +1,532 @@
+use std::sync::Arc;
+
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+
+use crate::*;
+use super::*;
+
+// ============================================================================
+// Sprint 45: GPU spatial hash (counting sort)
+// ============================================================================
+
+/// Layout musí matchnout `shaders/spatial_hash.wgsl`. Bucket grid je fixed
+/// 64×32×4 = 8192 cells krytí ±2048 / ±512 / ±128 world units při
+/// `GRID_CELL_SIZE = 64`.
+pub const GPU_HASH_GRID_NX: i32 = 64;
+pub const GPU_HASH_GRID_NY: i32 = 32;
+pub const GPU_HASH_GRID_NZ: i32 = 4;
+pub const GPU_HASH_NUM_BUCKETS: usize =
+    (GPU_HASH_GRID_NX * GPU_HASH_GRID_NY * GPU_HASH_GRID_NZ) as usize;
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
+struct HashParams {
+    num_cells: u32,
+    cell_size: f32,
+    /// Sprint 55: xy world bounds pro toroidal bucket wrap.
+    world_half_x: f32,
+    world_half_y: f32,
+}
+
+pub struct SpatialHashGpu {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    pipeline_count: wgpu::ComputePipeline,
+    pipeline_prefix: wgpu::ComputePipeline,
+    pipeline_scatter: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    capacity: usize,
+    cell_size: f32,
+    /// Sprint 55: xy world bounds pro toroidal bucket wrap.
+    world_half_xy: [f32; 2],
+    params_buf: wgpu::Buffer,
+    positions_buf: wgpu::Buffer,
+    counts_buf: wgpu::Buffer,
+    offsets_buf: wgpu::Buffer,
+    sorted_buf: wgpu::Buffer,
+    offsets_readback: wgpu::Buffer,
+    sorted_readback: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    positions_packed: Vec<f32>,
+}
+
+impl SpatialHashGpu {
+    pub fn new(capacity: usize, cell_size: f32, world_half_xy: [f32; 2]) -> Result<Self, String> {
+        assert!(capacity > 0);
+        let ctx = GpuContext::new()?;
+        Self::with_device_inner(ctx.device, ctx.queue, capacity, cell_size, world_half_xy)
+    }
+
+    pub fn with_context(
+        ctx: &GpuContext,
+        capacity: usize,
+        cell_size: f32,
+        world_half_xy: [f32; 2],
+    ) -> Result<Self, String> {
+        Self::with_device_inner(
+            Arc::clone(&ctx.device),
+            Arc::clone(&ctx.queue),
+            capacity,
+            cell_size,
+            world_half_xy,
+        )
+    }
+
+    fn with_device_inner(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        capacity: usize,
+        cell_size: f32,
+        world_half_xy: [f32; 2],
+    ) -> Result<Self, String> {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("spatial_hash"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/spatial_hash.wgsl").into(),
+            ),
+        });
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("hash-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hash-pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let make_pipe = |entry: &str, label: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        let pipeline_count = make_pipe("count", "hash-count");
+        let pipeline_prefix = make_pipe("prefix_sum", "hash-prefix");
+        let pipeline_scatter = make_pipe("scatter", "hash-scatter");
+
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hash-params"),
+            contents: bytemuck::bytes_of(&HashParams::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let (positions_buf, counts_buf, offsets_buf, sorted_buf, offsets_readback, sorted_readback) =
+            Self::alloc_buffers(&device, capacity);
+        let bind_group = Self::make_bind_group(
+            &device,
+            &bind_group_layout,
+            &params_buf,
+            &positions_buf,
+            &counts_buf,
+            &offsets_buf,
+            &sorted_buf,
+        );
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline_count,
+            pipeline_prefix,
+            pipeline_scatter,
+            bind_group_layout,
+            capacity,
+            cell_size,
+            world_half_xy,
+            params_buf,
+            positions_buf,
+            counts_buf,
+            offsets_buf,
+            sorted_buf,
+            offsets_readback,
+            sorted_readback,
+            bind_group,
+            positions_packed: Vec::new(),
+        })
+    }
+
+    fn alloc_buffers(
+        device: &wgpu::Device,
+        capacity: usize,
+    ) -> (
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+    ) {
+        let pos_size = (capacity * 3 * std::mem::size_of::<f32>()) as u64;
+        let counts_size = (GPU_HASH_NUM_BUCKETS * std::mem::size_of::<u32>()) as u64;
+        let offsets_size = ((GPU_HASH_NUM_BUCKETS + 1) * std::mem::size_of::<u32>()) as u64;
+        let sorted_size = (capacity * std::mem::size_of::<u32>()) as u64;
+        let positions_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hash-positions"),
+            size: pos_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hash-counts"),
+            size: counts_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let offsets_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hash-offsets"),
+            size: offsets_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let sorted_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hash-sorted"),
+            size: sorted_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let offsets_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hash-offsets-readback"),
+            size: offsets_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sorted_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hash-sorted-readback"),
+            size: sorted_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        (
+            positions_buf,
+            counts_buf,
+            offsets_buf,
+            sorted_buf,
+            offsets_readback,
+            sorted_readback,
+        )
+    }
+
+    fn make_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        params: &wgpu::Buffer,
+        positions: &wgpu::Buffer,
+        counts: &wgpu::Buffer,
+        offsets: &wgpu::Buffer,
+        sorted: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hash-bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: positions.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: counts.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: sorted.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn ensure_capacity(&mut self, n: usize) {
+        if n <= self.capacity {
+            return;
+        }
+        let new_cap = (self.capacity * 2).max(n);
+        let (p, c, o, s, or_, sr) = Self::alloc_buffers(&self.device, new_cap);
+        self.positions_buf = p;
+        self.counts_buf = c;
+        self.offsets_buf = o;
+        self.sorted_buf = s;
+        self.offsets_readback = or_;
+        self.sorted_readback = sr;
+        self.bind_group = Self::make_bind_group(
+            &self.device,
+            &self.bind_group_layout,
+            &self.params_buf,
+            &self.positions_buf,
+            &self.counts_buf,
+            &self.offsets_buf,
+            &self.sorted_buf,
+        );
+        self.capacity = new_cap;
+    }
+
+    /// Vrátí `(offsets[NUM_BUCKETS+1], sorted_cells[N])`. offsets[b] je
+    /// inclusive začátek a offsets[b+1] exclusive konec range v sorted_cells
+    /// pro bucket b. offsets[NUM_BUCKETS] = N (total).
+    pub fn rebuild(&mut self, positions: &[[f32; 3]]) -> (Vec<u32>, Vec<u32>) {
+        let n = positions.len();
+        if n == 0 {
+            return (vec![0; GPU_HASH_NUM_BUCKETS + 1], Vec::new());
+        }
+        self.ensure_capacity(n);
+
+        // Reset counts to 0 (rebuild expects fresh state).
+        self.queue.write_buffer(
+            &self.counts_buf,
+            0,
+            &vec![0u8; GPU_HASH_NUM_BUCKETS * 4],
+        );
+
+        self.positions_packed.clear();
+        self.positions_packed.reserve(n * 3);
+        for p in positions {
+            self.positions_packed.push(p[0]);
+            self.positions_packed.push(p[1]);
+            self.positions_packed.push(p[2]);
+        }
+
+        let params = HashParams {
+            num_cells: n as u32,
+            cell_size: self.cell_size,
+            world_half_x: self.world_half_xy[0],
+            world_half_y: self.world_half_xy[1],
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(
+            &self.positions_buf,
+            0,
+            bytemuck::cast_slice(&self.positions_packed),
+        );
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hash-encoder"),
+            });
+        let workgroups = ((n as u32) + 63) / 64;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-count-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_count);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-prefix-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_prefix);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-scatter-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_scatter);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        let offsets_bytes = ((GPU_HASH_NUM_BUCKETS + 1) * 4) as u64;
+        let sorted_bytes = (n * 4) as u64;
+        encoder.copy_buffer_to_buffer(
+            &self.offsets_buf,
+            0,
+            &self.offsets_readback,
+            0,
+            offsets_bytes,
+        );
+        encoder.copy_buffer_to_buffer(&self.sorted_buf, 0, &self.sorted_readback, 0, sorted_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let off_slice = self.offsets_readback.slice(0..offsets_bytes);
+        let sor_slice = self.sorted_readback.slice(0..sorted_bytes);
+        off_slice.map_async(wgpu::MapMode::Read, |_| {});
+        sor_slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let offsets: Vec<u32> = {
+            let data = off_slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, u32>(&data).to_vec()
+        };
+        let sorted: Vec<u32> = {
+            let data = sor_slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, u32>(&data).to_vec()
+        };
+        self.offsets_readback.unmap();
+        self.sorted_readback.unmap();
+        (offsets, sorted)
+    }
+
+    /// Sprint 60: variant of `rebuild()` bez per-tick readback. Just submits
+    /// count → prefix → scatter dispatch a vrací. Použito v full-GPU sensor
+    /// pipeline kde offsets/sorted čte SensorGatherGpu shader direct přes
+    /// `offsets_buffer()` / `sorted_buffer()` accessory. Eliminuje 2× `device.poll(Wait)`
+    /// round-trip per tick (cell hash + food hash).
+    pub fn dispatch(&mut self, positions: &[[f32; 3]]) {
+        let n = positions.len();
+        if n == 0 {
+            return;
+        }
+        self.ensure_capacity(n);
+
+        self.queue.write_buffer(
+            &self.counts_buf,
+            0,
+            &vec![0u8; GPU_HASH_NUM_BUCKETS * 4],
+        );
+
+        self.positions_packed.clear();
+        self.positions_packed.reserve(n * 3);
+        for p in positions {
+            self.positions_packed.push(p[0]);
+            self.positions_packed.push(p[1]);
+            self.positions_packed.push(p[2]);
+        }
+
+        let params = HashParams {
+            num_cells: n as u32,
+            cell_size: self.cell_size,
+            world_half_x: self.world_half_xy[0],
+            world_half_y: self.world_half_xy[1],
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(
+            &self.positions_buf,
+            0,
+            bytemuck::cast_slice(&self.positions_packed),
+        );
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hash-dispatch-encoder"),
+            });
+        let workgroups = ((n as u32) + 63) / 64;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-count-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_count);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-prefix-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_prefix);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-scatter-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_scatter);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Sprint 49: accessor pro chained shadery (NeighborsGpu) — bind hash
+    /// buffery jako read-only ne další pass. Buffery jsou platné dokud
+    /// SpatialHashGpu žije.
+    pub fn offsets_buffer(&self) -> &wgpu::Buffer {
+        &self.offsets_buf
+    }
+
+    pub fn sorted_buffer(&self) -> &wgpu::Buffer {
+        &self.sorted_buf
+    }
+
+    /// CPU side mirror funkce `bucket_id_of` v shaderu. Useful pro testy a
+    /// pro callers, kteří chtějí dohnat GPU bucket layout.
+    pub fn bucket_id_of(pos: [f32; 3], cell_size: f32) -> u32 {
+        let bx = (pos[0] / cell_size).floor() as i32 + GPU_HASH_GRID_NX / 2;
+        let by = (pos[1] / cell_size).floor() as i32 + GPU_HASH_GRID_NY / 2;
+        let bz = (pos[2] / cell_size).floor() as i32 + GPU_HASH_GRID_NZ / 2;
+        let bx_c = bx.clamp(0, GPU_HASH_GRID_NX - 1);
+        let by_c = by.clamp(0, GPU_HASH_GRID_NY - 1);
+        let bz_c = bz.clamp(0, GPU_HASH_GRID_NZ - 1);
+        (bx_c + by_c * GPU_HASH_GRID_NX + bz_c * GPU_HASH_GRID_NX * GPU_HASH_GRID_NY) as u32
+    }
+}
+
