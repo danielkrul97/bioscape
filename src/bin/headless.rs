@@ -8,12 +8,13 @@
 
 use bioscape::{
     adhesion_velocity_delta, bond_velocity_delta, nearest_attackable_cell,
-    reject_food_for_richness, Bond, Cell, EventCalendar, Food, Hunter, ShockScheduleConfig,
-    SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR, ATTACK_THRESHOLD,
-    BOND_BREAK_THRESHOLD,
+    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, Hunter,
+    ShockScheduleConfig, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
+    ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
-    COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
+    COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, COOP_FOOD_MAX_CONCURRENT,
+    COOP_FOOD_SPAWN_RATE_PER_TICK, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
     DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
     GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
     HERD_RADIUS, HUNTER_GRID_CELL_SIZE, HUNTER_TARGET_COUNT,
@@ -116,6 +117,18 @@ struct PhaseTimings {
 struct World {
     cells: Vec<Cell>,
     foods: Vec<Food>,
+    /// Sprint 128: cooperative food nodes. Lifecycle waiting → triggered/expired
+    /// (separate od regular `Food` — odlišný spawn rate, žádný eat-by-cell,
+    /// reward distribuovaný up-front při dosažení threshold).
+    coop_foods: Vec<CoopFood>,
+    /// Sprint 128: per-gen counters pro CSV diagnostiku. Reset v end-of-gen
+    /// stejně jako `bonds_formed_gen`.
+    coop_food_solved_gen: u64,
+    coop_food_failed_gen: u64,
+    /// Sprint 128: suma arrivals.len() přes všechny coop nodes ke konci jejich
+    /// lifecyklu (trigger nebo expire) — dělená total events daň mean per gen.
+    coop_food_arrivals_sum_gen: u64,
+    coop_food_events_gen: u64,
     clock: SimClock,
     density_factor: f32,
     smell: SmellField,
@@ -269,6 +282,11 @@ impl World {
         Self {
             cells,
             foods,
+            coop_foods: Vec::new(),
+            coop_food_solved_gen: 0,
+            coop_food_failed_gen: 0,
+            coop_food_arrivals_sum_gen: 0,
+            coop_food_events_gen: 0,
             clock: SimClock::new(TICKS_PER_GENERATION, GENERATIONS_PER_EPOCH),
             density_factor: 1.0,
             smell: SmellField::new([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z], WORLD_HALF),
@@ -397,6 +415,11 @@ impl World {
         Ok(Self {
             cells: chk.cells,
             foods: chk.foods,
+            coop_foods: Vec::new(),
+            coop_food_solved_gen: 0,
+            coop_food_failed_gen: 0,
+            coop_food_arrivals_sum_gen: 0,
+            coop_food_events_gen: 0,
             clock: chk.clock,
             density_factor: chk.density_factor,
             smell: chk.smell,
@@ -497,10 +520,64 @@ impl World {
         self.hunter_lifecycle(rng);
         timed!(eat_food, self.eat_food());
         timed!(spawn_food, self.spawn_food(rng));
+        self.spawn_coop_food(rng);
+        self.update_coop_food();
         timed!(reproduce, self.reproduce(rng));
         timed!(die_and_drop_carrion, self.die_and_drop_carrion(rng));
 
         transitions.generation_ended
+    }
+
+    /// Sprint 128: per-tick spawn pokud pod cap. Poisson-like Bernoulli draw
+    /// — drobná pravděpodobnost na každý tick než hard quota per gen, aby
+    /// distribuce events byla rozprostřena rovnoměrně časem.
+    fn spawn_coop_food(&mut self, rng: &mut impl Rng) {
+        if self.coop_foods.len() >= COOP_FOOD_MAX_CONCURRENT {
+            return;
+        }
+        if rng.random::<f32>() >= COOP_FOOD_SPAWN_RATE_PER_TICK {
+            return;
+        }
+        let pos = bioscape::random_coop_position(rng, WORLD_HALF);
+        self.coop_foods
+            .push(CoopFood::new(pos, self.clock.tick));
+    }
+
+    /// Sprint 128: per-tick arrival registration → trigger pokus → cleanup.
+    /// Triggered + expired nodes se odstraňují stejným průchodem; counters
+    /// se nakrmí pro CSV diagnostiku (reset per gen).
+    fn update_coop_food(&mut self) {
+        if self.coop_foods.is_empty() {
+            return;
+        }
+        bioscape::register_coop_arrivals_for_all(
+            &mut self.coop_foods,
+            &self.cells,
+            WORLD_HALF,
+        );
+        let current_tick = self.clock.tick;
+        let cells = &mut self.cells;
+        let mut i = 0;
+        while i < self.coop_foods.len() {
+            let triggered_now = bioscape::try_trigger_coop(&mut self.coop_foods[i], cells);
+            if triggered_now {
+                self.coop_food_solved_gen += 1;
+                self.coop_food_arrivals_sum_gen +=
+                    self.coop_foods[i].arrivals.len() as u64;
+                self.coop_food_events_gen += 1;
+                self.coop_foods.swap_remove(i);
+                continue;
+            }
+            if self.coop_foods[i].is_expired(current_tick) {
+                self.coop_food_failed_gen += 1;
+                self.coop_food_arrivals_sum_gen +=
+                    self.coop_foods[i].arrivals.len() as u64;
+                self.coop_food_events_gen += 1;
+                self.coop_foods.swap_remove(i);
+                continue;
+            }
+            i += 1;
+        }
     }
 
     fn apply_morph(&mut self, dt: f32) {
@@ -719,7 +796,11 @@ impl World {
             .map(|c| c.phenotype.effective_radius())
             .collect();
         let vision_radii: Vec<f32> = self.cells.iter().map(|c| c.genome.vision_radius).collect();
-        let food_positions: Vec<[f32; 3]> = self.foods.iter().map(|f| f.position).collect();
+        // Sprint 128: coop foods se shoda do same sensor pool jako regular food.
+        // GPU sensor shader dělá nearest_food selection napříč single array,
+        // takže injekce na konec stačí (pozice se needitují).
+        let mut food_positions: Vec<[f32; 3]> = self.foods.iter().map(|f| f.position).collect();
+        food_positions.extend(self.coop_foods.iter().map(|c| c.position));
 
         // Per-cell metadata pro populate_inputs + motor + step shaders.
         let energies: Vec<f32> = self.cells.iter().map(|c| c.energy).collect();
@@ -965,6 +1046,7 @@ impl World {
         let food_grid = &self.food_grid;
         let smell = &self.smell;
         let pheromone_fields = &self.pheromone_fields;
+        let coop_foods = &self.coop_foods;
         let tick = self.clock.tick;
         let gen = self.clock.generation;
 
@@ -998,6 +1080,23 @@ impl World {
                     best_food_d2 = d2;
                     best_food = Some(d);
                 });
+                // Sprint 128: scan coop foods proti same FOV/range — sdílené
+                // input slot (`nearest_food`), aby cells reagovaly stejným
+                // approach behavior. Trade-off vůči regular food je čistě
+                // distance — coop food má vyšší expected value, ale solo
+                // arrival nedostane reward.
+                for coop in coop_foods.iter() {
+                    let d = bioscape::min_image_delta(pos, coop.position, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                    if d2 > vr2 || d2 >= best_food_d2 {
+                        continue;
+                    }
+                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                        continue;
+                    }
+                    best_food_d2 = d2;
+                    best_food = Some(d);
+                }
 
                 let mut best_cell: Option<([f32; 3], f32)> = None;
                 let mut best_cell_d2 = f32::MAX;
@@ -1149,6 +1248,7 @@ impl World {
         let food_grid = &self.food_grid;
         let smell = &self.smell;
         let pheromone_fields = &self.pheromone_fields;
+        let coop_foods = &self.coop_foods;
         let tick = self.clock.tick;
         let gen = self.clock.generation;
 
@@ -1181,6 +1281,20 @@ impl World {
                     best_food_d2 = d2;
                     best_food = Some(d);
                 });
+                // Sprint 128: coop food candidates injected do same nearest_food
+                // selection. Linear scan — typický coop_foods.len() ≤ 8.
+                for coop in coop_foods.iter() {
+                    let d = bioscape::min_image_delta(pos, coop.position, WORLD_HALF);
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                    if d2 > vr2 || d2 >= best_food_d2 {
+                        continue;
+                    }
+                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                        continue;
+                    }
+                    best_food_d2 = d2;
+                    best_food = Some(d);
+                }
 
                 let mut best_cell: Option<([f32; 3], f32)> = None;
                 let mut best_cell_d2 = f32::MAX;
@@ -2605,9 +2719,17 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
         // Sprint 113: shock_food_factor reportuje i v empty-pop branch.
         let shock_food_factor =
             bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
+        // Sprint 128: i v empty-pop branch reportujeme coop counters
+        // (events probíhají nezávisle na cell pop > 0; pro extinction-on-empty
+        // řádek je smysl reportovat 0/0/0).
+        let coop_arrivals_avg = if world.coop_food_events_gen > 0 {
+            world.coop_food_arrivals_sum_gen as f64 / world.coop_food_events_gen as f64
+        } else {
+            0.0
+        };
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,{:.3},0,0.000,0.000,{:.1}",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,{:.3},0,0.000,0.000,{:.1},{},{},{:.3}",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2627,6 +2749,9 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
             shock_hazard_max,
             shock_food_factor,
             ticks_per_sec,
+            world.coop_food_solved_gen,
+            world.coop_food_failed_gen,
+            coop_arrivals_avg,
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -3062,9 +3187,16 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
     let spike_count_avg = if n > 0 { spike_count_sum as f64 / nf } else { 0.0 };
     let spike_complexity_avg = if n > 0 { spike_complexity_sum / nf } else { 0.0 };
     let spike_total_length_avg = if n > 0 { spike_total_length_sum / nf } else { 0.0 };
+    // Sprint 128: coop food per-gen events (solved/failed) + mean arrivals per
+    // event (přes všechny zaniklé v gen, vč. expired-without-trigger).
+    let coop_arrivals_avg = if world.coop_food_events_gen > 0 {
+        world.coop_food_arrivals_sum_gen as f64 / world.coop_food_events_gen as f64
+    } else {
+        0.0
+    };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -3177,6 +3309,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
         spike_complexity_avg,
         spike_total_length_avg,
         ticks_per_sec,
+        // Sprint 128: cooperative food packet events.
+        world.coop_food_solved_gen,
+        world.coop_food_failed_gen,
+        coop_arrivals_avg,
     )
 }
 
@@ -3549,7 +3685,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg"
     )
     .unwrap();
     write_stats(&mut log, &world, 0.0).unwrap();
@@ -3655,6 +3791,11 @@ fn main() {
             // Sprint 99: hunter bond counters.
             world.hunter_bonds_formed_gen = 0;
             world.hunter_bonds_broken_gen = 0;
+            // Sprint 128: coop food per-gen counters.
+            world.coop_food_solved_gen = 0;
+            world.coop_food_failed_gen = 0;
+            world.coop_food_arrivals_sum_gen = 0;
+            world.coop_food_events_gen = 0;
         }
         if world.cells.is_empty() {
             eprintln!("extinction at gen {}", world.clock.generation);

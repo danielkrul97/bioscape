@@ -4248,6 +4248,120 @@ pub const PLANT_FOOD_VALUE: f32 = 20.0;
 pub const CARRION_FOOD_VALUE: f32 = 30.0;
 pub const HUNTER_CARRION_FOOD_VALUE: f32 = 50.0;
 
+/// Sprint 128: cooperative food node — high-value spawn, který nepřináší
+/// nic dokud N cells během time window nedorazí. Vytváří fitness coupling
+/// pro recruitment signaling: solo cells nedostanou nic, coordinated
+/// trio dostane high reward → selekce na "I see food, signal peers".
+pub const COOP_FOOD_REQUIRED_ARRIVALS: usize = 3;
+/// Time okno (ticks) od spawnu. Po vypršení: despawn bez reward.
+pub const COOP_FOOD_TIME_WINDOW_TICKS: u32 = 120;
+/// Per-participant reward při úspěšné koordinaci. Asymetricky vysoký vůči
+/// regular Plant food (20) — incentive justifying loiter cost.
+pub const COOP_FOOD_REWARD_PER_CELL: f32 = 80.0;
+/// Radius (sim units), v rámci kterého cell counts as "arrived". Větší než
+/// regular eat radius (~20) — coop food má vizuální/aroma signal "here is
+/// gathering point", cells nemusí stát přímo na něm.
+pub const COOP_FOOD_ARRIVAL_RADIUS: f32 = 30.0;
+/// Spawn pravděpodobnost per tick (Poisson-like). Kalibrováno tak, aby vznikalo
+/// cca 10-15 coop nodes per generation (600 ticků). 0.02 → ~12 events/gen.
+pub const COOP_FOOD_SPAWN_RATE_PER_TICK: f32 = 0.02;
+/// Max simultaneous coop nodes ve světě. Cap pro ohraničení complexity
+/// (a paměť).
+pub const COOP_FOOD_MAX_CONCURRENT: usize = 8;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoopFood {
+    pub position: [f32; 3],
+    pub spawn_tick: u64,
+    /// Set unique cell_ids, které byly v `ARRIVAL_RADIUS` aspoň jeden tick.
+    /// Vec<u64> aby zachoval Serde + insertion order; lookup je O(N), ale
+    /// N je malé (typicky < 10).
+    pub arrivals: Vec<u64>,
+    /// True pokud byl threshold dosažen → reward distribuován + bude
+    /// despawnut na konci aktuálního ticku.
+    pub triggered: bool,
+}
+
+impl CoopFood {
+    pub fn new(position: [f32; 3], spawn_tick: u64) -> Self {
+        Self {
+            position,
+            spawn_tick,
+            arrivals: Vec::new(),
+            triggered: false,
+        }
+    }
+
+    /// True pokud věk > TIME_WINDOW. Caller volá po pokusu o trigger,
+    /// aby triggered nodes (které trigger zvládly přesně v expiry frame)
+    /// nebyly mylně klasifikovány jako "expired no reward".
+    #[inline]
+    pub fn is_expired(&self, current_tick: u64) -> bool {
+        current_tick.saturating_sub(self.spawn_tick) >= COOP_FOOD_TIME_WINDOW_TICKS as u64
+    }
+}
+
+/// Sprint 128: zaregistruj cell_id jako arrival. Insertion order zachovaná,
+/// duplikáty ignorovány (cell může být v radius víc ticků). Vrací true pokud
+/// byl id přidán, false pokud už evidoval.
+pub fn register_coop_arrival(coop: &mut CoopFood, cell_id: u64) -> bool {
+    if coop.arrivals.iter().any(|id| *id == cell_id) {
+        return false;
+    }
+    coop.arrivals.push(cell_id);
+    true
+}
+
+/// Sprint 128: pokus o trigger threshold. Vrací true pokud byl reward distribuován
+/// (= aspoň REQUIRED arrivals + ne-yet-triggered). Caller propaguje return value
+/// do per-gen counterů (coop_food_solved).
+pub fn try_trigger_coop(coop: &mut CoopFood, cells: &mut [Cell]) -> bool {
+    if coop.triggered || coop.arrivals.len() < COOP_FOOD_REQUIRED_ARRIVALS {
+        return false;
+    }
+    for cell_id in &coop.arrivals {
+        if let Some(cell) = cells.iter_mut().find(|c| c.cell_id == *cell_id) {
+            cell.energy += COOP_FOOD_REWARD_PER_CELL;
+        }
+    }
+    coop.triggered = true;
+    true
+}
+
+/// Sprint 128: vyber random pozici uvnitř world bounds (toroidal world,
+/// stejná logika jako `Food::random`). Pokud `world_half[2] == 0`, z-osa
+/// vrací 0 — backward-compat s pre-S33 baseline.
+pub fn random_coop_position(rng: &mut impl Rng, world_half: [f32; 3]) -> [f32; 3] {
+    let z = if world_half[2] > 0.0 {
+        rng.random_range(-world_half[2]..world_half[2])
+    } else {
+        0.0
+    };
+    [
+        rng.random_range(-world_half[0]..world_half[0]),
+        rng.random_range(-world_half[1]..world_half[1]),
+        z,
+    ]
+}
+
+/// Sprint 128: per-tick scan + arrival registration pro každý coop node.
+/// Cell je v radius pokud (toroidal-aware) Euclidean distance ≤ ARRIVAL_RADIUS.
+pub fn register_coop_arrivals_for_all(coops: &mut [CoopFood], cells: &[Cell], world_half: [f32; 3]) {
+    let r2 = COOP_FOOD_ARRIVAL_RADIUS * COOP_FOOD_ARRIVAL_RADIUS;
+    for coop in coops.iter_mut() {
+        if coop.triggered {
+            continue;
+        }
+        for cell in cells.iter() {
+            let d = min_image_delta(coop.position, cell.position, world_half);
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if d2 <= r2 {
+                let _ = register_coop_arrival(coop, cell.cell_id);
+            }
+        }
+    }
+}
+
 #[inline]
 pub fn food_base_value(kind: FoodKind) -> f32 {
     match kind {
@@ -6506,6 +6620,83 @@ mod tests {
             (food_base_value(FoodKind::HunterCarrion) - HUNTER_CARRION_FOOD_VALUE).abs() < 1e-6
         );
         assert!(food_base_value(FoodKind::HunterCarrion) > food_base_value(FoodKind::Plant));
+    }
+
+    #[test]
+    fn coop_food_lifecycle_no_arrivals_expires() {
+        // Sprint 128: bez arrivals coop node prošlý TIME_WINDOW musí vrátit
+        // is_expired = true → caller cleanup, no reward.
+        let mut coop = CoopFood::new([0.0, 0.0, 0.0], 0);
+        assert!(!coop.is_expired(0));
+        assert!(!coop.is_expired((COOP_FOOD_TIME_WINDOW_TICKS as u64).saturating_sub(1)));
+        assert!(coop.is_expired(COOP_FOOD_TIME_WINDOW_TICKS as u64));
+        let mut cells: [Cell; 0] = [];
+        assert!(!try_trigger_coop(&mut coop, &mut cells));
+        assert!(!coop.triggered);
+    }
+
+    #[test]
+    fn coop_food_threshold_triggers_reward() {
+        // Sprint 128: 3 cells s unique cell_id v arrivals → trigger distribuuje
+        // COOP_FOOD_REWARD_PER_CELL na každého. Caller pak coop odstraní.
+        let mut coop = CoopFood::new([0.0, 0.0, 0.0], 0);
+        let mut cells = [
+            Cell {
+                cell_id: 1,
+                energy: 50.0,
+                ..base_cell()
+            },
+            Cell {
+                cell_id: 2,
+                energy: 30.0,
+                ..base_cell()
+            },
+            Cell {
+                cell_id: 3,
+                energy: 70.0,
+                ..base_cell()
+            },
+        ];
+        register_coop_arrival(&mut coop, 1);
+        register_coop_arrival(&mut coop, 2);
+        register_coop_arrival(&mut coop, 3);
+        // Duplicate id ignored.
+        assert!(!register_coop_arrival(&mut coop, 1));
+        assert_eq!(coop.arrivals.len(), 3);
+        assert!(try_trigger_coop(&mut coop, &mut cells));
+        assert!(coop.triggered);
+        assert!((cells[0].energy - (50.0 + COOP_FOOD_REWARD_PER_CELL)).abs() < 1e-4);
+        assert!((cells[1].energy - (30.0 + COOP_FOOD_REWARD_PER_CELL)).abs() < 1e-4);
+        assert!((cells[2].energy - (70.0 + COOP_FOOD_REWARD_PER_CELL)).abs() < 1e-4);
+        // Idempotent: druhý try_trigger nesmí znovu rozdat reward.
+        assert!(!try_trigger_coop(&mut coop, &mut cells));
+        assert!((cells[0].energy - (50.0 + COOP_FOOD_REWARD_PER_CELL)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn coop_food_below_threshold_no_reward() {
+        // Sprint 128: 2 < REQUIRED_ARRIVALS (=3) → trigger nefiringuje, energie
+        // beze změny, coop stále alive.
+        let mut coop = CoopFood::new([0.0, 0.0, 0.0], 0);
+        let mut cells = [
+            Cell {
+                cell_id: 1,
+                energy: 50.0,
+                ..base_cell()
+            },
+            Cell {
+                cell_id: 2,
+                energy: 30.0,
+                ..base_cell()
+            },
+        ];
+        register_coop_arrival(&mut coop, 1);
+        register_coop_arrival(&mut coop, 2);
+        assert!(!try_trigger_coop(&mut coop, &mut cells));
+        assert!(!coop.triggered);
+        assert!((cells[0].energy - 50.0).abs() < 1e-4);
+        assert!((cells[1].energy - 30.0).abs() < 1e-4);
+        assert!(!coop.is_expired(0));
     }
 
     #[test]

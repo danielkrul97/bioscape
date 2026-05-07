@@ -380,6 +380,12 @@ struct PheromoneResource {
     fields: [SmellField; bioscape::N_PHEROMONE_CHANNELS],
 }
 
+/// Sprint 128: cooperative food packets. Vec uloženo přímo v Resource (žádná
+/// per-node Entity — coop food má jen pozici a stav, žádné rendering aspekty
+/// v této verzi).
+#[derive(Resource, Default)]
+struct CoopFoodResource(Vec<bioscape::CoopFood>);
+
 #[derive(Resource)]
 struct WorldMapResource(WorldMap);
 
@@ -504,6 +510,7 @@ fn main() {
         .init_resource::<NextHunterId>()
         .init_resource::<ContactProgress>()
         .init_resource::<HunterContactProgress>()
+        .init_resource::<CoopFoodResource>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
         .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay, rebuild_cell_grid).chain())
@@ -537,6 +544,8 @@ fn main() {
                     hunters_lifecycle,
                     cell_eats_food,
                     spawn_food,
+                    spawn_coop_food,
+                    update_coop_food,
                     cell_reproduces_on_threshold,
                     cell_dies_on_zero_energy,
                     tick_death_fade,
@@ -1393,6 +1402,7 @@ fn cells_brain_act(
     food_grid: Res<FoodGrid>,
     smell: Res<SmellResource>,
     pheromone: Res<PheromoneResource>,
+    coop_foods: Res<CoopFoodResource>,
     slot_map: Res<CellSlotMap>,
     clock: Res<Clock>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
@@ -1410,6 +1420,7 @@ fn cells_brain_act(
 
     // Sprint 52: helper closure pro per-cell sensor gather + populate_brain_inputs.
     // Reused jak v CPU tak GPU path. Takes &mut Cell + Entity, vrací inputs[36].
+    let coop_positions: Vec<[f32; 3]> = coop_foods.0.iter().map(|c| c.position).collect();
     let gather = |entity: Entity, cell: &mut Cell| -> [f32; BRAIN_INPUTS] {
         let pos = cell.position;
         let vision_r = cell.genome.vision_radius;
@@ -1435,6 +1446,19 @@ fn cells_brain_act(
             best_food_d2 = d2;
             nearest_food = Some(d);
         });
+        // Sprint 128: coop food candidates do same nearest_food selection.
+        for cp in coop_positions.iter() {
+            let d = bioscape::min_image_delta(pos, *cp, WORLD_HALF);
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if d2 > vr2 || d2 >= best_food_d2 {
+                continue;
+            }
+            if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                continue;
+            }
+            best_food_d2 = d2;
+            nearest_food = Some(d);
+        }
         let mut nearest_cell: Option<([f32; 3], f32)> = None;
         let mut best_cell_d2 = f32::MAX;
         let mut neighbors_in_vision: u32 = 0;
@@ -1640,6 +1664,70 @@ fn spawn_food(
         // All MAX_SPAWN_ATTEMPTS rolls fell inside someone's eat radius — skip
         // this slot. Population is dense enough that the food world is at
         // (ecological) saturation; we'll catch up later when cells move.
+    }
+}
+
+/// Sprint 128: per-tick spawn coop food node pokud pod cap. Single Bernoulli
+/// draw; pozice uniform world bounds (žádný richness check — coop nodes nejsou
+/// vázané na food density mapu).
+fn spawn_coop_food(extent: Res<WorldExtent>, mut coop: ResMut<CoopFoodResource>, clock: Res<Clock>) {
+    if coop.0.len() >= bioscape::COOP_FOOD_MAX_CONCURRENT {
+        return;
+    }
+    let mut rng = rand::rng();
+    if rng.random::<f32>() >= bioscape::COOP_FOOD_SPAWN_RATE_PER_TICK {
+        return;
+    }
+    let pos = bioscape::random_coop_position(&mut rng, extent.as_array());
+    coop.0
+        .push(bioscape::CoopFood::new(pos, clock.0.tick));
+}
+
+/// Sprint 128: per-tick arrival registration → trigger pokus → cleanup.
+/// Cells in arrival radius dostávají reward při dosažení threshold; expirace
+/// odstraní node bez reward. Counter logika (per-gen solved/failed) tu není —
+/// renderer pouze visualizuje, headless drží authoritative metrics.
+fn update_coop_food(
+    mut coop: ResMut<CoopFoodResource>,
+    cells: Query<&CellEntity, Without<Dying>>,
+    clock: Res<Clock>,
+) {
+    if coop.0.is_empty() {
+        return;
+    }
+    let r2 = bioscape::COOP_FOOD_ARRIVAL_RADIUS * bioscape::COOP_FOOD_ARRIVAL_RADIUS;
+    let cell_snapshot: Vec<(u64, [f32; 3])> = cells.iter().map(|c| (c.0.cell_id, c.0.position)).collect();
+    for c in coop.0.iter_mut() {
+        if c.triggered {
+            continue;
+        }
+        for (id, pos) in cell_snapshot.iter() {
+            let d = bioscape::min_image_delta(c.position, *pos, WORLD_HALF);
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if d2 <= r2 {
+                let _ = bioscape::register_coop_arrival(c, *id);
+            }
+        }
+    }
+    let current_tick = clock.0.tick;
+    // Reward distribution + cleanup. Two-pass: detect indices to mutate, pak
+    // apply na cells v separate query (Cells query je `Without<Dying>` immutable
+    // tady, takže reward write přes side query není možný v 1 systému).
+    // V této první iteraci coop reward v rendereru čistě cleanup-only —
+    // headless drží authoritative reward distribuci, renderer slouží jako
+    // visualization. Pro plný coupling v rendereru je nutný separátní system
+    // s `Query<&mut CellEntity>` — odloženo do pozdější iterace.
+    let mut i = 0;
+    while i < coop.0.len() {
+        let arrivals = coop.0[i].arrivals.len();
+        if arrivals >= bioscape::COOP_FOOD_REQUIRED_ARRIVALS && !coop.0[i].triggered {
+            coop.0[i].triggered = true;
+        }
+        if coop.0[i].triggered || coop.0[i].is_expired(current_tick) {
+            coop.0.swap_remove(i);
+            continue;
+        }
+        i += 1;
     }
 }
 
