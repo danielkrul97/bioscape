@@ -2135,7 +2135,7 @@ fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>)
         }
     }
 
-    let new_speed = if keys.just_pressed(KeyCode::Digit1) {
+    let preset = if keys.just_pressed(KeyCode::Digit1) {
         Some(1.0)
     } else if keys.just_pressed(KeyCode::Digit2) {
         Some(10.0)
@@ -2145,6 +2145,20 @@ fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>)
         Some(1000.0)
     } else {
         None
+    };
+
+    let delta = if keys.just_pressed(KeyCode::ArrowUp) {
+        1.0
+    } else if keys.just_pressed(KeyCode::ArrowDown) {
+        -1.0
+    } else {
+        0.0
+    };
+
+    let new_speed = match (preset, delta) {
+        (Some(p), _) => Some(p),
+        (None, d) if d != 0.0 => Some((time.relative_speed() + d).clamp(1.0, 1000.0)),
+        _ => None,
     };
 
     if let Some(speed) = new_speed {
@@ -2238,10 +2252,10 @@ fn camera_pan_input(
     if keys.pressed(KeyCode::ArrowRight) || keys.pressed(KeyCode::KeyD) {
         delta.x += 1.0;
     }
-    if keys.pressed(KeyCode::ArrowDown) || keys.pressed(KeyCode::KeyS) {
+    if keys.pressed(KeyCode::KeyS) {
         delta.y -= 1.0;
     }
-    if keys.pressed(KeyCode::ArrowUp) || keys.pressed(KeyCode::KeyW) {
+    if keys.pressed(KeyCode::KeyW) {
         delta.y += 1.0;
     }
     if delta == Vec2::ZERO {
