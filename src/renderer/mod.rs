@@ -859,6 +859,7 @@ fn setup(
             Mesh3d(food_mesh_handle.clone()),
             MeshMaterial3d(food_material.clone()),
             Transform::from_xyz(food.position[0], food.position[1], food.position[2]),
+            Visibility::Hidden,
         ));
     }
 
@@ -1649,6 +1650,7 @@ fn spawn_food(
                         candidate.position[1],
                         candidate.position[2],
                     ),
+                    Visibility::Hidden,
                 ));
                 continue 'spawn;
             }
@@ -2106,6 +2108,7 @@ fn hunters_lifecycle(
                     Mesh3d(food_mesh.0.clone()),
                     MeshMaterial3d(food_material.0.clone()),
                     Transform::from_xyz(pos[0], pos[1], pos[2]),
+                    Visibility::Hidden,
                 ));
             }
         }
@@ -2711,6 +2714,7 @@ fn cell_dies_on_zero_energy(
                     Mesh3d(food_mesh.0.clone()),
                     MeshMaterial3d(food_material.0.clone()),
                     Transform::from_xyz(pos[0], pos[1], pos[2]),
+                    Visibility::Hidden,
                 ));
             }
             // Sprint 52: release slot ihned na Dying. Entity ještě existuje

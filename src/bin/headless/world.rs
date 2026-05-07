@@ -8,8 +8,7 @@
 
 use bioscape::{
     adhesion_velocity_delta, bond_velocity_delta, nearest_attackable_cell,
-    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, Hunter,
-    ShockScheduleConfig, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
+    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, Hunter, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
     ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
@@ -17,9 +16,7 @@ use bioscape::{
     COOP_FOOD_SPAWN_RATE_PER_TICK, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
     DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
     GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
-    HERD_RADIUS, HUNTER_GRID_CELL_SIZE, HUNTER_TARGET_COUNT,
-    INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
-    MATING_RADIUS, MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    HERD_RADIUS, HUNTER_GRID_CELL_SIZE, HUNTER_TARGET_COUNT, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MAX_BONDS_PER_CELL, MAX_SPAWN_ATTEMPTS,
     N_PHEROMONE_CHANNELS,
     PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE,
     PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH,
@@ -28,12 +25,12 @@ use bioscape::{
     SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
     SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_HALF,
     WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
-    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
+    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
 };
 #[cfg(feature = "gpu")]
 use bioscape::{
     gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
+        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, HebbianGpu, MotorGpu,
         PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
         StepGpu, StepParamsGpu,
     },
@@ -46,8 +43,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::env;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 

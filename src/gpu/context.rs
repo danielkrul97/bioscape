@@ -1,7 +1,5 @@
-use crate::{Brain, BRAIN_HIDDEN, BRAIN_HIDDEN_DEFAULT, BRAIN_INPUTS, BRAIN_OUTPUTS, SPIKE_SLOTS};
-use bytemuck::{Pod, Zeroable};
+use crate::{BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS};
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 // ============================================================================
 // Sprint 47: shared GPU context — jeden device pro všechny subsystémy

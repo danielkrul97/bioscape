@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 use crate::*;
 use super::*;
