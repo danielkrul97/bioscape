@@ -8,7 +8,7 @@
 //! weights, dispatch compute, readback hidden + outputs. State on GPU mezi
 //! ticky **NE** drží — to je Sprint 47.
 
-use crate::{Brain, BRAIN_HIDDEN, BRAIN_HIDDEN_DEFAULT, BRAIN_INPUTS, BRAIN_OUTPUTS};
+use crate::{Brain, BRAIN_HIDDEN, BRAIN_HIDDEN_DEFAULT, BRAIN_INPUTS, BRAIN_OUTPUTS, SPIKE_SLOTS};
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -3875,11 +3875,17 @@ pub struct PredateGpu {
     pos_buf: wgpu::Buffer,
     eff_radii_buf: wgpu::Buffer,
     headings_buf: wgpu::Buffer,
-    spike_buf: wgpu::Buffer,
+    /// Sprint 126: per-cell n × SPIKE_SLOTS × vec4<f32> (length, azim, elev, complexity).
+    spikes_packed_buf: wgpu::Buffer,
     attack_buf: wgpu::Buffer,
     herd_buf: wgpu::Buffer,
     energy_delta_buf: wgpu::Buffer,
     damage_delta_buf: wgpu::Buffer,
+    /// Sprint 126: per-cell aktivní spike count (`u32`).
+    spike_counts_buf: wgpu::Buffer,
+    /// Sprint 126: per-cell pitch (rad) — multi-spike potřebuje 3D forward
+    /// direction (yaw + azim, pitch + elev).
+    pitches_buf: wgpu::Buffer,
     herd_rb: wgpu::Buffer,
     energy_rb: wgpu::Buffer,
     damage_rb: wgpu::Buffer,
@@ -3906,11 +3912,16 @@ impl PredateGpu {
             label: Some("predate"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/predate.wgsl").into()),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..11)
+        // Sprint 126: 13 bindings total (1 uniform + 12 storage). Storage 1..=7
+        // a 11..=12 jsou read-only (positions, eff_radii, headings, spikes_packed,
+        // attack_signals, hash_offsets, hash_sorted, spike_counts, pitches);
+        // 8..=10 jsou read_write (herd_counts, energy_delta atomic, damage_delta
+        // atomic).
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
-                } else if (1..=7).contains(&i) {
+                } else if (1..=7).contains(&i) || (11..=12).contains(&i) {
                     wgpu::BufferBindingType::Storage { read_only: true }
                 } else {
                     wgpu::BufferBindingType::Storage { read_only: false }
@@ -3974,11 +3985,15 @@ impl PredateGpu {
         let pos_buf = mk("predate-pos", n * 3 * f, stor_dst);
         let eff_radii_buf = mk("predate-eff", n * f, stor_dst);
         let headings_buf = mk("predate-heading", n * f, stor_dst);
-        let spike_buf = mk("predate-spike", n * f, stor_dst);
+        // Sprint 126: SPIKE_SLOTS × vec4<f32> = 5 × 4 × 4 B = 80 B per cell.
+        let spike_slots = SPIKE_SLOTS as u64;
+        let spikes_packed_buf = mk("predate-spikes-packed", n * spike_slots * 4 * f, stor_dst);
         let attack_buf = mk("predate-attack", n * f, stor_dst);
         let herd_buf = mk("predate-herd", n * f, stor_dst_src);
         let energy_delta_buf = mk("predate-energy-delta", n * f, stor_dst_src);
         let damage_delta_buf = mk("predate-damage-delta", n * f, stor_dst_src);
+        let spike_counts_buf = mk("predate-spike-counts", n * f, stor_dst);
+        let pitches_buf = mk("predate-pitches", n * f, stor_dst);
         let herd_rb = mk("predate-herd-rb", n * f, read);
         let energy_rb = mk("predate-energy-rb", n * f, read);
         let damage_rb = mk("predate-damage-rb", n * f, read);
@@ -3994,11 +4009,13 @@ impl PredateGpu {
             pos_buf,
             eff_radii_buf,
             headings_buf,
-            spike_buf,
+            spikes_packed_buf,
             attack_buf,
             herd_buf,
             energy_delta_buf,
             damage_delta_buf,
+            spike_counts_buf,
+            pitches_buf,
             herd_rb,
             energy_rb,
             damage_rb,
@@ -4006,19 +4023,28 @@ impl PredateGpu {
         })
     }
 
+    /// Sprint 126: full multi-spike. `spikes_packed[i*SPIKE_SLOTS + slot]` =
+    /// `[length, azimuth_offset, elevation_offset, complexity]`. `spike_counts[i]`
+    /// určuje aktivní sloty (rest zero-init). `pitches[i]` per cell pro 3D
+    /// forward direction.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
         positions: &[[f32; 3]],
         eff_radii: &[f32],
         headings: &[f32],
-        spike_lengths: &[f32],
+        pitches: &[f32],
+        spikes_packed: &[[f32; 4]],
+        spike_counts: &[u32],
         attack_signals: &[f32],
         cell_hash: &SpatialHashGpu,
         params: PredateParamsGpu,
     ) -> PredateResult {
         let n = positions.len();
         assert!(n <= self.capacity, "predate capacity overflow");
+        assert_eq!(pitches.len(), n);
+        assert_eq!(spike_counts.len(), n);
+        assert_eq!(spikes_packed.len(), n * SPIKE_SLOTS);
         if n == 0 {
             return PredateResult {
                 herd_counts: Vec::new(),
@@ -4050,10 +4076,20 @@ impl PredateGpu {
             .write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
         self.queue
             .write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
-        self.queue
-            .write_buffer(&self.spike_buf, 0, bytemuck::cast_slice(spike_lengths));
+        self.queue.write_buffer(
+            &self.spikes_packed_buf,
+            0,
+            bytemuck::cast_slice(spikes_packed),
+        );
         self.queue
             .write_buffer(&self.attack_buf, 0, bytemuck::cast_slice(attack_signals));
+        self.queue.write_buffer(
+            &self.spike_counts_buf,
+            0,
+            bytemuck::cast_slice(spike_counts),
+        );
+        self.queue
+            .write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("predate-bg"),
@@ -4063,13 +4099,15 @@ impl PredateGpu {
                 wgpu::BindGroupEntry { binding: 1, resource: self.pos_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.eff_radii_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.headings_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.spike_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.spikes_packed_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.attack_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: cell_hash.offsets_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: cell_hash.sorted_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: self.herd_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: self.energy_delta_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: self.damage_delta_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.spike_counts_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: self.pitches_buf.as_entire_binding() },
             ],
         });
 
@@ -6038,12 +6076,15 @@ mod tests {
     /// Sprint 50: predate GPU vs CPU parity. Cluster cells s mixed sizes a
     /// random attack signals; herd_counts + energy_delta + damage_delta v ε
     /// match. Atomic float CAS sumace má ULP drift, tolerance 1e-3 absolute.
+    /// Sprint 126: rozšířen o full multi-spike fixture — variable spike_count,
+    /// per-slot azimuth/elevation/complexity, per-cell pitch. CPU baseline
+    /// zrcadlí WGSL `multi_spike_bonus` 1:1.
     #[test]
     fn predate_gpu_matches_cpu() {
         use crate::{
-            ATTACK_THRESHOLD, CELL_RADIUS, DILUTION_K, HERD_RADIUS, PREDATION_DRAIN_PER_TICK,
-            PREDATION_GAIN_PER_TICK, SIZE_RATIO_THRESHOLD, SPIKE_DOT_THRESHOLD,
-            SPIKE_PREDATION_BONUS,
+            ATTACK_THRESHOLD, CELL_RADIUS, COMPLEXITY_ATTACK_GAIN, DILUTION_K, HERD_RADIUS,
+            PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, SIZE_RATIO_THRESHOLD,
+            SPIKE_DOT_THRESHOLD, SPIKE_PREDATION_BONUS,
         };
         let mut rng = StdRng::seed_from_u64(67);
         let n = 80;
@@ -6062,7 +6103,34 @@ mod tests {
         let headings: Vec<f32> = (0..n)
             .map(|_| rng.random_range(0.0_f32..core::f32::consts::TAU))
             .collect();
-        let spike_lengths: Vec<f32> = (0..n).map(|_| rng.random_range(0.0_f32..0.3)).collect();
+        // Sprint 126: per-cell pitch ∈ [-π/4, π/4] — multi-spike používá 3D
+        // forward (yaw + azim, pitch + elev).
+        let pitches: Vec<f32> = (0..n)
+            .map(|_| rng.random_range(-core::f32::consts::FRAC_PI_4..core::f32::consts::FRAC_PI_4))
+            .collect();
+        // Sprint 126: per-cell spike_count + per-slot spike attribs. Mix:
+        // ~20 % cells `spike_count = 0` (no bonus path), zbylé 1..=SPIKE_SLOTS.
+        let spike_counts: Vec<u32> = (0..n)
+            .map(|i| {
+                if i % 5 == 0 {
+                    0
+                } else {
+                    rng.random_range(1..=SPIKE_SLOTS as u32)
+                }
+            })
+            .collect();
+        let spikes_packed: Vec<[f32; 4]> = (0..n * SPIKE_SLOTS)
+            .map(|_| {
+                [
+                    rng.random_range(0.0_f32..1.0),
+                    rng.random_range(-core::f32::consts::PI..core::f32::consts::PI),
+                    rng.random_range(
+                        -core::f32::consts::FRAC_PI_2..core::f32::consts::FRAC_PI_2,
+                    ),
+                    rng.random_range(0.0_f32..1.0),
+                ]
+            })
+            .collect();
         let attack_signals: Vec<f32> = (0..n).map(|_| rng.random_range(-0.5_f32..1.0)).collect();
 
         let ctx = match GpuContext::new() {
@@ -6088,7 +6156,15 @@ mod tests {
             ..PredateParamsGpu::default()
         };
         let res = pred.compute(
-            &positions, &eff_radii, &headings, &spike_lengths, &attack_signals, &hash, params,
+            &positions,
+            &eff_radii,
+            &headings,
+            &pitches,
+            &spikes_packed,
+            &spike_counts,
+            &attack_signals,
+            &hash,
+            params,
         );
 
         // CPU brute force.
@@ -6106,14 +6182,47 @@ mod tests {
             }
         }
 
+        // Sprint 126: CPU multi-spike baseline mirroring WGSL `multi_spike_bonus`.
+        // Stejné formule: dir = forward(yaw + azim, pitch + elev), cone test
+        // cosine ≥ SPIKE_DOT_THRESHOLD, per-slot bonus = length × (1 +
+        // COMPLEXITY_ATTACK_GAIN × complexity) × SPIKE_PREDATION_BONUS.
+        let multi_spike_bonus = |i: usize, to_target: [f32; 3]| -> f32 {
+            let n_spikes = spike_counts[i].min(SPIKE_SLOTS as u32) as usize;
+            let yaw = headings[i];
+            let pitch = pitches[i];
+            let mut acc = 0.0_f32;
+            for slot in 0..n_spikes {
+                let spk = spikes_packed[i * SPIKE_SLOTS + slot];
+                let length = spk[0];
+                if length <= 0.0 {
+                    continue;
+                }
+                let yaw_s = yaw + spk[1];
+                let pit_s = pitch + spk[2];
+                let cos_p = pit_s.cos();
+                let dir = [
+                    yaw_s.cos() * cos_p,
+                    yaw_s.sin() * cos_p,
+                    pit_s.sin(),
+                ];
+                let cos_a =
+                    dir[0] * to_target[0] + dir[1] * to_target[1] + dir[2] * to_target[2];
+                if cos_a < SPIKE_DOT_THRESHOLD {
+                    continue;
+                }
+                let cmplx = spk[3].clamp(0.0, 1.0);
+                let attack_factor = 1.0 + COMPLEXITY_ATTACK_GAIN * cmplx;
+                acc += length * attack_factor * SPIKE_PREDATION_BONUS;
+            }
+            acc
+        };
+
         let mut cpu_energy = vec![0.0_f32; n];
         let mut cpu_damage = vec![0.0_f32; n];
         for i in 0..n {
             let attack = attack_signals[i].max(0.0);
             if attack <= ATTACK_THRESHOLD { continue; }
             let r_i = eff_radii[i];
-            let spike = spike_lengths[i];
-            let heading = headings[i];
             for j in 0..n {
                 if i == j { continue; }
                 let r_j = eff_radii[j];
@@ -6126,14 +6235,11 @@ mod tests {
                 let d2 = dx * dx + dy * dy + dz * dz;
                 if d2 < pair_r2 {
                     let mut gain = PREDATION_GAIN_PER_TICK;
-                    if spike > 0.0 && d2 > 0.0 {
+                    if spike_counts[i] > 0 && d2 > 0.0 {
                         let inv_d = 1.0 / d2.sqrt();
-                        let to_j_x = -dx * inv_d;
-                        let to_j_y = -dy * inv_d;
-                        let cos_angle = heading.cos() * to_j_x + heading.sin() * to_j_y;
-                        if cos_angle >= SPIKE_DOT_THRESHOLD {
-                            gain += PREDATION_GAIN_PER_TICK * spike * SPIKE_PREDATION_BONUS;
-                        }
+                        let to_target = [-dx * inv_d, -dy * inv_d, -dz * inv_d];
+                        let bonus = multi_spike_bonus(i, to_target);
+                        gain += PREDATION_GAIN_PER_TICK * bonus;
                     }
                     let dilution = 1.0 / (1.0 + DILUTION_K * cpu_herd[j] as f32);
                     gain *= dilution;

@@ -1,9 +1,16 @@
 // Sprint 50: GPU mirror headless::predate. 2 passes:
 //   herd_count — per cell, count neighbors v HERD_RADIUS (write-only per i).
 //   attack     — per attacker s `attack > threshold`, find smaller cells v
-//                pair_r, compute gain (size + spike + dilution), atomic-add
+//                pair_r, compute gain (size + multi-spike + dilution), atomic-add
 //                drain do victim energy_delta + damage_delta. Self-gain
 //                accumulated lokálně, atomic-add na konci.
+//
+// Sprint 126: full multi-spike. `spikes_packed` per cell = 5×vec4 (length, azim,
+// elev, complexity), `spike_counts` u32 určuje aktivní sloty. Per attacker
+// iterace přes 0..min(spike_count, 5), per slot 3D forward (yaw + azim,
+// pitch + elev), 3D cone test, per-spike `length × (1 + COMPLEXITY_ATTACK_GAIN
+// × complexity) × spike_bonus` akumulace. Single atomic CAS per (i,j) pair —
+// žádná regrese contention.
 //
 // Atomic float add: WGSL CAS loop přes `atomicCompareExchangeWeak` +
 // `bitcast<u32>` ↔ `bitcast<f32>`. Storage pointer ne-passable do funkce
@@ -15,6 +22,11 @@ const GRID_NZ: i32 = 4;
 const HALF_NX: i32 = 32;
 const HALF_NY: i32 = 16;
 const HALF_NZ: i32 = 2;
+
+const SPIKE_SLOTS: u32 = 5u;
+// Sprint 126: matches `lib.rs::COMPLEXITY_ATTACK_GAIN`. Inlined jako WGSL const
+// — pokud lib.rs hodnotu změní, tady taky.
+const COMPLEXITY_ATTACK_GAIN: f32 = 0.5;
 
 struct PredateParams {
     num_cells: u32,
@@ -61,13 +73,15 @@ fn bucket_id_wrapped(pos: vec3<f32>) -> u32 {
 @group(0) @binding(1) var<storage, read> positions: array<f32>;
 @group(0) @binding(2) var<storage, read> eff_radii: array<f32>;
 @group(0) @binding(3) var<storage, read> headings: array<f32>;
-@group(0) @binding(4) var<storage, read> spike_lengths: array<f32>;
+@group(0) @binding(4) var<storage, read> spikes_packed: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> attack_signals: array<f32>;
 @group(0) @binding(6) var<storage, read> hash_offsets: array<u32>;
 @group(0) @binding(7) var<storage, read> hash_sorted: array<u32>;
 @group(0) @binding(8) var<storage, read_write> herd_counts: array<u32>;
 @group(0) @binding(9) var<storage, read_write> energy_delta: array<atomic<u32>>;
 @group(0) @binding(10) var<storage, read_write> damage_delta: array<atomic<u32>>;
+@group(0) @binding(11) var<storage, read> spike_counts: array<u32>;
+@group(0) @binding(12) var<storage, read> pitches: array<f32>;
 
 @compute @workgroup_size(64)
 fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -121,6 +135,39 @@ fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     herd_counts[i] = count;
 }
 
+// Sprint 126: per-attacker spike bonus akumulátor pro single (i,j) pair.
+// `to_target` je unit vector od attackera k cíli. Iteruje přes aktivní spike
+// sloty, per slot 3D forward přes (yaw + azim, pitch + elev), cone test, sum.
+fn multi_spike_bonus(
+    spike_count: u32,
+    base_offset: u32,
+    yaw: f32,
+    pitch: f32,
+    to_target: vec3<f32>,
+) -> f32 {
+    let n = min(spike_count, SPIKE_SLOTS);
+    var acc: f32 = 0.0;
+    for (var s: u32 = 0u; s < n; s = s + 1u) {
+        let spk = spikes_packed[base_offset + s];
+        let length = spk.x;
+        if (length <= 0.0) {
+            continue;
+        }
+        let yaw_s = yaw + spk.y;
+        let pit_s = pitch + spk.z;
+        let cos_p = cos(pit_s);
+        let dir = vec3<f32>(cos(yaw_s) * cos_p, sin(yaw_s) * cos_p, sin(pit_s));
+        let cos_a = dot(dir, to_target);
+        if (cos_a < params.spike_dot_threshold) {
+            continue;
+        }
+        let cmplx = clamp(spk.w, 0.0, 1.0);
+        let attack_factor = 1.0 + COMPLEXITY_ATTACK_GAIN * cmplx;
+        acc = acc + length * attack_factor * params.spike_bonus;
+    }
+    return acc;
+}
+
 @compute @workgroup_size(64)
 fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -137,8 +184,10 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
         positions[i * 3u + 2u],
     );
     let r_i = eff_radii[i];
-    let spike = spike_lengths[i];
-    let heading = headings[i];
+    let yaw_i = headings[i];
+    let pitch_i = pitches[i];
+    let n_spikes = spike_counts[i];
+    let spikes_base = i * SPIKE_SLOTS;
 
     // Search radius: pair_r = CELL_RADIUS × (r_i + r_j). Předpoklad r_j ≤ r_i
     // (size ratio threshold předtím), tedy max pair_r = 2 × CELL_RADIUS × r_i.
@@ -184,14 +233,22 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let d2 = dot(d, d);
                     if (d2 < pair_r2) {
                         var gain = params.predation_gain;
-                        if (spike > 0.0 && d2 > 0.0) {
-                            let inv_d = 1.0 / sqrt(d2);
-                            let to_j_x = -d.x * inv_d;
-                            let to_j_y = -d.y * inv_d;
-                            let cos_angle = cos(heading) * to_j_x + sin(heading) * to_j_y;
-                            if (cos_angle >= params.spike_dot_threshold) {
-                                gain = gain + params.predation_gain * spike * params.spike_bonus;
-                            }
+                        if (n_spikes > 0u && d2 > 0.0) {
+                            let inv_d = inverseSqrt(d2);
+                            // d je (pos_i - pj), takže to_target = -d * inv_d.
+                            let to_target = vec3<f32>(
+                                -d.x * inv_d,
+                                -d.y * inv_d,
+                                -d.z * inv_d,
+                            );
+                            let spike_bonus = multi_spike_bonus(
+                                n_spikes,
+                                spikes_base,
+                                yaw_i,
+                                pitch_i,
+                                to_target,
+                            );
+                            gain = gain + params.predation_gain * spike_bonus;
                         }
                         let n_neigh = f32(herd_counts[j]);
                         let dilution = 1.0 / (1.0 + params.dilution_k * n_neigh);
