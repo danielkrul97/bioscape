@@ -3,7 +3,7 @@
 // Mutuje per-cell velocity (3D), angular_velocity, pitch_velocity.
 // Outputs read-only — výsledky jiného passu (typicky brain forward).
 
-const BRAIN_OUTPUTS: u32 = 10u; // Sprint 66 (output[9] = bond signal)
+const BRAIN_OUTPUTS: u32 = 12u; // Sprint 126 (+2 ch1/ch2 emit slots, motor čte jen 0/1/7)
 
 struct Params {
     num_cells: u32,

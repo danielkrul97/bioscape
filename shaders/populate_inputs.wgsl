@@ -9,12 +9,15 @@
 // CPU brain_act_gpu_full po dispatch tohoto shaderu může damage_accum přečíst
 // jako 0 (nebo nemusí — bez readback je in-shader reset jediný path).
 
+// Sprint 126: BRAIN_INPUTS_SENSORY 21→27 (sloty 21-26 = ch1/ch2 pheromone
+// gradient xyz, GPU path zatím píše 0 — multi-channel sensor gather je
+// CPU-only). BRAIN_INPUTS 71→77, BRAIN_OUTPUTS 10→12.
 struct Params {
     num_cells: u32,
-    brain_inputs: u32,           // 36
-    brain_inputs_sensory: u32,   // 20
-    brain_hidden: u32,           // 16
-    brain_recurrent: u32,        // 16 (== brain_hidden)
+    brain_inputs: u32,           // Sprint 126: 77
+    brain_inputs_sensory: u32,   // Sprint 126: 27
+    brain_hidden: u32,           // 50
+    brain_recurrent: u32,        // 50 (== brain_hidden)
     smell_norm_gain: f32,
     phero_norm_gain: f32,
     damage_norm_gain: f32,

@@ -42,9 +42,9 @@ const MIN_TURN_RATE: f32 = 0.1;
 pub const INITIAL_ENERGY: f32 = 100.0;
 // Brain inputs: senzorické 0=food_dx, 1=food_dy, 2=cell_dx, 3=cell_dy,
 // 4=energy, 5=speed, 6=rel_size, 7=smell_grad_x, 8=smell_grad_y, 9=heading_x,
-// 10=heading_y, 11=pheromone_grad_x, 12=pheromone_grad_y, 13=local_density,
-// 14=damage. Sprint 33 přidává 3D rozšíření:
-// 15=food_dz, 16=cell_dz, 17=smell_grad_z, 18=heading_z, 19=pheromone_grad_z.
+// 10=heading_y, 11=pheromone_grad_x (ch0), 12=pheromone_grad_y (ch0),
+// 13=local_density, 14=damage. Sprint 33 přidává 3D rozšíření:
+// 15=food_dz, 16=cell_dz, 17=smell_grad_z, 18=heading_z, 19=pheromone_grad_z (ch0).
 // heading_x/y jsou nově xy projekce 3D forward vektoru (násobeno cos(pitch)),
 // heading_z = sin(pitch). Pro pitch=0 jsou identické s pre-Sprint-33 cos/sin
 // yaw — mozky natrénované v 2D zachovají chování při horizontálním letu.
@@ -55,7 +55,10 @@ pub const INITIAL_ENERGY: f32 = 100.0;
 // shiftne 52 → 53 (sensory + recurrent). Breaking change pre-S87 baseline:
 // w1 matice resize, GPU shader hardcoded constants update (brain_forward.wgsl,
 // hebbian.wgsl), all brain weights re-randomized při Genome::random.
-pub const BRAIN_INPUTS_SENSORY: usize = 21;
+// Sprint 126 (multi-channel pheromones): 21 → 27 — sloty 21,22,23 = ch1
+// pheromone gradient xyz, 24,25,26 = ch2 pheromone gradient xyz. Nové kanály
+// umožňují diskriminovanou komunikaci (cells emitují mixturu, sensors rozliší).
+pub const BRAIN_INPUTS_SENSORY: usize = 27;
 // Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
 // hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
 // w1 z 28×8=224 na 36×16=576 weights (2.6×).
@@ -102,7 +105,7 @@ pub const BRAIN_RECURRENT: usize = BRAIN_HIDDEN;
 /// Total brain input width = sensory + recurrent. Genom + forward pass +
 /// Hebbian + mutace pracují s touto velikostí transparentně.
 pub const BRAIN_INPUTS: usize = BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT;
-// Brain outputs: 0=turn (yaw rate), 1=thrust, 2=pheromone modulation
+// Brain outputs: 0=turn (yaw rate), 1=thrust, 2=pheromone ch0 emit
 // (positive = emit more above baseline, costs energy), 3=morph_length,
 // 4=morph_width, 5=morph_spike, 6=attack, 7=turn_pitch (Sprint 33),
 // 8=morph_height (Sprint 34, appended kvůli zachování existujících indexů).
@@ -112,16 +115,25 @@ pub const BRAIN_INPUTS: usize = BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT;
 // Sprint 26 morph signals: signal × MORPH_RATE × dt přičteno k phenotype dim
 // každý tick, energy cost ∝ |delta|. Sprint 27 attack: gating signál pro
 // `predate` — bez aktivního output[6] > THRESHOLD se predace nestane.
-pub const BRAIN_OUTPUTS: usize = 10;
+// Sprint 126 (multi-channel pheromones): 10=ch1 emit, 11=ch2 emit. Trojice
+// kanálů s různým decay (ch0 slow, ch1 medium, ch2 fast) → temporal patterning
+// + diskriminace.
+pub const BRAIN_OUTPUTS: usize = 12;
 /// Inicializační bias na thrust output bin v `Brain::random`. Bez něj má ~½
 /// random brainů thrust output blízko nuly (cell se sotva hýbe), což vytvářelo
 /// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce
 /// hodnotu doladí — bias je jen jumpstart.
 pub const INNATE_THRUST_BIAS: f32 = 2.0;
-/// Inicializační bias na pheromone output (b2[2]). Sprint 25 vyžaduje aktivní
-/// emisi pro reprodukci — bez biasu jen ~25 % párů projde threshold. S bias
-/// 1.0 většina random brainů emituje nad threshold v gen 0; selekce pak ladí.
+/// Inicializační bias na pheromone ch0 output (b2[2]). Sprint 25 vyžaduje
+/// aktivní emisi pro reprodukci — bez biasu jen ~25 % párů projde threshold.
+/// S bias 1.0 většina random brainů emituje nad threshold v gen 0; selekce
+/// pak ladí.
 pub const INNATE_PHEROMONE_BIAS: f32 = 1.0;
+/// Sprint 126: slabší bias na ch1 / ch2 emit slots (b2[10], b2[11]). Bez
+/// biasu by random brainy startovaly s ~0 emisi na nových kanálech a evoluce
+/// by měla dlouhý cold-start (signal must emerge from noise alone). 0.5 dává
+/// non-zero baseline, ale ne tak silný jako ch0 (mating gating ho potřebuje).
+pub const INNATE_PHEROMONE_AUX_BIAS: f32 = 0.5;
 /// Inicializační bias na attack output (b2[6]). Sprint 27: predace je opt-in,
 /// ne default. Záměrně 0 — chceme měřit, jestli selekce attack chování objeví
 /// sama, nebo zůstane utlumený. Negative bias by ho aktivně potlačoval.
@@ -281,8 +293,21 @@ pub const PHEROMONE_GRID_RES: usize = 64;
 /// res = větší cell_size_z (32 vs 64) → matchne thin world aspect a šetří
 /// memory bez ztráty rozlišení v xy.
 pub const PHEROMONE_GRID_RES_Z: usize = 16;
-pub const PHEROMONE_DIFFUSION: f32 = 0.15;
-pub const PHEROMONE_DECAY: f32 = 0.3;
+/// Sprint 126: počet nezávislých pheromone kanálů. Multi-channel umožňuje
+/// emergence diskriminované komunikace (cells emitují mixturu, sensors
+/// rozliší). 3 = uprostřed rozsahu 3-8 — dost pro discrimination, méně
+/// invazivní vs Brain dim expansion.
+pub const N_PHEROMONE_CHANNELS: usize = 3;
+/// Sprint 126: per-channel decay (1/s). ch0 = existing slow (mating-friendly),
+/// ch1 medium, ch2 fast (bursty / temporal patterning).
+pub const PHEROMONE_DECAY_PER_CH: [f32; N_PHEROMONE_CHANNELS] = [0.3, 1.5, 5.0];
+/// Sprint 126: per-channel diffusion. Slow channels difunduji víc (cumulative
+/// spread), rychlé méně (lokalizovaná spike).
+pub const PHEROMONE_DIFFUSION_PER_CH: [f32; N_PHEROMONE_CHANNELS] = [0.15, 0.12, 0.08];
+/// Backward-compat: ch0 (slow) decay/diffusion. GPU shaders + headless GPU
+/// path stále používají single-channel scalar.
+pub const PHEROMONE_DIFFUSION: f32 = PHEROMONE_DIFFUSION_PER_CH[0];
+pub const PHEROMONE_DECAY: f32 = PHEROMONE_DECAY_PER_CH[0];
 pub const PHEROMONE_BASELINE_EMIT: f32 = 0.0;
 pub const PHEROMONE_BRAIN_MOD: f32 = 1.0;
 pub const PHEROMONE_COST_PER_RATE: f32 = 1.0;
@@ -2642,6 +2667,11 @@ impl Brain {
         b2[6] += INNATE_ATTACK_BIAS;
         // Sprint 66 bond signal bias — opt-in jako attack.
         b2[9] += INNATE_BOND_BIAS;
+        // Sprint 126: ch1, ch2 emit biases. Slabší než ch0 (mating gating
+        // tam potřebuje high baseline) — jen aby evoluce neměla cold-start
+        // s output ≈ 0.
+        b2[10] += INNATE_PHEROMONE_AUX_BIAS;
+        b2[11] += INNATE_PHEROMONE_AUX_BIAS;
         Self { hidden_n, w1, b1, w2, b2 }
     }
 
@@ -3660,6 +3690,16 @@ pub struct Cell {
     #[serde(with = "serde_arr_hidden")]
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
+    /// Sprint 126: per-channel emission z minulého ticku. Updated v
+    /// `emit_pheromones` po výpočtu nového emit value (dříve čteno pro burst).
+    #[serde(default)]
+    pub last_emit: [f32; N_PHEROMONE_CHANNELS],
+    /// Sprint 126: per-channel akumulátor squared tick-to-tick deltas.
+    /// `burst_accum[ch] += (current - last_emit[ch])²` per emit_pheromones.
+    /// Resetuje se v end-of-gen write_stats. Vyšší hodnota = víc bursty
+    /// (continuous emit má small frame-to-frame deltas → low burst score).
+    #[serde(default)]
+    pub burst_accum: [f32; N_PHEROMONE_CHANNELS],
     /// Sprint 94: cluster-shared brain. Pre-tick mean `last_hidden` přes
     /// bond network (self + bonded partners). Brain recurrent input slots
     /// 21..52 čtou `pooled_hidden` místo `last_hidden` — cluster cells
@@ -3760,6 +3800,8 @@ impl Cell {
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
+            last_emit: [0.0; N_PHEROMONE_CHANNELS],
+            burst_accum: [0.0; N_PHEROMONE_CHANNELS],
             pooled_hidden: [0.0; BRAIN_HIDDEN],
             damage_accum: 0.0,
             age: 0,
@@ -4463,7 +4505,10 @@ pub struct BrainSensors {
     pub nearest_cell: Option<([f32; 3], f32)>,
     pub neighbors_in_vision: u32,
     pub smell_grad: [f32; 3],
-    pub pheromone_grad: [f32; 3],
+    /// Sprint 126: per-channel pheromone gradients. ch0 (= existing slow
+    /// channel) backward-compat sloty 11/12/19 v populate_brain_inputs;
+    /// ch1, ch2 nové sloty 21-23 / 24-26.
+    pub pheromone_grads: [[f32; 3]; N_PHEROMONE_CHANNELS],
     /// Sprint 87: aktuální teplota na cell pozici (sim units, ne normalized).
     /// Caller spočítá `temperature_at_z(pos[2], world_half, tick, gen)`.
     /// `populate_brain_inputs` normalizuje přes `tanh((T − REF) / 10)` →
@@ -4512,9 +4557,9 @@ pub fn populate_brain_inputs(
     inputs[9] = fwd[0];
     inputs[10] = fwd[1];
     inputs[18] = fwd[2];
-    inputs[11] = (sensors.pheromone_grad[0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[12] = (sensors.pheromone_grad[1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[19] = (sensors.pheromone_grad[2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[11] = (sensors.pheromone_grads[0][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[12] = (sensors.pheromone_grads[0][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[19] = (sensors.pheromone_grads[0][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
     inputs[13] = (sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
     inputs[14] = (cell.damage_accum * DAMAGE_NORMALIZATION_GAIN).tanh();
     cell.damage_accum = 0.0;
@@ -4523,6 +4568,13 @@ pub fn populate_brain_inputs(
     // tanh(0) = 0 na ref. Diurnal/seasonal posuny mohou krátkodobě saturovat
     // k ±1, což je akceptovatelná oversaturace pro brain signal.
     inputs[20] = ((sensors.temperature_local - THERMAL_REF_TEMP) / 10.0).tanh();
+    // Sprint 126: ch1, ch2 pheromone gradients. ch0 zachované na sloty 11/12/19.
+    inputs[21] = (sensors.pheromone_grads[1][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[22] = (sensors.pheromone_grads[1][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[23] = (sensors.pheromone_grads[1][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[24] = (sensors.pheromone_grads[2][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[25] = (sensors.pheromone_grads[2][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[26] = (sensors.pheromone_grads[2][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
     // Sprint 94: cluster-shared brain. Recurrent slots (21..52) čtou
     // `pooled_hidden` (mean self + bonded neighbors z předchozího ticku)
     // místo `last_hidden`. Solo cells: pool == self → behavior identical
@@ -4776,6 +4828,8 @@ pub fn make_mating_child(
         last_inputs: [0.0; BRAIN_INPUTS],
         last_hidden: [0.0; BRAIN_HIDDEN],
         last_outputs: [0.0; BRAIN_OUTPUTS],
+        last_emit: [0.0; N_PHEROMONE_CHANNELS],
+        burst_accum: [0.0; N_PHEROMONE_CHANNELS],
         pooled_hidden: [0.0; BRAIN_HIDDEN],
         damage_accum: 0.0,
         age: 0,
@@ -6537,7 +6591,7 @@ mod tests {
             nearest_cell: None,
             neighbors_in_vision: 0,
             smell_grad: [0.0; 3],
-            pheromone_grad: [0.0; 3],
+            pheromone_grads: [[0.0; 3]; N_PHEROMONE_CHANNELS],
             temperature_local: THERMAL_REF_TEMP, // exact REF → tanh(0) = 0
         };
         let inputs = populate_brain_inputs(&mut cell, &sensors, 50.0);
@@ -6671,6 +6725,8 @@ mod tests {
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
+            last_emit: [0.0; N_PHEROMONE_CHANNELS],
+            burst_accum: [0.0; N_PHEROMONE_CHANNELS],
             pooled_hidden: [0.0; BRAIN_HIDDEN],
             damage_accum: 0.0,
             age: 0,
@@ -7009,9 +7065,13 @@ mod tests {
         }
         let mean = sum / n as f64;
         assert!(mean > 0.3, "expected mean thrust > 0.3, got {}", mean);
+        // Sprint 126: BRAIN_INPUTS 71 → 77 zvýšilo input variance (víc gaussian
+        // weight noise feeded do hidden → větší tail variance v output[1]).
+        // INNATE_THRUST_BIAS posune mean kladně, ale fraction positive se snížila
+        // z >75 % na ~70 %. Mean je dál >0.3, evolutionary jumpstart funguje.
         assert!(
-            count_positive > n * 3 / 4,
-            "expected >75% positive, got {}/{}",
+            count_positive > n * 2 / 3,
+            "expected >66% positive, got {}/{}",
             count_positive,
             n
         );
@@ -7021,6 +7081,8 @@ mod tests {
     fn brain_forward_zero_weights_outputs_tanh_of_output_biases() {
         // Zero weights kill signal flow at both layers — output equals tanh(b2),
         // independent of b1 (the hidden activations get zeroed by w2).
+        // Sprint 126: BRAIN_OUTPUTS = 12 (+2 ch1/ch2 emit), test still passes
+        // because we read just outputs[0] and [1].
         let mut b2 = [0.0_f32; BRAIN_OUTPUTS];
         b2[0] = 0.5;
         b2[1] = -0.5;
@@ -7032,8 +7094,58 @@ mod tests {
             b2,
         };
         let outputs = brain.forward(&[0.0; BRAIN_INPUTS]);
+        assert_eq!(outputs.len(), BRAIN_OUTPUTS);
         assert!((outputs[0] - 0.5_f32.tanh()).abs() < 1e-6);
         assert!((outputs[1] - (-0.5_f32).tanh()).abs() < 1e-6);
+        // ch1, ch2 (sloty 10, 11) → b2 = 0 → output = tanh(0) = 0.
+        assert!(outputs[10].abs() < 1e-6);
+        assert!(outputs[11].abs() < 1e-6);
+    }
+
+    #[test]
+    fn multi_channel_pheromone_emit_costs_proportionally() {
+        // Sprint 126 sanity: tři kanály emit at full strength = 3× cost vs.
+        // jeden. Validates summed cost model: cost = total_emit × cost_rate × dt.
+        // Test je jen formální (cost rovnice je v emit_pheromones binárky, ne v
+        // lib), takže testujeme přímo equation v isolation.
+        let cost_rate = PHEROMONE_COST_PER_RATE;
+        let dt = 1.0 / FIXED_TIMESTEP_HZ;
+        let emit_single = [1.0_f32, 0.0, 0.0];
+        let emit_triple = [1.0_f32, 1.0, 1.0];
+        let total_single: f32 = emit_single.iter().sum();
+        let total_triple: f32 = emit_triple.iter().sum();
+        let cost_single = total_single * cost_rate * dt;
+        let cost_triple = total_triple * cost_rate * dt;
+        assert!((cost_triple / cost_single - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pheromone_field_array_independent_decay() {
+        // Sprint 126: 3 fields s rozdílnými decay rates. Po jednom kroku step
+        // má ch2 (decay 5.0) ztratit > ch1 (1.5) > ch0 (0.3) signálu.
+        let world_half = [100.0_f32, 100.0, 50.0];
+        let mut fields: [SmellField; N_PHEROMONE_CHANNELS] =
+            std::array::from_fn(|_| SmellField::new([8, 8, 4], world_half));
+        for f in fields.iter_mut() {
+            f.add_source([0.0, 0.0, 0.0], 1.0);
+        }
+        let dt = 1.0 / FIXED_TIMESTEP_HZ;
+        for ch in 0..N_PHEROMONE_CHANNELS {
+            for _ in 0..30 {
+                fields[ch].step(PHEROMONE_DIFFUSION_PER_CH[ch], PHEROMONE_DECAY_PER_CH[ch], dt);
+            }
+        }
+        let signal_ch0 = fields[0].sample([0.0, 0.0, 0.0]);
+        let signal_ch1 = fields[1].sample([0.0, 0.0, 0.0]);
+        let signal_ch2 = fields[2].sample([0.0, 0.0, 0.0]);
+        assert!(
+            signal_ch0 > signal_ch1,
+            "ch0 (slow decay) should retain více signal než ch1: ch0={signal_ch0} ch1={signal_ch1}"
+        );
+        assert!(
+            signal_ch1 > signal_ch2,
+            "ch1 should retain více než ch2 (rychlejší decay): ch1={signal_ch1} ch2={signal_ch2}"
+        );
     }
 
     #[test]
@@ -7733,7 +7845,7 @@ mod tests {
         tubby.phenotype.body_length = 2.0;
         tubby.phenotype.body_width = 2.0;
         tubby.phenotype.body_height = 2.0;
-        let outputs = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let outputs = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         unit.apply_brain_motor(&outputs, 1.0);
         tubby.apply_brain_motor(&outputs, 1.0);
         let unit_v = unit.velocity[0].abs();

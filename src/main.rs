@@ -43,8 +43,10 @@ use bioscape::{
     HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, HERD_RADIUS,
     HUNTER_GRID_CELL_SIZE, HUNTER_TARGET_COUNT, INITIAL_CELLS, LEARNING_RATE,
     MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MATING_RADIUS, MAX_BODY_LENGTH,
-    MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_BASELINE_EMIT,
-    PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY, PHEROMONE_DIFFUSION,
+    MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, N_PHEROMONE_CHANNELS,
+    PHEROMONE_BASELINE_EMIT,
+    PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY_PER_CH,
+    PHEROMONE_DIFFUSION_PER_CH,
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
     SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
@@ -370,8 +372,13 @@ impl OrbitCamera {
 #[derive(Resource)]
 struct SmellResource(SmellField);
 
+/// Sprint 126: multi-channel pheromone fields. Pole `[SmellField; N_PHEROMONE_CHANNELS]`
+/// — každý kanál má vlastní decay/diffusion (viz `PHEROMONE_DECAY_PER_CH` / `_DIFFUSION_PER_CH`).
+/// ch0 = slow (mating-friendly, backward-compat), ch1 medium, ch2 fast (bursty).
 #[derive(Resource)]
-struct PheromoneResource(SmellField);
+struct PheromoneResource {
+    fields: [SmellField; bioscape::N_PHEROMONE_CHANNELS],
+}
 
 #[derive(Resource)]
 struct WorldMapResource(WorldMap);
@@ -885,10 +892,14 @@ fn setup(
         [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
         half,
     )));
-    commands.insert_resource(PheromoneResource(SmellField::new(
-        [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-        half,
-    )));
+    commands.insert_resource(PheromoneResource {
+        fields: std::array::from_fn(|_| {
+            SmellField::new(
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                half,
+            )
+        }),
+    });
     commands.insert_resource(WorldMapResource(world_map));
 }
 
@@ -1266,17 +1277,24 @@ fn update_pheromone_field(
     let t = Instant::now();
     let dt = time.delta_secs();
 
-    // Sprint 59: GPU step + readback pokud field state available.
+    // Sprint 126: ch0 GPU path zachovaný (FieldGpu má jen single channel).
+    // ch1/ch2 vždy CPU step — nárůst load je marginal (2× další 64×64×16 grid
+    // diffusion).
     #[cfg(feature = "gpu")]
     if let Some(mut gpu) = gpu_field {
-        gpu.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+        gpu.pheromone.step(PHEROMONE_DIFFUSION_PER_CH[0], PHEROMONE_DECAY_PER_CH[0], dt);
         let grid = gpu.pheromone.download();
-        pheromone.0.replace_grid_from(&grid);
+        pheromone.fields[0].replace_grid_from(&grid);
+        for ch in 1..N_PHEROMONE_CHANNELS {
+            pheromone.fields[ch].step(PHEROMONE_DIFFUSION_PER_CH[ch], PHEROMONE_DECAY_PER_CH[ch], dt);
+        }
         diag.add_measurement(&DIAG_PHEROMONE, || t.elapsed().as_secs_f64() * 1000.0);
         return;
     }
 
-    pheromone.0.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+    for ch in 0..N_PHEROMONE_CHANNELS {
+        pheromone.fields[ch].step(PHEROMONE_DIFFUSION_PER_CH[ch], PHEROMONE_DECAY_PER_CH[ch], dt);
+    }
     diag.add_measurement(&DIAG_PHEROMONE, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
@@ -1288,32 +1306,57 @@ fn emit_pheromones(
 ) {
     let dt = time.delta_secs();
 
-    // Sprint 59: deposit do GPU pending_sources (flushed v dalším ticku
-    // update_pheromone_field step). CPU pheromone.grid není updated — sensor
-    // gather už proběhl s pre-emission stavem.
+    // Sprint 126: per-channel emission. Brain output sloty:
+    //   [2]  = ch0 emit (existing slow channel, mating-friendly)
+    //   [10] = ch1 emit (medium decay)
+    //   [11] = ch2 emit (fast decay, bursty)
+    // Cost = sum of all positive emissions × PHEROMONE_COST_PER_RATE.
+    const EMIT_SLOTS: [usize; N_PHEROMONE_CHANNELS] = [2, 10, 11];
+
     #[cfg(feature = "gpu")]
     if let Some(mut gpu) = gpu_field {
         for mut cell in &mut cells {
-            let mod_strength = cell.0.last_outputs[2].max(0.0);
-            let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
-            let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
-            gpu.pheromone.add_source(
-                [cell.0.position[0], cell.0.position[1], cell.0.position[2]],
-                rate * dt,
-            );
-            cell.0.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+            let pos = [cell.0.position[0], cell.0.position[1], cell.0.position[2]];
+            let mut total_emit = 0.0_f32;
+            let mut emits = [0.0_f32; N_PHEROMONE_CHANNELS];
+            for ch in 0..N_PHEROMONE_CHANNELS {
+                let mod_strength = cell.0.last_outputs[EMIT_SLOTS[ch]].max(0.0);
+                let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+                emits[ch] = brain_emit;
+                total_emit += brain_emit;
+                let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+                if ch == 0 {
+                    gpu.pheromone.add_source(pos, rate * dt);
+                } else {
+                    pheromone.fields[ch].add_source(pos, rate * dt);
+                }
+                let prev = cell.0.last_emit[ch];
+                let delta = brain_emit - prev;
+                cell.0.burst_accum[ch] += delta * delta;
+            }
+            cell.0.last_emit = emits;
+            cell.0.energy -= PHEROMONE_COST_PER_RATE * total_emit * dt;
         }
         return;
     }
 
     for mut cell in &mut cells {
-        let mod_strength = cell.0.last_outputs[2].max(0.0);
-        let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
-        let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
-        pheromone
-            .0
-            .add_source([cell.0.position[0], cell.0.position[1], cell.0.position[2]], rate * dt);
-        cell.0.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+        let pos = [cell.0.position[0], cell.0.position[1], cell.0.position[2]];
+        let mut total_emit = 0.0_f32;
+        let mut emits = [0.0_f32; N_PHEROMONE_CHANNELS];
+        for ch in 0..N_PHEROMONE_CHANNELS {
+            let mod_strength = cell.0.last_outputs[EMIT_SLOTS[ch]].max(0.0);
+            let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+            emits[ch] = brain_emit;
+            total_emit += brain_emit;
+            let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+            pheromone.fields[ch].add_source(pos, rate * dt);
+            let prev = cell.0.last_emit[ch];
+            let delta = brain_emit - prev;
+            cell.0.burst_accum[ch] += delta * delta;
+        }
+        cell.0.last_emit = emits;
+        cell.0.energy -= PHEROMONE_COST_PER_RATE * total_emit * dt;
     }
 }
 
@@ -1417,14 +1460,17 @@ fn cells_brain_act(
             });
         let pos_xyz = [pos[0], pos[1], pos[2]];
         let smell_grad = smell.0.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
-        let pheromone_grad = pheromone.0.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+        let mut pheromone_grads = [[0.0_f32; 3]; N_PHEROMONE_CHANNELS];
+        for ch in 0..N_PHEROMONE_CHANNELS {
+            pheromone_grads[ch] = pheromone.fields[ch].gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+        }
         let temperature_local = bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
         let sensors = bioscape::BrainSensors {
             nearest_food,
             nearest_cell,
             neighbors_in_vision,
             smell_grad,
-            pheromone_grad,
+            pheromone_grads,
             temperature_local,
         };
         cell.apply_shell_absorb(dt);

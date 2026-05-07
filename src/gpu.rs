@@ -83,10 +83,13 @@ const _: () = assert!(W1_OFFSET == 0);
 // = 2058.
 // Sprint 103 (HIDDEN 32 → 50): B1 = 50*71 = 3550, W2 = 3550+50 = 3600,
 // B2 = 3600+10*50 = 4100, WEIGHTS_PER_CELL = 4100+10 = 4110.
-const _: () = assert!(B1_OFFSET == 3550);
-const _: () = assert!(W2_OFFSET == 3600);
-const _: () = assert!(B2_OFFSET == 4100);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4110);
+// Sprint 126 (multi-channel pheromones, BRAIN_INPUTS_SENSORY 21 → 27,
+// BRAIN_INPUTS 71 → 77, BRAIN_OUTPUTS 10 → 12): B1 = 50*77 = 3850,
+// W2 = 3850+50 = 3900, B2 = 3900+12*50 = 4500, WEIGHTS_PER_CELL = 4500+12 = 4512.
+const _: () = assert!(B1_OFFSET == 3850);
+const _: () = assert!(W2_OFFSET == 3900);
+const _: () = assert!(B2_OFFSET == 4500);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4512);
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]

@@ -19,8 +19,10 @@ use bioscape::{
     HERD_RADIUS, HUNTER_GRID_CELL_SIZE, HUNTER_TARGET_COUNT,
     INITIAL_CELLS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
     MATING_RADIUS, MAX_BONDS_PER_CELL, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
-    PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY,
-    PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON,
+    N_PHEROMONE_CHANNELS,
+    PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE,
+    PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH,
+    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON,
     PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
     SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
     SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_HALF,
@@ -55,8 +57,10 @@ use std::time::Instant;
 /// deserializovat — load vrací error.
 /// Sprint 103 bump: BRAIN_HIDDEN 32→50, BRAIN_INPUTS 53→71. Brain weight
 /// arrays resize → V3 savefiles incompatible.
+/// Sprint 126 bump: multi-channel pheromones (3 fields), BRAIN_INPUTS_SENSORY
+/// 21→27, BRAIN_INPUTS 71→77, BRAIN_OUTPUTS 10→12. V4 savefiles incompatible.
 const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
-const CHECKPOINT_VERSION: u32 = 4;
+const CHECKPOINT_VERSION: u32 = 5;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -73,7 +77,10 @@ struct Checkpoint {
     clock: SimClock,
     density_factor: f32,
     smell: SmellField,
-    pheromone: SmellField,
+    /// Sprint 126: multi-channel pheromone fields. Backward-compat: starší
+    /// V4 checkpointy s `pheromone: SmellField` (ch0 only) už nelze
+    /// deserializovat — version bump.
+    pheromone_fields: Vec<SmellField>,
     map: WorldMap,
     births_gen: u64,
     deaths_gen: u64,
@@ -112,7 +119,11 @@ struct World {
     clock: SimClock,
     density_factor: f32,
     smell: SmellField,
-    pheromone: SmellField,
+    /// Sprint 126: multi-channel pheromone fields (3 nezávislých polí).
+    /// ch0 = slow (mating-friendly, decay 0.3), ch1 medium (1.5),
+    /// ch2 fast (5.0, bursty). GPU path používá pouze ch0 ve `gpu.pheromone`,
+    /// ch1/ch2 vždy CPU step.
+    pheromone_fields: [SmellField; N_PHEROMONE_CHANNELS],
     map: WorldMap,
     // Sprint 43: spatial hashes pro broad-phase. Rebuild před fází, která
     // neighbors používá — `cell_grid` před brain_act/resolve_collisions/predate,
@@ -261,10 +272,12 @@ impl World {
             clock: SimClock::new(TICKS_PER_GENERATION, GENERATIONS_PER_EPOCH),
             density_factor: 1.0,
             smell: SmellField::new([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z], WORLD_HALF),
-            pheromone: SmellField::new(
-                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-                WORLD_HALF,
-            ),
+            pheromone_fields: std::array::from_fn(|_| {
+                SmellField::new(
+                    [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                    WORLD_HALF,
+                )
+            }),
             map,
             cell_grid: SpatialGrid::new(GRID_CELL_SIZE),
             food_grid: SpatialGrid::new(GRID_CELL_SIZE),
@@ -320,7 +333,7 @@ impl World {
             clock: self.clock,
             density_factor: self.density_factor,
             smell: self.smell.clone(),
-            pheromone: self.pheromone.clone(),
+            pheromone_fields: self.pheromone_fields.iter().cloned().collect(),
             map: self.map.clone(),
             births_gen: self.births_gen,
             deaths_gen: self.deaths_gen,
@@ -366,13 +379,28 @@ impl World {
             .max()
             .map(|m| m + 1)
             .unwrap_or(0);
+        // Sprint 126: deserialize multi-channel pheromone_fields. Délka
+        // checkpoint pole se musí shodovat s build-time `N_PHEROMONE_CHANNELS`.
+        if chk.pheromone_fields.len() != N_PHEROMONE_CHANNELS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "checkpoint pheromone_fields len {} expected {}",
+                    chk.pheromone_fields.len(),
+                    N_PHEROMONE_CHANNELS
+                ),
+            ));
+        }
+        let mut pheromone_iter = chk.pheromone_fields.into_iter();
+        let pheromone_fields: [SmellField; N_PHEROMONE_CHANNELS] =
+            std::array::from_fn(|_| pheromone_iter.next().expect("checked length above"));
         Ok(Self {
             cells: chk.cells,
             foods: chk.foods,
             clock: chk.clock,
             density_factor: chk.density_factor,
             smell: chk.smell,
-            pheromone: chk.pheromone,
+            pheromone_fields,
             map: chk.map,
             cell_grid: SpatialGrid::new(GRID_CELL_SIZE),
             food_grid: SpatialGrid::new(GRID_CELL_SIZE),
@@ -559,41 +587,80 @@ impl World {
         // emit_pheromones, called after brain_act). Cells thus read the
         // gradient ze stavu pole na předchozí tick — prevents instant
         // self-feedback (cell vidí svůj vlastní právě emitovaný puff).
-        // Sprint 60: GPU step bez readback.
+        // Sprint 126: per-channel decay/diffusion. ch0 GPU step (single
+        // FieldGpu instance), ch1/ch2 vždy CPU.
         #[cfg(feature = "gpu")]
         if let Some(gpu) = self.gpu_full.as_mut() {
-            gpu.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+            gpu.pheromone.step(PHEROMONE_DIFFUSION_PER_CH[0], PHEROMONE_DECAY_PER_CH[0], dt);
+            for ch in 1..N_PHEROMONE_CHANNELS {
+                self.pheromone_fields[ch].step(
+                    PHEROMONE_DIFFUSION_PER_CH[ch],
+                    PHEROMONE_DECAY_PER_CH[ch],
+                    dt,
+                );
+            }
             return;
         }
-        self.pheromone.step(PHEROMONE_DIFFUSION, PHEROMONE_DECAY, dt);
+        for ch in 0..N_PHEROMONE_CHANNELS {
+            self.pheromone_fields[ch].step(
+                PHEROMONE_DIFFUSION_PER_CH[ch],
+                PHEROMONE_DECAY_PER_CH[ch],
+                dt,
+            );
+        }
     }
 
     fn emit_pheromones(&mut self, dt: f32) {
-        // Sprint 59: pokud --gpu-full, deposit do GPU pending_sources (flushed
-        // at next tick's update_pheromone step()). CPU pheromone.grid není
-        // updated — sensor gather už proběhl s pre-emission state (Sprint 38
-        // semantika "no self-feedback within tick").
+        // Sprint 126: per-channel emission. Brain output sloty:
+        //   [2]  = ch0 (slow, mating-friendly)
+        //   [10] = ch1 (medium decay)
+        //   [11] = ch2 (fast decay, bursty / temporal patterning)
+        // Cost = sum všech positive emisí × PHEROMONE_COST_PER_RATE.
+        const EMIT_SLOTS: [usize; N_PHEROMONE_CHANNELS] = [2, 10, 11];
+
         #[cfg(feature = "gpu")]
         if let Some(gpu) = self.gpu_full.as_mut() {
             for cell in &mut self.cells {
-                let mod_strength = cell.last_outputs[2].max(0.0);
-                let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
-                let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
-                gpu.pheromone.add_source(
-                    [cell.position[0], cell.position[1], cell.position[2]],
-                    rate * dt,
-                );
-                cell.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+                let pos = [cell.position[0], cell.position[1], cell.position[2]];
+                let mut total_emit = 0.0_f32;
+                let mut emits = [0.0_f32; N_PHEROMONE_CHANNELS];
+                for ch in 0..N_PHEROMONE_CHANNELS {
+                    let mod_strength = cell.last_outputs[EMIT_SLOTS[ch]].max(0.0);
+                    let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+                    emits[ch] = brain_emit;
+                    total_emit += brain_emit;
+                    let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+                    if ch == 0 {
+                        gpu.pheromone.add_source(pos, rate * dt);
+                    } else {
+                        self.pheromone_fields[ch].add_source(pos, rate * dt);
+                    }
+                    let prev = cell.last_emit[ch];
+                    let delta = brain_emit - prev;
+                    cell.burst_accum[ch] += delta * delta;
+                }
+                cell.last_emit = emits;
+                cell.energy -= PHEROMONE_COST_PER_RATE * total_emit * dt;
             }
             return;
         }
         for cell in &mut self.cells {
-            let mod_strength = cell.last_outputs[2].max(0.0);
-            let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
-            let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
-            self.pheromone
-                .add_source([cell.position[0], cell.position[1], cell.position[2]], rate * dt);
-            cell.energy -= PHEROMONE_COST_PER_RATE * brain_emit * dt;
+            let pos = [cell.position[0], cell.position[1], cell.position[2]];
+            let mut total_emit = 0.0_f32;
+            let mut emits = [0.0_f32; N_PHEROMONE_CHANNELS];
+            for ch in 0..N_PHEROMONE_CHANNELS {
+                let mod_strength = cell.last_outputs[EMIT_SLOTS[ch]].max(0.0);
+                let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+                emits[ch] = brain_emit;
+                total_emit += brain_emit;
+                let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+                self.pheromone_fields[ch].add_source(pos, rate * dt);
+                let prev = cell.last_emit[ch];
+                let delta = brain_emit - prev;
+                cell.burst_accum[ch] += delta * delta;
+            }
+            cell.last_emit = emits;
+            cell.energy -= PHEROMONE_COST_PER_RATE * total_emit * dt;
         }
     }
 
@@ -897,7 +964,7 @@ impl World {
         let cell_grid = &self.cell_grid;
         let food_grid = &self.food_grid;
         let smell = &self.smell;
-        let pheromone = &self.pheromone;
+        let pheromone_fields = &self.pheromone_fields;
         let tick = self.clock.tick;
         let gen = self.clock.generation;
 
@@ -956,7 +1023,11 @@ impl World {
 
                 let pos_xyz = [pos[0], pos[1], pos[2]];
                 let smell_grad = smell.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
-                let pheromone_grad = pheromone.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+                let mut pheromone_grads = [[0.0_f32; 3]; N_PHEROMONE_CHANNELS];
+                for ch in 0..N_PHEROMONE_CHANNELS {
+                    pheromone_grads[ch] =
+                        pheromone_fields[ch].gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+                }
                 let temperature_local =
                     bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
                 let sensors = bioscape::BrainSensors {
@@ -964,7 +1035,7 @@ impl World {
                     nearest_cell: best_cell,
                     neighbors_in_vision,
                     smell_grad,
-                    pheromone_grad,
+                    pheromone_grads,
                     temperature_local,
                 };
                 cell.apply_shell_absorb(dt);
@@ -1077,7 +1148,7 @@ impl World {
         let cell_grid = &self.cell_grid;
         let food_grid = &self.food_grid;
         let smell = &self.smell;
-        let pheromone = &self.pheromone;
+        let pheromone_fields = &self.pheromone_fields;
         let tick = self.clock.tick;
         let gen = self.clock.generation;
 
@@ -1135,7 +1206,11 @@ impl World {
 
                 let pos_xyz = [pos[0], pos[1], pos[2]];
                 let smell_grad = smell.gradient_at(pos_xyz, SMELL_SAMPLE_EPSILON);
-                let pheromone_grad = pheromone.gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+                let mut pheromone_grads = [[0.0_f32; 3]; N_PHEROMONE_CHANNELS];
+                for ch in 0..N_PHEROMONE_CHANNELS {
+                    pheromone_grads[ch] =
+                        pheromone_fields[ch].gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
+                }
                 let temperature_local =
                     bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
                 let sensors = bioscape::BrainSensors {
@@ -1143,7 +1218,7 @@ impl World {
                     nearest_cell: best_cell,
                     neighbors_in_vision,
                     smell_grad,
-                    pheromone_grad,
+                    pheromone_grads,
                     temperature_local,
                 };
 
@@ -2532,7 +2607,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
             bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,{:.3},0,0.000,0.000,{:.1}",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,{:.3},0,0.000,0.000,{:.1}",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -2568,7 +2643,12 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
     let mut spike_count_sum = 0_u64;
     let mut spike_complexity_sum = 0.0_f64;
     let mut spike_total_length_sum = 0.0_f64;
-    let mut ph_emit_sum = 0.0_f64;
+    // Sprint 126: per-channel emit statistics. ph_emit_sum nahrazen polem
+    // (avg + sumsq pro stddev). burst_score = mean ((emit_now - emit_prev)²)
+    // — vyšší = víc bursty (vs. continuous emission).
+    let mut ph_emit_sums = [0.0_f64; N_PHEROMONE_CHANNELS];
+    let mut ph_emit_sumsq = [0.0_f64; N_PHEROMONE_CHANNELS];
+    let mut ph_burst_sums = [0.0_f64; N_PHEROMONE_CHANNELS];
     let mut atk_emit_sum = 0.0_f64;
     let mut recurrent_io_sum = 0.0_f64;
     let mut density_sum = 0.0_f64;
@@ -2768,7 +2848,15 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
             }
             spike_complexity_sum += cmplx_sum / active_n as f64;
         }
-        ph_emit_sum += c.last_outputs[2].max(0.0) as f64;
+        // Sprint 126: per-channel emit aggregates + burst score (累积 variance
+        // ze squared tick-to-tick deltas, /TICKS_PER_GENERATION pro mean).
+        // last_emit reflektuje právě emitovanou hodnotu (post emit_pheromones).
+        for ch in 0..N_PHEROMONE_CHANNELS {
+            let cur = c.last_emit[ch] as f64;
+            ph_emit_sums[ch] += cur;
+            ph_emit_sumsq[ch] += cur * cur;
+            ph_burst_sums[ch] += c.burst_accum[ch] as f64;
+        }
         atk_emit_sum += c.last_outputs[6].max(0.0) as f64;
         // Sprint 28 adoption metric: jak silně se používá recurrent state.
         // Mean |last_hidden| napříč 8 dimenzemi → ∈ [0, 1]. Pokud je ~0,
@@ -2845,7 +2933,18 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
     let spd_d = ((spd_sumsq / nf) - spd_m * spd_m).max(0.0).sqrt();
     let vis_d = ((vis_sumsq / nf) - vis_m * vis_m).max(0.0).sqrt();
     let asp_d = ((asp_sumsq / nf) - asp_m * asp_m).max(0.0).sqrt();
-    let ph_emit_m = ph_emit_sum / nf;
+    // Sprint 126: per-channel emit/burst means + std. ph_burst is normalized
+    // per-tick (suma squared deltas / ticks_per_gen) — comparable napříč gens.
+    let ticks_per_gen = TICKS_PER_GENERATION as f64;
+    let mut ph_emit_m = [0.0_f64; N_PHEROMONE_CHANNELS];
+    let mut ph_emit_d = [0.0_f64; N_PHEROMONE_CHANNELS];
+    let mut ph_burst_m = [0.0_f64; N_PHEROMONE_CHANNELS];
+    for ch in 0..N_PHEROMONE_CHANNELS {
+        let m = ph_emit_sums[ch] / nf;
+        ph_emit_m[ch] = m;
+        ph_emit_d[ch] = ((ph_emit_sumsq[ch] / nf) - m * m).max(0.0).sqrt();
+        ph_burst_m[ch] = ph_burst_sums[ch] / (nf * ticks_per_gen);
+    }
     let atk_emit_m = atk_emit_sum / nf;
     let recurrent_io_m = recurrent_io_sum / nf;
     let energy_m = energy_sum / nf;
@@ -2965,7 +3064,7 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
     let spike_total_length_avg = if n > 0 { spike_total_length_sum / nf } else { 0.0 };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}",
         world.clock.generation,
         n,
         spd_m,
@@ -2983,7 +3082,15 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
         world.density_factor,
         lineages.len(),
         oldest_age,
-        ph_emit_m,
+        ph_emit_m[0],
+        ph_emit_m[1],
+        ph_emit_m[2],
+        ph_emit_d[0],
+        ph_emit_d[1],
+        ph_emit_d[2],
+        ph_burst_m[0],
+        ph_burst_m[1],
+        ph_burst_m[2],
         abs_x_m,
         abs_y_m,
         edge_f,
@@ -3442,7 +3549,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec"
     )
     .unwrap();
     write_stats(&mut log, &world, 0.0).unwrap();
@@ -3493,6 +3600,11 @@ fn main() {
                 0.0
             };
             write_stats(&mut log, &world, tps).unwrap();
+            // Sprint 126: reset burst_accum aby každá generace měřila vlastní
+            // tick-to-tick variance. Bez resetu by hodnoty monotonně rostly.
+            for cell in &mut world.cells {
+                cell.burst_accum = [0.0; N_PHEROMONE_CHANNELS];
+            }
             gen_start = Instant::now();
             gen_ticks = 0;
             // Sprint 43: po první dokončené generaci vypiš per-fáze timing

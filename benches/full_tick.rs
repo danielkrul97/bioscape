@@ -92,13 +92,15 @@ impl BenchWorld {
             .zip(self.brains.par_iter_mut())
             .map(|(cell, brain)| {
                 let smell_grad = smell.gradient_at(cell.position, 4.0);
-                let pheromone_grad = pheromone.gradient_at(cell.position, 4.0);
+                let pheromone_grad_ch0 = pheromone.gradient_at(cell.position, 4.0);
+                let mut pheromone_grads = [[0.0_f32; 3]; bioscape::N_PHEROMONE_CHANNELS];
+                pheromone_grads[0] = pheromone_grad_ch0;
                 let sensors = BrainSensors {
                     nearest_food: None,
                     nearest_cell: None,
                     neighbors_in_vision: 0,
                     smell_grad,
-                    pheromone_grad,
+                    pheromone_grads,
                     temperature_local: 17.0,
                 };
                 let inputs = populate_brain_inputs(cell, &sensors, cell.genome.vision_radius);

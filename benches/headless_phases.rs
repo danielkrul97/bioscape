@@ -174,12 +174,14 @@ fn bench_cell_step(c: &mut Criterion) {
 
 fn bench_populate_brain_inputs(c: &mut Criterion) {
     let mut group = c.benchmark_group("populate_brain_inputs");
+    let mut pheromone_grads = [[0.0_f32; 3]; bioscape::N_PHEROMONE_CHANNELS];
+    pheromone_grads[0] = [0.0, 0.1, -0.05];
     let sensors = BrainSensors {
         nearest_food: Some([12.0, -7.0, 1.0]),
         nearest_cell: Some(([3.0, 4.0, -2.0], 6.0)),
         neighbors_in_vision: 5,
         smell_grad: [0.1, -0.2, 0.05],
-        pheromone_grad: [0.0, 0.1, -0.05],
+        pheromone_grads,
         temperature_local: 17.0,
     };
     for n in [1000usize] {
