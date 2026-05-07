@@ -170,26 +170,23 @@ emit/burst sloupce vyplněné.
 4. **Korelace s clustering?** Sprint 67-71 bondy → multi-channel by mohly přinést
    cluster-level coordination (alarm vs. food signal).
 
-## Experiment: 155+ gen × 3 seeds (cílem 300, run zatím probíhá)
+## Experiment: 300 gen × 3 seeds (full)
 
-Spuštěny tři paralelní headless runy seed ∈ {0, 1, 42}, target 300 gen.
-V čase commitu finální analýzy seed0 = gen 172, seed1/42 = gen 155.
-Trajektorie ch1/ch2 se ustálila už okolo gen 30 a dál monotónně klesá —
-finální 300 gen verdict je **prediktabilní** a zůstávající 130 gens
-nedotkne závěr (dynamics jsou settled). Plné CSV + raw data:
-`docs/comm-experiment/{analyze.py, analysis_report.txt}`. Future
-research může re-spustit při zvýšeném budgetu.
+Tři paralelní headless runy seed ∈ {0, 1, 42}, **300 generací každý**
+(2h 25min wall-clock, 3 procesy sdílící 12-thread CPU). Plné CSV
+agregáty + analyzer: `docs/comm-experiment/{analyze.py,
+analysis_report.txt}`.
 
-### Late phase agregáty (gen 100+, mean ± sd, 3 seedy)
+### Late phase agregáty (gen 100-299, mean ± sd, 3 seedy)
 
 | metrika                   | mean   | sd     | CV   |
 |---------------------------|-------:|-------:|-----:|
-| `ph_emit_ch0_avg`         | 0.981  | 0.008  | 0.01 |
-| `ph_emit_ch1_avg`         | 0.005  | 0.001  | 0.27 |
-| `ph_emit_ch2_avg`         | 0.005  | 0.002  | 0.31 |
-| `ph_burst_score_ch0`      | 0.0012 | 0.0006 | 0.51 |
-| `ph_burst_score_ch1`      | 0.0006 | 0.0002 | 0.38 |
-| `ph_burst_score_ch2`      | 0.0006 | 0.0002 | 0.37 |
+| `ph_emit_ch0_avg`         | 0.987  | 0.004  | 0.00 |
+| `ph_emit_ch1_avg`         | **0.004** | 0.001  | 0.20 |
+| `ph_emit_ch2_avg`         | **0.004** | 0.001  | 0.20 |
+| `ph_burst_score_ch0`      | 0.0007 | 0.0003 | 0.43 |
+| `ph_burst_score_ch1`      | **0.0003** | 0.0002 | 0.53 |
+| `ph_burst_score_ch2`      | **0.0003** | 0.0002 | 0.50 |
 
 **Reprodukovatelně přes seedy** (CV < 0.5): ch1/ch2 essentially zero,
 ch0 saturován na 0.98. Burst scores u všech kanálů < 0.002 = continuous
@@ -213,22 +210,38 @@ ch1/ch2 do gen 30** (cost ~3× without payoff = klesá k baseline noise).
 ### Korelace channel ↔ environment — temporal artifact
 
 Plný timeline ukazuje silné korelace ch1/ch2 ↔ {bonds, food, density}
-(r > 0.8), ALE **late-phase only test je rozpadne**:
+(r > 0.8), ALE **late-phase only test je rozpadne** nebo dramaticky
+oslabí:
 
-| pair                          | full timeline r | late only (gen 100+) r |
-|-------------------------------|----------------:|-----------------------:|
-| seed=0  ch1 ↔ mean_bond_count | +0.924          | +0.009                 |
-| seed=1  ch1 ↔ mean_bond_count | +0.842          | −0.275                 |
-| seed=42 ch1 ↔ mean_bond_count | +0.831          | +0.075                 |
-| seed=0  ch1 ↔ food            | +0.681          | +0.071                 |
-| seed=1  ch1 ↔ food            | +0.643          | +0.520                 |
-| seed=42 ch1 ↔ food            | +0.781          | −0.119                 |
+| pair                          | full timeline r | late only (gen 100-299) r |
+|-------------------------------|----------------:|--------------------------:|
+| seed=0  ch1 ↔ mean_bond_count | +0.924          | **+0.012**                |
+| seed=1  ch1 ↔ mean_bond_count | +0.847          | **+0.084**                |
+| seed=42 ch1 ↔ mean_bond_count | +0.830          | **+0.038**                |
+| seed=0  ch1 ↔ food            | +0.693          | −0.090                    |
+| seed=1  ch1 ↔ food            | +0.668          | +0.410                    |
+| seed=42 ch1 ↔ food            | +0.792          | +0.235                    |
+| seed=0  ch1 ↔ density_avg     | +0.619          | +0.165                    |
+| seed=1  ch1 ↔ density_avg     | +0.741          | +0.564                    |
+| seed=42 ch1 ↔ density_avg     | +0.405          | +0.544                    |
 
-Late-phase korelace jsou **inkonzistentní napříč seedy** (pozitivní,
-negativní, blízko 0) → **temporal artifact**. Plné korelace byly
-driveny společným monotónním decayem ch1/ch2 + bonds + food early-mid
-fázi. V stable late phase ch1/ch2 emise nemá žádný persistent
-behavioral signal — žádná diskriminovaná komunikace.
+`ch ↔ mean_bond_count` korelace **kompletně mizí** v late phase
+(plné +0.83-0.92 → late +0.01-0.08) — čistý temporal artifact.
+
+`ch ↔ density_avg` korelace **přežívá v 2/3 seedů** s r ≈ +0.5 (seed0
+mizí na +0.17). To je nejlepší candidate signal v experimentu, ale
+absolutní emise jsou tak nízké (~0.004) že "komunikace" nemá
+funkční dosah — i kdyby ch1/ch2 ladně tracking density, signal je
+near-noise.
+
+`ch ↔ food` korelace **nestabilní** napříč seedy (range −0.09 až +0.41)
+— inkonzistentní = no robust signal.
+
+**Závěr**: některé late-phase korelace s density jsou statisticky
+nenulové, ale (1) nejsou napříč seedy konzistentní, (2) absolutní
+emise je < 0.005 (= 0.5 % saturation level), (3) `ch ↔ bonds`
+původně silný full-timeline signal byl entirely temporal artifact.
+**Žádná funkční diskriminovaná komunikace** se nevyvinula.
 
 ## Verdict
 
