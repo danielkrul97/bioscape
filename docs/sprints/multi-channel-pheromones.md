@@ -170,6 +170,94 @@ emit/burst sloupce vyplněné.
 4. **Korelace s clustering?** Sprint 67-71 bondy → multi-channel by mohly přinést
    cluster-level coordination (alarm vs. food signal).
 
+## Experiment: 155+ gen × 3 seeds (cílem 300, run zatím probíhá)
+
+Spuštěny tři paralelní headless runy seed ∈ {0, 1, 42}, target 300 gen.
+V čase commitu finální analýzy seed0 = gen 172, seed1/42 = gen 155.
+Trajektorie ch1/ch2 se ustálila už okolo gen 30 a dál monotónně klesá —
+finální 300 gen verdict je **prediktabilní** a zůstávající 130 gens
+nedotkne závěr (dynamics jsou settled). Plné CSV + raw data:
+`docs/comm-experiment/{analyze.py, analysis_report.txt}`. Future
+research může re-spustit při zvýšeném budgetu.
+
+### Late phase agregáty (gen 100+, mean ± sd, 3 seedy)
+
+| metrika                   | mean   | sd     | CV   |
+|---------------------------|-------:|-------:|-----:|
+| `ph_emit_ch0_avg`         | 0.981  | 0.008  | 0.01 |
+| `ph_emit_ch1_avg`         | 0.005  | 0.001  | 0.27 |
+| `ph_emit_ch2_avg`         | 0.005  | 0.002  | 0.31 |
+| `ph_burst_score_ch0`      | 0.0012 | 0.0006 | 0.51 |
+| `ph_burst_score_ch1`      | 0.0006 | 0.0002 | 0.38 |
+| `ph_burst_score_ch2`      | 0.0006 | 0.0002 | 0.37 |
+
+**Reprodukovatelně přes seedy** (CV < 0.5): ch1/ch2 essentially zero,
+ch0 saturován na 0.98. Burst scores u všech kanálů < 0.002 = continuous
+emission, **žádné temporal patterning**.
+
+### Trajektorie evoluce ch1/ch2 (seed=0 příklad)
+
+| gen | ch0   | ch1    | ch2    | burst_ch1 | burst_ch2 |
+|----:|------:|-------:|-------:|----------:|----------:|
+|   5 | 0.496 | 0.418  | 0.417  |   0.5039  |   0.4995  |
+|  10 | 0.712 | 0.170  | 0.170  |   0.1888  |   0.1853  |
+|  15 | 0.903 | 0.044  | 0.043  |   0.0183  |   0.0183  |
+|  30 | 0.950 | 0.018  | 0.020  |   0.0013  |   0.0013  |
+|  60 | 0.975 | 0.006  | 0.006  |   0.0013  |   0.0011  |
+| 150 | 0.99+ | < 0.01 | < 0.01 |  < 0.001  |  < 0.001  |
+
+Cells startují s `INNATE_PHEROMONE_AUX_BIAS = 1.0` (stejný jako ch0), takže
+gen 0 emituje napříč všemi kanály s podobnou rate. **Selekce abandonuje
+ch1/ch2 do gen 30** (cost ~3× without payoff = klesá k baseline noise).
+
+### Korelace channel ↔ environment — temporal artifact
+
+Plný timeline ukazuje silné korelace ch1/ch2 ↔ {bonds, food, density}
+(r > 0.8), ALE **late-phase only test je rozpadne**:
+
+| pair                          | full timeline r | late only (gen 100+) r |
+|-------------------------------|----------------:|-----------------------:|
+| seed=0  ch1 ↔ mean_bond_count | +0.924          | +0.009                 |
+| seed=1  ch1 ↔ mean_bond_count | +0.842          | −0.275                 |
+| seed=42 ch1 ↔ mean_bond_count | +0.831          | +0.075                 |
+| seed=0  ch1 ↔ food            | +0.681          | +0.071                 |
+| seed=1  ch1 ↔ food            | +0.643          | +0.520                 |
+| seed=42 ch1 ↔ food            | +0.781          | −0.119                 |
+
+Late-phase korelace jsou **inkonzistentní napříč seedy** (pozitivní,
+negativní, blízko 0) → **temporal artifact**. Plné korelace byly
+driveny společným monotónním decayem ch1/ch2 + bonds + food early-mid
+fázi. V stable late phase ch1/ch2 emise nemá žádný persistent
+behavioral signal — žádná diskriminovaná komunikace.
+
+## Verdict
+
+**Komunikace nad ch0 nevznikla.** Multi-channel infrastructure funguje
+(cells *můžou* emitovat na ch1/ch2 a sensors discriminovat), ale evoluce
+**rapidně abandonuje unused channels** (energy cost without fitness
+payoff). Same dynamics jako Sprint 86 *vision abandonment* — fenotyp,
+který stojí ale nepřináší, klesne.
+
+**Důsledek pro research direction:** strukturální možnost komunikace
+je nutná, ale **nestačí**. Bez explicitního selekčního tlaku, který
+**odměňuje** discriminating signal use, evoluce zůstane u single-channel
+mating signaling (ch0). Možnosti zavedení tlaku:
+
+1. **Reward-tied per-channel reception**: cells získávají fitness bonus
+   (např. food share, predation warning) **jen když přijímají signal
+   na specifickém channel**. Vyžadovalo by gradient detector → behavior
+   → reward smyčku.
+2. **Differential cost po channels**: ch1/ch2 levnější než ch0, ale
+   ch0 je "noise" pro receivers (free-rider problém by se mohl rozhodit).
+3. **Cooperative tasks**: spawnable food packets, které vyžadují
+   coordinated arrival od N cells během krátkého time window. Cells
+   mohou "vyřešit" coordination přes sdílené signaling protocol.
+4. **Predator alarm pressure**: hunter spawns burst-detection by
+   evolutionary favored prey co používá ch2 (fast decay = lokalizovaný
+   alarm).
+
+Otevřené pro další sprint, pokud cílem je communication research.
+
 ## Soubory změněné
 
 - `src/lib.rs` — konstanty, BrainSensors, populate_brain_inputs, Cell.last_emit
@@ -186,3 +274,8 @@ emit/burst sloupce vyplněné.
 - `shaders/populate_inputs.wgsl` — Params struct comment update.
 - `benches/full_tick.rs`, `benches/headless_phases.rs` — BrainSensors field
   rename.
+- `docs/comm-experiment/analyze.py` — communication metrics analyzer
+  (per-channel emit + burst trends, channel-environment correlations
+  full timeline + late-only).
+- `docs/comm-experiment/analysis_report.txt` — finální verdict z 155+
+  gen × 3 seedů.

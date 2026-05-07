@@ -1,0 +1,130 @@
+================================================================================
+MULTI-CHANNEL PHEROMONE EXPERIMENT — COMMUNICATION SIGNAL ANALYSIS
+================================================================================
+
+## SEED 0 (n=173 generations)
+
+### early (0-29)
+  cells=1024, lineages=39.7, predation=1902, bonds=0.014
+  Emit:    ch0=0.733±0.316  ch1=0.128±0.249  ch2=0.126±0.245
+  Burst:   ch0=0.1221  ch1=0.1193  ch2=0.1178
+
+### mid (30-99)
+  cells=1087, lineages=3.6, predation=2656, bonds=0.000
+  Emit:    ch0=0.969±0.153  ch1=0.011±0.099  ch2=0.011±0.101
+  Burst:   ch0=0.0011  ch1=0.0015  ch2=0.0015
+
+### late (100-299)
+  cells=925, lineages=3.0, predation=4658, bonds=0.000
+  Emit:    ch0=0.990±0.092  ch1=0.004±0.056  ch2=0.004±0.054
+  Burst:   ch0=0.0005  ch1=0.0003  ch2=0.0003
+
+### Channel-environment correlations (Pearson, full timeline)
+  channel                | predation_events   | food               | density_avg        | mean_bond_count   
+  ph_emit_ch0_avg        | +0.310               | -0.921               | -0.452               | -0.657              
+  ph_emit_ch1_avg        | -0.141               | +0.681               | +0.693               | +0.924              
+  ph_emit_ch2_avg        | -0.140               | +0.678               | +0.696               | +0.926              
+
+### Channel-environment correlations (LATE PHASE ONLY, gen 100+)
+  channel                | predation_events   | food               | density_avg        | mean_bond_count   
+  ph_emit_ch0_avg        | +0.501               | -0.550               | -0.410               | -0.169              
+  ph_emit_ch1_avg        | -0.009               | +0.071               | +0.333               | +0.009              
+  ph_emit_ch2_avg        | -0.054               | +0.131               | +0.316               | +0.019              
+
+## SEED 1 (n=156 generations)
+
+### early (0-29)
+  cells=944, lineages=43.0, predation=3491, bonds=0.038
+  Emit:    ch0=0.574±0.432  ch1=0.250±0.385  ch2=0.249±0.383
+  Burst:   ch0=0.2798  ch1=0.2568  ch2=0.2528
+
+### mid (30-99)
+  cells=925, lineages=6.0, predation=3787, bonds=0.001
+  Emit:    ch0=0.937±0.202  ch1=0.022±0.138  ch2=0.021±0.136
+  Burst:   ch0=0.0111  ch1=0.0103  ch2=0.0102
+
+### late (100-299)
+  cells=923, lineages=6.0, predation=3381, bonds=0.000
+  Emit:    ch0=0.983±0.108  ch1=0.005±0.065  ch2=0.004±0.061
+  Burst:   ch0=0.0011  ch1=0.0006  ch2=0.0006
+
+### Channel-environment correlations (Pearson, full timeline)
+  channel                | predation_events   | food               | density_avg        | mean_bond_count   
+  ph_emit_ch0_avg        | +0.138               | -0.784               | -0.689               | -0.678              
+  ph_emit_ch1_avg        | +0.082               | +0.643               | +0.846               | +0.842              
+  ph_emit_ch2_avg        | +0.084               | +0.644               | +0.844               | +0.843              
+
+### Channel-environment correlations (LATE PHASE ONLY, gen 100+)
+  channel                | predation_events   | food               | density_avg        | mean_bond_count   
+  ph_emit_ch0_avg        | +0.074               | -0.545               | -0.707               | +0.236              
+  ph_emit_ch1_avg        | -0.155               | +0.520               | +0.484               | -0.275              
+  ph_emit_ch2_avg        | -0.068               | +0.340               | +0.345               | -0.188              
+
+## SEED 42 (n=156 generations)
+
+### early (0-29)
+  cells=952, lineages=37.6, predation=3522, bonds=0.031
+  Emit:    ch0=0.744±0.345  ch1=0.101±0.248  ch2=0.099±0.241
+  Burst:   ch0=0.0724  ch1=0.0426  ch2=0.0389
+
+### mid (30-99)
+  cells=985, lineages=6.0, predation=3246, bonds=0.001
+  Emit:    ch0=0.951±0.178  ch1=0.012±0.105  ch2=0.010±0.096
+  Burst:   ch0=0.0053  ch1=0.0026  ch2=0.0025
+
+### late (100-299)
+  cells=978, lineages=4.5, predation=3103, bonds=0.000
+  Emit:    ch0=0.970±0.142  ch1=0.007±0.083  ch2=0.007±0.082
+  Burst:   ch0=0.0019  ch1=0.0009  ch2=0.0008
+
+### Channel-environment correlations (Pearson, full timeline)
+  channel                | predation_events   | food               | density_avg        | mean_bond_count   
+  ph_emit_ch0_avg        | +0.025               | -0.945               | -0.074               | -0.532              
+  ph_emit_ch1_avg        | +0.292               | +0.781               | +0.311               | +0.831              
+  ph_emit_ch2_avg        | +0.300               | +0.779               | +0.295               | +0.830              
+
+### Channel-environment correlations (LATE PHASE ONLY, gen 100+)
+  channel                | predation_events   | food               | density_avg        | mean_bond_count   
+  ph_emit_ch0_avg        | +0.124               | -0.233               | -0.325               | -0.049              
+  ph_emit_ch1_avg        | +0.034               | -0.119               | +0.074               | +0.075              
+  ph_emit_ch2_avg        | +0.009               | +0.072               | +0.245               | +0.061              
+
+================================================================================
+CROSS-SEED CONSISTENCY (late phase 100-299)
+================================================================================
+  ph_emit_ch0_avg              mean=0.9808 sd=0.0083 CV=0.01
+  ph_emit_ch1_avg              mean=0.0053 sd=0.0014 CV=0.27
+  ph_emit_ch2_avg              mean=0.0049 sd=0.0015 CV=0.31
+  ph_burst_score_ch0           mean=0.0012 sd=0.0006 CV=0.51
+  ph_burst_score_ch1           mean=0.0006 sd=0.0002 CV=0.38
+  ph_burst_score_ch2           mean=0.0006 sd=0.0002 CV=0.37
+
+================================================================================
+VERDICT — did communication beyond ch0 emerge?
+================================================================================
+
+  Late ch1 emit (mean across seeds): 0.005
+  Late ch2 emit (mean across seeds): 0.005
+  Late ch1 burst_score:              0.0006
+  Late ch2 burst_score:              0.0006
+
+  ch1 above 0.1 threshold: no
+  ch2 above 0.1 threshold: no
+
+  Hot environment correlations |r| > 0.4 (= signal candidates):
+    seed=0: ph_emit_ch1_avg ↔ food: r=+0.681
+    seed=0: ph_emit_ch1_avg ↔ density_avg: r=+0.693
+    seed=0: ph_emit_ch1_avg ↔ mean_bond_count: r=+0.924
+    seed=0: ph_emit_ch2_avg ↔ food: r=+0.678
+    seed=0: ph_emit_ch2_avg ↔ density_avg: r=+0.696
+    seed=0: ph_emit_ch2_avg ↔ mean_bond_count: r=+0.926
+    seed=1: ph_emit_ch1_avg ↔ food: r=+0.643
+    seed=1: ph_emit_ch1_avg ↔ density_avg: r=+0.846
+    seed=1: ph_emit_ch1_avg ↔ mean_bond_count: r=+0.842
+    seed=1: ph_emit_ch2_avg ↔ food: r=+0.644
+    seed=1: ph_emit_ch2_avg ↔ density_avg: r=+0.844
+    seed=1: ph_emit_ch2_avg ↔ mean_bond_count: r=+0.843
+    seed=42: ph_emit_ch1_avg ↔ food: r=+0.781
+    seed=42: ph_emit_ch1_avg ↔ mean_bond_count: r=+0.831
+    seed=42: ph_emit_ch2_avg ↔ food: r=+0.779
+    seed=42: ph_emit_ch2_avg ↔ mean_bond_count: r=+0.830
