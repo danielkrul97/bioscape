@@ -1,10 +1,10 @@
-pub mod brain;
-pub mod morphology;
-pub mod pheromone;
-pub mod physics;
-pub mod reproduction;
-pub mod thermal;
-pub mod world;
+mod brain;
+mod morphology;
+mod pheromone;
+mod physics;
+mod reproduction;
+mod thermal;
+mod world;
 
 pub use brain::*;
 pub use morphology::*;
