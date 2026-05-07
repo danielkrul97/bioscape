@@ -72,16 +72,6 @@ impl Brain {
 
 // ─── End Sprint 105 CPPN scaffolding ─────────────────────────────────────────
 
-pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
-    drag: DRAG_COEFFICIENT,
-    angular_drag: ANGULAR_DRAG,
-    energy_cost_per_v_sq: ENERGY_COST_PER_V_SQ,
-    angular_energy_cost: ANGULAR_ENERGY_COST,
-    vision_cost_per_radius: VISION_COST_PER_RADIUS,
-    body_cost_factor: BODY_COST_FACTOR,
-    thermal_optimum_penalty: THERMAL_OPTIMUM_PENALTY,
-};
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Brain {
     /// Sprint 80: active hidden neuron count (≤ BRAIN_HIDDEN storage). Default
