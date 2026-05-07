@@ -71,181 +71,181 @@ const CHECKPOINT_VERSION: u32 = 5;
 /// RNG state se NEUKLÁDÁ — load resetuje RNG ze --seed argument. Pro full
 /// reproducibility add chacha state serializace v pozdějším sprintu.
 #[derive(Serialize, Deserialize)]
-struct Checkpoint {
-    version: u32,
-    cells: Vec<Cell>,
-    foods: Vec<Food>,
-    clock: SimClock,
-    density_factor: f32,
-    smell: SmellField,
+pub struct Checkpoint {
+    pub version: u32,
+    pub cells: Vec<Cell>,
+    pub foods: Vec<Food>,
+    pub clock: SimClock,
+    pub density_factor: f32,
+    pub smell: SmellField,
     /// Sprint 126: multi-channel pheromone fields. Backward-compat: starší
     /// V4 checkpointy s `pheromone: SmellField` (ch0 only) už nelze
     /// deserializovat — version bump.
-    pheromone_fields: Vec<SmellField>,
-    map: WorldMap,
-    births_gen: u64,
-    deaths_gen: u64,
-    fertile_ticks_gen: u64,
-    predation_events_gen: u64,
-    mating_radius: f32,
-    max_population: usize,
+    pub pheromone_fields: Vec<SmellField>,
+    pub map: WorldMap,
+    pub births_gen: u64,
+    pub deaths_gen: u64,
+    pub fertile_ticks_gen: u64,
+    pub predation_events_gen: u64,
+    pub mating_radius: f32,
+    pub max_population: usize,
 }
 
 /// Sprint 43: per-fáze accumulator (mikrosekundy). World::tick zvyšuje každou
 /// dobu a main je čte/resetuje per generation. Default je all-zero.
 #[derive(Debug, Default, Clone, Copy)]
-struct PhaseTimings {
-    update_smell: f64,
-    update_pheromone: f64,
-    brain_act: f64,
-    emit_pheromones: f64,
-    apply_morph: f64,
-    apply_brownian: f64,
-    step: f64,
-    apply_food_gravity: f64,
-    apply_hazards: f64,
-    resolve_collisions: f64,
-    resolve_hunter_collisions: f64,
-    predate: f64,
-    hunt: f64,
-    eat_food: f64,
-    spawn_food: f64,
-    reproduce: f64,
-    die_and_drop_carrion: f64,
+pub struct PhaseTimings {
+    pub update_smell: f64,
+    pub update_pheromone: f64,
+    pub brain_act: f64,
+    pub emit_pheromones: f64,
+    pub apply_morph: f64,
+    pub apply_brownian: f64,
+    pub step: f64,
+    pub apply_food_gravity: f64,
+    pub apply_hazards: f64,
+    pub resolve_collisions: f64,
+    pub resolve_hunter_collisions: f64,
+    pub predate: f64,
+    pub hunt: f64,
+    pub eat_food: f64,
+    pub spawn_food: f64,
+    pub reproduce: f64,
+    pub die_and_drop_carrion: f64,
 }
 
-struct World {
-    cells: Vec<Cell>,
-    foods: Vec<Food>,
+pub struct World {
+    pub cells: Vec<Cell>,
+    pub foods: Vec<Food>,
     /// Sprint 128: cooperative food nodes. Lifecycle waiting → triggered/expired
     /// (separate od regular `Food` — odlišný spawn rate, žádný eat-by-cell,
     /// reward distribuovaný up-front při dosažení threshold).
-    coop_foods: Vec<CoopFood>,
+    pub coop_foods: Vec<CoopFood>,
     /// Sprint 128: per-gen counters pro CSV diagnostiku. Reset v end-of-gen
     /// stejně jako `bonds_formed_gen`.
-    coop_food_solved_gen: u64,
-    coop_food_failed_gen: u64,
+    pub coop_food_solved_gen: u64,
+    pub coop_food_failed_gen: u64,
     /// Sprint 128: suma arrivals.len() přes všechny coop nodes ke konci jejich
     /// lifecyklu (trigger nebo expire) — dělená total events daň mean per gen.
-    coop_food_arrivals_sum_gen: u64,
-    coop_food_events_gen: u64,
-    clock: SimClock,
-    density_factor: f32,
-    smell: SmellField,
+    pub coop_food_arrivals_sum_gen: u64,
+    pub coop_food_events_gen: u64,
+    pub clock: SimClock,
+    pub density_factor: f32,
+    pub smell: SmellField,
     /// Sprint 126: multi-channel pheromone fields (3 nezávislých polí).
     /// ch0 = slow (mating-friendly, decay 0.3), ch1 medium (1.5),
     /// ch2 fast (5.0, bursty). GPU path používá pouze ch0 ve `gpu.pheromone`,
     /// ch1/ch2 vždy CPU step.
-    pheromone_fields: [SmellField; N_PHEROMONE_CHANNELS],
-    map: WorldMap,
+    pub pheromone_fields: [SmellField; N_PHEROMONE_CHANNELS],
+    pub map: WorldMap,
     // Sprint 43: spatial hashes pro broad-phase. Rebuild před fází, která
     // neighbors používá — `cell_grid` před brain_act/resolve_collisions/predate,
     // `food_grid` před brain_act/eat_food.
-    cell_grid: SpatialGrid<usize, f32>,
-    food_grid: SpatialGrid<usize, bioscape::FoodKind>,
+    pub cell_grid: SpatialGrid<usize, f32>,
+    pub food_grid: SpatialGrid<usize, bioscape::FoodKind>,
     // Persistent scratch — reused per tick to avoid hot-loop allocations.
-    deltas_scratch: Vec<[f32; 3]>,
+    pub deltas_scratch: Vec<[f32; 3]>,
     /// Sprint 65: collision velocity damping (inelastic) — per pair, closing
     /// velocity podél separation normal je halved. Cell i sees pair (i, j),
     /// computes own delta; symmetric (Newton 3rd law) když j visits i.
-    velocity_deltas_scratch: Vec<[f32; 3]>,
-    energy_deltas_scratch: Vec<f32>,
-    damage_deltas_scratch: Vec<f32>,
-    eaten_scratch: Vec<bool>,
-    births_gen: u64,
-    deaths_gen: u64,
-    fertile_ticks_gen: u64,
-    predation_events_gen: u64,
+    pub velocity_deltas_scratch: Vec<[f32; 3]>,
+    pub energy_deltas_scratch: Vec<f32>,
+    pub damage_deltas_scratch: Vec<f32>,
+    pub eaten_scratch: Vec<bool>,
+    pub births_gen: u64,
+    pub deaths_gen: u64,
+    pub fertile_ticks_gen: u64,
+    pub predation_events_gen: u64,
     /// Sprint 66: monotonic counter pro stable Cell.cell_id přidělování.
     /// Initial population uses 0..INITIAL_CELLS, takže start = INITIAL_CELLS.
-    next_cell_id: u64,
+    pub next_cell_id: u64,
     /// Sprint 66: per-pair (min_id, max_id) → consecutive contact ticks.
     /// Vstupy se přidávají v `resolve_collisions` Phase 2 (sequential merge),
     /// odebírají při decay timeout. Sparse — pouze dvojice s aktuálním kontaktem.
-    contact_progress: rustc_hash::FxHashMap<(u64, u64), u32>,
+    pub contact_progress: rustc_hash::FxHashMap<(u64, u64), u32>,
     /// Sprint 66 diagnostic counter — počet bondů vytvořených v aktuální generaci.
     /// Zatím log-only, future může být CSV column.
-    bonds_formed_gen: u64,
+    pub bonds_formed_gen: u64,
     /// Sprint 66 diagnostic — počet bondů přervaných v aktuální generaci.
-    bonds_broken_gen: u64,
+    pub bonds_broken_gen: u64,
     /// Sprint 71: macropredator entities (Hunter). Sprint 89: + heritable
     /// genome + lifecycle (energy, reprodukce, smrt, floor respawn). Populace
     /// dynamic [1, HUNTER_MAX_POP]; initial = HUNTER_TARGET_COUNT.
-    hunters: Vec<Hunter>,
+    pub hunters: Vec<Hunter>,
     /// Sprint 71 diagnostic — počet hunter útoků v aktuální generaci.
-    hunter_attacks_gen: u64,
+    pub hunter_attacks_gen: u64,
     /// Sprint 89: monotonic counter pro nové hunter_id při reproduce + floor
     /// respawn. lineage_id = hunter_id pro nové lineage (floor respawn) nebo
     /// parent.lineage_id (reproduce continuation).
-    next_hunter_id: u64,
+    pub next_hunter_id: u64,
     /// Sprint 89: hunter lifecycle metrics per generation.
-    hunter_births_gen: u64,
-    hunter_deaths_gen: u64,
+    pub hunter_births_gen: u64,
+    pub hunter_deaths_gen: u64,
     /// Sprint 99: hunter-hunter contact ticks (mirror cells `contact_progress`),
     /// + bond formation/breaking counters. Persistent across ticks; rebuild
     /// per `resolve_hunter_collisions` pass.
-    hunter_contact_progress: rustc_hash::FxHashMap<(u64, u64), u32>,
-    hunter_bonds_formed_gen: u64,
-    hunter_bonds_broken_gen: u64,
-    mating_radius: f32,
+    pub hunter_contact_progress: rustc_hash::FxHashMap<(u64, u64), u32>,
+    pub hunter_bonds_formed_gen: u64,
+    pub hunter_bonds_broken_gen: u64,
+    pub mating_radius: f32,
     // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
     // může nastavit výš (potřeba pro bench při N > 1000).
-    max_population: usize,
+    pub max_population: usize,
     /// Sprint 109: deterministicky vygenerovaný kalendář environmentálních
     /// shocků. Default empty (no-op) — sim loop ho zatím nečte; integrace
     /// efektů přijde v Sprintu 110+.
-    events: EventCalendar,
+    pub events: EventCalendar,
     // Sprint 87 Hamilton-rule sweep: runtime overrides pro food share. Default
     // = pre-sweep behavior (BOND_FOOD_SHARE_FRAC, no kin filter).
-    share_frac: f32,
-    kin_filter: bool,
-    bench_timings: PhaseTimings,
+    pub share_frac: f32,
+    pub kin_filter: bool,
+    pub bench_timings: PhaseTimings,
     // Sprint 44: pokud `Some`, brain_act offloaduje forward pass na GPU.
     // Sensor gather + populate_brain_inputs + apply_brain_motor zůstává CPU.
     #[cfg(feature = "gpu")]
-    gpu: Option<BrainGpu>,
+    pub gpu: Option<BrainGpu>,
     // Sprint 51: full-GPU brain pipeline. Když Some, drží brain weights
     // persistent na GPU mezi ticky (eliminuje 30 MB/tick upload Sprintu 44),
     // GPU Hebbian replace CPU brain.hebbian_update, GPU Brownian replace
     // CPU apply_brownian. Sensor/motor/step/collision/predate zůstávají CPU
     // rayon (Sprint 50 standalone shadery jsou ready, integrace je Sprint 52+).
     #[cfg(feature = "gpu")]
-    gpu_full: Option<GpuFullState>,
+    pub gpu_full: Option<GpuFullState>,
 }
 
 #[cfg(feature = "gpu")]
-struct GpuFullState {
-    cells: CellsGpu,
-    brain: BrainGpu,
-    hebbian: HebbianGpu,
-    brownian: BrownianGpu,
+pub struct GpuFullState {
+    pub cells: CellsGpu,
+    pub brain: BrainGpu,
+    pub hebbian: HebbianGpu,
+    pub brownian: BrownianGpu,
     /// Sprint 59: GPU smell + pheromone field (3D 7-point Jacobi).
     /// Sprint 60: po wire SensorGatherGpu už NEČTE CPU SmellField shadow —
     /// sensor shader bere field grid storage buffer direct. Per-tick readback
     /// eliminován; CPU `World.smell` / `pheromone` zůstávají jen pro
     /// checkpoint serialization (po `--gpu-full` jsou CPU shadows out-of-date).
-    smell: FieldGpu,
-    pheromone: FieldGpu,
+    pub smell: FieldGpu,
+    pub pheromone: FieldGpu,
     /// Sprint 60: GPU spatial hashes pro sensor broad-phase. Per-tick
     /// `dispatch()` (no readback) + sensor shader čte `offsets_buffer()` /
     /// `sorted_buffer()` přes binding group.
-    cell_hash: SpatialHashGpu,
-    food_hash: SpatialHashGpu,
-    sensor: SensorGatherGpu,
+    pub cell_hash: SpatialHashGpu,
+    pub food_hash: SpatialHashGpu,
+    pub sensor: SensorGatherGpu,
     /// Sprint 61: GPU populate_brain_inputs shader fuze sensor output + cell
     /// metadata → brain inputs buffer. Eliminuje sensor 60 KB readback round-trip.
-    populate: PopulateInputsGpu,
+    pub populate: PopulateInputsGpu,
     /// Sprint 62: motor on GPU (apply brain outputs → velocity/ang_vel/pitch_vel).
     /// Fused s brownian dispatch v brain_act → single batch readback eliminuje
     /// round-trip #2 (hidden+outputs) i round-trip #3 (velocities).
-    motor: MotorGpu,
+    pub motor: MotorGpu,
     /// Sprint 63: step on GPU (kinematics + drag + energy + bounce).
     /// Fused do brain_act batch readback. Skip CPU `step` fáze v `--gpu-full`.
-    step: StepGpu,
+    pub step: StepGpu,
 }
 
 impl World {
-    fn new(
+    pub fn new(
         rng: &mut impl Rng,
         map_seed: u64,
         mating_radius: f32,
@@ -343,7 +343,7 @@ impl World {
     /// Sprint 48: snapshot sim state do versioned binary blob. Format:
     /// `MAGIC[8] | bincode(Checkpoint)`. Idempotent — caller může volat
     /// průběžně i na konci.
-    fn save_checkpoint(&self, path: &Path) -> std::io::Result<()> {
+    pub fn save_checkpoint(&self, path: &Path) -> std::io::Result<()> {
         let chk = Checkpoint {
             version: CHECKPOINT_VERSION,
             cells: self.cells.clone(),
@@ -369,7 +369,7 @@ impl World {
 
     /// Sprint 48: rekonstrukce World z binary checkpointu. Magic + version
     /// validace. RNG, grids, scratch a GPU se re-inicializují (NE z checkpointu).
-    fn load_checkpoint(path: &Path) -> std::io::Result<Self> {
+    pub fn load_checkpoint(path: &Path) -> std::io::Result<Self> {
         let data = std::fs::read(path)?;
         if data.len() < 8 || &data[..8] != CHECKPOINT_MAGIC {
             return Err(std::io::Error::new(
@@ -473,7 +473,7 @@ impl World {
         })
     }
 
-    fn tick(&mut self, rng: &mut impl Rng) -> Option<u64> {
+    pub fn tick(&mut self, rng: &mut impl Rng) -> Option<u64> {
         let dt = 1.0 / FIXED_TIMESTEP_HZ;
         let transitions = self.clock.advance();
         if transitions.generation_ended.is_some() {
@@ -1403,7 +1403,7 @@ impl World {
 
     /// Sprint 112: per-cell climate offset helper, sdílený mezi tick hot path
     /// a `write_stats` (CSV column `shock_climate_offset`).
-    fn climate_offset_at(&self, pos_xy: [f32; 2]) -> f32 {
+    pub fn climate_offset_at(&self, pos_xy: [f32; 2]) -> f32 {
         bioscape::climate_shock_offset(
             &self.events.events,
             self.clock.generation,
@@ -2680,15 +2680,15 @@ impl World {
     }
 }
 
-fn food_multiplier(noise: f32) -> f32 {
+pub fn food_multiplier(noise: f32) -> f32 {
     WORLD_MAP_FOOD_FLOOR + WORLD_MAP_FOOD_AMP * noise
 }
 
-fn hazard_drain(noise: f32) -> f32 {
+pub fn hazard_drain(noise: f32) -> f32 {
     HAZARD_DRAIN_PER_SEC * (HAZARD_FLOOR + HAZARD_AMP * noise)
 }
 
-fn food_target(factor: f32) -> usize {
+pub fn food_target(factor: f32) -> usize {
     // Sprint 53: scale s 3D objemem aby food density per volume zůstala
     // konstantní napříč z-expansionem. Pre-Sprint-53 baseline: z=2 → z_extent=4.
     // Volumetric factor = z_extent / 4. Při z=20: 10× food count vs pre-Sprint-53.
@@ -2701,1130 +2701,5 @@ fn food_target(factor: f32) -> usize {
 // Spatial occupancy thresholds for clustering diagnostics. A cell is
 // "near edge" if its position falls in the outer 10 % of either axis;
 // "in corner" if both axes simultaneously meet that criterion.
-const EDGE_FRAC_THRESHOLD: f32 = 0.9;
+pub const EDGE_FRAC_THRESHOLD: f32 = 0.9;
 
-fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::io::Result<()> {
-    let n = world.cells.len();
-    if n == 0 {
-        // 64 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
-        // + 3 birth/death + 1 atk_emit 0 + predation + 6 brain/density 0 + 2
-        // bonds + 6 bond/adhesion 0 + 2 hunter + 1 immune_frac 0 +
-        // 3 cell_state 0 (Sprint 80) + 2 vision_fov 0 (Sprint 83) +
-        // 1 thermal 0 (Sprint 85) + 2 thermal_optimum 0 (Sprint 87) +
-        // 7 hunter genome 0 (Sprint 89) + 2 diet/exposure 0 (Sprint 93).
-        // Sprint 99: + 2 hunter bond means + 2 hunter bond formed/broken counters.
-        // Sprint 111: i v empty-pop branch reportujeme aktuální shock stav,
-        // protože shocky existují nezávisle na živé populaci.
-        let (shock_active, shock_hazard_max) = shock_summary(world);
-        // Sprint 113: shock_food_factor reportuje i v empty-pop branch.
-        let shock_food_factor =
-            bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
-        // Sprint 128: i v empty-pop branch reportujeme coop counters
-        // (events probíhají nezávisle na cell pop > 0; pro extinction-on-empty
-        // řádek je smysl reportovat 0/0/0).
-        let coop_arrivals_avg = if world.coop_food_events_gen > 0 {
-            world.coop_food_arrivals_sum_gen as f64 / world.coop_food_events_gen as f64
-        } else {
-            0.0
-        };
-        return writeln!(
-            w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,{:.3},0,0.000,0.000,{:.1},{},{},{:.3}",
-            world.clock.generation,
-            world.foods.len(),
-            world.density_factor,
-            world.births_gen,
-            world.deaths_gen,
-            world.fertile_ticks_gen,
-            world.predation_events_gen,
-            world.bonds_formed_gen,
-            world.bonds_broken_gen,
-            world.hunter_attacks_gen,
-            world.hunters.len(),
-            world.hunter_births_gen,
-            world.hunter_deaths_gen,
-            world.hunter_bonds_formed_gen,
-            world.hunter_bonds_broken_gen,
-            shock_active,
-            shock_hazard_max,
-            shock_food_factor,
-            ticks_per_sec,
-            world.coop_food_solved_gen,
-            world.coop_food_failed_gen,
-            coop_arrivals_avg,
-        );
-    }
-    let mut spd_sum = 0.0_f64;
-    let mut spd_sumsq = 0.0_f64;
-    let mut vis_sum = 0.0_f64;
-    let mut vis_sumsq = 0.0_f64;
-    let mut len_sum = 0.0_f64;
-    let mut wid_sum = 0.0_f64;
-    let mut hgt_sum = 0.0_f64;
-    let mut asp_sum = 0.0_f64;
-    let mut asp_sumsq = 0.0_f64;
-    let mut spk_sum = 0.0_f64;
-    let mut spk_max = 0.0_f64;
-    let mut spike_count_sum = 0_u64;
-    let mut spike_complexity_sum = 0.0_f64;
-    let mut spike_total_length_sum = 0.0_f64;
-    // Sprint 126: per-channel emit statistics. ph_emit_sum nahrazen polem
-    // (avg + sumsq pro stddev). burst_score = mean ((emit_now - emit_prev)²)
-    // — vyšší = víc bursty (vs. continuous emission).
-    let mut ph_emit_sums = [0.0_f64; N_PHEROMONE_CHANNELS];
-    let mut ph_emit_sumsq = [0.0_f64; N_PHEROMONE_CHANNELS];
-    let mut ph_burst_sums = [0.0_f64; N_PHEROMONE_CHANNELS];
-    let mut atk_emit_sum = 0.0_f64;
-    let mut recurrent_io_sum = 0.0_f64;
-    let mut density_sum = 0.0_f64;
-    let mut density_sumsq = 0.0_f64;
-    let mut dmg_sum = 0.0_f64;
-    let mut noise_sum = 0.0_f64;
-    let mut energy_sum = 0.0_f64;
-    let mut abs_x_sum = 0.0_f64;
-    let mut abs_y_sum = 0.0_f64;
-    let mut x_sum = 0.0_f64;
-    let mut y_sum = 0.0_f64;
-    let mut edge_count = 0_u64;
-    let mut corner_count = 0_u64;
-    let mut lineages: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut oldest_age: u64 = 0;
-    // Sprint 67 bond/adhesion diagnostics: per-cell aggregates pro CSV.
-    let mut bond_signal_sum = 0.0_f64;
-    let mut total_bonds = 0_u64;
-    let mut bonded_cells = 0_u64;
-    // Sprint 71: cells s ≥ HUNTER_BOND_IMMUNITY_THRESHOLD bondů — immune
-    // proti hunteru. Pop-level metric pro „kolik populace dosáhlo proto-tissue".
-    let mut immune_cells = 0_u64;
-    let mut adhesion_hist = [0_u64; bioscape::ADHESION_TYPE_COUNT as usize];
-    // Sprint 68: gene-level diagnostics — mean of bond_stiffness / bond_damping
-    // přes celou populaci. Porovnáním s initial draw centerem (BOND_STIFFNESS=4.0,
-    // BOND_DAMPING=0.6) se dá detekovat selekční drift.
-    let mut bond_stiff_sum = 0.0_f64;
-    let mut bond_damp_sum = 0.0_f64;
-    // Sprint 80: bistable cell_state diagnostics. Mean + std + altruist_frac
-    // (cells s state > 0.6 = committed k altruist attractoru). Bimodální
-    // distribuce (mean okolo 0.5, std velký, altruist_frac mezi 0.3-0.7) =
-    // očekávaný steady-state. Unimodální drift k 0 = celá populace selfish
-    // = food share zcela vypnutý → tissue regime collapsuje.
-    let mut state_sum = 0.0_f64;
-    let mut state_sumsq = 0.0_f64;
-    let mut altruist_count = 0_u64;
-    // Sprint 83: per-gen FOV diagnostika. Init populace = π (full sphere);
-    // pokles avg + růst dev = aktivní selekce na užší kužel.
-    let mut fov_sum = 0.0_f64;
-    let mut fov_sumsq = 0.0_f64;
-    // Sprint 85: thermal niche metric. Mean temperature na cell pozicích —
-    // posun směrem k THERMAL_BOTTOM (~4) = populace migrovala ke dnu (cold,
-    // pomalý metabolism), posun k THERMAL_TOP (~30) = surface dwellers.
-    let mut temp_sum = 0.0_f64;
-    // Sprint 87: thermal_optimum gen statistics. Mean + std → speciation
-    // ukazuje, jak se populace rozčlenila mezi cold-prefer / warm-prefer
-    // fenotypy. Gen 0 mean ≈ (BOTTOM+TOP)/2 = 17 (uniform init), std ≈ 7.5
-    // (uniform sigma).
-    let mut topt_sum = 0.0_f64;
-    let mut topt_sumsq = 0.0_f64;
-    // Sprint 89: hunter genome diagnostics. Mean napříč alive hunters —
-    // arms race signal v drift těchto hodnot napříč gens.
-    let mut h_spd_sum = 0.0_f64;
-    let mut h_vis_sum = 0.0_f64;
-    let mut h_fov_sum = 0.0_f64;
-    let mut h_dmg_sum = 0.0_f64;
-    let mut h_size_sum = 0.0_f64;
-    // Sprint 93: per-cell diet + defense diagnostics.
-    let mut carnivore_sum = 0.0_f64;
-    let mut exposure_sum = 0.0_f64;
-    // Sprint 97: per-category sensor_gain means + stddev. Specialization
-    // signal — high stddev (bimodální distribuce) = role differentiation
-    // mezi cells. Low stddev s drift v meanu = uniform shift, pokles bez
-    // specializace. Mean alone nerozliší tyto dva režimy.
-    let mut gain_sum = [0.0_f64; bioscape::N_SENSOR_CATEGORIES];
-    let mut gain_sumsq = [0.0_f64; bioscape::N_SENSOR_CATEGORIES];
-    for c in &world.cells {
-        carnivore_sum += c.genome.carnivore_score as f64;
-        exposure_sum += bioscape::cell_exposure(c.n_bonds()) as f64;
-        for k in 0..bioscape::N_SENSOR_CATEGORIES {
-            let g = c.genome.sensor_gains[k] as f64;
-            gain_sum[k] += g;
-            gain_sumsq[k] += g * g;
-        }
-    }
-    let cell_count = world.cells.len();
-    let carnivore_m = if cell_count > 0 { carnivore_sum / cell_count as f64 } else { 0.0 };
-    let exposure_m = if cell_count > 0 { exposure_sum / cell_count as f64 } else { 0.0 };
-    let gain_mean_dev = |k: usize| -> (f64, f64) {
-        if cell_count == 0 { return (0.0, 0.0); }
-        let n = cell_count as f64;
-        let m = gain_sum[k] / n;
-        let var = (gain_sumsq[k] / n - m * m).max(0.0);
-        (m, var.sqrt())
-    };
-    let (gain_vis_m, gain_vis_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_VISION);
-    let (gain_chem_m, gain_chem_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_CHEMISTRY);
-    let (gain_def_m, gain_def_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_DEFENSIVE);
-    // Sprint 107: speciation distance diagnostic. Sample N pairs random,
-    // průměr compatibility_distance na CPPN. Indicator of population-wide
-    // genetic divergence (vyšší = víc speciation).
-    let cppn_compat_m: f64 = {
-        let n_cells = world.cells.len();
-        if n_cells < 2 {
-            0.0
-        } else {
-            let pairs = (n_cells.min(50)).max(2);
-            let mut sum = 0.0_f64;
-            let mut count = 0u32;
-            for k in 0..pairs {
-                let i = k % n_cells;
-                let j = (k + n_cells / 2) % n_cells;
-                if i != j {
-                    sum += bioscape::Cppn::compatibility_distance(
-                        &world.cells[i].genome.cppn,
-                        &world.cells[j].genome.cppn,
-                    ) as f64;
-                    count += 1;
-                }
-            }
-            if count > 0 {
-                sum / count as f64
-            } else {
-                0.0
-            }
-        }
-    };
-    let n_hunters = world.hunters.len();
-    let mut h_bond_count_sum: u64 = 0;
-    let mut h_bonded_count: u64 = 0;
-    if n_hunters > 0 {
-        for h in &world.hunters {
-            h_spd_sum += h.genome.max_speed as f64;
-            h_vis_sum += h.genome.vision_radius as f64;
-            h_fov_sum += h.genome.vision_fov as f64;
-            h_dmg_sum += h.genome.damage_per_tick as f64;
-            h_size_sum += h.genome.body_size as f64;
-            // Sprint 99: hunter bond count
-            let nb = h.bonds.iter().filter(|b| b.is_some()).count() as u64;
-            h_bond_count_sum += nb;
-            if nb > 0 {
-                h_bonded_count += 1;
-            }
-        }
-    }
-    let nhf = n_hunters as f64;
-    let h_spd_m = if n_hunters > 0 { h_spd_sum / nhf } else { 0.0 };
-    let h_vis_m = if n_hunters > 0 { h_vis_sum / nhf } else { 0.0 };
-    let h_fov_m = if n_hunters > 0 { h_fov_sum / nhf } else { 0.0 };
-    let h_dmg_m = if n_hunters > 0 { h_dmg_sum / nhf } else { 0.0 };
-    let h_size_m = if n_hunters > 0 { h_size_sum / nhf } else { 0.0 };
-    let h_bond_n_m = if n_hunters > 0 {
-        h_bond_count_sum as f64 / nhf
-    } else {
-        0.0
-    };
-    let h_bond_active_f = if n_hunters > 0 {
-        h_bonded_count as f64 / nhf
-    } else {
-        0.0
-    };
-    let current_gen = world.clock.generation;
-    for c in &world.cells {
-        let s = c.genome.max_speed as f64;
-        let v = c.genome.vision_radius as f64;
-        let l = c.phenotype.body_length as f64;
-        let wd = c.phenotype.body_width as f64;
-        let hg = c.phenotype.body_height as f64;
-        let aspect = if wd > 1e-6 { l / wd } else { 0.0 };
-        let spk = c.phenotype.primary_spike_length() as f64;
-        spd_sum += s;
-        spd_sumsq += s * s;
-        vis_sum += v;
-        vis_sumsq += v * v;
-        len_sum += l;
-        wid_sum += wd;
-        hgt_sum += hg;
-        asp_sum += aspect;
-        asp_sumsq += aspect * aspect;
-        spk_sum += spk;
-        let fov = c.genome.vision_fov as f64;
-        fov_sum += fov;
-        fov_sumsq += fov * fov;
-        // Sprint 86: temperature includes diurnal + seasonal cycles. Snapshot
-        // se bere v aktuálním clock state — temp_avg pak odráží environmental
-        // teplotu cells **v okamžiku end-of-gen**, ne time-averaged.
-        temp_sum += bioscape::temperature_at_z(
-            c.position[2],
-            WORLD_HALF,
-            world.clock.tick,
-            world.clock.generation,
-        ) as f64;
-        let topt = c.genome.thermal_optimum as f64;
-        topt_sum += topt;
-        topt_sumsq += topt * topt;
-        if spk > spk_max {
-            spk_max = spk;
-        }
-        // Sprint 123: per-cell aggregates pro multi-spike observability.
-        spike_count_sum += c.phenotype.spike_count as u64;
-        spike_total_length_sum += c.phenotype.total_spike_length() as f64;
-        let active_n = c.phenotype.spike_count.min(bioscape::SPIKE_SLOTS as u8) as usize;
-        if active_n > 0 {
-            let mut cmplx_sum = 0.0_f64;
-            for slot in 0..active_n {
-                cmplx_sum += c.phenotype.spikes[slot].complexity as f64;
-            }
-            spike_complexity_sum += cmplx_sum / active_n as f64;
-        }
-        // Sprint 126: per-channel emit aggregates + burst score (累积 variance
-        // ze squared tick-to-tick deltas, /TICKS_PER_GENERATION pro mean).
-        // last_emit reflektuje právě emitovanou hodnotu (post emit_pheromones).
-        for ch in 0..N_PHEROMONE_CHANNELS {
-            let cur = c.last_emit[ch] as f64;
-            ph_emit_sums[ch] += cur;
-            ph_emit_sumsq[ch] += cur * cur;
-            ph_burst_sums[ch] += c.burst_accum[ch] as f64;
-        }
-        atk_emit_sum += c.last_outputs[6].max(0.0) as f64;
-        // Sprint 28 adoption metric: jak silně se používá recurrent state.
-        // Mean |last_hidden| napříč 8 dimenzemi → ∈ [0, 1]. Pokud je ~0,
-        // brain ignoruje paměť (recurrent weights se nepřipojily k hidden);
-        // pokud roste, paměť je aktivně modulovaná.
-        let mut h_abs = 0.0_f64;
-        for &h in c.last_hidden.iter() {
-            h_abs += h.abs() as f64;
-        }
-        recurrent_io_sum += h_abs / BRAIN_RECURRENT as f64;
-        // Sprint 29 quorum sensing metric: index 13 = local_density input.
-        let dens = c.last_inputs[13] as f64;
-        density_sum += dens;
-        density_sumsq += dens * dens;
-        // Sprint 30 damage signal adoption: index 14 = damage input. Když roste
-        // napříč generacemi, populace je pod selekčním tlakem (predace/hazard),
-        // pokud zůstává ~0, žádná nedobrovolná energy loss neprobíhá.
-        dmg_sum += c.last_inputs[14] as f64;
-        noise_sum += world.map.sample([c.position[0], c.position[1], c.position[2]]) as f64;
-        energy_sum += c.energy as f64;
-        let nx = (c.position[0] / WORLD_HALF[0]).clamp(-1.0, 1.0);
-        let ny = (c.position[1] / WORLD_HALF[1]).clamp(-1.0, 1.0);
-        let ax = nx.abs();
-        let ay = ny.abs();
-        x_sum += nx as f64;
-        y_sum += ny as f64;
-        abs_x_sum += ax as f64;
-        abs_y_sum += ay as f64;
-        let near_x = ax >= EDGE_FRAC_THRESHOLD;
-        let near_y = ay >= EDGE_FRAC_THRESHOLD;
-        if near_x || near_y {
-            edge_count += 1;
-        }
-        if near_x && near_y {
-            corner_count += 1;
-        }
-        lineages.insert(c.lineage_id);
-        let age = current_gen.saturating_sub(c.lineage_birth_gen);
-        if age > oldest_age {
-            oldest_age = age;
-        }
-        // Sprint 67 bond/adhesion diagnostics.
-        bond_signal_sum += c.last_outputs[9].max(0.0) as f64;
-        let cell_bonds = c.bonds.iter().filter(|b| b.is_some()).count() as u64;
-        total_bonds += cell_bonds;
-        if cell_bonds > 0 {
-            bonded_cells += 1;
-        }
-        // Sprint 71: hunter-immune cells (≥3 bondy → cluster „too big to swallow").
-        if cell_bonds >= bioscape::HUNTER_BOND_IMMUNITY_THRESHOLD as u64 {
-            immune_cells += 1;
-        }
-        let t_idx = (c.genome.adhesion_type as usize) % adhesion_hist.len();
-        adhesion_hist[t_idx] += 1;
-        // Sprint 68 gene means.
-        bond_stiff_sum += c.genome.bond_stiffness as f64;
-        bond_damp_sum += c.genome.bond_damping as f64;
-        // Sprint 80 cell_state.
-        let cs = c.cell_state as f64;
-        state_sum += cs;
-        state_sumsq += cs * cs;
-        if cs > 0.6 {
-            altruist_count += 1;
-        }
-    }
-    let nf = n as f64;
-    let spd_m = spd_sum / nf;
-    let vis_m = vis_sum / nf;
-    let len_m = len_sum / nf;
-    let wid_m = wid_sum / nf;
-    let hgt_m = hgt_sum / nf;
-    let asp_m = asp_sum / nf;
-    let spk_m = spk_sum / nf;
-    let spd_d = ((spd_sumsq / nf) - spd_m * spd_m).max(0.0).sqrt();
-    let vis_d = ((vis_sumsq / nf) - vis_m * vis_m).max(0.0).sqrt();
-    let asp_d = ((asp_sumsq / nf) - asp_m * asp_m).max(0.0).sqrt();
-    // Sprint 126: per-channel emit/burst means + std. ph_burst is normalized
-    // per-tick (suma squared deltas / ticks_per_gen) — comparable napříč gens.
-    let ticks_per_gen = TICKS_PER_GENERATION as f64;
-    let mut ph_emit_m = [0.0_f64; N_PHEROMONE_CHANNELS];
-    let mut ph_emit_d = [0.0_f64; N_PHEROMONE_CHANNELS];
-    let mut ph_burst_m = [0.0_f64; N_PHEROMONE_CHANNELS];
-    for ch in 0..N_PHEROMONE_CHANNELS {
-        let m = ph_emit_sums[ch] / nf;
-        ph_emit_m[ch] = m;
-        ph_emit_d[ch] = ((ph_emit_sumsq[ch] / nf) - m * m).max(0.0).sqrt();
-        ph_burst_m[ch] = ph_burst_sums[ch] / (nf * ticks_per_gen);
-    }
-    let atk_emit_m = atk_emit_sum / nf;
-    let recurrent_io_m = recurrent_io_sum / nf;
-    let energy_m = energy_sum / nf;
-    let abs_x_m = abs_x_sum / nf;
-    let abs_y_m = abs_y_sum / nf;
-    let x_m = x_sum / nf;
-    let y_m = y_sum / nf;
-    let edge_f = edge_count as f64 / nf;
-    let corner_f = corner_count as f64 / nf;
-    let density_m = density_sum / nf;
-    let density_d = ((density_sumsq / nf) - density_m * density_m).max(0.0).sqrt();
-    let dmg_m = dmg_sum / nf;
-    let noise_m = noise_sum / nf;
-    // Sprint 67 bond/adhesion diagnostics.
-    let bond_signal_m = bond_signal_sum / nf;
-    let mean_bond_count = total_bonds as f64 / nf;
-    let bond_active_frac = bonded_cells as f64 / nf;
-    // Shannon entropy of adhesion_type distribution, normalized by log2(K)
-    // (K = ADHESION_TYPE_COUNT) — uniformní distribuce → 1.0, monokultura → 0.0.
-    let adhesion_entropy = {
-        let k = adhesion_hist.len() as f64;
-        if k <= 1.0 {
-            0.0
-        } else {
-            let mut h = 0.0_f64;
-            for &count in adhesion_hist.iter() {
-                if count == 0 {
-                    continue;
-                }
-                let p = count as f64 / nf;
-                h -= p * p.log2();
-            }
-            h / k.log2()
-        }
-    };
-    // Sprint 68 gene means.
-    let bond_stiff_m = bond_stiff_sum / nf;
-    let bond_damp_m = bond_damp_sum / nf;
-    // Sprint 80 cell_state stats.
-    let state_m = state_sum / nf;
-    let state_d = ((state_sumsq / nf) - state_m * state_m).max(0.0).sqrt();
-    let altruist_frac = altruist_count as f64 / nf;
-    // Sprint 83 vision_fov stats.
-    let fov_m = fov_sum / nf;
-    let fov_d = ((fov_sumsq / nf) - fov_m * fov_m).max(0.0).sqrt();
-    // Sprint 85 thermal niche — mean teplota.
-    let temp_m = temp_sum / nf;
-    // Sprint 87 thermal_optimum gen.
-    let topt_m = topt_sum / nf;
-    let topt_d = ((topt_sumsq / nf) - topt_m * topt_m).max(0.0).sqrt();
-    // Sprint 29 spatial clustering metric: mean nearest-neighbor distance.
-    // Sprint 43: grid lookup s expanding radius. Začni na GRID_CELL_SIZE (=64),
-    // pokud nikdo není, double až po WORLD diagonal — typický nn dist je < 50,
-    // takže first try téměř vždy najde souseda.
-    let nn_dist_m = if n >= 2 {
-        let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE);
-        grid.rebuild(
-            world
-                .cells
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.position, ())),
-        );
-        let world_diag = (4.0 * (WORLD_HALF[0] * WORLD_HALF[0] + WORLD_HALF[1] * WORLD_HALF[1]))
-            .sqrt();
-        let mut sum = 0.0_f64;
-        for i in 0..n {
-            let pi = world.cells[i].position;
-            let mut min_d2 = f32::MAX;
-            let mut search_r = GRID_CELL_SIZE;
-            while min_d2 == f32::MAX && search_r <= world_diag {
-                grid.for_each_in_radius_toroidal(pi, search_r, WORLD_HALF, |j, pj, _| {
-                    if i == j {
-                        return;
-                    }
-                    let d = bioscape::min_image_delta(pi, pj, WORLD_HALF);
-                    let d2 = d[0] * d[0] + d[1] * d[1];
-                    if d2 < min_d2 {
-                        min_d2 = d2;
-                    }
-                });
-                search_r *= 2.0;
-            }
-            if min_d2 < f32::MAX {
-                sum += min_d2.sqrt() as f64;
-            }
-        }
-        sum / nf
-    } else {
-        0.0
-    };
-    let immune_f = immune_cells as f64 / nf;
-    // Sprint 111: shock observability + diversity metrics (Shannon attack
-    // entropy, brain w1 frobenius std).
-    let (shock_active, shock_hazard_max) = shock_summary(world);
-    // Sprint 112: per-population mean climate offset (suma signed offsetů /
-    // n). Identical 0.0 když events.empty nebo žádný ClimateShift aktivní.
-    let climate_offset_avg: f64 = if n > 0 {
-        let sum: f64 = world
-            .cells
-            .iter()
-            .map(|c| world.climate_offset_at([c.position[0], c.position[1]]) as f64)
-            .sum();
-        sum / nf
-    } else {
-        0.0
-    };
-    let lineage_count = lineages.len();
-    let behavioral_entropy_attack = attack_entropy(&world.cells);
-    let weight_diversity_w1_norm = w1_frobenius_std(&world.cells);
-    // Sprint 113: globální FoodCrash multiplikátor (1.0 default, < 1.0 při
-    // aktivním FoodCrash). Single per-gen scalar — žádný spatial average.
-    let shock_food_factor =
-        bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
-    let spike_count_avg = if n > 0 { spike_count_sum as f64 / nf } else { 0.0 };
-    let spike_complexity_avg = if n > 0 { spike_complexity_sum / nf } else { 0.0 };
-    let spike_total_length_avg = if n > 0 { spike_total_length_sum / nf } else { 0.0 };
-    // Sprint 128: coop food per-gen events (solved/failed) + mean arrivals per
-    // event (přes všechny zaniklé v gen, vč. expired-without-trigger).
-    let coop_arrivals_avg = if world.coop_food_events_gen > 0 {
-        world.coop_food_arrivals_sum_gen as f64 / world.coop_food_events_gen as f64
-    } else {
-        0.0
-    };
-    writeln!(
-        w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3}",
-        world.clock.generation,
-        n,
-        spd_m,
-        spd_d,
-        vis_m,
-        vis_d,
-        len_m,
-        wid_m,
-        hgt_m,
-        asp_m,
-        asp_d,
-        spk_m,
-        spk_max,
-        world.foods.len(),
-        world.density_factor,
-        lineages.len(),
-        oldest_age,
-        ph_emit_m[0],
-        ph_emit_m[1],
-        ph_emit_m[2],
-        ph_emit_d[0],
-        ph_emit_d[1],
-        ph_emit_d[2],
-        ph_burst_m[0],
-        ph_burst_m[1],
-        ph_burst_m[2],
-        abs_x_m,
-        abs_y_m,
-        edge_f,
-        corner_f,
-        x_m,
-        y_m,
-        energy_m,
-        world.births_gen,
-        world.deaths_gen,
-        world.fertile_ticks_gen,
-        atk_emit_m,
-        world.predation_events_gen,
-        recurrent_io_m,
-        nn_dist_m,
-        density_m,
-        density_d,
-        dmg_m,
-        noise_m,
-        // Sprint 67 bond/adhesion diagnostics.
-        world.bonds_formed_gen,
-        world.bonds_broken_gen,
-        mean_bond_count,
-        bond_active_frac,
-        bond_signal_m,
-        adhesion_entropy,
-        // Sprint 68 gene means.
-        bond_stiff_m,
-        bond_damp_m,
-        // Sprint 71 hunter diagnostics.
-        world.hunter_attacks_gen,
-        world.hunters.len(),
-        immune_f,
-        // Sprint 80 cell_state diagnostics.
-        state_m,
-        state_d,
-        altruist_frac,
-        // Sprint 83 vision_fov diagnostics.
-        fov_m,
-        fov_d,
-        // Sprint 85 thermal niche.
-        temp_m,
-        // Sprint 87 thermal_optimum gen.
-        topt_m,
-        topt_d,
-        // Sprint 89 hunter genome + lifecycle.
-        world.hunter_births_gen,
-        world.hunter_deaths_gen,
-        h_spd_m,
-        h_vis_m,
-        h_fov_m,
-        h_dmg_m,
-        h_size_m,
-        // Sprint 93 diet + defense diagnostics.
-        carnivore_m,
-        exposure_m,
-        // Sprint 97 sensor_gain category means + stddev.
-        gain_vis_m,
-        gain_chem_m,
-        gain_def_m,
-        gain_vis_d,
-        gain_chem_d,
-        gain_def_d,
-        // Sprint 99 hunter bond stats.
-        h_bond_n_m,
-        h_bond_active_f,
-        world.hunter_bonds_formed_gen,
-        world.hunter_bonds_broken_gen,
-        // Sprint 107: CPPN speciation distance.
-        cppn_compat_m,
-        // Sprint 111: shock state + diversity metrics.
-        // Sprint 112: shock_climate_offset = mean signed temperature offset
-        // přes všechny cells z aktivních ClimateShift shocků (0.0 default).
-        // Sprint 113: shock_food_factor = global FoodCrash multiplikátor
-        // (1.0 default, clamp na FOOD_CRASH_MIN_FACTOR floor).
-        shock_active,
-        shock_hazard_max,
-        climate_offset_avg,
-        shock_food_factor,
-        lineage_count,
-        behavioral_entropy_attack,
-        weight_diversity_w1_norm,
-        // Sprint 123/125 multi-spike observability.
-        spike_count_avg,
-        spike_complexity_avg,
-        spike_total_length_avg,
-        ticks_per_sec,
-        // Sprint 128: cooperative food packet events.
-        world.coop_food_solved_gen,
-        world.coop_food_failed_gen,
-        coop_arrivals_avg,
-    )
-}
-
-/// Sprint 111: aktivní shock summary pro CSV. Vrací `(count, hazard_intensity_max)`,
-/// kde max je `intensity * shock_ramp_factor(event, gen)` přes všechny aktivní
-/// `HazardPulse` eventy. Bez aktivních eventů nebo žádný HazardPulse → `(0, 0.0)`.
-fn shock_summary(world: &World) -> (u32, f64) {
-    let gen = world.clock.generation;
-    let tick = world.clock.tick;
-    let mut count: u32 = 0;
-    let mut hazard_max: f64 = 0.0;
-    for event in world.events.active(gen, tick) {
-        count += 1;
-        if matches!(event.kind, bioscape::ShockKind::HazardPulse) {
-            let factor = bioscape::shock_ramp_factor(event, gen);
-            let intensity = (event.intensity * factor) as f64;
-            if intensity > hazard_max {
-                hazard_max = intensity;
-            }
-        }
-    }
-    (count, hazard_max)
-}
-
-/// Sprint 111: Shannon entropy histogramu `cell.last_outputs[6]` (attack signal).
-/// 8 bins na intervalu [-1, 1], hodnoty mimo se clampují. Empty population → 0.0.
-fn attack_entropy(cells: &[Cell]) -> f64 {
-    if cells.is_empty() {
-        return 0.0;
-    }
-    const BINS: usize = 8;
-    let mut hist = [0_u64; BINS];
-    for c in cells {
-        let v = c.last_outputs[6].clamp(-1.0, 1.0);
-        let mut idx = ((v + 1.0) * 0.5 * BINS as f32) as usize;
-        if idx >= BINS {
-            idx = BINS - 1;
-        }
-        hist[idx] += 1;
-    }
-    let total = cells.len() as f64;
-    let mut h = 0.0_f64;
-    for &count in hist.iter() {
-        if count == 0 {
-            continue;
-        }
-        let p = count as f64 / total;
-        h -= p * p.log2();
-    }
-    h
-}
-
-/// Sprint 111: zapíše scheduled shock events do sidecar CSV vedle hlavního
-/// out_path (`events_seed{seed}.csv`). Caller už ověřil, že `events` není prázdný.
-fn write_events_sidecar(
-    out_path: &Path,
-    seed: u64,
-    events: &EventCalendar,
-) -> std::io::Result<()> {
-    let dir = out_path.parent().unwrap_or_else(|| Path::new("."));
-    let sidecar = dir.join(format!("events_seed{}.csv", seed));
-    let file = std::fs::File::create(&sidecar)?;
-    let mut w = BufWriter::new(file);
-    writeln!(w, "start_gen,duration_gen,kind,intensity,center_x,center_y,radius")?;
-    for e in &events.events {
-        let kind = match e.kind {
-            bioscape::ShockKind::HazardPulse => "hazard_pulse",
-            bioscape::ShockKind::ClimateShift => "climate_shift",
-            bioscape::ShockKind::FoodCrash => "food_crash",
-        };
-        let cx = e
-            .center_xy
-            .map(|c| format!("{:.2}", c[0]))
-            .unwrap_or_default();
-        let cy = e
-            .center_xy
-            .map(|c| format!("{:.2}", c[1]))
-            .unwrap_or_default();
-        let r = e
-            .radius
-            .map(|r| format!("{:.2}", r))
-            .unwrap_or_default();
-        writeln!(
-            w,
-            "{},{},{},{:.3},{},{},{}",
-            e.start_gen, e.duration_gen, kind, e.intensity, cx, cy, r
-        )?;
-    }
-    w.flush()?;
-    Ok(())
-}
-
-/// Sprint 111: per-cell brain w1 Frobenius norm, pak std přes všechny cells.
-/// `std = sqrt(mean((x_i - mean)²))`. Empty population → 0.0.
-fn w1_frobenius_std(cells: &[Cell]) -> f64 {
-    if cells.is_empty() {
-        return 0.0;
-    }
-    let norms: Vec<f64> = cells
-        .iter()
-        .map(|c| {
-            let mut sumsq = 0.0_f64;
-            for row in c.genome.brain.w1.iter() {
-                for &w in row.iter() {
-                    sumsq += (w as f64) * (w as f64);
-                }
-            }
-            sumsq.sqrt()
-        })
-        .collect();
-    let n = norms.len() as f64;
-    let mean = norms.iter().sum::<f64>() / n;
-    let var = norms.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
-    var.sqrt()
-}
-
-fn main() {
-    let raw_args: Vec<String> = env::args().collect();
-    // Sprint 44: `--gpu` flag (filtered před positional parsingem). Bez
-    // `--features gpu` se flag tiše ignoruje.
-    // Sprint 51: `--gpu-full` flag — persistent brain weights + GPU Hebbian +
-    // GPU Brownian. Implies --gpu (brain forward na GPU).
-    let want_gpu_full = raw_args.iter().any(|a| a == "--gpu-full");
-    let want_gpu = want_gpu_full || raw_args.iter().any(|a| a == "--gpu");
-    // Sprint 48: `--save=PATH` / `--load=PATH` checkpoint flags. Form
-    // `--key=value` aby se PATH ne-leakoval do positional indexingu.
-    let save_path: Option<String> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--save=").map(|s| s.to_string()));
-    let load_path: Option<String> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--load=").map(|s| s.to_string()));
-    // Sprint 87 Hamilton sweep: `--share-frac=X` runtime override pro
-    // BOND_FOOD_SHARE_FRAC, `--kin` zapne kin filter (food share jen na
-    // partnery se stejným lineage_id).
-    let share_frac_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--share-frac=").and_then(|s| s.parse().ok()));
-    let kin_filter = raw_args.iter().any(|a| a == "--kin");
-    // Sprint 109: `--shocks-mean-gens N` (space-separated) nebo
-    // `--shocks-mean-gens=N` (= form). Default 0 = no-op (empty kalendář).
-    // `consumed_value_idx` drží pozici následujícího raw arg pokud je flag
-    // space-separated; ten se musí vyfiltrovat z positional setu.
-    let mut shocks_mean_gens: u32 = 0;
-    let mut consumed_value_idx: Option<usize> = None;
-    for (i, a) in raw_args.iter().enumerate() {
-        if let Some(rest) = a.strip_prefix("--shocks-mean-gens") {
-            if let Some(eq_val) = rest.strip_prefix('=') {
-                if let Ok(v) = eq_val.parse::<u32>() {
-                    shocks_mean_gens = v;
-                }
-            } else if rest.is_empty() {
-                if let Some(next) = raw_args.get(i + 1) {
-                    if let Ok(v) = next.parse::<u32>() {
-                        shocks_mean_gens = v;
-                        consumed_value_idx = Some(i + 1);
-                    }
-                }
-            }
-            break;
-        }
-    }
-    let args: Vec<String> = raw_args
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| !a.starts_with("--") && Some(*i) != consumed_value_idx)
-        .map(|(_, a)| a.clone())
-        .collect();
-    let seed: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let max_gens: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(500);
-    let out_path = args
-        .get(3)
-        .cloned()
-        .unwrap_or_else(|| format!("run_seed{}.csv", seed));
-    let map_seed: u64 = args
-        .get(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(WORLD_MAP_SEED);
-    let mating_radius: f32 = args
-        .get(5)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MATING_RADIUS);
-    // Sprint 43: positional override pro initial cells / max population /
-    // rayon thread count. Default zachovává pre-Sprint-43 chování.
-    let initial_cells: usize = args
-        .get(6)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(INITIAL_CELLS);
-    let max_population: usize = args
-        .get(7)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MAX_POPULATION);
-    let threads: usize = args
-        .get(8)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
-
-    if threads > 0 {
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global();
-    }
-
-    let mut rng = StdRng::seed_from_u64(seed);
-    // Sprint 109: kalendář environmentálních shocků. Když mean_gens_between == 0,
-    // generate vrátí prázdný kalendář (no-op) — byte-identical s pre-S109 baseline.
-    let shock_cfg = if shocks_mean_gens > 0 {
-        ShockScheduleConfig {
-            mean_gens_between: shocks_mean_gens,
-            ..Default::default()
-        }
-    } else {
-        ShockScheduleConfig::default()
-    };
-    let events = EventCalendar::generate(seed, &shock_cfg, max_gens);
-    // Sprint 111: pokud kalendář není prázdný, dump sidecar `events_seed{seed}.csv`
-    // vedle hlavního CSV. Žádný file pokud `events` empty (žádný error).
-    if !events.events.is_empty() {
-        if let Err(e) = write_events_sidecar(Path::new(&out_path), seed, &events) {
-            eprintln!("events sidecar: write failed ({e})");
-        }
-    }
-    let mut world = if let Some(path) = load_path.as_ref() {
-        match World::load_checkpoint(Path::new(path)) {
-            Ok(mut w) => {
-                eprintln!(
-                    "checkpoint: loaded {} (cells={}, foods={}, gen={}, tick={})",
-                    path,
-                    w.cells.len(),
-                    w.foods.len(),
-                    w.clock.generation,
-                    w.clock.tick,
-                );
-                w.events = events.clone();
-                w
-            }
-            Err(e) => {
-                eprintln!("checkpoint: load failed ({e}); starting fresh");
-                World::new(
-                    &mut rng,
-                    map_seed,
-                    mating_radius,
-                    initial_cells,
-                    max_population,
-                    events.clone(),
-                )
-            }
-        }
-    } else {
-        World::new(
-            &mut rng,
-            map_seed,
-            mating_radius,
-            initial_cells,
-            max_population,
-            events,
-        )
-    };
-    // Sprint 87 Hamilton sweep: aplikuj CLI overrides AFTER World::new (i po
-    // checkpoint load) — nikdy se neserializují, vždy z aktuálního CLI.
-    if let Some(sf) = share_frac_override {
-        world.share_frac = sf;
-    }
-    world.kin_filter = kin_filter;
-
-    #[cfg(feature = "gpu")]
-    if want_gpu_full {
-        let cap = initial_cells.max(max_population).max(64);
-        // Sprint 59: FieldGpu sources capacity. Per-tick deposit count =
-        // foods (smell) + cells (pheromone). food_target může bumpnout přes
-        // density cycles (CYCLE_AMPLITUDE), s safety margin × 2.
-        let field_sources_cap = (food_target(1.0 + CYCLE_AMPLITUDE) + max_population) * 2;
-        let init = || -> Result<GpuFullState, String> {
-            let ctx = GpuContext::new()?;
-            let cells_gpu = CellsGpu::with_context(&ctx, cap);
-            cells_gpu.upload_brains(world.cells.iter().map(|c| &c.genome.brain));
-            cells_gpu.upload_xoshiro_seeds(world.cells.iter().enumerate().map(|(slot, c)| {
-                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
-            }));
-            let brain = BrainGpu::with_context(&ctx, cap)?;
-            let hebbian = HebbianGpu::with_context(&ctx, cap)?;
-            let brownian = BrownianGpu::with_context(&ctx, cap)?;
-            // Sprint 59: smell + pheromone FieldGpu instances, sdílí GpuContext.
-            let smell = FieldGpu::with_context(
-                &ctx,
-                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
-                WORLD_HALF,
-                field_sources_cap,
-            )?;
-            let pheromone = FieldGpu::with_context(
-                &ctx,
-                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-                WORLD_HALF,
-                field_sources_cap,
-            )?;
-            // Sprint 60: spatial hashes pro sensor broad-phase. Sdílí
-            // GRID_CELL_SIZE konstantu s CPU SpatialGrid; xy world bounds
-            // pro toroidal bucket wrap.
-            let cell_hash = SpatialHashGpu::with_context(
-                &ctx,
-                cap,
-                GRID_CELL_SIZE,
-                [WORLD_HALF[0], WORLD_HALF[1]],
-            )?;
-            let food_capacity = field_sources_cap;
-            let food_hash = SpatialHashGpu::with_context(
-                &ctx,
-                food_capacity,
-                GRID_CELL_SIZE,
-                [WORLD_HALF[0], WORLD_HALF[1]],
-            )?;
-            let sensor = SensorGatherGpu::with_context(&ctx, cap, food_capacity)?;
-            let populate = PopulateInputsGpu::with_context(&ctx)?;
-            let motor = MotorGpu::with_context(&ctx, cap)?;
-            let step = StepGpu::with_context(&ctx, cap)?;
-            // Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim
-            // init; reproduce volá `upload_turn_rates` znovu (per-event sparse).
-            let turn_rates: Vec<f32> = world.cells.iter().map(|c| c.genome.turn_rate).collect();
-            cells_gpu.upload_turn_rates(&turn_rates);
-            Ok(GpuFullState {
-                cells: cells_gpu,
-                brain,
-                hebbian,
-                brownian,
-                smell,
-                pheromone,
-                cell_hash,
-                food_hash,
-                sensor,
-                populate,
-                motor,
-                step,
-            })
-        };
-        match init() {
-            Ok(state) => {
-                eprintln!(
-                    "gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (cap {} cells, {} field sources)",
-                    cap, field_sources_cap
-                );
-                world.gpu_full = Some(state);
-            }
-            Err(e) => {
-                eprintln!("gpu-full: init failed ({e}); fallback to CPU");
-            }
-        }
-    }
-    #[cfg(feature = "gpu")]
-    if want_gpu && !want_gpu_full && world.gpu_full.is_none() {
-        match BrainGpu::new(initial_cells.max(64)) {
-            Ok(g) => {
-                eprintln!("gpu: BrainGpu initialized (capacity {})", initial_cells.max(64));
-                world.gpu = Some(g);
-            }
-            Err(e) => {
-                eprintln!("gpu: init failed ({e}); falling back to CPU");
-            }
-        }
-    }
-    #[cfg(not(feature = "gpu"))]
-    if want_gpu {
-        eprintln!("gpu: --gpu / --gpu-full requested but binary built without --features gpu");
-    }
-
-    let file = std::fs::File::create(&out_path).expect("can't create output file");
-    let mut log = BufWriter::new(file);
-    writeln!(
-        log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg"
-    )
-    .unwrap();
-    write_stats(&mut log, &world, 0.0).unwrap();
-
-    let baseline_samples = 10_000;
-    let mut bsum = 0.0_f64;
-    let mut brng = StdRng::seed_from_u64(99);
-    for _ in 0..baseline_samples {
-        let p = [
-            brng.random_range(-WORLD_HALF[0]..WORLD_HALF[0]),
-            brng.random_range(-WORLD_HALF[1]..WORLD_HALF[1]),
-            brng.random_range(-WORLD_HALF[2]..WORLD_HALF[2]),
-        ];
-        bsum += world.map.sample(p) as f64;
-    }
-    let noise_baseline = bsum / baseline_samples as f64;
-    eprintln!("noise_baseline (uniform-position mean over map): {:.4}", noise_baseline);
-
-    eprintln!(
-        "headless: seed={} map_seed={} mating_radius={} max_gens={} out={} initial_cells={} initial_food={} max_pop={} threads={}",
-        seed,
-        map_seed,
-        mating_radius,
-        max_gens,
-        out_path,
-        world.cells.len(),
-        world.foods.len(),
-        max_population,
-        rayon::current_num_threads()
-    );
-    eprintln!(
-        "shocks: mean_gens_between={} scheduled={} (sim loop integration arrives in S110+)",
-        shocks_mean_gens,
-        world.events.events.len()
-    );
-
-    let start = Instant::now();
-    let mut gen_start = Instant::now();
-    let mut gen_ticks = 0_u64;
-    while world.clock.generation < max_gens {
-        let gen_ended = world.tick(&mut rng);
-        gen_ticks += 1;
-        if gen_ended.is_some() {
-            let gen_elapsed = gen_start.elapsed().as_secs_f64();
-            let tps = if gen_elapsed > 0.0 {
-                gen_ticks as f64 / gen_elapsed
-            } else {
-                0.0
-            };
-            write_stats(&mut log, &world, tps).unwrap();
-            // Sprint 126: reset burst_accum aby každá generace měřila vlastní
-            // tick-to-tick variance. Bez resetu by hodnoty monotonně rostly.
-            for cell in &mut world.cells {
-                cell.burst_accum = [0.0; N_PHEROMONE_CHANNELS];
-            }
-            gen_start = Instant::now();
-            gen_ticks = 0;
-            // Sprint 43: po první dokončené generaci vypiš per-fáze timing
-            // (mikrosekundy total + průměr per tick). Reset accumulator.
-            if world.clock.generation == 1 {
-                let t = world.bench_timings;
-                let ticks = TICKS_PER_GENERATION as f64;
-                let dump = |name: &str, total_us: f64| {
-                    eprintln!(
-                        "phase={} n={} ticks={} us_total={:.1} us_avg={:.3}",
-                        name,
-                        world.cells.len(),
-                        TICKS_PER_GENERATION,
-                        total_us,
-                        total_us / ticks
-                    );
-                };
-                dump("update_smell", t.update_smell);
-                dump("update_pheromone", t.update_pheromone);
-                dump("brain_act", t.brain_act);
-                dump("emit_pheromones", t.emit_pheromones);
-                dump("apply_morph", t.apply_morph);
-                dump("apply_brownian", t.apply_brownian);
-                dump("step", t.step);
-                dump("apply_food_gravity", t.apply_food_gravity);
-                dump("apply_hazards", t.apply_hazards);
-                dump("resolve_collisions", t.resolve_collisions);
-                dump("predate", t.predate);
-                dump("hunt", t.hunt);
-                dump("eat_food", t.eat_food);
-                dump("spawn_food", t.spawn_food);
-                dump("reproduce", t.reproduce);
-                dump("die_and_drop_carrion", t.die_and_drop_carrion);
-                world.bench_timings = PhaseTimings::default();
-            }
-            world.births_gen = 0;
-            world.deaths_gen = 0;
-            world.fertile_ticks_gen = 0;
-            world.predation_events_gen = 0;
-            // Sprint 66: bond formation/break per-gen counters.
-            world.bonds_formed_gen = 0;
-            world.bonds_broken_gen = 0;
-            // Sprint 71: hunter attack counter.
-            world.hunter_attacks_gen = 0;
-            // Sprint 89: hunter lifecycle counters.
-            world.hunter_births_gen = 0;
-            world.hunter_deaths_gen = 0;
-            // Sprint 99: hunter bond counters.
-            world.hunter_bonds_formed_gen = 0;
-            world.hunter_bonds_broken_gen = 0;
-            // Sprint 128: coop food per-gen counters.
-            world.coop_food_solved_gen = 0;
-            world.coop_food_failed_gen = 0;
-            world.coop_food_arrivals_sum_gen = 0;
-            world.coop_food_events_gen = 0;
-        }
-        if world.cells.is_empty() {
-            eprintln!("extinction at gen {}", world.clock.generation);
-            break;
-        }
-    }
-    log.flush().unwrap();
-
-    if let Some(path) = save_path.as_ref() {
-        match world.save_checkpoint(Path::new(path)) {
-            Ok(()) => eprintln!(
-                "checkpoint: saved to {} (cells={}, gen={}, tick={})",
-                path,
-                world.cells.len(),
-                world.clock.generation,
-                world.clock.tick,
-            ),
-            Err(e) => eprintln!("checkpoint: save failed ({e})"),
-        }
-    }
-
-    let elapsed = start.elapsed();
-    let ticks_per_sec = world.clock.tick as f32 / elapsed.as_secs_f32().max(1e-3);
-    eprintln!(
-        "done. {} gen, {} ticks in {:.1}s ({:.0} ticks/s). final pop: {}",
-        world.clock.generation,
-        world.clock.tick,
-        elapsed.as_secs_f32(),
-        ticks_per_sec,
-        world.cells.len()
-    );
-}
