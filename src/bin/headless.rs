@@ -700,7 +700,7 @@ impl World {
             .iter()
             .map(|c| {
                 [
-                    c.phenotype.primary_spike_length(),
+                    c.phenotype.total_spike_cost_factor(),
                     c.phenotype.shell_thickness,
                     c.genome.vision_radius,
                     c.last_outputs[6].max(0.0),
@@ -2565,6 +2565,9 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
     let mut asp_sumsq = 0.0_f64;
     let mut spk_sum = 0.0_f64;
     let mut spk_max = 0.0_f64;
+    let mut spike_count_sum = 0_u64;
+    let mut spike_complexity_sum = 0.0_f64;
+    let mut spike_total_length_sum = 0.0_f64;
     let mut ph_emit_sum = 0.0_f64;
     let mut atk_emit_sum = 0.0_f64;
     let mut recurrent_io_sum = 0.0_f64;
@@ -2753,6 +2756,17 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
         topt_sumsq += topt * topt;
         if spk > spk_max {
             spk_max = spk;
+        }
+        // Sprint 123: per-cell aggregates pro multi-spike observability.
+        spike_count_sum += c.phenotype.spike_count as u64;
+        spike_total_length_sum += c.phenotype.total_spike_length() as f64;
+        let active_n = c.phenotype.spike_count.min(bioscape::SPIKE_SLOTS as u8) as usize;
+        if active_n > 0 {
+            let mut cmplx_sum = 0.0_f64;
+            for slot in 0..active_n {
+                cmplx_sum += c.phenotype.spikes[slot].complexity as f64;
+            }
+            spike_complexity_sum += cmplx_sum / active_n as f64;
         }
         ph_emit_sum += c.last_outputs[2].max(0.0) as f64;
         atk_emit_sum += c.last_outputs[6].max(0.0) as f64;
@@ -2946,9 +2960,12 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
     // aktivním FoodCrash). Single per-gen scalar — žádný spatial average.
     let shock_food_factor =
         bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
+    let spike_count_avg = if n > 0 { spike_count_sum as f64 / nf } else { 0.0 };
+    let spike_complexity_avg = if n > 0 { spike_complexity_sum / nf } else { 0.0 };
+    let spike_total_length_avg = if n > 0 { spike_total_length_sum / nf } else { 0.0 };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.1}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}",
         world.clock.generation,
         n,
         spd_m,
@@ -3048,6 +3065,10 @@ fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::i
         lineage_count,
         behavioral_entropy_attack,
         weight_diversity_w1_norm,
+        // Sprint 123/125 multi-spike observability.
+        spike_count_avg,
+        spike_complexity_avg,
+        spike_total_length_avg,
         ticks_per_sec,
     )
 }
@@ -3421,7 +3442,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,ticks_per_sec"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,hunter_attacks,hunters_alive,immune_frac,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,hunter_births,hunter_deaths,h_spd_avg,h_vis_avg,h_fov_avg,h_dmg_avg,h_size_avg,carnivore_avg,exposure_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,h_bond_n,h_bond_active,h_bonds_formed,h_bonds_broken,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec"
     )
     .unwrap();
     write_stats(&mut log, &world, 0.0).unwrap();

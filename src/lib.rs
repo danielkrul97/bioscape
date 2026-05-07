@@ -1726,9 +1726,10 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // drift v azimuth/elevation per gen — slow per-spike directional evolution.
     spike_count_mutation_rate: 0.05,
     sigma_spike_orientation: 0.05,
-    // Sprint 123: complexity drift zapne se v Sprint 123. Sprint 122: 0.0 →
-    // complexity zůstává 0 → COMPLEXITY_*_GAIN multipliers = 1.0.
-    sigma_spike_complexity: 0.0,
+    // Sprint 123: complexity drift aktivní. 0.02 = 2 % range/gen ([0, 1] range,
+    // 1000-gen drift dosáhne ~MAX). Slow drift aby selekce stihla najít
+    // intermediate sweet-spot (~0.4-0.6) místo random walk k extremům.
+    sigma_spike_complexity: 0.02,
     // Sprint 122: per-non-primary spike length drift. Když spike_count_mutation_rate
     // aktivuje slot, dítě dostane init length = 0 (nový spike), který
     // postupně mutuje. 0.03 stejně jako sigma_spike_length (slot 0).
@@ -3489,6 +3490,30 @@ impl Phenotype {
         &self.spikes[..n]
     }
 
+    /// Sprint 124: aggregate spike maintenance cost factor pro GPU step shader
+    /// aux[0]. CPU energy drain semantika:
+    /// `total_spike_cost_factor × SPIKE_COST_PER_SEC × dt_eff`. S spike_count=1
+    /// a complexity=0 redukuje na pre-S121 `spike_length`.
+    pub fn total_spike_cost_factor(&self) -> f32 {
+        let mut acc = 0.0;
+        for spike in self.active_spikes() {
+            acc += spike.length * spike_complexity_cost_factor(spike.complexity);
+        }
+        acc
+    }
+
+    /// Sprint 124: primary spike attack factor pro GPU predate shader
+    /// `spike_lengths[i]` semantiku. `length × attack_complexity_factor`
+    /// pro slot 0 (single-direction predicate). Multi-spike non-primary
+    /// sloty na GPU nedostávají bonus — CPU path je multi-spike-faithful.
+    pub fn primary_spike_attack_factor(&self) -> f32 {
+        if self.spike_count == 0 {
+            return 0.0;
+        }
+        let s = self.spikes[0];
+        s.length * spike_complexity_attack_factor(s.complexity)
+    }
+
     /// Proxy pro circular-collision codepaths (eat radius, broad phase).
     /// Sprint 34: aritmetický průměr 3 os; když length=width=height=s, dostane s
     /// — backward compat s pre-Sprint-34 izotropním tělem.
@@ -3562,7 +3587,11 @@ impl Phenotype {
             } else {
                 1.0 / n as f32
             };
-            let delta = raw_ds * weight;
+            // Sprint 123: high-complexity spike morphuje pomaleji — geometric
+            // structure je commitment, ne behavioral knob. complexity=1 → 50 %
+            // rate, complexity=0 → 100 % (pre-S123 sémantika).
+            let rate_factor = 1.0 - 0.5 * self.spikes[i].complexity.clamp(0.0, 1.0);
+            let delta = raw_ds * weight * rate_factor;
             let new_len = (self.spikes[i].length + delta)
                 .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
             total_delta += (new_len - self.spikes[i].length).abs();
