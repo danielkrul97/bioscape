@@ -93,6 +93,10 @@ harness = false
 name = "full_tick"
 harness = false
 
+[[bench]]
+name = "predate_gpu"
+harness = false
+
 # Bevy recommended dev profile: fast compile for our code, optimized deps for runtime.
 [profile.dev]
 opt-level = 1
