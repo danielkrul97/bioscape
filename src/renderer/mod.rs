@@ -1347,11 +1347,11 @@ fn apply_brownian_motion(
     // dá jiný RNG stream než xoshiro, drift je acceptable (consistent
     // s S113 stochastic-reorder konvencí).
     let t_total = Instant::now();
-    let dt = time.delta_secs();
+    let sqrt_dt = time.delta_secs().sqrt();
     let half_z = extent.as_array()[2];
     cells.par_iter_mut().for_each(|mut cell| {
         let mut rng = rand::rng();
-        cell.0.apply_brownian(&mut rng, dt, half_z);
+        cell.0.apply_brownian(&mut rng, sqrt_dt, half_z);
     });
     diag.add_measurement(&DIAG_BROWNIAN, || t_total.elapsed().as_secs_f64() * 1000.0);
 }

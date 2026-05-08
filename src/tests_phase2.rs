@@ -930,7 +930,7 @@ fn brownian_zero_dt_is_noop() {
     let mut rng = StdRng::seed_from_u64(0xE001);
     let mut c = base_cell();
     let v0 = c.velocity;
-    c.apply_brownian(&mut rng, 0.0, 50.0);
+    c.apply_brownian(&mut rng, 0.0_f32, 50.0);
     assert_eq!(c.velocity, v0);
 }
 

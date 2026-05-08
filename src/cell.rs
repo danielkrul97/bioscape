@@ -647,8 +647,9 @@ impl Cell {
     /// Sprint 42: Brownův pohyb — gaussian noise na velocity. `√dt` scaling je
     /// correct stochastic integration (Wiener process), ne lineární dt. z-osa
     /// se rušený jen když je z-volume aktivní (`world_half_z > 0`).
-    pub fn apply_brownian(&mut self, rng: &mut impl Rng, dt: f32, world_half_z: f32) {
-        let scale = THERMAL_NOISE * dt.sqrt();
+    /// Caller předává pre-computed `sqrt_dt` aby se sqrt nepočítal per cell.
+    pub fn apply_brownian(&mut self, rng: &mut impl Rng, sqrt_dt: f32, world_half_z: f32) {
+        let scale = THERMAL_NOISE * sqrt_dt;
         self.velocity[0] += gaussian(rng) * scale;
         self.velocity[1] += gaussian(rng) * scale;
         if world_half_z > 0.0 {

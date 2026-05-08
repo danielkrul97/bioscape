@@ -689,8 +689,9 @@ impl World {
     }
 
     fn apply_brownian_cpu(&mut self, rng: &mut impl Rng, dt: f32) {
+        let sqrt_dt = dt.sqrt();
         for cell in &mut self.cells {
-            cell.apply_brownian(rng, dt, WORLD_HALF[2]);
+            cell.apply_brownian(rng, sqrt_dt, WORLD_HALF[2]);
         }
     }
 

@@ -2101,8 +2101,9 @@ fn brownian_perturbs_zero_velocity() {
     let mut rng = rand::rng();
     let mut cell = base_cell();
     // 100 brownian steps; statisticky téměř jistě některá komponenta != 0.
+    let sqrt_dt = (1.0_f32 / FIXED_TIMESTEP_HZ).sqrt();
     for _ in 0..100 {
-        cell.apply_brownian(&mut rng, 1.0 / FIXED_TIMESTEP_HZ, 0.0);
+        cell.apply_brownian(&mut rng, sqrt_dt, 0.0);
     }
     // 2D případ (world_half_z = 0) — z se nesmí měnit.
     assert_eq!(cell.velocity[2], 0.0);
@@ -2116,8 +2117,9 @@ fn brownian_z_only_in_3d_world() {
     let mut rng = rand::rng();
     let mut cell = base_cell();
     // 3D mode: world_half_z > 0 → z se má hýbat.
+    let sqrt_dt = (1.0_f32 / FIXED_TIMESTEP_HZ).sqrt();
     for _ in 0..100 {
-        cell.apply_brownian(&mut rng, 1.0 / FIXED_TIMESTEP_HZ, 2.0);
+        cell.apply_brownian(&mut rng, sqrt_dt, 2.0);
     }
     assert!(cell.velocity[2] != 0.0, "expected nonzero z velocity in 3D");
 }
