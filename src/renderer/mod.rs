@@ -1970,11 +1970,6 @@ fn cells_brain_act_gpu_full(
     pipeline.cells.upload_body_dims(body_dims);
     pipeline.cells.upload_aux(aux);
 
-    // Phase 3: spatial hash dispatches (no readback).
-    pipeline.cell_hash.dispatch(positions);
-    pipeline.food_hash.dispatch(food_positions);
-
-    // Phase 4: GPU SensorGather dispatch_no_readback — output v output_buf.
     let sensor_params = SensorParamsGpu {
         num_cells: n as u32,
         num_foods: food_positions.len() as u32,
@@ -1991,19 +1986,6 @@ fn cells_brain_act_gpu_full(
         field_world_half_z: world_half[2],
         _pad0: 0,
     };
-    pipeline.sensor.dispatch_no_readback(
-        positions,
-        eff_radii,
-        vision_radii,
-        food_positions,
-        &pipeline.cell_hash,
-        &pipeline.food_hash,
-        &pipeline.smell,
-        &pipeline.pheromone,
-        sensor_params,
-    );
-
-    // Phase 5: GPU populate_inputs.
     let populate_params = PopulateInputsParams {
         num_cells: n as u32,
         brain_inputs: BRAIN_INPUTS as u32,
@@ -2018,25 +2000,7 @@ fn cells_brain_act_gpu_full(
         _pad0: 0,
         _pad1: 0,
     };
-    pipeline
-        .populate
-        .dispatch(&pipeline.cells, &pipeline.sensor, populate_params);
-
-    // Phase 6: GPU brain forward.
-    pipeline.brain.forward_persistent(&pipeline.cells, n);
-
-    // Phase 7: GPU motor.
-    pipeline
-        .motor
-        .dispatch_with_cells(&pipeline.cells, n, dt, DRAG_COEFFICIENT);
-
-    // Phase 8: GPU brownian.
     let has_z = world_half[2] > 0.0;
-    pipeline
-        .brownian
-        .compute_persistent(&pipeline.cells, n, THERMAL_NOISE, dt, has_z);
-
-    // Phase 9: GPU step.
     let step_params = StepParamsGpu {
         num_cells: n as u32,
         _pad_a0: 0,
@@ -2071,10 +2035,58 @@ fn cells_brain_act_gpu_full(
         thermal_seasonal_phase: (clock.0.generation % CYCLE_GEN_PERIOD) as f32
             / CYCLE_GEN_PERIOD as f32,
     };
-    pipeline.step.dispatch_with_cells(&pipeline.cells, n, step_params);
 
-    // Phase 10: single readback (Wait barrier).
-    pipeline.cells.download_full_batch_into(
+    let mut encoder = pipeline
+        .cells
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-full-tick"),
+        });
+
+    pipeline.cell_hash.dispatch_into(&mut encoder, positions);
+    pipeline.food_hash.dispatch_into(&mut encoder, food_positions);
+    pipeline.sensor.dispatch_no_readback_into(
+        &mut encoder,
+        positions,
+        eff_radii,
+        vision_radii,
+        food_positions,
+        &pipeline.cell_hash,
+        &pipeline.food_hash,
+        &pipeline.smell,
+        &pipeline.pheromone,
+        sensor_params,
+    );
+    pipeline
+        .populate
+        .dispatch_into(&mut encoder, &pipeline.cells, &pipeline.sensor, populate_params);
+    pipeline.brain.forward_persistent_into(&mut encoder, &pipeline.cells, n);
+    pipeline.motor.dispatch_with_cells_into(
+        &mut encoder,
+        &pipeline.cells,
+        n,
+        dt,
+        DRAG_COEFFICIENT,
+    );
+    pipeline.brownian.compute_persistent_into(
+        &mut encoder,
+        &pipeline.cells,
+        n,
+        THERMAL_NOISE,
+        dt,
+        has_z,
+    );
+    pipeline
+        .step
+        .dispatch_with_cells_into(&mut encoder, &pipeline.cells, n, step_params);
+    pipeline.cells.download_full_copy_into(&mut encoder, n);
+
+    pipeline
+        .cells
+        .queue()
+        .submit(Some(encoder.finish()));
+
+    pipeline.cells.download_full_read_into(
         n,
         &mut pipeline.scratch.dl_hiddens,
         &mut pipeline.scratch.dl_outputs,

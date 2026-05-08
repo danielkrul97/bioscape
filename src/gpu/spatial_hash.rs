@@ -430,13 +430,29 @@ impl SpatialHashGpu {
     /// `offsets_buffer()` / `sorted_buffer()` accessory. Eliminuje 2× `device.poll(Wait)`
     /// round-trip per tick (cell hash + food hash).
     pub fn dispatch(&mut self, positions: &[[f32; 3]]) {
+        if positions.is_empty() {
+            return;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hash-dispatch-encoder"),
+            });
+        self.dispatch_into(&mut encoder, positions);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn dispatch_into(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        positions: &[[f32; 3]],
+    ) {
         let n = positions.len();
         if n == 0 {
             return;
         }
         self.ensure_capacity(n);
 
-        // Persistent counts_zero + bytemuck cast_slice direct — viz `rebuild`.
         self.queue
             .write_buffer(&self.counts_buf, 0, &self.counts_zero);
         let params = HashParams {
@@ -453,11 +469,6 @@ impl SpatialHashGpu {
             bytemuck::cast_slice(positions),
         );
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("hash-dispatch-encoder"),
-            });
         let workgroups = ((n as u32) + 63) / 64;
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -486,7 +497,6 @@ impl SpatialHashGpu {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
-        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Sprint 49: accessor pro chained shadery (NeighborsGpu) — bind hash

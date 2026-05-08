@@ -124,6 +124,23 @@ impl PopulateInputsGpu {
         if params.num_cells == 0 {
             return;
         }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("populate-inputs-encoder"),
+        });
+        self.dispatch_into(&mut encoder, cells, sensor, params);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn dispatch_into(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        cells: &CellsGpu,
+        sensor: &SensorGatherGpu,
+        params: PopulateInputsParams,
+    ) {
+        if params.num_cells == 0 {
+            return;
+        }
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -144,20 +161,14 @@ impl PopulateInputsGpu {
                 wgpu::BindGroupEntry { binding: 11, resource: cells.last_inputs_buffer().as_entire_binding() },
             ],
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("populate-inputs-encoder"),
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("populate-inputs-pass"),
+            timestamp_writes: None,
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("populate-inputs-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = (params.num_cells + 63) / 64;
-            pass.dispatch_workgroups(workgroups, 1, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let workgroups = (params.num_cells + 63) / 64;
+        pass.dispatch_workgroups(workgroups, 1, 1);
     }
 }
 

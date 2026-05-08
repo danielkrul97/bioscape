@@ -392,6 +392,23 @@ impl StepGpu {
         if num_cells == 0 {
             return;
         }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("step-dispatch-cells-encoder"),
+        });
+        self.dispatch_with_cells_into(&mut encoder, cells, num_cells, params);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn dispatch_with_cells_into(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        cells: &CellsGpu,
+        num_cells: usize,
+        params: StepParamsGpu,
+    ) {
+        if num_cells == 0 {
+            return;
+        }
         let mut params = params;
         params.num_cells = num_cells as u32;
         self.queue
@@ -414,20 +431,14 @@ impl StepGpu {
                 wgpu::BindGroupEntry { binding: 11, resource: cells.aux_buffer().as_entire_binding() },
             ],
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("step-dispatch-cells-encoder"),
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("step-pass"),
+            timestamp_writes: None,
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("step-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = (num_cells as u32 + 63) / 64;
-            pass.dispatch_workgroups(workgroups, 1, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let workgroups = (num_cells as u32 + 63) / 64;
+        pass.dispatch_workgroups(workgroups, 1, 1);
     }
 }
 

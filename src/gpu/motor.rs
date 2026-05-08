@@ -307,6 +307,24 @@ impl MotorGpu {
         if num_cells == 0 {
             return;
         }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("motor-dispatch-cells-encoder"),
+        });
+        self.dispatch_with_cells_into(&mut encoder, cells, num_cells, dt, drag_coefficient);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn dispatch_with_cells_into(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        cells: &CellsGpu,
+        num_cells: usize,
+        dt: f32,
+        drag_coefficient: f32,
+    ) {
+        if num_cells == 0 {
+            return;
+        }
         let params = MotorParams {
             num_cells: num_cells as u32,
             dt,
@@ -315,8 +333,6 @@ impl MotorGpu {
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        // Per-call bind group s cells accessory (vlastní bind_group field je
-        // pre-Sprint-62 standalone, drží MotorGpu duplicate buffery).
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("motor-bg-cells"),
             layout: &self.bind_group_layout,
@@ -333,20 +349,14 @@ impl MotorGpu {
                 wgpu::BindGroupEntry { binding: 9, resource: cells.pitch_velocity_buffer().as_entire_binding() },
             ],
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("motor-dispatch-cells-encoder"),
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("motor-pass"),
+            timestamp_writes: None,
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("motor-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = (num_cells as u32 + 63) / 64;
-            pass.dispatch_workgroups(workgroups, 1, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let workgroups = (num_cells as u32 + 63) / 64;
+        pass.dispatch_workgroups(workgroups, 1, 1);
     }
 }
 

@@ -197,6 +197,41 @@ impl SensorGatherGpu {
         pheromone: &FieldGpu,
         params: SensorParamsGpu,
     ) {
+        if positions.is_empty() {
+            return;
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sensor-dispatch-encoder"),
+        });
+        self.dispatch_no_readback_into(
+            &mut encoder,
+            positions,
+            eff_radii,
+            vision_radii,
+            food_positions,
+            cell_hash,
+            food_hash,
+            smell,
+            pheromone,
+            params,
+        );
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_no_readback_into(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        positions: &[[f32; 3]],
+        eff_radii: &[f32],
+        vision_radii: &[f32],
+        food_positions: &[[f32; 3]],
+        cell_hash: &SpatialHashGpu,
+        food_hash: &SpatialHashGpu,
+        smell: &FieldGpu,
+        pheromone: &FieldGpu,
+        params: SensorParamsGpu,
+    ) {
         let n = positions.len();
         let nf = food_positions.len();
         assert!(n <= self.capacity_cells, "sensor cell capacity overflow");
@@ -247,21 +282,13 @@ impl SensorGatherGpu {
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("sensor-dispatch-encoder"),
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("sensor-pass"),
+            timestamp_writes: None,
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("sensor-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
-        }
-        // Sprint 61: NO copy_buffer_to_buffer to readback — output_buf
-        // zůstává jako storage pro PopulateInputsGpu chained access.
-        self.queue.submit(Some(encoder.finish()));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
     }
 
     /// Spustí celý sensor gather pipeline. `cell_hash` musí být rebuildnut z

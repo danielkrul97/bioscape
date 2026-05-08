@@ -200,6 +200,25 @@ impl BrownianGpu {
         if n == 0 {
             return;
         }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("brownian-encoder-persistent"),
+        });
+        self.compute_persistent_into(&mut encoder, cells_gpu, n, thermal_noise, dt, has_z);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn compute_persistent_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        cells_gpu: &CellsGpu,
+        n: usize,
+        thermal_noise: f32,
+        dt: f32,
+        has_z: bool,
+    ) {
+        if n == 0 {
+            return;
+        }
         let params = BrownianParams {
             num_cells: n as u32,
             has_z: if has_z { 1 } else { 0 },
@@ -216,19 +235,13 @@ impl BrownianGpu {
                 wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.xoshiro_state_buffer().as_entire_binding() },
             ],
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("brownian-encoder-persistent"),
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("brownian-pass-persistent"),
+            timestamp_writes: None,
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("brownian-pass-persistent"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
-        }
-        self.queue.submit(Some(encoder.finish()));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
     }
 }
 

@@ -207,6 +207,14 @@ impl CellsGpu {
         self.capacity
     }
 
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     pub fn last_inputs_buffer(&self) -> &wgpu::Buffer { &self.last_inputs_buf }
     pub fn last_hidden_buffer(&self) -> &wgpu::Buffer { &self.last_hidden_buf }
     pub fn last_outputs_buffer(&self) -> &wgpu::Buffer { &self.last_outputs_buf }
@@ -281,6 +289,82 @@ impl CellsGpu {
         cooldowns_out: &mut Vec<u32>,
         energies_out: &mut Vec<f32>,
     ) {
+        if n == 0 {
+            hidden_out.clear();
+            outputs_out.clear();
+            velocities_out.clear();
+            angular_out.clear();
+            pitch_out.clear();
+            positions_out.clear();
+            ages_out.clear();
+            cooldowns_out.clear();
+            energies_out.clear();
+            return;
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cells-download-full"),
+        });
+        self.download_full_copy_into(&mut encoder, n);
+        self.queue.submit(Some(encoder.finish()));
+        self.download_full_read_into(
+            n,
+            hidden_out,
+            outputs_out,
+            velocities_out,
+            angular_out,
+            pitch_out,
+            positions_out,
+            ages_out,
+            cooldowns_out,
+            energies_out,
+        );
+    }
+
+    pub fn download_full_copy_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        n: usize,
+    ) {
+        if n == 0 {
+            return;
+        }
+        assert!(n <= self.capacity);
+        let h_bytes = (n * BRAIN_HIDDEN * 4) as u64;
+        let o_bytes = (n * BRAIN_OUTPUTS * 4) as u64;
+        let v_bytes = (n * 3 * 4) as u64;
+        let a_bytes = (n * 4) as u64;
+        let p_bytes = (n * 4) as u64;
+        let pos_bytes = (n * 3 * 4) as u64;
+        let age_bytes = (n * 4) as u64;
+        let cd_bytes = (n * 4) as u64;
+        let e_bytes = (n * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.last_hidden_buf, 0, &self.last_hidden_rb, 0, h_bytes);
+        encoder.copy_buffer_to_buffer(&self.last_outputs_buf, 0, &self.last_outputs_rb, 0, o_bytes);
+        encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_rb, 0, v_bytes);
+        encoder.copy_buffer_to_buffer(&self.angular_velocity_buf, 0, &self.angular_velocity_rb, 0, a_bytes);
+        encoder.copy_buffer_to_buffer(&self.pitch_velocity_buf, 0, &self.pitch_velocity_rb, 0, p_bytes);
+        encoder.copy_buffer_to_buffer(&self.position_buf, 0, &self.position_rb, 0, pos_bytes);
+        encoder.copy_buffer_to_buffer(&self.age_buf, 0, &self.age_rb, 0, age_bytes);
+        encoder.copy_buffer_to_buffer(&self.cooldown_buf, 0, &self.cooldown_rb, 0, cd_bytes);
+        encoder.copy_buffer_to_buffer(&self.energy_buf, 0, &self.energy_rb, 0, e_bytes);
+    }
+
+    /// Map readback buffers, Wait, copy out into caller scratch. MUST be called
+    /// after the encoder containing `download_full_copy_into` has been submitted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn download_full_read_into(
+        &self,
+        n: usize,
+        hidden_out: &mut Vec<[f32; BRAIN_HIDDEN]>,
+        outputs_out: &mut Vec<[f32; BRAIN_OUTPUTS]>,
+        velocities_out: &mut Vec<[f32; 3]>,
+        angular_out: &mut Vec<f32>,
+        pitch_out: &mut Vec<f32>,
+        positions_out: &mut Vec<[f32; 3]>,
+        ages_out: &mut Vec<u32>,
+        cooldowns_out: &mut Vec<u32>,
+        energies_out: &mut Vec<f32>,
+    ) {
         hidden_out.clear();
         outputs_out.clear();
         velocities_out.clear();
@@ -303,19 +387,6 @@ impl CellsGpu {
         let age_bytes = (n * 4) as u64;
         let cd_bytes = (n * 4) as u64;
         let e_bytes = (n * 4) as u64;
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("cells-download-full"),
-        });
-        encoder.copy_buffer_to_buffer(&self.last_hidden_buf, 0, &self.last_hidden_rb, 0, h_bytes);
-        encoder.copy_buffer_to_buffer(&self.last_outputs_buf, 0, &self.last_outputs_rb, 0, o_bytes);
-        encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_rb, 0, v_bytes);
-        encoder.copy_buffer_to_buffer(&self.angular_velocity_buf, 0, &self.angular_velocity_rb, 0, a_bytes);
-        encoder.copy_buffer_to_buffer(&self.pitch_velocity_buf, 0, &self.pitch_velocity_rb, 0, p_bytes);
-        encoder.copy_buffer_to_buffer(&self.position_buf, 0, &self.position_rb, 0, pos_bytes);
-        encoder.copy_buffer_to_buffer(&self.age_buf, 0, &self.age_rb, 0, age_bytes);
-        encoder.copy_buffer_to_buffer(&self.cooldown_buf, 0, &self.cooldown_rb, 0, cd_bytes);
-        encoder.copy_buffer_to_buffer(&self.energy_buf, 0, &self.energy_rb, 0, e_bytes);
-        self.queue.submit(Some(encoder.finish()));
         let h_s = self.last_hidden_rb.slice(0..h_bytes);
         let o_s = self.last_outputs_rb.slice(0..o_bytes);
         let v_s = self.velocities_rb.slice(0..v_bytes);
