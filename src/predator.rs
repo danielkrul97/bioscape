@@ -40,10 +40,13 @@ pub const HUNTER_IDLE_DRIFT: f32 = 30.0;
 /// binary immunity s gradient damage. Hunters chase low-bond cells normally,
 /// vysoký bond count = invisible target (čisté efficiency rozhodnutí).
 pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 4;
-/// Sprint 92: per-bond exposure reduction. `exposure = max(0, 1 - n_bonds × this)`.
-/// 0.25 → 0/1/2/3+ bonds dávají exposure 1.0/0.75/0.5/0.25. Při 4+ bonds
-/// exposure floor = 0 a hunter neuvidí target (HUNTER_BOND_IMMUNITY_THRESHOLD).
-pub const EXPOSURE_PER_BOND: f32 = 0.25;
+/// Sprint 92: per-bond exposure reduction. `exposure = max(0, 1 - n_bonds × this)²`.
+/// Sprint 132+ jemný bump 0.25 → 0.30: rychlejší ramp k immunity, menší cluster
+/// dosáhne plné protection. Linear values: 0/1/2/3 bonds dávají 1.0/0.7/0.4/0.1
+/// (squared 1.0/0.49/0.16/0.01). Cluster s 3 bondy je teď prakticky immune
+/// (1 % damage) místo 6 % v původním 0.25 — třídní imunita ramps in 1 bond
+/// dříve. Hunter immunity threshold (HUNTER_BOND_IMMUNITY_THRESHOLD) zůstává 4.
+pub const EXPOSURE_PER_BOND: f32 = 0.30;
 
 /// Sprint 97: per-tick energy drain coefficient pro sensor specialization.
 /// `drain = sum(sensor_gains) × this × dt`. Default sum = 3 × 1.0 = 3 →

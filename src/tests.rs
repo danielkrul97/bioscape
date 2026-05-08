@@ -621,14 +621,15 @@ fn pool_bonded_sensors_ignores_proprio_slots() {
 fn cell_exposure_endpoints() {
     // Sprint 96: quadratic falloff — `(linear)²`. Solo cell fully exposed,
     // first bondy mají dramatic defense bonus, ≥4 plně immune.
+    // Sprint 132+: EXPOSURE_PER_BOND 0.25 → 0.30, ramp je strmější.
     assert!((cell_exposure(0) - 1.0).abs() < 1e-6);
-    // 1 bond → 0.75² = 0.5625
-    assert!((cell_exposure(1) - 0.5625).abs() < 1e-6);
-    // 2 bonds → 0.5² = 0.25
-    assert!((cell_exposure(2) - 0.25).abs() < 1e-6);
-    // 3 bonds → 0.25² = 0.0625
-    assert!((cell_exposure(3) - 0.0625).abs() < 1e-6);
-    // 4+ bonds → 0 (effectively immune)
+    // 1 bond → 0.7² = 0.49
+    assert!((cell_exposure(1) - 0.49).abs() < 1e-6);
+    // 2 bonds → 0.4² = 0.16
+    assert!((cell_exposure(2) - 0.16).abs() < 1e-6);
+    // 3 bonds → 0.1² = 0.01
+    assert!((cell_exposure(3) - 0.01).abs() < 1e-6);
+    // 4+ bonds → 0 (clamped, effectively immune)
     assert!(cell_exposure(4).abs() < 1e-6);
     assert!(cell_exposure(10).abs() < 1e-6);
 }
