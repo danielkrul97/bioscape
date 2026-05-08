@@ -2316,9 +2316,10 @@ fn cell_eats_food(
     // R-#13: Local scratch pro snapshot/cell_carnivore/candidates — pre-fix
     // 3 fresh allocs per tick.
     snapshot_scratch.clear();
-    snapshot_scratch.extend(cells.iter().map(|(e, c)| {
+    cell_carnivore_scratch.clear();
+    for (e, c) in cells.iter() {
         let has_bonds = c.0.bonds.iter().any(|b| b.is_some());
-        (
+        snapshot_scratch.push((
             e,
             c.0.position,
             c.0.phenotype.max_axis(),
@@ -2332,14 +2333,11 @@ fn cell_eats_food(
             c.0.last_best_food_d2,
             c.0.genome.vision_radius,
             has_bonds,
-        )
-    }));
+        ));
+        cell_carnivore_scratch.insert(e, c.0.genome.carnivore_score);
+    }
     let snapshot = snapshot_scratch.as_slice();
     let food_grid_ref = &food_grid.0;
-    // Sprint 92: snapshot s carnivore_score per cell pro food efficiency lookup.
-    // FxHashMap (fixed seed) místo std SipHash — par_iter dělá ~N lookupů/tick.
-    cell_carnivore_scratch.clear();
-    cell_carnivore_scratch.extend(cells.iter().map(|(e, c)| (e, c.0.genome.carnivore_score)));
     let cell_carnivore = &*cell_carnivore_scratch;
     candidates_scratch.clear();
     // eat_food skip optim: gate `!has_bonds` chrání determinismus — bonded cells
@@ -2673,11 +2671,16 @@ fn hunters_lifecycle(
     clock: Res<Clock>,
     mut next_hunter_id: ResMut<NextHunterId>,
     mut commands: Commands,
+    mut alive_scratch: Local<Vec<(Entity, Hunter)>>,
+    mut fertile_scratch: Local<Vec<(Entity, [f32; 3])>>,
+    mut lookup_scratch: Local<FxHashMap<Entity, Hunter>>,
 ) {
     let mut rng = rand::rng();
     let half = extent.as_array();
     let current_gen = clock.0.generation;
-    let alive: Vec<(Entity, Hunter)> = hunters.iter().map(|(e, h)| (e, h.0)).collect();
+    alive_scratch.clear();
+    alive_scratch.extend(hunters.iter().map(|(e, h)| (e, h.0)));
+    let alive = alive_scratch.as_slice();
 
     // Floor respawn: pokud all extinct, spawn 1 fresh genome (předchází total
     // predator collapse blokující arms race).
@@ -2695,7 +2698,7 @@ fn hunters_lifecycle(
     }
 
     // Death pass.
-    for (entity, h) in &alive {
+    for (entity, h) in alive {
         if h.energy <= 0.0 {
             commands.entity(*entity).despawn();
             for _ in 0..bioscape::HUNTER_CARRION_DROP {
@@ -2730,21 +2733,24 @@ fn hunters_lifecycle(
     if budget == 0 {
         return;
     }
-    let fertile: Vec<(Entity, [f32; 3])> = alive
-        .iter()
-        .filter(|(_, h)| {
-            h.energy >= bioscape::HUNTER_REPRODUCE_THRESHOLD
-                && h.reproduce_cooldown_ticks == 0
-        })
-        .map(|(e, h)| (*e, h.position))
-        .collect();
-    if fertile.len() < 2 {
+    fertile_scratch.clear();
+    fertile_scratch.extend(
+        alive
+            .iter()
+            .filter(|(_, h)| {
+                h.energy >= bioscape::HUNTER_REPRODUCE_THRESHOLD
+                    && h.reproduce_cooldown_ticks == 0
+            })
+            .map(|(e, h)| (*e, h.position)),
+    );
+    if fertile_scratch.len() < 2 {
         return;
     }
     let mating_r2 = bioscape::HUNTER_MATING_RADIUS * bioscape::HUNTER_MATING_RADIUS;
-    let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
-    let lookup: FxHashMap<Entity, Hunter> =
-        alive.iter().map(|(e, h)| (*e, *h)).collect();
+    let matings = bioscape::pair_fertile(fertile_scratch.as_slice(), mating_r2, budget, WORLD_HALF);
+    lookup_scratch.clear();
+    lookup_scratch.extend(alive.iter().map(|(e, h)| (*e, *h)));
+    let lookup = &*lookup_scratch;
     for &(ea, eb) in &matings {
         let parent_a = match lookup.get(&ea) {
             Some(p) => *p,
@@ -2798,24 +2804,26 @@ fn sync_hunter_transforms(mut hunters: Query<(&HunterEntity, &mut Transform)>) {
 /// `adhesion_type` (bondy se tvoří jen mezi same-type páry, takže obě cells
 /// sdílí hue). Toroidal wrap-aware: skip line, pokud raw distance > poloviny
 /// world (znamená že bond jde "přes okraj", straight line by visuálně lhala).
+#[derive(Clone, Copy)]
+struct BondSnapshot {
+    cell_id: u64,
+    start: Vec3,
+    color: Color,
+    partners: [Option<u64>; bioscape::MAX_BONDS_PER_CELL],
+}
+
 fn draw_bond_gizmos(
     cells: Query<&CellEntity, Without<Dying>>,
     mut gizmos: Gizmos,
     mut id_to_pos: Local<FxHashMap<u64, Vec3>>,
+    mut snapshot: Local<Vec<BondSnapshot>>,
+    mut segments: Local<Vec<(Vec3, Vec3, Color)>>,
 ) {
-    // R-#14: per-frame system (Update schedule, ~60+ Hz). Pre-fix
-    // `FxHashMap::default()` per frame; persistent Local zachová capacity.
     id_to_pos.clear();
-    for cell in &cells {
-        id_to_pos.insert(
-            cell.0.cell_id,
-            Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]),
-        );
-    }
-    let half_x = WORLD_HALF[0];
-    let half_y = WORLD_HALF[1];
+    snapshot.clear();
     for cell in &cells {
         let start = Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]);
+        id_to_pos.insert(cell.0.cell_id, start);
         let hue = adhesion_hue(cell.0.genome.adhesion_type);
         // Sprint 85: saturation 0.85 → 1.0, match s body color v adhesion_material.
         // Sprint 88: linear color × 3.0 multiplier — Bevy gizmos render do HDR
@@ -2823,22 +2831,38 @@ fn draw_bond_gizmos(
         // skutečné spring laser-lines.
         let base = Color::hsl(hue, 1.0, 0.6).to_linear();
         let color = Color::linear_rgba(base.red * 3.0, base.green * 3.0, base.blue * 3.0, 1.0);
-        for bond in cell.0.bonds.iter().flatten() {
-            let Some(end) = id_to_pos.get(&bond.other_cell_id) else {
-                continue;
-            };
-            // Each bond rendered jen jednou — kresli pouze pokud cell_id <
-            // partner_id (canonical owner pravidlo).
-            if cell.0.cell_id >= bond.other_cell_id {
-                continue;
-            }
-            let dx = (start.x - end.x).abs();
-            let dy = (start.y - end.y).abs();
-            if dx > half_x || dy > half_y {
-                continue;
-            }
-            gizmos.line(start, *end, color);
+        let mut partners = [None; bioscape::MAX_BONDS_PER_CELL];
+        for (i, slot) in cell.0.bonds.iter().enumerate() {
+            partners[i] = slot.as_ref().map(|b| b.other_cell_id);
         }
+        snapshot.push(BondSnapshot {
+            cell_id: cell.0.cell_id,
+            start,
+            color,
+            partners,
+        });
+    }
+    let half_x = WORLD_HALF[0];
+    let half_y = WORLD_HALF[1];
+    let id_to_pos_ref = &*id_to_pos;
+    segments.clear();
+    segments.par_extend(snapshot.par_iter().flat_map_iter(|s| {
+        s.partners.iter().filter_map(move |partner| {
+            let other_id = (*partner)?;
+            if s.cell_id >= other_id {
+                return None;
+            }
+            let end = *id_to_pos_ref.get(&other_id)?;
+            let dx = (s.start.x - end.x).abs();
+            let dy = (s.start.y - end.y).abs();
+            if dx > half_x || dy > half_y {
+                return None;
+            }
+            Some((s.start, end, s.color))
+        })
+    }));
+    for (a, b, c) in segments.iter() {
+        gizmos.line(*a, *b, *c);
     }
 }
 
@@ -3249,9 +3273,7 @@ fn cell_reproduces_on_threshold(
                 }
             }
         }
-    }
-    #[cfg(feature = "gpu")]
-    if let Some(gpu) = gpu_full.as_ref() {
+    } else if let Some(gpu) = gpu_full.as_ref() {
         for &(a, b) in &matings {
             if let (Some(slot_a), Some(slot_b)) = (slot_map.slot_of(a), slot_map.slot_of(b)) {
                 let brain_a = gpu.cells.download_brain_at(slot_a);
