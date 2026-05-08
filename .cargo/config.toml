@@ -1,2 +1,11 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+[target.x86_64-unknown-linux-gnu]
+# mold linker saves 5-15s per build vs default ld.bfd; gcc 12+ supports
+# -fuse-ld=mold natively, gcc 11 needs the binutils wrapper but works.
+# target-cpu=native enables FMA/AVX2 for the wide SIMD path in the brain
+# forward kernel (Sprint 112).
+rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "target-cpu=native"]
+
+[alias]
+# `cargo dev` = run with bevy dynamic linking. Cuts incremental rebuild
+# from ~30s to ~3s after the first warm build.
+dev = "run --features dev"
