@@ -1,86 +1,86 @@
 # Bioscape
 
-Simulace evoluce, která má pomoct pochopit, jak vzniká inteligence. Žádný předem daný cíl, žádná „buď chytrý" fitness — jen prostředí, replikace, mutace, selekce a hodně času.
+An evolution simulation built to help understand how intelligence emerges. No predefined goal, no "be smart" fitness — just an environment, replication, mutation, selection, and a lot of time.
 
-## Cíl
+## Goal
 
-Postavit otevřený systém, ve kterém se z primitivních agentů (něco jako buňky) vyvine smysluplné chování — sami od sebe. Tři velké otázky, které projekt sleduje:
+Build an open-ended system in which meaningful behavior evolves on its own from primitive agents (something like cells). Three large questions the project pursues:
 
-1. Jak se z chemie stane buňka?
-2. Jak se z buněk stanou těla a mozky?
-3. Jak se z mozků stane inteligence?
+1. How does a cell arise from chemistry?
+2. How do bodies and brains arise from cells?
+3. How does intelligence arise from brains?
 
-## Architektura
+## Architecture
 
-- **Jazyk:** Rust (CPU i GPU)
-- **Engine:** [Bevy 0.18](https://bevyengine.org) (ECS + 3D rendering přes wgpu — orbit Camera3d, StandardMaterial, ellipsoid těla), trimmed feature set bez `bevy_gilrs` a `audio` (žádné systémové `libudev-dev` / `libasound2-dev`)
-- **Split kódu:**
-  - `src/lib.rs` — čistá simulační logika (`Cell`, `step()`, brain, world map, smell/pheromone fields …) bez Bevy. Single source of truth pro simulační konstanty + helpery (`populate_brain_inputs`, `pair_fertile`, `make_mating_child`).
-  - `src/main.rs` — Bevy app, ECS svět + `Transform` synchronizace, 3D renderer.
-  - `src/bin/headless.rs` — bezokenní harness pro batch experimenty (CSV log per generaci, deterministický seed).
-- **GPU compute:** opt-in feature `gpu` (přímý wgpu + bytemuck + pollster) pro vlastní kernely; Bevy už wgpu táhne pro rendering
+- **Language:** Rust (CPU + GPU)
+- **Engine:** [Bevy 0.18](https://bevyengine.org) (ECS + 3D rendering via wgpu — orbit Camera3d, StandardMaterial, ellipsoid bodies), trimmed feature set without `bevy_gilrs` and `audio` (no system `libudev-dev` / `libasound2-dev`)
+- **Code split:**
+  - `src/lib.rs` — pure simulation logic (`Cell`, `step()`, brain, world map, smell/pheromone fields …) without Bevy. Single source of truth for simulation constants + helpers (`populate_brain_inputs`, `pair_fertile`, `make_mating_child`).
+  - `src/main.rs` — Bevy app, ECS world + `Transform` synchronization, 3D renderer.
+  - `src/bin/headless.rs` — windowless harness for batch experiments (CSV log per generation, deterministic seed).
+- **GPU compute:** opt-in `gpu` feature (raw wgpu + bytemuck + pollster) for custom kernels; Bevy already pulls in wgpu for rendering
 
-## Spuštění
+## Running
 
 **Renderer (3D viz):**
 
 ```bash
-# Default běh — `gpu` feature aktivní, GPU compute pipeline default-on
-# (sensor + populate + brain + motor + brownian + step na GPU,
+# Default run — `gpu` feature active, GPU compute pipeline default-on
+# (sensor + populate + brain + motor + brownian + step on GPU,
 # single-Wait readback per tick).
 cargo run --release
 
-# Vynutit CPU SIMD path (pro srovnání nebo na adapter bez compute).
+# Force CPU SIMD path (for comparison or on adapters without compute).
 BIOSCAPE_GPU_FULL=0 cargo run --release
 
-# Rychlejší inkrementální iterace (dynamic linking Bevy).
+# Faster incremental iteration (Bevy dynamic linking).
 cargo run --features dev
 ```
 
-Ovládání: **levé tlačítko + drag** = orbit, **střední tlačítko + drag** = pan, **kolečko** = zoom (orthographic scale), **WASD/šipky** = pan z klávesnice.
+Controls: **left button + drag** = orbit, **middle button + drag** = pan, **scroll wheel** = zoom (orthographic scale), **WASD/arrows** = pan from keyboard.
 
-**Headless (batch experimenty, CSV log):**
+**Headless (batch experiments, CSV log):**
 
 ```bash
-# Argumenty: <seed> <max_gens> <out.csv>
+# Arguments: <seed> <max_gens> <out.csv>
 cargo build --release --bin headless
 ./target/release/headless 0 200 /tmp/run.csv
 ```
 
-CSV obsahuje per-generaci stats: pop, lineages, body morphology, predation events, brain adoption metriky a další.
+The CSV contains per-generation stats: pop, lineages, body morphology, predation events, brain adoption metrics, and more.
 
-## Dokumentace
+## Documentation
 
-Rešerše vědeckého kontextu projektu (česky, srozumitelně i pro laika) je v [`docs/`](docs/README.md):
+A scientific-context survey for the project (in Czech, accessible to laypeople too) lives in [`docs/`](docs/README.md):
 
-- [Úvod a motivace](docs/00-uvod.md)
-- [Základy evoluce](docs/01-evoluce-zakladny.md)
-- [Umělý život: Tierra, Avida, Karl Sims, Lenia, Stanford DERL](docs/02-umely-zivot.md)
-- [Neuroevoluce: NEAT, HyperNEAT, MAP-Elites](docs/03-neuroevoluce.md)
-- [Buňky a morfogeneze: Neural CA, Levin, bioelektřina](docs/04-bunky-a-morfogeneze.md)
-- [Neurony a mozek: Izhikevich, spiking sítě, plasticita](docs/05-neurony-a-mozek.md)
-- [Inteligence a embodiment: Free Energy Principle, Baldwin effect](docs/06-inteligence-a-embodiment.md)
+- [Introduction and motivation](docs/00-uvod.md)
+- [Foundations of evolution](docs/01-evoluce-zakladny.md)
+- [Artificial life: Tierra, Avida, Karl Sims, Lenia, Stanford DERL](docs/02-umely-zivot.md)
+- [Neuroevolution: NEAT, HyperNEAT, MAP-Elites](docs/03-neuroevoluce.md)
+- [Cells and morphogenesis: Neural CA, Levin, bioelectricity](docs/04-bunky-a-morfogeneze.md)
+- [Neurons and the brain: Izhikevich, spiking networks, plasticity](docs/05-neurony-a-mozek.md)
+- [Intelligence and embodiment: Free Energy Principle, Baldwin effect](docs/06-inteligence-a-embodiment.md)
 - [Open-ended evolution: novelty search, quality-diversity](docs/07-open-ended-evolution.md)
-- [Implementace v Rustu na GPU](docs/08-implementace-rust-gpu.md)
+- [Implementation in Rust on GPU](docs/08-implementace-rust-gpu.md)
 
 ## Status
 
-120+ sprintů. Plná 3D simulace: ellipsoid morfologie (length × width × height + spike), 3D pohyb (yaw + pitch), gravitace s vztlakem, predace s attack-gate + gradient exposure podle počtu bondů, mating přes pheromone signaling, food clustering ve world map, hazard zóny, thermal field (vertikální gradient + diurnal/seasonal oscilace, per-cell `thermal_optimum` gen), multi-trophic food (plant / carrion / hunter-carrion + evoluční `carnivore_score`), recurrent brain (21 sensory + recurrent vstupy × NEAT-rostoucí hidden × 10 výstupů, Elman feedback), HyperNEAT CPPN templates, cluster-shared brain pooling přes bonded peers (proto-distributed cognition), persistentní spring bondy → tissue regime, evolving Hunter s vlastním brainem (biological arms race), bistabilní cell-state, periodické environmentální shocks (HazardPulse / ClimateShift / FoodCrash). Headless harness pro deterministické batch experimenty, 3D renderer s orbit kamerou (HDR + bloom + fog + procedurální bio-textury).
+120+ sprints. Full 3D simulation: ellipsoid morphology (length × width × height + spike), 3D motion (yaw + pitch), gravity with buoyancy, predation with attack-gate + gradient exposure based on bond count, mating via pheromone signaling, food clustering in the world map, hazard zones, thermal field (vertical gradient + diurnal/seasonal oscillation, per-cell `thermal_optimum` gene), multi-trophic food (plant / carrion / hunter-carrion + evolutionary `carnivore_score`), recurrent brain (21 sensory + recurrent inputs × NEAT-grown hidden × 10 outputs, Elman feedback), HyperNEAT CPPN templates, cluster-shared brain pooling across bonded peers (proto-distributed cognition), persistent spring bonds → tissue regime, evolving Hunter with its own brain (biological arms race), bistable cell-state, periodic environmental shocks (HazardPulse / ClimateShift / FoodCrash). Headless harness for deterministic batch experiments, 3D renderer with orbit camera (HDR + bloom + fog + procedural bio-textures).
 
-**Performance decade 111–120** přinesla **~9× ticks/s @ 2 500 cells**
-přes target-cpu=native (S111), SIMD brain forward (S112, 2.1×), Bevy
-rayon paralelizaci (S113, 4.6× per fáze), SIMD field diffusion (S117,
-4×), plus PGO infrastructure (S119, opt-in). Baseline na i5-12400F
-(12 vláken, target-cpu=native, lto=fat): 1k cells = 2 994 ticks/s,
-2,5k = 1 408, 5k = 598. Detail: [`docs/sprints/111-120-perf.md`](docs/sprints/111-120-perf.md).
+**Performance decade 111–120** delivered **~9× ticks/s @ 2,500 cells**
+via target-cpu=native (S111), SIMD brain forward (S112, 2.1×), Bevy
+rayon parallelization (S113, 4.6× per phase), SIMD field diffusion (S117,
+4×), plus PGO infrastructure (S119, opt-in). Baseline on i5-12400F
+(12 threads, target-cpu=native, lto=fat): 1k cells = 2,994 ticks/s,
+2.5k = 1,408, 5k = 598. Detail: [`docs/sprints/111-120-perf.md`](docs/sprints/111-120-perf.md).
 
-**Decade 128–137 (renderer-side perf)** navazuje: per-system scratch
-reuse v hot loopech (Local + persistent Resources, ~30–40 alloc/tick →
-0), `--gpu-full` single-Wait pipeline default-on v rendereru (nahrazuje
-fragmentovaný S132 path), `eat_food` solo-skip přes sensor cache.
+**Decade 128–137 (renderer-side perf)** continues: per-system scratch
+reuse in hot loops (Local + persistent Resources, ~30–40 alloc/tick →
+0), `--gpu-full` single-Wait pipeline default-on in the renderer (replaces
+the fragmented S132 path), `eat_food` solo-skip via the sensor cache.
 Detail: [`docs/sprints/128-137-perf.md`](docs/sprints/128-137-perf.md).
 
-Detailní stav po sprintech: [`docs/sprints/`](docs/sprints/).
+Detailed sprint-by-sprint status: [`docs/sprints/`](docs/sprints/).
 
 ## Emergent behaviors
 
@@ -115,6 +115,6 @@ Measured empirically — three 300-generation headless runs (seeds 0, 1, 42) plu
 
 **Reading these results:** the simulation reliably reproduces predator-driven simplifying dynamics — diversity collapse, signal saturation, sensor abandonment, cooperation breakdown. Mechanisms aimed at multicellularity (food-sharing, phenotypic memory) work as transients but do not yet hold a tissue regime against long-run hunter pressure. The one cooperative-looking pattern that *does* persist — same-type spatial clustering — comes for free from physics, not from any of the explicit cooperation machinery. That gap is the open research question.
 
-## Licence
+## License
 
 MIT OR Apache-2.0
