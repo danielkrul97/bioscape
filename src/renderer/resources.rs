@@ -1,0 +1,295 @@
+use bevy::prelude::*;
+use bioscape::{
+    EventCalendar, FoodKind, SimClock, SmellField, SpatialGrid, WorldMap, HUNTER_GRID_CELL_SIZE,
+    HUNTER_TARGET_COUNT, INITIAL_CELLS,
+};
+use rustc_hash::FxHashMap;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use super::config::{
+    CAMERA_PITCH_INITIAL, CAMERA_SCALE_INITIAL, GRID_CELL_SIZE,
+};
+use super::material::BioMaterial;
+
+#[derive(Resource, Default)]
+pub(super) struct TickCounter {
+    pub(super) ticks_this_frame: u32,
+    pub(super) sim_ms_this_frame: f64,
+    pub(super) tick_start: Option<Instant>,
+}
+
+#[derive(Resource, Debug, Clone, Copy)]
+pub(super) struct WorldExtent {
+    pub(super) half_x: f32,
+    pub(super) half_y: f32,
+    pub(super) half_z: f32,
+}
+
+impl WorldExtent {
+    pub(super) fn as_array(self) -> [f32; 3] {
+        [self.half_x, self.half_y, self.half_z]
+    }
+}
+
+#[derive(Resource, Debug)]
+pub(super) struct Clock(pub(super) SimClock);
+
+#[derive(Resource, Debug, Clone, Copy)]
+pub(super) struct FoodDensityFactor(pub(super) f32);
+
+impl Default for FoodDensityFactor {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+#[derive(Resource)]
+pub(super) struct CellGrid(pub(super) SpatialGrid<Entity, f32>);
+
+impl Default for CellGrid {
+    fn default() -> Self {
+        Self(SpatialGrid::new(GRID_CELL_SIZE))
+    }
+}
+
+#[derive(Resource)]
+pub(super) struct FoodGrid(pub(super) SpatialGrid<Entity, FoodKind>);
+
+impl Default for FoodGrid {
+    fn default() -> Self {
+        Self(SpatialGrid::new(GRID_CELL_SIZE))
+    }
+}
+
+/// Persistent cell_id ↔ Entity ↔ position lookup. Build raz/tick v
+/// `rebuild_cell_entity_lookups` před brain_act fází; consume v
+/// resolve_cell_collisions, cell_eats_food, draw_bond_gizmos, pool_bonded_*.
+/// Pre-fix: 6+ systémů buildovalo vlastní `FxHashMap` per tick.
+#[derive(Resource, Default)]
+pub(super) struct CellEntityLookups {
+    pub(super) id_to_entity: FxHashMap<u64, Entity>,
+    pub(super) id_to_position: FxHashMap<u64, [f32; 3]>,
+    pub(super) entity_to_idx: FxHashMap<Entity, usize>,
+    /// Vec indexed by `entity_to_idx[Entity]` — drží position pro O(1) lookup
+    /// v collision phase 2.
+    pub(super) positions_by_idx: Vec<[f32; 3]>,
+}
+
+impl CellEntityLookups {
+    pub(super) fn rebuild<'a>(
+        &mut self,
+        iter: impl Iterator<Item = (Entity, u64, [f32; 3])>,
+    ) {
+        self.id_to_entity.clear();
+        self.id_to_position.clear();
+        self.entity_to_idx.clear();
+        self.positions_by_idx.clear();
+        for (entity, cell_id, pos) in iter {
+            let idx = self.positions_by_idx.len();
+            self.positions_by_idx.push(pos);
+            self.id_to_entity.insert(cell_id, entity);
+            self.id_to_position.insert(cell_id, pos);
+            self.entity_to_idx.insert(entity, idx);
+        }
+    }
+}
+
+/// Sprint 102 mirror: persistent spatial grid pro hunter pack sensing
+/// (`gather_hunter_sensors`, `nearest_attackable_cell`). Větší cell size než
+/// `CellGrid` — typický hunter vision_radius je ~200, takže `r_cells` zůstane
+/// 1–2 → 27–125 bucket lookups vs ~1300 při `GRID_CELL_SIZE = 100`.
+/// Pre-fix: fresh `SpatialGrid::new()` per `step_hunters` tick.
+#[derive(Resource)]
+pub(super) struct HunterCellGrid(pub(super) SpatialGrid<usize, ()>);
+
+impl Default for HunterCellGrid {
+    fn default() -> Self {
+        Self(SpatialGrid::new(HUNTER_GRID_CELL_SIZE))
+    }
+}
+
+/// Sprint 66: monotonic counter pro Cell.cell_id přidělování. Initial pop
+/// uses ids 0..INITIAL_CELLS, takže start = INITIAL_CELLS. Children z
+/// reproduce čerpají odsud.
+#[derive(Resource)]
+pub(super) struct NextCellId(pub(super) u64);
+
+impl Default for NextCellId {
+    fn default() -> Self {
+        Self(INITIAL_CELLS as u64)
+    }
+}
+
+/// Sprint 89: monotonic counter pro hunter_id + lineage_id při reproduce
+/// nebo floor respawn. Init seed uses ids 0..HUNTER_TARGET_COUNT.
+#[derive(Resource)]
+pub(super) struct NextHunterId(pub(super) u64);
+
+impl Default for NextHunterId {
+    fn default() -> Self {
+        Self(HUNTER_TARGET_COUNT as u64)
+    }
+}
+
+/// Sprint 66: per-pair contact tick tracker. Klíč je `(min_id, max_id)`
+/// stable Cell.cell_id páru. Resource žije celý běh — generation reset
+/// nemažeme (kontakt může běžet napříč generační hranicí).
+#[derive(Resource, Default)]
+pub(super) struct ContactProgress(pub(super) FxHashMap<(u64, u64), u32>);
+
+/// Sprint 99: hunter-hunter contact tracker (mirror cells). Survives
+/// across ticks — bond formation gates na BOND_FORM_TICKS consecutive.
+#[derive(Resource, Default)]
+pub(super) struct HunterContactProgress(pub(super) FxHashMap<(u64, u64), u32>);
+
+/// Sprint 109: deterministicky vygenerovaný kalendář environmentálních shocků
+/// pro celý běh rendereru. Default empty (no-op). Sprint 110+ integruje efekty
+/// per shock kind. Init z env varu `BIOSCAPE_SHOCKS_MEAN_GENS` (parse u32);
+/// ignoruje ho při unset / `0`.
+#[derive(Resource, Default)]
+pub(super) struct EventCalendarResource(pub(super) EventCalendar);
+
+/// Sprint 52: maps Bevy `Entity` ↔ slot index v `CellsGpu` SoA bufferech.
+/// Sloty jsou dense (0..n, žádné holes) přes swap_remove pattern při death.
+#[derive(Resource, Default)]
+pub(super) struct CellSlotMap {
+    pub(super) slot_to_entity: Vec<Entity>,
+    pub(super) entity_to_slot: FxHashMap<Entity, usize>,
+}
+
+impl CellSlotMap {
+    pub(super) fn allocate(&mut self, entity: Entity) -> usize {
+        let slot = self.slot_to_entity.len();
+        self.slot_to_entity.push(entity);
+        self.entity_to_slot.insert(entity, slot);
+        slot
+    }
+
+    /// Release slot pro entity. Vrací `Some((freed_slot, moved_entity))`
+    /// pokud entity byla zaregistrovaná. `moved_entity` je Some pokud
+    /// freed_slot byl zaplněn cell ze zadního slotu (swap_remove pattern).
+    pub(super) fn release(&mut self, entity: Entity) -> Option<(usize, Option<Entity>)> {
+        let slot = self.entity_to_slot.remove(&entity)?;
+        let last = self.slot_to_entity.len() - 1;
+        let moved = if slot != last {
+            let moved_entity = self.slot_to_entity[last];
+            self.slot_to_entity[slot] = moved_entity;
+            self.entity_to_slot.insert(moved_entity, slot);
+            Some(moved_entity)
+        } else {
+            None
+        };
+        self.slot_to_entity.pop();
+        Some((slot, moved))
+    }
+
+    pub(super) fn slot_of(&self, entity: Entity) -> Option<usize> {
+        self.entity_to_slot.get(&entity).copied()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.slot_to_entity.len()
+    }
+}
+
+#[derive(Resource)]
+pub(super) struct CellMesh(pub(super) Handle<Mesh>);
+
+#[derive(Resource)]
+pub(super) struct FoodMesh(pub(super) Handle<Mesh>);
+
+#[derive(Resource)]
+pub(super) struct FoodMaterial(pub(super) Handle<StandardMaterial>);
+
+/// Sprint 71: shared mesh + material pro Hunter entities. Single resource —
+/// všichni hunters vypadají stejně, žádný cache potřeba. Resources drží
+/// handles při životě (Assets refcount); fields se přímo nečtou.
+#[derive(Resource)]
+#[allow(dead_code)]
+pub(super) struct HunterMesh(pub(super) Handle<Mesh>);
+
+#[derive(Resource)]
+#[allow(dead_code)]
+pub(super) struct HunterMaterial(pub(super) Handle<BioMaterial>);
+
+/// Sprint 36: per-lineage material cache. Lineage hue → handle do
+/// `Assets<StandardMaterial>`. Bevy automaticky deduplikuje stejné materialy
+/// na renderer instances draw call.
+///
+/// Sprint 69: keyovaný podle `adhesion_type` (0..ADHESION_TYPE_COUNT) místo
+/// `lineage_id`. 8 distinct hues = vidíš "tribes" na první pohled, jakmile
+/// začne Steinberg sorting (same-type cells gravitují k sobě). Pre-Sprint 69
+/// se barvilo podle lineage_hue (random hue per linii) — ten signal byl
+/// užitečný pro fyzickou separaci, ale přebíjel adhesion clustering. Lineage
+/// info zůstává v HUD + CSV `lineages` count.
+#[derive(Resource, Default)]
+pub(super) struct AdhesionMaterials(pub(super) [Option<Handle<BioMaterial>>; 8]);
+
+/// Sprint 36 orbit camera state. Camera obíhá kolem `target` ve sférických
+/// souřadnicích (yaw + pitch). Distance camera→target je fixní
+/// `CAMERA_OFFSET_DISTANCE`; "zoom" modifikuje `scale` (orthographic projection
+/// scale). Yaw = rotace kolem world Z, pitch = elevace nad xy plochou
+/// (0 = horizon, π/2 = top-down).
+#[derive(Resource, Debug, Clone, Copy)]
+pub(super) struct OrbitCamera {
+    pub(super) target: Vec3,
+    pub(super) yaw: f32,
+    pub(super) pitch: f32,
+    /// Orthographic scale (world units per pixel). Menší = zoom in.
+    pub(super) scale: f32,
+}
+
+impl Default for OrbitCamera {
+    fn default() -> Self {
+        Self {
+            target: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: CAMERA_PITCH_INITIAL,
+            scale: CAMERA_SCALE_INITIAL,
+        }
+    }
+}
+
+impl OrbitCamera {
+    pub(super) fn transform(&self) -> Transform {
+        let cos_p = self.pitch.cos();
+        let offset = Vec3::new(
+            -self.yaw.sin() * cos_p,
+            -self.yaw.cos() * cos_p,
+            self.pitch.sin(),
+        ) * super::config::CAMERA_OFFSET_DISTANCE;
+        let pos = self.target + offset;
+        Transform::from_translation(pos).looking_at(self.target, Vec3::Z)
+    }
+}
+
+#[derive(Resource)]
+pub(super) struct SmellResource(pub(super) SmellField);
+
+/// Sprint 126: multi-channel pheromone fields. Pole `[SmellField; N_PHEROMONE_CHANNELS]`
+/// — každý kanál má vlastní decay/diffusion (viz `PHEROMONE_DECAY_PER_CH` / `_DIFFUSION_PER_CH`).
+/// ch0 = slow (mating-friendly, backward-compat), ch1 medium, ch2 fast (bursty).
+#[derive(Resource)]
+pub(super) struct PheromoneResource {
+    pub(super) fields: [SmellField; bioscape::N_PHEROMONE_CHANNELS],
+}
+
+/// Sprint 128: cooperative food packets. Vec uloženo přímo v Resource (žádná
+/// per-node Entity — coop food má jen pozici a stav, žádné rendering aspekty
+/// v této verzi).
+#[derive(Resource, Default)]
+pub(super) struct CoopFoodResource(pub(super) Vec<bioscape::CoopFood>);
+
+#[derive(Resource)]
+pub(super) struct WorldMapResource(pub(super) WorldMap);
+
+#[derive(Resource, Clone)]
+pub(super) struct ScreencastConfig {
+    pub(super) dir: PathBuf,
+    pub(super) interval_secs: f32,
+    pub(super) duration_secs: f32,
+    pub(super) started_at: Option<f32>,
+    pub(super) last_capture: f32,
+    pub(super) frame_idx: u32,
+}

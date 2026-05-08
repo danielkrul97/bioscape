@@ -1,60 +1,82 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use wide::f32x8;
 
 use crate::*;
 use super::cppn::Cppn;
 
+/// Vectorized tanh approximation: (3,2) Padé rational form, clamped to ±3.
+/// At |x|=3 numerator and denominator both equal 108, so the function
+/// saturates cleanly to ±1. Max error ~2% inside the active range — not
+/// meaningful for tanh activation (signal is already saturating there).
+/// The win is replacing N scalar `f32::tanh` calls with one SIMD op.
+#[inline]
+fn tanh_fast(x: f32x8) -> f32x8 {
+    let x = x.fast_max(f32x8::splat(-3.0)).fast_min(f32x8::splat(3.0));
+    let x2 = x * x;
+    x * (f32x8::splat(27.0) + x2) / (f32x8::splat(27.0) + f32x8::splat(9.0) * x2)
+}
+
 impl Brain {
-    /// Sprint 106: derive brain weights z CPPN substrate query. Pro každý
-    /// (input slot, hidden slot) pár zavolá cppn.forward([from.coord, to.coord, 1.0]),
-    /// extrahuje weight + link_exists. Stejně pro (hidden, output).
-    /// Biases (b1, b2) odvozeny z CPPN query s "self-loop" coord (oba inputs
-    /// stejné). hidden_n = BRAIN_HIDDEN_DEFAULT.
+    /// Derive brain weights from a CPPN substrate query. For each
+    /// (input, hidden) and (hidden, output) pair the CPPN is queried with
+    /// both substrate coordinates and a sentinel input (1.0); the output
+    /// supplies a weight and a link-existence bit. Biases come from a
+    /// self-loop query (from = to, sentinel = 0). The resulting brain has
+    /// `hidden_n = BRAIN_HIDDEN_DEFAULT`.
     pub fn from_cppn(cppn: &Cppn) -> Brain {
+        // Pre-compute substrate coordinates — otherwise input coords are
+        // recomputed BRAIN_HIDDEN times, hidden coords BRAIN_OUTPUTS times.
+        let input_coords: [_; BRAIN_INPUTS] =
+            std::array::from_fn(substrate_input_coords);
+        let hidden_coords: [_; BRAIN_HIDDEN] =
+            std::array::from_fn(substrate_hidden_coords);
+        let output_coords: [_; BRAIN_OUTPUTS] =
+            std::array::from_fn(substrate_output_coords);
+
         let mut w1 = [[0.0_f32; BRAIN_INPUTS]; BRAIN_HIDDEN];
         let mut b1 = [0.0_f32; BRAIN_HIDDEN];
         let mut w2 = [[0.0_f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS];
         let mut b2 = [0.0_f32; BRAIN_OUTPUTS];
 
-        // w1: input → hidden
+        // L1: input → hidden.
         for h in 0..BRAIN_HIDDEN {
-            let to_c = substrate_hidden_coords(h);
+            let to_c = hidden_coords[h];
             for i in 0..BRAIN_INPUTS {
-                let from_c = substrate_input_coords(i);
-                let inputs = [
+                let from_c = input_coords[i];
+                let out = cppn.forward([
                     from_c[0], from_c[1], from_c[2],
                     to_c[0], to_c[1], to_c[2],
                     1.0,
-                ];
-                let out = cppn.forward(inputs);
+                ]);
                 if out[1] >= CPPN_LINK_EXISTS_THRESHOLD {
                     w1[h][i] = out[0];
                 }
             }
-            // b1[h]: query CPPN with from = hidden (self-loop sentinel)
-            let inputs = [to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0];
-            let out = cppn.forward(inputs);
-            b1[h] = out[0] * 0.5; // dampen bias
+            // Bias: self-loop sentinel (from = to, marker = 0). Dampened.
+            let out = cppn.forward([
+                to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0,
+            ]);
+            b1[h] = out[0] * 0.5;
         }
 
-        // w2: hidden → output
+        // L2: hidden → output.
         for o in 0..BRAIN_OUTPUTS {
-            let to_c = substrate_output_coords(o);
+            let to_c = output_coords[o];
             for h in 0..BRAIN_HIDDEN {
-                let from_c = substrate_hidden_coords(h);
-                let inputs = [
+                let from_c = hidden_coords[h];
+                let out = cppn.forward([
                     from_c[0], from_c[1], from_c[2],
                     to_c[0], to_c[1], to_c[2],
                     1.0,
-                ];
-                let out = cppn.forward(inputs);
+                ]);
                 if out[1] >= CPPN_LINK_EXISTS_THRESHOLD {
                     w2[o][h] = out[0];
                 }
             }
-            // b2[o]: self-loop sentinel
-            let inputs = [to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0];
-            let out = cppn.forward(inputs);
+            let out = cppn.forward([
+                to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0,
+            ]);
             b2[o] = out[0] * 0.5;
         }
 
@@ -68,17 +90,12 @@ impl Brain {
     }
 }
 
-// ─── End Sprint 106 ──────────────────────────────────────────────────────────
-
-// ─── End Sprint 105 CPPN scaffolding ─────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Brain {
-    /// Sprint 80: active hidden neuron count (≤ BRAIN_HIDDEN storage). Default
-    /// = BRAIN_HIDDEN_DEFAULT. forward/mutate/crossover/hebbian iterují jen
-    /// [0..hidden_n]; dead zone (hidden_n..BRAIN_HIDDEN) drží 0 a do výpočtu
-    /// nepřispívá. Strukturální mutace (add/remove neuron) přijdou v dalších
-    /// sprintech a budou tuhle hodnotu měnit.
+    /// Active hidden neuron count (≤ BRAIN_HIDDEN storage). forward, mutate,
+    /// crossover, and hebbian iterate only `[0..hidden_n]`; the dead zone
+    /// `[hidden_n..BRAIN_HIDDEN]` stays at zero and contributes nothing.
+    /// Structural mutations (add_neuron, remove_neuron, split_link) move it.
     #[serde(default = "default_hidden_n")]
     pub hidden_n: u32,
     #[serde(with = "serde_arrays_w1")]
@@ -94,9 +111,9 @@ fn default_hidden_n() -> u32 {
     BRAIN_HIDDEN_DEFAULT as u32
 }
 
-// Sprint 48: serde 1 has native const-generic support pro `[T; N]` ale
-// nested fixed arrays (`[[f32; 36]; 16]`) potřebují manual workaround.
-// Encode jako flat Vec<f32> length × 36, decode reverse.
+// Serde 1 has native const-generic support for `[T; N]`, but nested fixed
+// arrays (`[[f32; 36]; 16]`) need a manual workaround — encode as flat
+// `Vec<f32>`, reconstruct on the way back.
 pub mod serde_arrays_w1 {
     use super::{BRAIN_HIDDEN, BRAIN_INPUTS};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -147,7 +164,8 @@ pub mod serde_arrays_w2 {
     }
 }
 
-// Sprint 48: serde 1 native podpora `[T; N]` jen pro N ≤ 32. `BRAIN_INPUTS` = 36.
+// Serde's native `[T; N]` impl only covers N ≤ 32 — these wrappers handle
+// `BRAIN_INPUTS` and `BRAIN_HIDDEN` which exceed that.
 pub mod serde_arr_inputs {
     use super::BRAIN_INPUTS;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -167,8 +185,6 @@ pub mod serde_arr_inputs {
     }
 }
 
-// Sprint 103: BRAIN_HIDDEN > 32 → serde's native `[T; N]` impl nepokrývá.
-// Wrapper sloučí pole do Vec<f32> na serializaci, resp. roundtripuje zpět.
 pub mod serde_arr_hidden {
     use super::BRAIN_HIDDEN;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -193,10 +209,11 @@ impl Brain {
         Self::random_with_hidden(rng, BRAIN_HIDDEN_DEFAULT as u32)
     }
 
-    /// Sprint 80: variable-size random init. `hidden_n` aktivních neuronů,
-    /// zbytek storage (BRAIN_HIDDEN..) zero-initialized a do forward passu
-    /// nepřispívá. RNG draws happen only for active region — same seed s
-    /// hidden_n=BRAIN_HIDDEN_DEFAULT reprodukuje pre-Sprint-80 sekvenci.
+    /// Variable-size random init. `hidden_n` neurons are populated; the rest
+    /// of the storage is zero and stays inert in forward passes. RNG draws
+    /// happen only inside the active region: the same seed with
+    /// `hidden_n = BRAIN_HIDDEN_DEFAULT` reproduces the pre-storage-bump
+    /// sequence byte-identical.
     pub fn random_with_hidden(rng: &mut impl Rng, hidden_n: u32) -> Self {
         debug_assert!(
             (hidden_n as usize) >= BRAIN_HIDDEN_MIN
@@ -207,9 +224,9 @@ impl Brain {
             BRAIN_HIDDEN
         );
         let h_n = hidden_n as usize;
-        // Sprint 80 (storage bump): active input width je sensory + hidden_n,
-        // ne celá BRAIN_INPUTS storage. Pro default h_n=16: 20+16 = 36, match
-        // Sprint A pre-bump RNG sekvence byte-identical.
+        // Active input width = sensory inputs + recurrent slots for live
+        // hiddens. With h_n = 16 default, 20 + 16 = 36 — matches the
+        // pre-storage-bump RNG sequence.
         let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
         let mut w1 = [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN];
         let mut b1 = [0.0; BRAIN_HIDDEN];
@@ -227,22 +244,20 @@ impl Brain {
             }
             *bias = gaussian(rng);
         }
-        // Innate thrust bias: bumps b2[1] (thrust output) above zero. Posune
-        // distribuci `thrust_norm = (tanh(b2 + ...) + 1) / 2` od mean ~0.5
-        // (random walk stuck) k mean ~0.7 (consistent forward motion). Hebbian
-        // + selekce dál ladí; tohle jen řeší kallové cells co se nehýbou.
+        // Innate thrust bias: pushes b2[1] above zero so post-tanh thrust
+        // lands around 0.7 instead of 0.5; without it ~half of fresh genomes
+        // would get stuck doing a stationary random walk.
         b2[1] += INNATE_THRUST_BIAS;
-        // Innate pheromone bias: Sprint 25 vyžaduje active emisi pro mating.
-        // Bez biasu by se polovina random cells nemohla reprodukovat.
+        // Innate pheromone bias: mating gating requires nonzero emission;
+        // without this, half of fresh genomes couldn't reproduce.
         b2[2] += INNATE_PHEROMONE_BIAS;
-        // Innate attack bias: Sprint 27 — default 0 (opt-in). Mění se přes
-        // konstantu, ne ad-hoc tady, ať se chování dá testovat A/B.
+        // Innate attack bias: defaults to 0 (opt-in); routed through a
+        // constant for clean A/B testing.
         b2[6] += INNATE_ATTACK_BIAS;
-        // Sprint 66 bond signal bias — opt-in jako attack.
+        // Bond signal bias — opt-in, like attack.
         b2[9] += INNATE_BOND_BIAS;
-        // Sprint 126: ch1, ch2 emit biases. Slabší než ch0 (mating gating
-        // tam potřebuje high baseline) — jen aby evoluce neměla cold-start
-        // s output ≈ 0.
+        // ch1, ch2 emit biases — gentler than ch0 (which gates mating and
+        // wants a high baseline). Just enough to avoid a cold start near 0.
         b2[10] += INNATE_PHEROMONE_AUX_BIAS;
         b2[11] += INNATE_PHEROMONE_AUX_BIAS;
         Self { hidden_n, w1, b1, w2, b2 }
@@ -252,71 +267,105 @@ impl Brain {
         self.forward_with_state(inputs).1
     }
 
-    /// Same forward pass as `forward`, but also returns hidden activations
-    /// (needed for Hebbian updates).
+    /// Forward pass that also returns hidden activations (needed for Hebbian
+    /// updates).
     ///
-    /// Sprint 112: `wide::f32x8` přes 10 lanes (padded BRAIN_INPUTS 71→80) v
-    /// L1, 7 lanes (padded BRAIN_HIDDEN 50→56) v L2. Dead zone (h_n..BRAIN_HIDDEN)
-    /// padding zero → mul_add se zapíše jako akumulace přes celou pad šíři bez
-    /// větvení. `target-cpu=native` (Sprint 111) zapne FMA, takže jeden chunk
-    /// dot product je 1× vfmadd231ps.
+    /// Matvec is SIMDified with `wide::f32x8`: full 8-lane chunks load
+    /// directly from weight rows, the trailing partial chunk uses a
+    /// zero-padded scratch lane. With `target-cpu=native` the inner mul_add
+    /// lowers to a single FMA. tanh activation is also vectorized via
+    /// `tanh_fast` over the active hidden range.
     pub fn forward_with_state(
         &self,
         inputs: &[f32; BRAIN_INPUTS],
     ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
-        use wide::f32x8;
-        const L1_PAD: usize = ((BRAIN_INPUTS + 7) / 8) * 8;
-        const L1_LANES: usize = L1_PAD / 8;
-        const L2_PAD: usize = ((BRAIN_HIDDEN + 7) / 8) * 8;
-        const L2_LANES: usize = L2_PAD / 8;
+        const L1_FULL: usize = BRAIN_INPUTS / 8;
+        const L1_TAIL: usize = BRAIN_INPUTS % 8;
+        const L1_LANES: usize = L1_FULL + (L1_TAIL != 0) as usize;
+        const L2_FULL: usize = BRAIN_HIDDEN / 8;
+        const L2_TAIL: usize = BRAIN_HIDDEN % 8;
+        const L2_LANES: usize = L2_FULL + (L2_TAIL != 0) as usize;
+
         let h_n = self.hidden_n as usize;
 
-        let mut padded_inputs = [0.0_f32; L1_PAD];
-        padded_inputs[..BRAIN_INPUTS].copy_from_slice(inputs);
+        // Pack inputs into f32x8 lanes; tail zero-padded.
         let mut input_lanes = [f32x8::ZERO; L1_LANES];
-        for (lane, chunk) in input_lanes.iter_mut().zip(padded_inputs.chunks_exact(8)) {
-            *lane = f32x8::new(chunk.try_into().unwrap());
+        for k in 0..L1_FULL {
+            input_lanes[k] = f32x8::new(inputs[k * 8..(k + 1) * 8].try_into().unwrap());
+        }
+        if L1_TAIL > 0 {
+            let mut tail = [0.0_f32; 8];
+            tail[..L1_TAIL].copy_from_slice(&inputs[L1_FULL * 8..]);
+            input_lanes[L1_FULL] = f32x8::new(tail);
         }
 
-        let mut hidden = [0.0_f32; BRAIN_HIDDEN];
-        let mut padded_w1_row = [0.0_f32; L1_PAD];
+        // L1 matvec — load weight chunks directly (no per-row scratch).
+        let mut pre_hidden = [0.0_f32; BRAIN_HIDDEN];
         for i in 0..h_n {
-            padded_w1_row[..BRAIN_INPUTS].copy_from_slice(&self.w1[i]);
+            let row = &self.w1[i];
             let mut acc = f32x8::ZERO;
-            for (lane_idx, chunk) in padded_w1_row.chunks_exact(8).enumerate() {
-                let w = f32x8::new(chunk.try_into().unwrap());
-                acc = w.mul_add(input_lanes[lane_idx], acc);
+            for k in 0..L1_FULL {
+                let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
+                acc = w.mul_add(input_lanes[k], acc);
             }
-            let sum = self.b1[i] + acc.reduce_add();
-            hidden[i] = sum.tanh();
+            if L1_TAIL > 0 {
+                let mut tail = [0.0_f32; 8];
+                tail[..L1_TAIL].copy_from_slice(&row[L1_FULL * 8..]);
+                acc = f32x8::new(tail).mul_add(input_lanes[L1_FULL], acc);
+            }
+            pre_hidden[i] = self.b1[i] + acc.reduce_add();
         }
 
-        let mut padded_hidden = [0.0_f32; L2_PAD];
-        padded_hidden[..BRAIN_HIDDEN].copy_from_slice(&hidden);
+        // Vectorized tanh in chunks of 8 over active hiddens; scalar tail.
+        let mut hidden = [0.0_f32; BRAIN_HIDDEN];
+        let full_chunks = h_n / 8;
+        for c in 0..full_chunks {
+            let start = c * 8;
+            let arr: [f32; 8] = pre_hidden[start..start + 8].try_into().unwrap();
+            let activated = tanh_fast(f32x8::new(arr)).to_array();
+            hidden[start..start + 8].copy_from_slice(&activated);
+        }
+        for i in full_chunks * 8..h_n {
+            hidden[i] = pre_hidden[i].tanh();
+        }
+
+        // Pack hidden into lanes for L2.
         let mut hidden_lanes = [f32x8::ZERO; L2_LANES];
-        for (lane, chunk) in hidden_lanes.iter_mut().zip(padded_hidden.chunks_exact(8)) {
-            *lane = f32x8::new(chunk.try_into().unwrap());
+        for k in 0..L2_FULL {
+            hidden_lanes[k] = f32x8::new(hidden[k * 8..(k + 1) * 8].try_into().unwrap());
+        }
+        if L2_TAIL > 0 {
+            let mut tail = [0.0_f32; 8];
+            tail[..L2_TAIL].copy_from_slice(&hidden[L2_FULL * 8..]);
+            hidden_lanes[L2_FULL] = f32x8::new(tail);
         }
 
+        // L2 matvec; BRAIN_OUTPUTS is small, scalar tanh per output is fine.
         let mut out = [0.0_f32; BRAIN_OUTPUTS];
-        let mut padded_w2_row = [0.0_f32; L2_PAD];
         for ((o, row), &bias) in out.iter_mut().zip(self.w2.iter()).zip(self.b2.iter()) {
-            padded_w2_row[..BRAIN_HIDDEN].copy_from_slice(row);
             let mut acc = f32x8::ZERO;
-            for (lane_idx, chunk) in padded_w2_row.chunks_exact(8).enumerate() {
-                let w = f32x8::new(chunk.try_into().unwrap());
-                acc = w.mul_add(hidden_lanes[lane_idx], acc);
+            for k in 0..L2_FULL {
+                let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
+                acc = w.mul_add(hidden_lanes[k], acc);
             }
-            let sum = bias + acc.reduce_add();
-            *o = sum.tanh();
+            if L2_TAIL > 0 {
+                let mut tail = [0.0_f32; 8];
+                tail[..L2_TAIL].copy_from_slice(&row[L2_FULL * 8..]);
+                acc = f32x8::new(tail).mul_add(hidden_lanes[L2_FULL], acc);
+            }
+            *o = (bias + acc.reduce_add()).tanh();
         }
         (hidden, out)
     }
 
-    /// Reward-modulated Hebbian update. `Δw = lr · reward · pre · post`.
-    /// Pre-/post-synaptic activations come from a stored prior forward
-    /// pass — this is "myopic" credit assignment (1-tick window). Reward
-    /// fires on biologically meaningful events (eating, predation kills).
+    /// Reward-modulated Hebbian update: `Δw = lr · reward · pre · post`.
+    /// Pre/post activations come from a stored prior forward pass, so credit
+    /// assignment is myopic (1-tick window). Reward fires on biologically
+    /// meaningful events (eating, predation kills).
+    ///
+    /// Updates iterate the full row width via `f32x8`. This is safe because
+    /// dead-zone activations and inputs are zero, so `lr · 0 · x = 0` leaves
+    /// those weights untouched.
     pub fn hebbian_update(
         &mut self,
         last_inputs: &[f32; BRAIN_INPUTS],
@@ -325,18 +374,55 @@ impl Brain {
         reward: f32,
         learning_rate: f32,
     ) {
+        const L1_FULL: usize = BRAIN_INPUTS / 8;
+        const L1_TAIL: usize = BRAIN_INPUTS % 8;
+        const L2_FULL: usize = BRAIN_HIDDEN / 8;
+        const L2_TAIL: usize = BRAIN_HIDDEN % 8;
+
         let lr = learning_rate * reward;
         let h_n = self.hidden_n as usize;
+
+        // L1: w1[i][j] += lr · last_hidden[i] · last_inputs[j].
         for i in 0..h_n {
-            let h = last_hidden[i];
-            for (w, &x) in self.w1[i].iter_mut().zip(last_inputs.iter()) {
-                *w += lr * h * x;
+            let scale = f32x8::splat(lr * last_hidden[i]);
+            let row = &mut self.w1[i];
+            for k in 0..L1_FULL {
+                let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
+                let x = f32x8::new(last_inputs[k * 8..(k + 1) * 8].try_into().unwrap());
+                let updated = scale.mul_add(x, w).to_array();
+                row[k * 8..(k + 1) * 8].copy_from_slice(&updated);
             }
-            self.b1[i] += lr * h;
+            if L1_TAIL > 0 {
+                let mut tail_w = [0.0_f32; 8];
+                let mut tail_x = [0.0_f32; 8];
+                tail_w[..L1_TAIL].copy_from_slice(&row[L1_FULL * 8..]);
+                tail_x[..L1_TAIL].copy_from_slice(&last_inputs[L1_FULL * 8..]);
+                let updated = scale
+                    .mul_add(f32x8::new(tail_x), f32x8::new(tail_w))
+                    .to_array();
+                row[L1_FULL * 8..].copy_from_slice(&updated[..L1_TAIL]);
+            }
+            self.b1[i] += lr * last_hidden[i];
         }
-        for (out_o, &o) in self.w2.iter_mut().zip(last_outputs.iter()) {
-            for j in 0..h_n {
-                out_o[j] += lr * o * last_hidden[j];
+
+        // L2: w2[o][j] += lr · last_outputs[o] · last_hidden[j].
+        for (o, row) in self.w2.iter_mut().enumerate() {
+            let scale = f32x8::splat(lr * last_outputs[o]);
+            for k in 0..L2_FULL {
+                let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
+                let h = f32x8::new(last_hidden[k * 8..(k + 1) * 8].try_into().unwrap());
+                let updated = scale.mul_add(h, w).to_array();
+                row[k * 8..(k + 1) * 8].copy_from_slice(&updated);
+            }
+            if L2_TAIL > 0 {
+                let mut tail_w = [0.0_f32; 8];
+                let mut tail_h = [0.0_f32; 8];
+                tail_w[..L2_TAIL].copy_from_slice(&row[L2_FULL * 8..]);
+                tail_h[..L2_TAIL].copy_from_slice(&last_hidden[L2_FULL * 8..]);
+                let updated = scale
+                    .mul_add(f32x8::new(tail_h), f32x8::new(tail_w))
+                    .to_array();
+                row[L2_FULL * 8..].copy_from_slice(&updated[..L2_TAIL]);
             }
         }
         for (b, &o) in self.b2.iter_mut().zip(last_outputs.iter()) {
@@ -363,20 +449,19 @@ impl Brain {
         out
     }
 
-    /// Sprint 80 Sprint C: structural mutation — přidá jeden hidden neuron.
-    /// Vrací `true` pokud se neuron přidal, `false` pokud cap (`hidden_n ==
-    /// BRAIN_HIDDEN`) nebo `BRAIN_HIDDEN_MIN` violation prevented.
+    /// Structural mutation: append one hidden neuron. Returns `false` if
+    /// `hidden_n` is already at the cap.
     ///
-    /// **Init logic (NEAT-style minimal disruption):**
-    /// - `w1[new_idx][0..active_inputs]` = gaussian × sigma (small, drift)
-    /// - `b1[new_idx]` = gaussian × sigma
-    /// - `w2[*][new_idx]` = gaussian × sigma (output contribution starts small)
-    /// - Existing neurons NETKNUTÉ (jejich w1[i][20+new_idx] zůstává 0 = no
-    ///   incoming connection from new recurrent slot; selekce + future
-    ///   weight mutace mohou prokopnout, pokud má smysl).
+    /// NEAT-style minimal-disruption init:
+    /// - `w1[new_idx][0..active_inputs]` = small gaussian (drift)
+    /// - `b1[new_idx]` = small gaussian
+    /// - `w2[*][new_idx]` = small gaussian (output contribution starts small)
+    /// - Existing neurons untouched: their `w1[i][BRAIN_INPUTS_SENSORY + new_idx]`
+    ///   stays 0 (no incoming connection from the new recurrent slot until
+    ///   weight mutation or selection wires it in).
     ///
-    /// `active_inputs = BRAIN_INPUTS_SENSORY + (hidden_n+1)` zahrnuje vlastní
-    /// recurrent slot nového neuronu (= připojení k své vlastní paměti).
+    /// `active_inputs = BRAIN_INPUTS_SENSORY + (hidden_n + 1)` includes the
+    /// new neuron's own recurrent slot — it can connect to its own memory.
     pub fn add_neuron(&mut self, rng: &mut impl Rng, sigma: f32) -> bool {
         let new_idx = self.hidden_n as usize;
         if new_idx >= BRAIN_HIDDEN {
@@ -394,22 +479,22 @@ impl Brain {
         true
     }
 
-    /// Sprint 104: classic NEAT split_link. Vyber random (input, hidden) pár
-    /// s |w|>threshold, deaktivuj přímou cestu (w → 0), insert nový hidden
-    /// neuron k mezi nimi: w1[k][input] = 1.0, w2[output][k] = original_w
-    /// (resp. pro hidden→hidden link: posuneme přes prostřední neuron).
-    /// Vrací `true` pokud mutace proběhla.
+    /// Classic NEAT split-link. Picks a random (input, hidden) pair with
+    /// |w| > threshold, disables the direct path (w → 0), and inserts a new
+    /// hidden neuron k between them so the same signal flows via a
+    /// recurrent hop: `w1[k][input] = 1.0`,
+    /// `w1[h_target][BRAIN_INPUTS_SENSORY + k] = original_w`. Returns
+    /// `true` if the mutation was applied.
     ///
-    /// **Topology-preserving:** forward output je při split exactly stejný
-    /// jako pre-split (pre-tanh: 1.0 × x = x, post tanh × original_w =
-    /// original × tanh(x) — pro malé x ≈ original × x). Drobná nelinearity
-    /// drift, ale zhruba zachovává funkci.
+    /// **Topology-preserving (approximately):** post-split, the next-tick
+    /// signal at h_target equals `original_w · tanh(input)`, vs. the
+    /// pre-split `original_w · input`. For small inputs `tanh(x) ≈ x`, so
+    /// behaviour drifts only mildly; selection re-tunes from there.
     pub fn split_link(&mut self, rng: &mut impl Rng, threshold: f32) -> bool {
         let new_idx = self.hidden_n as usize;
         if new_idx >= BRAIN_HIDDEN {
             return false;
         }
-        // Find candidates: w1 entries (h, i) s |w|>threshold (active links).
         let h_n = self.hidden_n as usize;
         let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
         let mut candidates: Vec<(usize, usize, f32)> = Vec::new();
@@ -426,42 +511,32 @@ impl Brain {
         }
         let pick = rng.random_range(0..candidates.len());
         let (h_target, i_src, w_orig) = candidates[pick];
-        // Disable direct path
         self.w1[h_target][i_src] = 0.0;
-        // Wire through new node k = new_idx
-        // input i_src → k weight = 1.0
-        // k → h_target via recurrent slot (h_target is fed from inputs[BRAIN_INPUTS_SENSORY + k])
-        // But w1 connects inputs to hidden, not hidden to hidden.
-        // Original link was input i_src → hidden h_target via w1.
-        // New: input i_src → hidden k (= new_idx) via w1[k][i_src] = 1.0
-        // Then hidden k must influence hidden h_target. Recurrent path:
-        //   k's tanh output → next tick's inputs[BRAIN_INPUTS_SENSORY + k]
-        //   → w1[h_target][BRAIN_INPUTS_SENSORY + k] propagates to h_target.
-        // Set that recurrent weight to w_orig.
+        // Wire input i_src → new hidden k via w1[k][i_src] = 1.0.
+        // k → h_target uses the recurrent path: k's tanh output reaches
+        // h_target on the next tick through inputs[BRAIN_INPUTS_SENSORY + k].
         self.w1[new_idx][i_src] = 1.0;
         self.b1[new_idx] = 0.0;
-        // recurrent index for k:
         let rec_idx = BRAIN_INPUTS_SENSORY + new_idx;
         if rec_idx < BRAIN_INPUTS {
             self.w1[h_target][rec_idx] = w_orig;
         }
-        // Output side: leave existing w2 (k contributes only via recurrent
-        // path, drives same downstream signal next tick).
         self.hidden_n += 1;
         true
     }
 
-    /// Sprint 104: structural mutation — odeber nejnižší prioritní hidden
-    /// neuron. Decrement hidden_n a zero-out jeho weights (oba w1 row +
-    /// w2 column + b1 entry). Vrací `true` pokud proběhlo (jinak při
-    /// hidden_n ≤ BRAIN_HIDDEN_MIN).
+    /// Structural mutation: remove a uniformly-random hidden neuron. The
+    /// removed slot is zeroed and the last live neuron is swapped into its
+    /// place to keep `[0..hidden_n]` dense. Returns `false` at the floor.
+    ///
+    /// Note: recurrent slot indices shift after the swap, which is a slight
+    /// semantic disruption — selection is expected to compensate.
     pub fn remove_neuron(&mut self, rng: &mut impl Rng) -> bool {
         let h_n = self.hidden_n as usize;
         if h_n <= BRAIN_HIDDEN_MIN {
             return false;
         }
         let pick = rng.random_range(0..h_n);
-        // Zero out w1 row + b1 + w2 column
         for j in 0..BRAIN_INPUTS {
             self.w1[pick][j] = 0.0;
         }
@@ -469,8 +544,6 @@ impl Brain {
         for o in 0..BRAIN_OUTPUTS {
             self.w2[o][pick] = 0.0;
         }
-        // Compact: pokud pick je poslední, jen decrementuj. Jinak swap-remove
-        // (last neuron → pick slot) k zachování dense [0..hidden_n] layout.
         let last = h_n - 1;
         if pick != last {
             self.w1[pick] = self.w1[last];
@@ -478,7 +551,6 @@ impl Brain {
             for o in 0..BRAIN_OUTPUTS {
                 self.w2[o][pick] = self.w2[o][last];
             }
-            // Zero out the (now duplicate) last slot.
             for j in 0..BRAIN_INPUTS {
                 self.w1[last][j] = 0.0;
             }
@@ -486,31 +558,22 @@ impl Brain {
             for o in 0..BRAIN_OUTPUTS {
                 self.w2[o][last] = 0.0;
             }
-            // NOTE: recurrent slot remap — ostatní neurony, které měly
-            // vstup z [BRAIN_INPUTS_SENSORY + last] (= last's recurrent feed)
-            // teď čtou prázdný slot (0). Ostatní s inputem z [SENSORY+pick]
-            // teď čtou last's signal. Je to slight semantic drift; pro tichou
-            // kompatibilitu by chtělo plné remapping, ale acceptujeme drobný
-            // disruption — selekce kompenzuje.
         }
         self.hidden_n -= 1;
         true
     }
 
-    /// Per-row uniform crossover. Each hidden neuron's `w1` row + `b1`
-    /// scalar comes from one parent (50/50); same for output neurons. Per-row
-    /// rather than per-weight preserves coordinated patterns within a single
+    /// Per-row uniform crossover. Each hidden neuron's `w1` row + `b1` scalar
+    /// comes from one parent (50/50); same for output neurons. Per-row rather
+    /// than per-weight preserves coordinated patterns inside a single
     /// neuron's receptive field.
     ///
-    /// Sprint 104: structural mutace mohou rozejít `hidden_n` rodičů. Pokud
-    /// neshoda, vezmi menší size (= disjoint hidden slots z většího parenta
-    /// nesharedily — drop). Child = min(a.hidden_n, b.hidden_n), per-row
-    /// crossover přes shared rozsah, base = parent s menším hidden_n
-    /// (zachovává jeho dead-zone weights v 0).
+    /// Structural mutations may diverge `hidden_n` between parents. Child
+    /// inherits `min(a.hidden_n, b.hidden_n)`; the smaller-`hidden_n` parent
+    /// is the base (its dead-zone weights are already zero), with per-row
+    /// crossover over the shared range.
     pub fn crossover(a: &Brain, b: &Brain, rng: &mut impl Rng) -> Brain {
         let h_n = a.hidden_n.min(b.hidden_n) as usize;
-        // Base = parent s menším hidden_n (jeho rows beyond h_n jsou zero
-        // díky add_neuron / remove_neuron logice).
         let (base, other) = if a.hidden_n <= b.hidden_n {
             (a, b)
         } else {
