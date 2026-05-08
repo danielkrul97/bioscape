@@ -1884,6 +1884,8 @@ impl World {
         // Sprint 57: paralelní attack candidate gathering. Pass 2a sbírá
         // (i, j, gain) eventy bez sdílených writes; Pass 2b aggreguje sekvenčně
         // do energy/damage scratch (řeší race na victim j shared mezi attackery).
+        // Spike attack cache built once per attacker — `spike_direction` etc.
+        // depend only on attacker pose + spikes, not on per-pair target.
         let attack_events: Vec<(usize, usize, f32, f32)> = (0..n)
             .into_par_iter()
             .flat_map_iter(|i| {
@@ -1895,6 +1897,7 @@ impl World {
                 let radius_a = cells[i].phenotype.effective_radius();
                 let search_r =
                     CELL_RADIUS * (radius_a + cells[i].phenotype.max_axis() * 2.0);
+                let spike_cache = cells[i].build_spike_attack_cache();
                 let mut local: Vec<(usize, usize, f32, f32)> = Vec::new();
                 cell_grid.for_each_in_radius_toroidal(
                     pos_i,
@@ -1917,7 +1920,7 @@ impl World {
                             let mut gain = PREDATION_GAIN_PER_TICK;
                             // Sprint 122: multi-spike per-spike cone test +
                             // complexity multiplikátor (S123 zapne complexity).
-                            gain += cells[i].spike_bonus_against(pos_j);
+                            gain += cells[i].spike_bonus_against_cached(pos_j, &spike_cache);
                             let dilution = 1.0 / (1.0 + DILUTION_K * herd_counts[j] as f32);
                             // Sprint 69: bonded prey takes less damage + yields
                             // less energy. Group-defense benefit činí bondování

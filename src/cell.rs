@@ -125,6 +125,34 @@ fn f32_max_default() -> f32 {
     f32::MAX
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SpikeAttackEntry {
+    pub dir: [f32; 3],
+    pub gain: f32,
+}
+
+impl SpikeAttackEntry {
+    pub const ZERO: Self = Self {
+        dir: [0.0, 0.0, 0.0],
+        gain: 0.0,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SpikeAttackCache {
+    pub entries: [SpikeAttackEntry; SPIKE_SLOTS],
+    pub count: usize,
+}
+
+impl Default for SpikeAttackCache {
+    fn default() -> Self {
+        Self {
+            entries: [SpikeAttackEntry::ZERO; SPIKE_SLOTS],
+            count: 0,
+        }
+    }
+}
+
 impl Cell {
     pub fn random(
         rng: &mut impl Rng,
@@ -476,6 +504,41 @@ impl Cell {
     /// aktivní spiky — každý kontribuuje vlastní cone test. S spike_count=1
     /// a azimuth/elev=0 redukuje na pre-S121 single-spike behavior.
     pub fn spike_bonus_against(&self, target_pos: [f32; 3]) -> f32 {
+        let cache = self.build_spike_attack_cache();
+        self.spike_bonus_against_cached(target_pos, &cache)
+    }
+
+    /// Pre-rotated spike directions + per-spike gain contributions. Pure cache:
+    /// values are derived from `self.heading`, `self.pitch`, `phenotype.spikes`
+    /// and global consts — same inputs as `spike_bonus_against`, just hoisted
+    /// out of the per-pair loop in predate hot path.
+    pub fn build_spike_attack_cache(&self) -> SpikeAttackCache {
+        let mut entries = [SpikeAttackEntry::ZERO; SPIKE_SLOTS];
+        let mut count = 0usize;
+        for spike in self.phenotype.active_spikes() {
+            if spike.length <= 0.0 {
+                continue;
+            }
+            let dir = spike_direction(self.heading, self.pitch, spike);
+            let gain = PREDATION_GAIN_PER_TICK
+                * spike.length
+                * spike_complexity_attack_factor(spike.complexity)
+                * SPIKE_PREDATION_BONUS;
+            entries[count] = SpikeAttackEntry { dir, gain };
+            count += 1;
+        }
+        SpikeAttackCache { entries, count }
+    }
+
+    /// Cached variant: `cache` must be built from this same cell (`build_spike_attack_cache`).
+    pub fn spike_bonus_against_cached(
+        &self,
+        target_pos: [f32; 3],
+        cache: &SpikeAttackCache,
+    ) -> f32 {
+        if cache.count == 0 {
+            return 0.0;
+        }
         let dx = target_pos[0] - self.position[0];
         let dy = target_pos[1] - self.position[1];
         let dz = target_pos[2] - self.position[2];
@@ -486,19 +549,14 @@ impl Cell {
         let dist = dist_sq.sqrt();
         let to_target = [dx / dist, dy / dist, dz / dist];
         let mut total = 0.0;
-        for spike in self.phenotype.active_spikes() {
-            if spike.length <= 0.0 {
-                continue;
-            }
-            let dir = spike_direction(self.heading, self.pitch, spike);
-            let cos_angle = dir[0] * to_target[0] + dir[1] * to_target[1] + dir[2] * to_target[2];
+        for entry in &cache.entries[..cache.count] {
+            let cos_angle = entry.dir[0] * to_target[0]
+                + entry.dir[1] * to_target[1]
+                + entry.dir[2] * to_target[2];
             if cos_angle < SPIKE_DOT_THRESHOLD {
                 continue;
             }
-            total += PREDATION_GAIN_PER_TICK
-                * spike.length
-                * spike_complexity_attack_factor(spike.complexity)
-                * SPIKE_PREDATION_BONUS;
+            total += entry.gain;
         }
         total
     }
