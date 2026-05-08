@@ -184,6 +184,8 @@ pub struct World {
     /// `(partner_id, energy)`. Krátké, ale per-tick.
     pub hunt_attacks_scratch: Vec<(usize, f32)>,
     pub hunt_pack_shares_scratch: Vec<(u64, f32)>,
+    pub hidden_snapshot_scratch: Vec<[f32; BRAIN_HIDDEN]>,
+    pub inputs_scratch: Vec<[f32; BRAIN_INPUTS]>,
     pub births_gen: u64,
     pub deaths_gen: u64,
     pub fertile_ticks_gen: u64,
@@ -351,6 +353,8 @@ impl World {
             hunter_snapshot_scratch: Vec::new(),
             hunt_attacks_scratch: Vec::new(),
             hunt_pack_shares_scratch: Vec::new(),
+            hidden_snapshot_scratch: Vec::new(),
+            inputs_scratch: Vec::new(),
             births_gen: 0,
             deaths_gen: 0,
             fertile_ticks_gen: 0,
@@ -489,6 +493,8 @@ impl World {
             hunter_snapshot_scratch: Vec::new(),
             hunt_attacks_scratch: Vec::new(),
             hunt_pack_shares_scratch: Vec::new(),
+            hidden_snapshot_scratch: Vec::new(),
+            inputs_scratch: Vec::new(),
             births_gen: chk.births_gen,
             deaths_gen: chk.deaths_gen,
             fertile_ticks_gen: chk.fertile_ticks_gen,
@@ -1281,12 +1287,12 @@ impl World {
         if self.cells.is_empty() {
             return;
         }
-        // Reuse persistent id_to_idx_scratch (built v `tick`).
+        self.hidden_snapshot_scratch.clear();
+        self.hidden_snapshot_scratch.reserve(self.cells.len());
+        self.hidden_snapshot_scratch
+            .extend(self.cells.iter().map(|c| c.last_hidden));
         let id_to_idx = &self.id_to_idx_scratch;
-        // Snapshot last_hidden array — read-only během compute, write-only
-        // do pooled_hidden, no aliasing issues.
-        let snapshot: Vec<[f32; BRAIN_HIDDEN]> =
-            self.cells.iter().map(|c| c.last_hidden).collect();
+        let snapshot = &self.hidden_snapshot_scratch;
         for (i, cell) in self.cells.iter_mut().enumerate() {
             let pooled = bioscape::pool_bonded_hidden(cell, |partner_id| {
                 let idx = id_to_idx.get(&partner_id).copied()?;
@@ -1326,11 +1332,14 @@ impl World {
 
         // Sprint 97: dvojfáze pro cluster sensor pooling. Phase 1: gather + apply
         // own gains. Phase 2: pool max-magnitude přes bond network + brain forward.
-        let inputs_vec: Vec<[f32; BRAIN_INPUTS]> = self
-            .cells
+        self.inputs_scratch.clear();
+        self.inputs_scratch
+            .resize(self.cells.len(), [0.0; BRAIN_INPUTS]);
+        self.cells
             .par_iter_mut()
+            .zip(self.inputs_scratch.par_iter_mut())
             .enumerate()
-            .map(|(i, cell)| {
+            .for_each(|(i, (cell, inputs_slot))| {
                 let pos = cell.position;
                 let vision_r = cell.genome.vision_radius;
                 let vr2 = vision_r * vision_r;
@@ -1414,23 +1423,23 @@ impl World {
                 cell.last_best_food_d2 = best_food_d2;
                 let mut inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
                 bioscape::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
-                inputs
-            })
-            .collect();
+                *inputs_slot = inputs;
+            });
 
         let id_to_idx = &self.id_to_idx_scratch;
+        let inputs_scratch = &self.inputs_scratch;
 
         self.cells
             .par_iter_mut()
             .enumerate()
             .for_each(|(i, cell)| {
-                let own = inputs_vec[i];
+                let own = inputs_scratch[i];
                 let pooled = bioscape::pool_bonded_sensors(cell, &own, |partner_id| {
                     let idx = id_to_idx.get(&partner_id).copied()?;
                     if idx == i {
                         return None;
                     }
-                    Some(inputs_vec[idx])
+                    Some(inputs_scratch[idx])
                 });
                 let (hidden, outputs) = cell.genome.brain.forward_with_state(&pooled);
                 cell.last_inputs = pooled;
