@@ -170,6 +170,10 @@ pub struct World {
     /// Phase 2 scratch — bond-formation candidate pairs. Pre-fix: fresh Vec
     /// collected per tick.
     pub bond_candidates_scratch: Vec<(u64, u64)>,
+    /// Phase 2 scratch — set of canonicalized (min_id, max_id) párů, které
+    /// jsou už bonded. O(1) lookup namísto lineárního scanu Cell.bonds per
+    /// kandidáta.
+    pub bonded_pairs_scratch: rustc_hash::FxHashSet<(u64, u64)>,
     /// Sprint 102: hunter cell grid. Pre-fix `let mut g = SpatialGrid::new()`
     /// uvnitř `hunt()` per tick → fresh FxHashMap allocation. Persistent reuse
     /// zachová bucket Vec capacities.
@@ -348,6 +352,7 @@ impl World {
             positions_snapshot_scratch: Vec::new(),
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
+            bonded_pairs_scratch: rustc_hash::FxHashSet::default(),
             hunter_cell_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
             hunter_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
             hunter_snapshot_scratch: Vec::new(),
@@ -488,6 +493,7 @@ impl World {
             positions_snapshot_scratch: Vec::new(),
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
+            bonded_pairs_scratch: rustc_hash::FxHashSet::default(),
             hunter_cell_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
             hunter_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
             hunter_snapshot_scratch: Vec::new(),
@@ -1770,6 +1776,20 @@ impl World {
         }
         // Take to drop borrow on self before mutating cells inside the loop.
         let candidates = std::mem::take(&mut self.bond_candidates_scratch);
+        let mut bonded_pairs = std::mem::take(&mut self.bonded_pairs_scratch);
+        bonded_pairs.clear();
+        for cell in self.cells.iter() {
+            for bond_opt in cell.bonds.iter() {
+                if let Some(b) = bond_opt {
+                    let pair = if cell.cell_id < b.other_cell_id {
+                        (cell.cell_id, b.other_cell_id)
+                    } else {
+                        (b.other_cell_id, cell.cell_id)
+                    };
+                    bonded_pairs.insert(pair);
+                }
+            }
+        }
         for (id_a, id_b) in candidates.iter().copied() {
             let Some(&i_a) = id_to_idx.get(&id_a) else { continue };
             let Some(&i_b) = id_to_idx.get(&id_b) else { continue };
@@ -1801,11 +1821,8 @@ impl World {
             };
             // Skip if už bonded (např. po prior tick — defensive, contact_progress
             // by se měl reseta při formaci, ale i bez toho ne-duplikujeme).
-            let already = self.cells[i_a]
-                .bonds
-                .iter()
-                .any(|b| b.map(|bb| bb.other_cell_id == id_b).unwrap_or(false));
-            if already {
+            let pair = if id_a < id_b { (id_a, id_b) } else { (id_b, id_a) };
+            if bonded_pairs.contains(&pair) {
                 continue;
             }
             let pos_a = positions_snapshot[i_a];
@@ -1839,6 +1856,7 @@ impl World {
             self.cells[i_a].energy -= BOND_FORMATION_COST;
             self.cells[i_b].energy -= BOND_FORMATION_COST;
             bonds_formed_this_tick += 1;
+            bonded_pairs.insert(pair);
             // Reset progress entry — nepokouší se znova ihned formovat.
             self.contact_progress.remove(&(id_a, id_b));
         }
@@ -1846,6 +1864,7 @@ impl World {
         let mut candidates = candidates;
         candidates.clear();
         self.bond_candidates_scratch = candidates;
+        self.bonded_pairs_scratch = bonded_pairs;
         self.bonds_formed_gen += bonds_formed_this_tick;
         self.bonds_broken_gen += bonds_broken_this_tick;
     }
