@@ -174,6 +174,9 @@ pub struct World {
     /// uvnitř `hunt()` per tick → fresh FxHashMap allocation. Persistent reuse
     /// zachová bucket Vec capacities.
     pub hunter_cell_grid_scratch: SpatialGrid<usize, ()>,
+    /// Hunter-hunter spatial grid pro broad-phase v `resolve_hunter_collisions`.
+    /// Replaces O(N²) inner loop. Sdílí HUNTER_GRID_CELL_SIZE s hunter-cell grid.
+    pub hunter_grid_scratch: SpatialGrid<usize, ()>,
     /// Hunters snapshot pro hunt sensor pack — minimální projekce
     /// `HunterSnapshotMin` per hunter. Pre-fix: fresh Vec collected per tick.
     pub hunter_snapshot_scratch: Vec<bioscape::HunterSnapshotMin>,
@@ -344,6 +347,7 @@ impl World {
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
             hunter_cell_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
+            hunter_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
             hunter_snapshot_scratch: Vec::new(),
             hunt_attacks_scratch: Vec::new(),
             hunt_pack_shares_scratch: Vec::new(),
@@ -481,6 +485,7 @@ impl World {
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
             hunter_cell_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
+            hunter_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE),
             hunter_snapshot_scratch: Vec::new(),
             hunt_attacks_scratch: Vec::new(),
             hunt_pack_shares_scratch: Vec::new(),
@@ -1983,6 +1988,22 @@ impl World {
         let mut in_contact_pairs: rustc_hash::FxHashSet<(u64, u64)> =
             rustc_hash::FxHashSet::default();
 
+        // Broad-phase grid pro hunter-hunter páry — replace O(N²) inner loop.
+        // Query radius musí pokrýt collision (pair_r) + adhesion (pair_r × ADHESION_RANGE_FACTOR).
+        let max_radius = self
+            .hunters
+            .iter()
+            .map(hunter_radius)
+            .fold(0.0_f32, f32::max);
+        let query_radius = 2.0 * max_radius * ADHESION_RANGE_FACTOR;
+        self.hunter_grid_scratch.rebuild(
+            self.hunters
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (i, h.position, ())),
+        );
+        let hunter_grid = &self.hunter_grid_scratch;
+
         // Phase 1: per-pair forces (pos depenetrace + adhesion + bondy).
         for i in 0..n {
             let pos_i = self.hunters[i].position;
@@ -1991,9 +2012,9 @@ impl World {
             let type_i = self.hunters[i].genome.adhesion_type;
             let id_i = self.hunters[i].hunter_id;
 
-            for j in 0..n {
-                if i == j {
-                    continue;
+            hunter_grid.for_each_in_radius_toroidal(pos_i, query_radius, WORLD_HALF, |j, _gpos, _| {
+                if j == i {
+                    return;
                 }
                 let pos_j = self.hunters[j].position;
                 let radius_j = hunter_radius(&self.hunters[j]);
@@ -2021,7 +2042,7 @@ impl World {
                     vel_deltas[i][1] += dv[1];
                     vel_deltas[i][2] += dv[2];
                 }
-            }
+            });
 
             // Apply own bond spring forces.
             for bond_opt in self.hunters[i].bonds.iter() {
