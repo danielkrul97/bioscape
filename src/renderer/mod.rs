@@ -314,8 +314,8 @@ struct GpuFieldState {
 
 /// Full GPU pipeline (mirror headless `--gpu-full`). Při insert nahradí
 /// `cells_brain_act` / `apply_brownian_motion` / `step_cells` GPU pipeline
-/// se single-Wait readback. Init pod env `BIOSCAPE_GPU_FULL=1` (mutually
-/// exclusive s `BIOSCAPE_GPU_BRAIN=1`).
+/// se single-Wait readback. **Default on**; opt-out přes `BIOSCAPE_GPU_FULL=0`.
+/// Legacy `BIOSCAPE_GPU_BRAIN=1` má prioritu (mutually exclusive).
 ///
 /// Drží vlastní `cells: CellsGpu` (sdíleno přes `GpuContext` clone s field
 /// state); `cell_hash`/`food_hash` `SpatialHashGpu` pro sensor broad-phase;
@@ -875,17 +875,26 @@ fn setup(
         initial_cells.push(cell);
     }
 
-    // Sprint 52: GPU compute init. Při failu fallback na CPU (Resource None).
+    // GPU compute init. Default = full pipeline (`GpuFullPipeline`, single-Wait
+    // readback). Init failure → CPU SIMD fallback (Resource None).
     //
-    // Sprint 132: opt-in. Diag (post-S130/131) ukázal `brain_gpu_rt_ms` ≈ 8.5 ms
-    // a `smell_field_ms` + `pheromone_field_ms` ≈ 1.8 ms — tj. ~10 ms / tick je
-    // čisté `Maintain::Wait` blokování CPU vlákna na GPU completionu. Per-S112
-    // SIMD CPU brain forward batch_seq/1500 < 1 ms (with par_iter ~150 µs);
-    // per-S117 SIMD CPU smell/pheromone step ~0.18 ms. CPU SIMD path je tedy
-    // 5–10× rychlejší než GPU s readback overheadem. Default = off; opt-in
-    // přes `BIOSCAPE_GPU_BRAIN=1` pro benchmark srovnání.
+    // Env var precedence:
+    //   `BIOSCAPE_GPU_FULL=0`  → opt-out, čistý CPU SIMD path
+    //   `BIOSCAPE_GPU_BRAIN=1` → legacy brain-only GPU (overrides GPU_FULL)
+    //   default                → GPU_FULL on
+    //
+    // Sprint 132 verdikt (CPU SIMD 5–10× faster) byl měřen na FRAGMENTED GPU
+    // path (`BIOSCAPE_GPU_BRAIN=1`) s per-system `Maintain::Wait` ~10 ms/tick.
+    // Single-Wait `download_full_batch_into` v gpu-full agreguje 9 readbacků
+    // do 1 polled barriera. Init fail je safety net pro adapters bez compute
+    // support.
     #[cfg(feature = "gpu")]
-    if std::env::var("BIOSCAPE_GPU_BRAIN").as_deref() == Ok("1") {
+    let want_gpu_full =
+        !matches!(std::env::var("BIOSCAPE_GPU_FULL").as_deref(), Ok("0"));
+    #[cfg(feature = "gpu")]
+    let want_gpu_brain = std::env::var("BIOSCAPE_GPU_BRAIN").as_deref() == Ok("1");
+    #[cfg(feature = "gpu")]
+    if want_gpu_brain {
         let cap = MAX_POPULATION + 64;
         let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
         let field_sources_cap = (initial_food_target + cap) * 2;
@@ -930,11 +939,10 @@ fn setup(
                 warn!("renderer-gpu: init failed ({}); CPU compute path active", e);
             }
         }
-    } else if std::env::var("BIOSCAPE_GPU_FULL").as_deref() == Ok("1") {
+    } else if want_gpu_full {
         // Full GPU pipeline (mirror headless `--gpu-full`): single-Wait readback,
-        // sensor + populate + brain + motor + step + brownian na GPU. Init pod
-        // exclusivním env varem; pokud BIOSCAPE_GPU_BRAIN=1 souběžně, zvítězí
-        // brain-only branch (zpracován výše).
+        // sensor + populate + brain + motor + step + brownian na GPU. Default
+        // path. Disable přes `BIOSCAPE_GPU_FULL=0` (forced CPU SIMD).
         let cap = MAX_POPULATION + 64;
         let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
         let field_sources_cap = (initial_food_target + cap) * 2;
@@ -998,7 +1006,7 @@ fn setup(
         match init_full() {
             Ok(pipeline) => {
                 info!(
-                    "renderer-gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (opt-in via BIOSCAPE_GPU_FULL=1, cap {} cells, {} field sources)",
+                    "renderer-gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (default; disable s BIOSCAPE_GPU_FULL=0; cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
                 commands.insert_resource(pipeline);
@@ -1008,7 +1016,7 @@ fn setup(
             }
         }
     } else {
-        info!("renderer: CPU compute path (S132 default; SIMD brain + field, no GPU sync stall)");
+        info!("renderer: CPU compute path (BIOSCAPE_GPU_FULL=0; SIMD brain + field, no GPU sync stall)");
     }
     commands.insert_resource(slot_map);
     let _ = initial_cells;
