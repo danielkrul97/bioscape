@@ -55,7 +55,18 @@ use bioscape::{
     WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
 #[cfg(feature = "gpu")]
-use bioscape::gpu::{BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu};
+use bioscape::gpu::{
+    BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
+    PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu, SensorParamsGpu,
+    SpatialHashGpu, StepGpu, StepParamsGpu,
+};
+#[cfg(feature = "gpu")]
+use bioscape::{
+    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_HIDDEN, BRAIN_INPUTS_SENSORY,
+    BRAIN_RECURRENT, DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT,
+    GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN, SHELL_COST_PER_SEC,
+    SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
+};
 use rand::Rng;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -299,6 +310,33 @@ struct GpuBrainState {
 struct GpuFieldState {
     smell: FieldGpu,
     pheromone: FieldGpu,
+}
+
+/// Full GPU pipeline (mirror headless `--gpu-full`). Při insert nahradí
+/// `cells_brain_act` / `apply_brownian_motion` / `step_cells` GPU pipeline
+/// se single-Wait readback. Init pod env `BIOSCAPE_GPU_FULL=1` (mutually
+/// exclusive s `BIOSCAPE_GPU_BRAIN=1`).
+///
+/// Drží vlastní `cells: CellsGpu` (sdíleno přes `GpuContext` clone s field
+/// state); `cell_hash`/`food_hash` `SpatialHashGpu` pro sensor broad-phase;
+/// `sensor` + `populate` + `motor` + `step` + `brownian` GPU stages. Vše na
+/// jednom `GpuContext`, single readback per tick přes `download_full_batch_into`.
+#[cfg(feature = "gpu")]
+#[derive(Resource)]
+struct GpuFullPipeline {
+    cells: CellsGpu,
+    brain: BrainGpu,
+    hebbian: HebbianGpu,
+    brownian: BrownianGpu,
+    smell: FieldGpu,
+    pheromone: FieldGpu,
+    cell_hash: SpatialHashGpu,
+    food_hash: SpatialHashGpu,
+    sensor: SensorGatherGpu,
+    populate: PopulateInputsGpu,
+    motor: MotorGpu,
+    step: StepGpu,
+    scratch: bioscape::gpu::GpuFullScratch,
 }
 
 /// Sprint 52: maps Bevy `Entity` ↔ slot index v `CellsGpu` SoA bufferech.
@@ -578,6 +616,9 @@ pub fn run() {
                     update_smell_field,
                     update_pheromone_field,
                     pool_bonded_hidden_cells,
+                    #[cfg(feature = "gpu")]
+                    cells_brain_act_gpu_full
+                        .run_if(resource_exists::<GpuFullPipeline>),
                     cells_brain_act,
                     emit_pheromones,
                     apply_cell_morph,
@@ -889,6 +930,83 @@ fn setup(
                 warn!("renderer-gpu: init failed ({}); CPU compute path active", e);
             }
         }
+    } else if std::env::var("BIOSCAPE_GPU_FULL").as_deref() == Ok("1") {
+        // Full GPU pipeline (mirror headless `--gpu-full`): single-Wait readback,
+        // sensor + populate + brain + motor + step + brownian na GPU. Init pod
+        // exclusivním env varem; pokud BIOSCAPE_GPU_BRAIN=1 souběžně, zvítězí
+        // brain-only branch (zpracován výše).
+        let cap = MAX_POPULATION + 64;
+        let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
+        let field_sources_cap = (initial_food_target + cap) * 2;
+        let world_half = extent.as_array();
+        let init_full = || -> Result<GpuFullPipeline, String> {
+            let ctx = GpuContext::new()?;
+            let cells = CellsGpu::with_context(&ctx, cap);
+            cells.upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
+            cells.upload_xoshiro_seeds(initial_cells.iter().enumerate().map(|(slot, c)| {
+                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
+            }));
+            let turn_rates: Vec<f32> = initial_cells.iter().map(|c| c.genome.turn_rate).collect();
+            cells.upload_turn_rates(&turn_rates);
+            let brain = BrainGpu::with_context(&ctx, cap)?;
+            let hebbian = HebbianGpu::with_context(&ctx, cap)?;
+            let brownian = BrownianGpu::with_context(&ctx, cap)?;
+            let smell = FieldGpu::with_context(
+                &ctx,
+                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+                world_half,
+                field_sources_cap,
+            )?;
+            let pheromone = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                world_half,
+                field_sources_cap,
+            )?;
+            let cell_hash = SpatialHashGpu::with_context(
+                &ctx,
+                cap,
+                bioscape::GRID_CELL_SIZE,
+                [world_half[0], world_half[1]],
+            )?;
+            let food_hash = SpatialHashGpu::with_context(
+                &ctx,
+                field_sources_cap,
+                bioscape::GRID_CELL_SIZE,
+                [world_half[0], world_half[1]],
+            )?;
+            let sensor = SensorGatherGpu::with_context(&ctx, cap, field_sources_cap)?;
+            let populate = PopulateInputsGpu::with_context(&ctx)?;
+            let motor = MotorGpu::with_context(&ctx, cap)?;
+            let step = StepGpu::with_context(&ctx, cap)?;
+            Ok(GpuFullPipeline {
+                cells,
+                brain,
+                hebbian,
+                brownian,
+                smell,
+                pheromone,
+                cell_hash,
+                food_hash,
+                sensor,
+                populate,
+                motor,
+                step,
+                scratch: bioscape::gpu::GpuFullScratch::default(),
+            })
+        };
+        match init_full() {
+            Ok(pipeline) => {
+                info!(
+                    "renderer-gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (opt-in via BIOSCAPE_GPU_FULL=1, cap {} cells, {} field sources)",
+                    cap, field_sources_cap
+                );
+                commands.insert_resource(pipeline);
+            }
+            Err(e) => {
+                warn!("renderer-gpu-full: init failed ({}); CPU compute path active", e);
+            }
+        }
     } else {
         info!("renderer: CPU compute path (S132 default; SIMD brain + field, no GPU sync stall)");
     }
@@ -1167,7 +1285,14 @@ fn step_cells(
     clock: Res<Clock>,
     events: Res<EventCalendarResource>,
     mut cells: Query<&mut CellEntity>,
+    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
 ) {
+    // Full GPU pipeline: kinematics + drag + energy + bounce už proběhly v
+    // `cells_brain_act_gpu_full` (StepGpu shader); tento systém je no-op.
+    #[cfg(feature = "gpu")]
+    if gpu_full.is_some() {
+        return;
+    }
     let dt = time.delta_secs();
     let half = extent.as_array();
     let tick = clock.0.tick;
@@ -1199,7 +1324,14 @@ fn apply_brownian_motion(
     extent: Res<WorldExtent>,
     mut cells: Query<&mut CellEntity, Without<Dying>>,
     mut diag: Diagnostics,
+    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
 ) {
+    // Full GPU pipeline: brownian dispatchnut v `cells_brain_act_gpu_full`
+    // (xoshiro128++ shader) — tento systém je no-op.
+    #[cfg(feature = "gpu")]
+    if gpu_full.is_some() {
+        return;
+    }
     // Sprint 129: vždy CPU rayon path. GPU brownian (xoshiro128++ per-cell)
     // měla compute < 30 µs, ale upload+download s `Maintain::Wait` přidávalo
     // ~0.8 ms / tick = 96 % phase costu. CPU `apply_brownian` (Box-Muller
@@ -1276,11 +1408,29 @@ fn update_smell_field(
     foods: Query<&FoodEntity>,
     mut smell: ResMut<SmellResource>,
     #[cfg(feature = "gpu")] gpu_field: Option<ResMut<GpuFieldState>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut diag: Diagnostics,
 ) {
     let t = Instant::now();
     let dt = time.delta_secs();
     diag.add_measurement(&DIAG_FOOD_COUNT, || foods.iter().count() as f64);
+
+    // Full GPU pipeline: pipeline.smell read přímo sensor shaderem v
+    // `cells_brain_act_gpu_full` přes storage binding — žádný CPU readback,
+    // SmellResource neaktualizujeme (CPU sensor path stejně skipne).
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu_full) = gpu_full {
+        for food in &foods {
+            gpu_full.smell.add_source(
+                [food.0.position[0], food.0.position[1], food.0.position[2]],
+                SMELL_PER_FOOD * dt,
+            );
+        }
+        gpu_full.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
+        let _ = smell;
+        diag.add_measurement(&DIAG_SMELL, || t.elapsed().as_secs_f64() * 1000.0);
+        return;
+    }
 
     // Sprint 59: pokud GpuFieldState available, GPU deposit + diffuse, readback
     // do CPU SmellResource pro sensor gather (gradient_at v cells_brain_act).
@@ -1312,6 +1462,7 @@ fn update_pheromone_field(
     time: Res<Time>,
     mut pheromone: ResMut<PheromoneResource>,
     #[cfg(feature = "gpu")] gpu_field: Option<ResMut<GpuFieldState>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut diag: Diagnostics,
 ) {
     // Diffuse + decay BEFORE this tick's emissions (in emit_pheromones, which
@@ -1319,6 +1470,24 @@ fn update_pheromone_field(
     // ze stavu pole na konci minulého ticku, žádný self-feedback.
     let t = Instant::now();
     let dt = time.delta_secs();
+
+    // Full GPU pipeline: ch0 step na pipeline.pheromone bez readback (sensor
+    // shader čte storage buffer direct). ch1/ch2 vždy CPU.
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu_full) = gpu_full {
+        gpu_full
+            .pheromone
+            .step(PHEROMONE_DIFFUSION_PER_CH[0], PHEROMONE_DECAY_PER_CH[0], dt);
+        for ch in 1..N_PHEROMONE_CHANNELS {
+            pheromone.fields[ch].step(
+                PHEROMONE_DIFFUSION_PER_CH[ch],
+                PHEROMONE_DECAY_PER_CH[ch],
+                dt,
+            );
+        }
+        diag.add_measurement(&DIAG_PHEROMONE, || t.elapsed().as_secs_f64() * 1000.0);
+        return;
+    }
 
     // Sprint 126: ch0 GPU path zachovaný (FieldGpu má jen single channel).
     // ch1/ch2 vždy CPU step — nárůst load je marginal (2× další 64×64×16 grid
@@ -1345,6 +1514,7 @@ fn emit_pheromones(
     time: Res<Time>,
     mut pheromone: ResMut<PheromoneResource>,
     #[cfg(feature = "gpu")] gpu_field: Option<ResMut<GpuFieldState>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut cells: Query<&mut CellEntity, Without<Dying>>,
 ) {
     let dt = time.delta_secs();
@@ -1355,6 +1525,33 @@ fn emit_pheromones(
     //   [11] = ch2 emit (fast decay, bursty)
     // Cost = sum of all positive emissions × PHEROMONE_COST_PER_RATE.
     const EMIT_SLOTS: [usize; N_PHEROMONE_CHANNELS] = [2, 10, 11];
+
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu_full) = gpu_full {
+        for mut cell in &mut cells {
+            let pos = [cell.0.position[0], cell.0.position[1], cell.0.position[2]];
+            let mut total_emit = 0.0_f32;
+            let mut emits = [0.0_f32; N_PHEROMONE_CHANNELS];
+            for ch in 0..N_PHEROMONE_CHANNELS {
+                let mod_strength = cell.0.last_outputs[EMIT_SLOTS[ch]].max(0.0);
+                let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
+                emits[ch] = brain_emit;
+                total_emit += brain_emit;
+                let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
+                if ch == 0 {
+                    gpu_full.pheromone.add_source(pos, rate * dt);
+                } else {
+                    pheromone.fields[ch].add_source(pos, rate * dt);
+                }
+                let prev = cell.0.last_emit[ch];
+                let delta = brain_emit - prev;
+                cell.0.burst_accum[ch] += delta * delta;
+            }
+            cell.0.last_emit = emits;
+            cell.0.energy -= PHEROMONE_COST_PER_RATE * total_emit * dt;
+        }
+        return;
+    }
 
     #[cfg(feature = "gpu")]
     if let Some(mut gpu) = gpu_field {
@@ -1442,12 +1639,20 @@ fn cells_brain_act(
     slot_map: Res<CellSlotMap>,
     clock: Res<Clock>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut diag: Diagnostics,
     mut coop_positions_scratch: Local<Vec<[f32; 3]>>,
     mut id_to_inputs_scratch: Local<FxHashMap<u64, [f32; BRAIN_INPUTS]>>,
     #[cfg(feature = "gpu")] mut inputs_by_slot_scratch: Local<Vec<[f32; BRAIN_INPUTS]>>,
 ) {
+    // Full GPU pipeline: separate `cells_brain_act_gpu_full` system handles
+    // all of brain_act + motor + step + brownian on GPU; this CPU/GPU-brain-only
+    // path is no-op when gpu_full is active.
+    #[cfg(feature = "gpu")]
+    if gpu_full.is_some() {
+        return;
+    }
     let _t_total = Instant::now();
     let dt = time.delta_secs();
     diag.add_measurement(&DIAG_CELL_COUNT, || cells.iter().count() as f64);
@@ -1549,6 +1754,9 @@ fn cells_brain_act(
             temperature_local,
         };
         cell.0.apply_shell_absorb(dt);
+        // eat_food skip optim: cache d² k nejbližšímu food pro `cell_eats_food`
+        // early skip kandidát gather (`f32::MAX` pokud sensor nic nenašel).
+        cell.0.last_best_food_d2 = best_food_d2;
         let mut inputs = bioscape::populate_brain_inputs(&mut cell.0, &sensors, vision_r);
         bioscape::apply_sensor_gains(&mut inputs, &cell.0.genome.sensor_gains);
         cell.0.last_inputs = inputs;
@@ -1633,6 +1841,267 @@ fn cells_brain_act(
         cell.0.apply_brain_motor(&outputs, dt);
     });
     diag.add_measurement(&DIAG_BRAIN_ACT, || _t_total.elapsed().as_secs_f64() * 1000.0);
+}
+
+/// Full GPU pipeline brain_act: zrcadlí headless `brain_act_gpu_full`.
+/// Single Wait barrier per tick — všechny GPU compute fáze (spatial hash,
+/// sensor gather, populate inputs, brain forward, motor, brownian, step)
+/// běží mezi sebou bez CPU readback; jediný `device.poll(Maintain::Wait)`
+/// přes `download_full_batch_into` na konci. CPU fáze `step_cells`,
+/// `apply_brownian_motion`, `cells_brain_act` (CPU/GPU-brain-only) se v
+/// gpu_full režimu stávají no-op.
+///
+/// Schedule: běží před `cells_brain_act` v Phase 1 chain (po
+/// `pool_bonded_hidden_cells`); CPU `cells_brain_act` se sám skipuje pokud
+/// `GpuFullPipeline` resource existuje.
+#[cfg(feature = "gpu")]
+fn cells_brain_act_gpu_full(
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+    foods: Query<&FoodEntity>,
+    coop_foods: Res<CoopFoodResource>,
+    slot_map: Res<CellSlotMap>,
+    mut pipeline: ResMut<GpuFullPipeline>,
+    fixed_time: Res<Time<Fixed>>,
+    clock: Res<Clock>,
+    extent: Res<WorldExtent>,
+    mut diag: Diagnostics,
+) {
+    let t_total = Instant::now();
+    let dt = fixed_time.delta_secs();
+    let n = slot_map.len();
+    if n == 0 {
+        return;
+    }
+    let world_half = extent.as_array();
+    // Bevy `ResMut<T>::deref_mut` neumožňuje split-field borrows, takže
+    // všechny `pipeline.field.method()` volání s args odkazujícími na sibling
+    // fields by failovaly. Explicit deref → raw `&mut GpuFullPipeline`
+    // unblockne split borrows (Rust borrow checker rozumí přes `&mut *T`).
+    let pipeline = &mut *pipeline;
+
+    // Phase 1: CPU snapshot — iterujeme cells v slot order (slot_map.slot_to_entity)
+    // aby buffer indexy odpovídaly GPU slotům. apply_shell_absorb mutuje
+    // damage_accum předem; last_best_food_d2 = 0.0 disable eat_food skip
+    // (sensor běžel na GPU, CPU nemá přístup k best_food_d2).
+    let food_n = foods.iter().count() + coop_foods.0.len();
+    pipeline.scratch.clear_and_reserve(n, food_n);
+    for slot in 0..n {
+        let entity = slot_map.slot_to_entity[slot];
+        let Ok(mut cell_entity) = cells.get_mut(entity) else { continue };
+        let cell = &mut cell_entity.0;
+        cell.apply_shell_absorb(dt);
+        cell.last_best_food_d2 = 0.0;
+        let s = &mut pipeline.scratch;
+        s.positions.push(cell.position);
+        s.eff_radii.push(cell.phenotype.effective_radius());
+        s.vision_radii.push(cell.genome.vision_radius);
+        s.energies.push(cell.energy);
+        s.headings.push(cell.heading);
+        s.pitches.push(cell.pitch);
+        s.damage_accums.push(cell.damage_accum);
+        s.max_speeds.push(cell.genome.max_speed);
+        s.velocities.push(cell.velocity);
+        s.angular_vels.push(cell.angular_velocity);
+        s.pitch_vels.push(cell.pitch_velocity);
+        s.turn_rates.push(cell.genome.turn_rate);
+        s.ages.push(cell.age as u32);
+        s.cooldowns.push(cell.reproduce_cooldown_ticks);
+        s.body_dims.push([
+            cell.phenotype.body_length,
+            cell.phenotype.body_width,
+            cell.phenotype.body_height,
+        ]);
+        s.aux.push([
+            cell.phenotype.total_spike_cost_factor(),
+            cell.phenotype.shell_thickness,
+            cell.genome.vision_radius,
+            cell.last_outputs[6].max(0.0),
+        ]);
+    }
+    // Foods + coop_foods do single sensor pool.
+    let s = &mut pipeline.scratch;
+    for food in &foods {
+        s.food_positions.push(food.0.position);
+    }
+    for coop in coop_foods.0.iter() {
+        s.food_positions.push(coop.position);
+    }
+
+    // Aliases pro split borrow — upload_* berou &[T] sliced ze scratch fields.
+    let positions = pipeline.scratch.positions.as_slice();
+    let eff_radii = pipeline.scratch.eff_radii.as_slice();
+    let vision_radii = pipeline.scratch.vision_radii.as_slice();
+    let food_positions = pipeline.scratch.food_positions.as_slice();
+    let energies = pipeline.scratch.energies.as_slice();
+    let headings = pipeline.scratch.headings.as_slice();
+    let pitches = pipeline.scratch.pitches.as_slice();
+    let damage_accums = pipeline.scratch.damage_accums.as_slice();
+    let max_speeds = pipeline.scratch.max_speeds.as_slice();
+    let velocities = pipeline.scratch.velocities.as_slice();
+    let angular_vels = pipeline.scratch.angular_vels.as_slice();
+    let pitch_vels = pipeline.scratch.pitch_vels.as_slice();
+    let turn_rates = pipeline.scratch.turn_rates.as_slice();
+    let ages = pipeline.scratch.ages.as_slice();
+    let cooldowns = pipeline.scratch.cooldowns.as_slice();
+    let body_dims = pipeline.scratch.body_dims.as_slice();
+    let aux = pipeline.scratch.aux.as_slice();
+
+    // Phase 2: uploads.
+    pipeline.cells.upload_metadata(
+        energies,
+        headings,
+        pitches,
+        damage_accums,
+        max_speeds,
+        eff_radii,
+    );
+    pipeline.cells.upload_velocities(velocities);
+    pipeline
+        .cells
+        .upload_angular_pitch(angular_vels, pitch_vels);
+    pipeline.cells.upload_turn_rates(turn_rates);
+    pipeline.cells.upload_positions(positions);
+    pipeline.cells.upload_age_cooldown(ages, cooldowns);
+    pipeline.cells.upload_body_dims(body_dims);
+    pipeline.cells.upload_aux(aux);
+
+    // Phase 3: spatial hash dispatches (no readback).
+    pipeline.cell_hash.dispatch(positions);
+    pipeline.food_hash.dispatch(food_positions);
+
+    // Phase 4: GPU SensorGather dispatch_no_readback — output v output_buf.
+    let sensor_params = SensorParamsGpu {
+        num_cells: n as u32,
+        num_foods: food_positions.len() as u32,
+        hash_cell_size: bioscape::GRID_CELL_SIZE,
+        world_half_x: world_half[0],
+        world_half_y: world_half[1],
+        world_half_z: world_half[2],
+        field_res_x: SMELL_GRID_RES as u32,
+        field_res_y: SMELL_GRID_RES as u32,
+        field_res_z: SMELL_GRID_RES_Z as u32,
+        field_eps: SMELL_SAMPLE_EPSILON,
+        field_world_half_x: world_half[0],
+        field_world_half_y: world_half[1],
+        field_world_half_z: world_half[2],
+        _pad0: 0,
+    };
+    pipeline.sensor.dispatch_no_readback(
+        positions,
+        eff_radii,
+        vision_radii,
+        food_positions,
+        &pipeline.cell_hash,
+        &pipeline.food_hash,
+        &pipeline.smell,
+        &pipeline.pheromone,
+        sensor_params,
+    );
+
+    // Phase 5: GPU populate_inputs.
+    let populate_params = PopulateInputsParams {
+        num_cells: n as u32,
+        brain_inputs: BRAIN_INPUTS as u32,
+        brain_inputs_sensory: BRAIN_INPUTS_SENSORY as u32,
+        brain_hidden: BRAIN_HIDDEN as u32,
+        brain_recurrent: BRAIN_RECURRENT as u32,
+        smell_norm_gain: SMELL_NORMALIZATION_GAIN,
+        phero_norm_gain: PHEROMONE_NORMALIZATION_GAIN,
+        damage_norm_gain: DAMAGE_NORMALIZATION_GAIN,
+        density_norm: DENSITY_NORM_COUNT,
+        reproduce_threshold: REPRODUCE_THRESHOLD,
+        _pad0: 0,
+        _pad1: 0,
+    };
+    pipeline
+        .populate
+        .dispatch(&pipeline.cells, &pipeline.sensor, populate_params);
+
+    // Phase 6: GPU brain forward.
+    pipeline.brain.forward_persistent(&pipeline.cells, n);
+
+    // Phase 7: GPU motor.
+    pipeline
+        .motor
+        .dispatch_with_cells(&pipeline.cells, n, dt, DRAG_COEFFICIENT);
+
+    // Phase 8: GPU brownian.
+    let has_z = world_half[2] > 0.0;
+    pipeline
+        .brownian
+        .compute_persistent(&pipeline.cells, n, THERMAL_NOISE, dt, has_z);
+
+    // Phase 9: GPU step.
+    let step_params = StepParamsGpu {
+        num_cells: n as u32,
+        _pad_a0: 0,
+        _pad_a1: 0,
+        _pad_a2: 0,
+        dt,
+        world_half_x: world_half[0],
+        world_half_y: world_half[1],
+        world_half_z: world_half[2],
+        gravity: PHYS_GRAVITY,
+        drag: PHYSICS_CONFIG.drag,
+        angular_drag: PHYSICS_CONFIG.angular_drag,
+        energy_cost_per_v_sq: PHYSICS_CONFIG.energy_cost_per_v_sq,
+        angular_energy_cost: PHYSICS_CONFIG.angular_energy_cost,
+        vision_cost_per_radius: PHYSICS_CONFIG.vision_cost_per_radius,
+        body_cost_factor: PHYSICS_CONFIG.body_cost_factor,
+        age_decay_per_sec: AGE_DECAY_PER_SEC,
+        fixed_timestep_hz: FIXED_TIMESTEP_HZ,
+        spike_cost_per_sec: SPIKE_COST_PER_SEC,
+        shell_cost_per_sec: SHELL_COST_PER_SEC,
+        attack_cost_per_sec: ATTACK_COST_PER_SEC,
+        pitch_clamp: core::f32::consts::FRAC_PI_6 * 0.5,
+        thermal_top: bioscape::THERMAL_TOP,
+        thermal_bottom: bioscape::THERMAL_BOTTOM,
+        thermal_q10: bioscape::THERMAL_Q10,
+        thermal_ref_temp: bioscape::THERMAL_REF_TEMP,
+        thermal_diurnal_amp: bioscape::THERMAL_DIURNAL_AMP,
+        thermal_seasonal_amp: bioscape::THERMAL_SEASONAL_AMP,
+        thermal_diurnal_phase: (clock.0.tick % bioscape::THERMAL_DIURNAL_PERIOD_TICKS)
+            as f32
+            / bioscape::THERMAL_DIURNAL_PERIOD_TICKS as f32,
+        thermal_seasonal_phase: (clock.0.generation % CYCLE_GEN_PERIOD) as f32
+            / CYCLE_GEN_PERIOD as f32,
+    };
+    pipeline.step.dispatch_with_cells(&pipeline.cells, n, step_params);
+
+    // Phase 10: single readback (Wait barrier).
+    pipeline.cells.download_full_batch_into(
+        n,
+        &mut pipeline.scratch.dl_hiddens,
+        &mut pipeline.scratch.dl_outputs,
+        &mut pipeline.scratch.dl_velocities,
+        &mut pipeline.scratch.dl_angular,
+        &mut pipeline.scratch.dl_pitch,
+        &mut pipeline.scratch.dl_positions,
+        &mut pipeline.scratch.dl_ages,
+        &mut pipeline.scratch.dl_cooldowns,
+        &mut pipeline.scratch.dl_energies,
+    );
+
+    // Phase 11: writeback to ECS — iterujeme slot order, get_mut entity, write
+    // back fields. damage_accum reset (mirror populate_inputs shader behavior).
+    let dl = &pipeline.scratch;
+    for slot in 0..n {
+        let entity = slot_map.slot_to_entity[slot];
+        let Ok(mut cell_entity) = cells.get_mut(entity) else { continue };
+        let cell = &mut cell_entity.0;
+        cell.last_hidden = dl.dl_hiddens[slot];
+        cell.last_outputs = dl.dl_outputs[slot];
+        cell.velocity = dl.dl_velocities[slot];
+        cell.angular_velocity = dl.dl_angular[slot];
+        cell.pitch_velocity = dl.dl_pitch[slot];
+        cell.position = dl.dl_positions[slot];
+        cell.age = dl.dl_ages[slot] as u64;
+        cell.reproduce_cooldown_ticks = dl.dl_cooldowns[slot];
+        cell.energy = dl.dl_energies[slot];
+        cell.damage_accum = 0.0;
+    }
+
+    diag.add_measurement(&DIAG_BRAIN_ACT, || t_total.elapsed().as_secs_f64() * 1000.0);
 }
 
 fn apply_cell_morph(time: Res<Time>, mut cells: Query<&mut CellEntity, Without<Dying>>) {
@@ -1797,9 +2266,10 @@ fn cell_eats_food(
     slot_map: Res<CellSlotMap>,
     lookups: Res<CellEntityLookups>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
     mut diag: Diagnostics,
-    mut snapshot_scratch: Local<Vec<(Entity, [f32; 3], f32, [f32; 3], f32, f32)>>,
+    mut snapshot_scratch: Local<Vec<(Entity, [f32; 3], f32, [f32; 3], f32, f32, f32, f32, bool)>>,
     mut cell_carnivore_scratch: Local<FxHashMap<Entity, f32>>,
     mut candidates_scratch: Local<Vec<Option<(Entity, f32)>>>,
     mut eaten_scratch: Local<FxHashSet<Entity>>,
@@ -1809,9 +2279,10 @@ fn cell_eats_food(
     let t_total = Instant::now();
 
     // Sprint 52: pokud GPU available, sbíráme rewards Vec[N] a dispatchneme
-    // GPU Hebbian na konci místo per-cell CPU brain.hebbian_update.
+    // GPU Hebbian na konci místo per-cell CPU brain.hebbian_update. Plná
+    // gpu_full pipeline má vlastní Hebbian instanci uvnitř `GpuFullPipeline`.
     #[cfg(feature = "gpu")]
-    let use_gpu_hebbian = gpu_state.is_some();
+    let use_gpu_hebbian = gpu_state.is_some() || gpu_full.is_some();
     #[cfg(not(feature = "gpu"))]
     let use_gpu_hebbian = false;
 
@@ -1828,6 +2299,7 @@ fn cell_eats_food(
     // 3 fresh allocs per tick.
     snapshot_scratch.clear();
     snapshot_scratch.extend(cells.iter().map(|(e, c)| {
+        let has_bonds = c.0.bonds.iter().any(|b| b.is_some());
         (
             e,
             c.0.position,
@@ -1839,6 +2311,9 @@ fn cell_eats_food(
             ],
             c.0.heading,
             c.0.pitch,
+            c.0.last_best_food_d2,
+            c.0.genome.vision_radius,
+            has_bonds,
         )
     }));
     let snapshot = snapshot_scratch.as_slice();
@@ -1849,10 +2324,21 @@ fn cell_eats_food(
     cell_carnivore_scratch.extend(cells.iter().map(|(e, c)| (e, c.0.genome.carnivore_score)));
     let cell_carnivore = &*cell_carnivore_scratch;
     candidates_scratch.clear();
+    // eat_food skip optim: gate `!has_bonds` chrání determinismus — bonded cells
+    // v dense clusterech mohou mít spring-impulse pohyb > 30 jednotek/tick, což
+    // by změnilo first-cell-wins ordering v Pass 2. Solo cells mají
+    // predictable kinetiku (velocity + drag + brownian, ~5 jednotek/tick).
+    const EAT_FOOD_MOVE_SLACK: f32 = 10.0;
     snapshot
         .par_iter()
-        .map(|(entity, pos, max_axis, dims, heading, pitch)| {
+        .map(|(entity, pos, max_axis, dims, heading, pitch, last_best_food_d2, vision_r, has_bonds)| {
             let eat_r = EAT_RADIUS * *max_axis;
+            let skip_threshold = eat_r + EAT_FOOD_MOVE_SLACK;
+            let skip_threshold_sq = skip_threshold * skip_threshold;
+            let sensor_covers = vision_r * vision_r >= skip_threshold_sq;
+            if !has_bonds && sensor_covers && *last_best_food_d2 > skip_threshold_sq {
+                return None;
+            }
             let carnivore_score = cell_carnivore.get(entity).copied().unwrap_or(0.0);
             let mut ate: Option<(Entity, f32)> = None;
             food_grid_ref.for_each_in_radius_toroidal(
@@ -1904,7 +2390,7 @@ fn cell_eats_food(
     share_deltas_scratch.clear();
     let eaten = &mut *eaten_scratch;
     let share_deltas = &mut *share_deltas_scratch;
-    for ((entity, _, _, _, _, _), opt) in snapshot.iter().zip(candidates.iter()) {
+    for ((entity, _, _, _, _, _, _, _, _), opt) in snapshot.iter().zip(candidates.iter()) {
         if let Some((food_e, value)) = opt {
             if eaten.contains(food_e) {
                 continue;
@@ -1976,7 +2462,16 @@ fn cell_eats_food(
     }
 
     #[cfg(feature = "gpu")]
-    if let Some(gpu) = gpu_state {
+    if let Some(mut gpu_full) = gpu_full {
+        let n = slot_map.len();
+        if n > 0 && rewards.iter().any(|&r| r > 0.0) {
+            let pipeline = &mut *gpu_full;
+            pipeline.cells.upload_rewards(rewards);
+            pipeline
+                .hebbian
+                .compute_persistent(&pipeline.cells, n, LEARNING_RATE);
+        }
+    } else if let Some(gpu) = gpu_state {
         let n = slot_map.len();
         if n > 0 && rewards.iter().any(|&r| r > 0.0) {
             gpu.cells.upload_rewards(&rewards);
