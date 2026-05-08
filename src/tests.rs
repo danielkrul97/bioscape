@@ -964,6 +964,7 @@ fn base_cell() -> Cell {
         cell_id: 0,
         bonds: [None; MAX_BONDS_PER_CELL],
         cell_state: 0.5,
+        last_best_food_d2: f32::MAX,
         phenotype,
         genome,
     }

@@ -30,7 +30,7 @@ use bioscape::{
 #[cfg(feature = "gpu")]
 use bioscape::{
     gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, HebbianGpu, MotorGpu,
+        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuFullScratch, HebbianGpu, MotorGpu,
         PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
         StepGpu, StepParamsGpu,
     },
@@ -57,7 +57,10 @@ use std::time::Instant;
 /// Sprint 126 bump: multi-channel pheromones (3 fields), BRAIN_INPUTS_SENSORY
 /// 21→27, BRAIN_INPUTS 71→77, BRAIN_OUTPUTS 10→12. V4 savefiles incompatible.
 const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
-const CHECKPOINT_VERSION: u32 = 5;
+/// V6: Cell.last_best_food_d2 added. `serde(default)` zajistí backward-compat
+/// při deserializaci V5 dat (default = f32::MAX → eat_food skip vždy v 1. ticku
+/// po loadu, neutral, brain_act nastaví v 1. ticku).
+const CHECKPOINT_VERSION: u32 = 6;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -238,73 +241,8 @@ pub struct World {
     pub gpu_full: Option<GpuFullState>,
 }
 
-/// Persistent scratch arrays pro `brain_act_gpu_full` cell-metadata snapshots.
-/// Pre-fix path měla 17 fresh `Vec::collect()` per tick (positions×2, eff_radii,
-/// vision_radii, food_positions, energies, headings, pitches, damage_accums,
-/// max_speeds, velocities, angular_vels, pitch_vels, turn_rates, ages,
-/// cooldowns, body_dims, aux). Persistent scratch zachovává kapacitu napříč
-/// ticky → 0 alloc/free v hot loop (bar capacity grow při pop spike).
-#[cfg(feature = "gpu")]
-#[derive(Default)]
-pub struct GpuFullScratch {
-    pub positions: Vec<[f32; 3]>,
-    pub eff_radii: Vec<f32>,
-    pub vision_radii: Vec<f32>,
-    pub food_positions: Vec<[f32; 3]>,
-    pub energies: Vec<f32>,
-    pub headings: Vec<f32>,
-    pub pitches: Vec<f32>,
-    pub damage_accums: Vec<f32>,
-    pub max_speeds: Vec<f32>,
-    pub velocities: Vec<[f32; 3]>,
-    pub angular_vels: Vec<f32>,
-    pub pitch_vels: Vec<f32>,
-    pub turn_rates: Vec<f32>,
-    pub ages: Vec<u32>,
-    pub cooldowns: Vec<u32>,
-    pub body_dims: Vec<[f32; 3]>,
-    pub aux: Vec<[f32; 4]>,
-    // Downstream readback scratch — vyplňuje `download_full_batch` na konci
-    // brain_act pipeline. Pre-fix: 9 fresh Vec collect/to_vec per tick.
-    pub dl_hiddens: Vec<[f32; BRAIN_HIDDEN]>,
-    pub dl_outputs: Vec<[f32; BRAIN_OUTPUTS]>,
-    pub dl_velocities: Vec<[f32; 3]>,
-    pub dl_angular: Vec<f32>,
-    pub dl_pitch: Vec<f32>,
-    pub dl_positions: Vec<[f32; 3]>,
-    pub dl_ages: Vec<u32>,
-    pub dl_cooldowns: Vec<u32>,
-    pub dl_energies: Vec<f32>,
-}
-
-#[cfg(feature = "gpu")]
-impl GpuFullScratch {
-    fn clear_and_reserve(&mut self, n: usize, food_n: usize) {
-        macro_rules! cr {
-            ($v:expr, $cap:expr) => {{
-                $v.clear();
-                $v.reserve($cap);
-            }};
-        }
-        cr!(self.positions, n);
-        cr!(self.eff_radii, n);
-        cr!(self.vision_radii, n);
-        cr!(self.food_positions, food_n);
-        cr!(self.energies, n);
-        cr!(self.headings, n);
-        cr!(self.pitches, n);
-        cr!(self.damage_accums, n);
-        cr!(self.max_speeds, n);
-        cr!(self.velocities, n);
-        cr!(self.angular_vels, n);
-        cr!(self.pitch_vels, n);
-        cr!(self.turn_rates, n);
-        cr!(self.ages, n);
-        cr!(self.cooldowns, n);
-        cr!(self.body_dims, n);
-        cr!(self.aux, n);
-    }
-}
+// `GpuFullScratch` přesunut do `bioscape::gpu::scratch` (lib) — sdílen mezi
+// headless `--gpu-full` pathem a renderer `BIOSCAPE_GPU_FULL=1` pathem.
 
 #[cfg(feature = "gpu")]
 pub struct GpuFullState {
@@ -917,6 +855,10 @@ impl World {
         // upload do GPU; populate_inputs shader read+reset.
         for cell in &mut self.cells {
             cell.apply_shell_absorb(dt);
+            // eat_food skip optim: GPU sensor pipeline nesdílí best_food_d2 zpět
+            // do CPU. Nastavíme 0.0 aby `cell_eats_food` skip nikdy netrigeroval
+            // (food_grid query běží jako pre-skip baseline).
+            cell.last_best_food_d2 = 0.0;
         }
 
         // Persistent scratch fill — single pass přes cells, zachovaná kapacita
@@ -1273,6 +1215,8 @@ impl World {
                     temperature_local,
                 };
                 cell.apply_shell_absorb(dt);
+                // eat_food skip optim: cache nejbližší food d² (viz CPU path).
+                cell.last_best_food_d2 = best_food_d2;
                 let mut inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
                 bioscape::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
                 inputs
@@ -1462,6 +1406,9 @@ impl World {
                 };
 
                 cell.apply_shell_absorb(dt);
+                // eat_food skip optim: cache squared distance k nejbližšímu food
+                // (vision-radius scope) pro pozdější `eat_food` early skip.
+                cell.last_best_food_d2 = best_food_d2;
                 let mut inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
                 bioscape::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
                 inputs
@@ -2451,6 +2398,14 @@ impl World {
         let foods = &self.foods;
         let map = &self.map;
         let food_grid = &self.food_grid;
+        // eat_food skip optim experiment (Sprint 132+ navrh): cache d² nejbližšího
+        // food ze sensor scan, skipnout food_grid query pokud `> threshold`.
+        // PROBLÉM: cell může být pohlcen kolizí s bonded sousedem (mass-symmetric
+        // depenetration + spring impulse), pohyb překračuje konzervativní slack.
+        // Pass 2 first-cell-wins ordering pak diverguje → CSV reproducibility
+        // breaks. Skip je v headless **disabled** (determinismus je sacred);
+        // `cell.last_best_food_d2` field se v headless nečte (renderer ho používá
+        // pro interaktivní speed při lower determinism budget).
         let candidates: Vec<Option<(usize, f32)>> = cells
             .par_iter()
             .map(|cell| {

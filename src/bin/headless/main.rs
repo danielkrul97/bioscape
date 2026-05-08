@@ -16,7 +16,7 @@ use bioscape::{
 };
 #[cfg(feature = "gpu")]
 use bioscape::gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
+        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, GpuFullScratch, HebbianGpu, MotorGpu,
         PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu,
         StepGpu,
     };
@@ -31,8 +31,6 @@ mod csv;
 mod world;
 
 use csv::*;
-#[cfg(feature = "gpu")]
-use world::GpuFullScratch;
 use world::*;
 
 fn main() {

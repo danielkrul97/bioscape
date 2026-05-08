@@ -187,6 +187,7 @@ pub fn make_mating_child(
         cell_state: ((parent_a.cell_state + parent_b.cell_state) * 0.5
             + rng.random_range(-CELL_STATE_INHERIT_NOISE..CELL_STATE_INHERIT_NOISE))
             .clamp(0.0, 1.0),
+        last_best_food_d2: f32::MAX,
         phenotype: child_phenotype,
         genome: child_genome,
     }

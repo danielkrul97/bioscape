@@ -105,8 +105,24 @@ pub struct Cell {
     /// stabilní attractory: ~0 (selfish) a ~1 (altruist). Reguluje food share
     /// frakci uvnitř bonded clusteru.
     pub cell_state: f32,
+    /// Sensor-derived squared distance k nejbližšímu food. Set v `brain_act`
+    /// (CPU sensor stage) z food_grid scanu, čte ho `eat_food` pro early-skip
+    /// kandidát gather: pokud `d² > (EAT_RADIUS × max_axis + slack)²`, žádný
+    /// food není dostupný k snědení tento tick i přes maximální per-tick pohyb,
+    /// takže food_grid query lze úplně přeskočit.
+    ///
+    /// `f32::MAX` = no food in vision (sensor returned `None`).
+    /// `0.0` (set in `--gpu-full` cestě) = disable skip (sensor běžel na GPU,
+    /// CPU nemá hodnotu — bezpečně eat_food vždy spustí query).
+    /// Backward-compat checkpoint: `serde(default = "f32_max_default")`.
+    #[serde(default = "f32_max_default")]
+    pub last_best_food_d2: f32,
     pub phenotype: Phenotype,
     pub genome: Genome,
+}
+
+fn f32_max_default() -> f32 {
+    f32::MAX
 }
 
 impl Cell {
@@ -185,6 +201,7 @@ impl Cell {
             // RNG sekvence — pre-Sprint-80 draws (direction, pos_z, pos_x,
             // pos_y) zůstávají v identickém pořadí, jen za nimi je 1 nový.
             cell_state: 0.5 + rng.random_range(-CELL_STATE_INIT_KICK..CELL_STATE_INIT_KICK),
+            last_best_food_d2: f32::MAX,
             phenotype,
             genome,
         }
