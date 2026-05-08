@@ -956,3 +956,7 @@ impl CellsGpu {
     }
 }
 
+#[cfg(test)]
+#[path = "cells_tests.rs"]
+mod tests;
+

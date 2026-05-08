@@ -744,3 +744,6 @@ pub fn w1_frobenius_std(cells: &[Cell]) -> f64 {
     var.sqrt()
 }
 
+#[cfg(test)]
+#[path = "csv_tests.rs"]
+mod tests;

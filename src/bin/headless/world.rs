@@ -27,6 +27,7 @@ use bioscape::{
     WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
     WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
 };
+use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
 #[cfg(feature = "gpu")]
 use bioscape::{
     gpu::{
@@ -34,10 +35,10 @@ use bioscape::{
         PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
         StepGpu, StepParamsGpu,
     },
-    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_INPUTS_SENSORY,
-    BRAIN_OUTPUTS, DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT,
-    GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN, SHELL_COST_PER_SEC,
-    SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
+    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
+    DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT, GRAVITY as PHYS_GRAVITY,
+    PHEROMONE_NORMALIZATION_GAIN, SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN,
+    SPIKE_COST_PER_SEC, THERMAL_NOISE,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -2782,4 +2783,8 @@ pub fn food_target(factor: f32) -> usize {
 // "near edge" if its position falls in the outer 10 % of either axis;
 // "in corner" if both axes simultaneously meet that criterion.
 pub const EDGE_FRAC_THRESHOLD: f32 = 0.9;
+
+#[cfg(test)]
+#[path = "world_tests.rs"]
+mod tests;
 

@@ -4130,3 +4130,6 @@ fn toggle_world_map_overlay(
         };
     }
 }
+
+#[cfg(test)]
+mod tests;

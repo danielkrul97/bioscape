@@ -325,5 +325,19 @@ pub fn cell_exposure(n_bonds: u32) -> f32 {
 
 
 
+// Sdílené testovací fixtures. Není gated #[cfg(test)] aby je mohly importovat
+// i binární testy (bin/headless/*_tests.rs) — bin se kompiluje proti lib bez
+// vlastního cfg(test) flagu lib.
+pub mod test_helpers;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_phase1;
+
+#[cfg(test)]
+mod tests_phase2;
+
+#[cfg(test)]
+mod tests_phase3;
