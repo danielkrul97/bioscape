@@ -80,6 +80,7 @@ pub struct CellsGpu {
     /// Sprint 51: staging pro `swap_to` — wgpu zakazuje same-buffer copy.
     swap_brain_temp: wgpu::Buffer,
     swap_xoshiro_temp: wgpu::Buffer,
+    swap_turn_rate_temp: wgpu::Buffer,
 }
 
 impl CellsGpu {
@@ -155,6 +156,11 @@ impl CellsGpu {
             16,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         );
+        let swap_turn_rate_temp = mk(
+            "cells-swap-turn-rate-temp",
+            f,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        );
         let _ = mk;
         Self {
             device,
@@ -193,6 +199,7 @@ impl CellsGpu {
             brain_weights_rb,
             swap_brain_temp,
             swap_xoshiro_temp,
+            swap_turn_rate_temp,
         }
     }
 
@@ -377,6 +384,12 @@ impl CellsGpu {
     /// (energy/heading/pitch/damage/max_speed/eff_radius).
     pub fn upload_turn_rates(&self, turn_rates: &[f32]) {
         self.queue.write_buffer(&self.turn_rate_buf, 0, bytemuck::cast_slice(turn_rates));
+    }
+
+    pub fn upload_turn_rate_at(&self, slot: usize, turn_rate: f32) {
+        assert!(slot < self.capacity);
+        let offset = (slot * std::mem::size_of::<f32>()) as u64;
+        self.queue.write_buffer(&self.turn_rate_buf, offset, bytemuck::cast_slice(&[turn_rate]));
     }
 
     /// Sprint 62: upload current angular + pitch velocity (Cell::angular_velocity,
@@ -677,6 +690,23 @@ impl CellsGpu {
             &self.xoshiro_state_buf,
             xosh_dst,
             xosh_bytes,
+        );
+        let tr_bytes = std::mem::size_of::<f32>() as u64;
+        let tr_src = src as u64 * tr_bytes;
+        let tr_dst = dst as u64 * tr_bytes;
+        encoder.copy_buffer_to_buffer(
+            &self.turn_rate_buf,
+            tr_src,
+            &self.swap_turn_rate_temp,
+            0,
+            tr_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.swap_turn_rate_temp,
+            0,
+            &self.turn_rate_buf,
+            tr_dst,
+            tr_bytes,
         );
         self.queue.submit(Some(encoder.finish()));
     }

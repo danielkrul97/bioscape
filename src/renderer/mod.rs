@@ -1911,7 +1911,6 @@ fn cells_brain_act_gpu_full(
         s.velocities.push(cell.velocity);
         s.angular_vels.push(cell.angular_velocity);
         s.pitch_vels.push(cell.pitch_velocity);
-        s.turn_rates.push(cell.genome.turn_rate);
         s.ages.push(cell.age as u32);
         s.cooldowns.push(cell.reproduce_cooldown_ticks);
         s.body_dims.push([
@@ -1948,7 +1947,6 @@ fn cells_brain_act_gpu_full(
     let velocities = pipeline.scratch.velocities.as_slice();
     let angular_vels = pipeline.scratch.angular_vels.as_slice();
     let pitch_vels = pipeline.scratch.pitch_vels.as_slice();
-    let turn_rates = pipeline.scratch.turn_rates.as_slice();
     let ages = pipeline.scratch.ages.as_slice();
     let cooldowns = pipeline.scratch.cooldowns.as_slice();
     let body_dims = pipeline.scratch.body_dims.as_slice();
@@ -1967,7 +1965,6 @@ fn cells_brain_act_gpu_full(
     pipeline
         .cells
         .upload_angular_pitch(angular_vels, pitch_vels);
-    pipeline.cells.upload_turn_rates(turn_rates);
     pipeline.cells.upload_positions(positions);
     pipeline.cells.upload_age_cooldown(ages, cooldowns);
     pipeline.cells.upload_body_dims(body_dims);
@@ -3199,6 +3196,7 @@ fn cell_reproduces_on_threshold(
     mut slot_map: ResMut<CellSlotMap>,
     mut next_cell_id: ResMut<NextCellId>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
     mut commands: Commands,
     mut fertile_scratch: Local<Vec<(Entity, [f32; 3])>>,
 ) {
@@ -3228,6 +3226,19 @@ fn cell_reproduces_on_threshold(
     // canonical). Pokud GPU available; jinak no-op (CPU brain je canonical).
     #[cfg(feature = "gpu")]
     if let Some(gpu) = gpu_state.as_ref() {
+        for &(a, b) in &matings {
+            if let (Some(slot_a), Some(slot_b)) = (slot_map.slot_of(a), slot_map.slot_of(b)) {
+                let brain_a = gpu.cells.download_brain_at(slot_a);
+                let brain_b = gpu.cells.download_brain_at(slot_b);
+                if let Ok([(_, mut ca), (_, mut cb)]) = cells.get_many_mut([a, b]) {
+                    ca.0.genome.brain = brain_a;
+                    cb.0.genome.brain = brain_b;
+                }
+            }
+        }
+    }
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = gpu_full.as_ref() {
         for &(a, b) in &matings {
             if let (Some(slot_a), Some(slot_b)) = (slot_map.slot_of(a), slot_map.slot_of(b)) {
                 let brain_a = gpu.cells.download_brain_at(slot_a);
@@ -3285,6 +3296,15 @@ fn cell_reproduces_on_threshold(
                 cell.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
             );
         }
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = gpu_full.as_ref() {
+            gpu.cells.upload_brain_at(slot, &cell.genome.brain);
+            gpu.cells.upload_xoshiro_seed_at(
+                slot,
+                cell.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
+            );
+            gpu.cells.upload_turn_rate_at(slot, cell.genome.turn_rate);
+        }
         let _ = slot;
     }
 }
@@ -3296,6 +3316,7 @@ fn cell_dies_on_zero_energy(
     food_material: Res<FoodMaterial>,
     mut slot_map: ResMut<CellSlotMap>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
     mut commands: Commands,
 ) {
     let mut rng = rand::rng();
@@ -3334,6 +3355,12 @@ fn cell_dies_on_zero_energy(
                     if let Some(_moved_entity) = moved {
                         // moved cell je ve slot_map.slot_of(moved_entity) = freed_slot
                         // teď. Source je old_slot = current cell count (po release).
+                        gpu.cells.swap_to(freed_slot, slot_map.len());
+                    }
+                }
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = gpu_full.as_ref() {
+                    if moved.is_some() {
                         gpu.cells.swap_to(freed_slot, slot_map.len());
                     }
                 }

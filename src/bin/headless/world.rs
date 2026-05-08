@@ -879,7 +879,6 @@ impl World {
             s.velocities.push(cell.velocity);
             s.angular_vels.push(cell.angular_velocity);
             s.pitch_vels.push(cell.pitch_velocity);
-            s.turn_rates.push(cell.genome.turn_rate);
             s.ages.push(cell.age as u32);
             s.cooldowns.push(cell.reproduce_cooldown_ticks);
             s.body_dims.push([
@@ -918,7 +917,6 @@ impl World {
         let velocities = s.velocities.as_slice();
         let angular_vels = s.angular_vels.as_slice();
         let pitch_vels = s.pitch_vels.as_slice();
-        let turn_rates = s.turn_rates.as_slice();
         let positions_for_step = positions;
         let ages = s.ages.as_slice();
         let cooldowns = s.cooldowns.as_slice();
@@ -936,7 +934,6 @@ impl World {
         );
         gpu.cells.upload_velocities(&velocities);
         gpu.cells.upload_angular_pitch(&angular_vels, &pitch_vels);
-        gpu.cells.upload_turn_rates(&turn_rates);
         // Sprint 63: step shader uploads.
         gpu.cells.upload_positions(&positions_for_step);
         gpu.cells.upload_age_cooldown(&ages, &cooldowns);
@@ -2631,6 +2628,7 @@ impl World {
                     slot,
                     child.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
                 );
+                gpu.cells.upload_turn_rate_at(slot, child.genome.turn_rate);
             }
         }
         let _ = n_births;

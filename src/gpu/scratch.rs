@@ -20,7 +20,6 @@ pub struct GpuFullScratch {
     pub velocities: Vec<[f32; 3]>,
     pub angular_vels: Vec<f32>,
     pub pitch_vels: Vec<f32>,
-    pub turn_rates: Vec<f32>,
     pub ages: Vec<u32>,
     pub cooldowns: Vec<u32>,
     pub body_dims: Vec<[f32; 3]>,
@@ -57,7 +56,6 @@ impl GpuFullScratch {
         cr!(self.velocities, n);
         cr!(self.angular_vels, n);
         cr!(self.pitch_vels, n);
-        cr!(self.turn_rates, n);
         cr!(self.ages, n);
         cr!(self.cooldowns, n);
         cr!(self.body_dims, n);

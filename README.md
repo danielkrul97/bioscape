@@ -25,14 +25,16 @@ Postavit otevřený systém, ve kterém se z primitivních agentů (něco jako b
 **Renderer (3D viz):**
 
 ```bash
-# Default běh
+# Default běh — `gpu` feature aktivní, GPU compute pipeline default-on
+# (sensor + populate + brain + motor + brownian + step na GPU,
+# single-Wait readback per tick).
 cargo run --release
 
-# Rychlejší inkrementální iterace (dynamic linking Bevy)
-cargo run --features dev
+# Vynutit CPU SIMD path (pro srovnání nebo na adapter bez compute).
+BIOSCAPE_GPU_FULL=0 cargo run --release
 
-# S GPU compute kernely
-cargo run --features gpu
+# Rychlejší inkrementální iterace (dynamic linking Bevy).
+cargo run --features dev
 ```
 
 Ovládání: **levé tlačítko + drag** = orbit, **střední tlačítko + drag** = pan, **kolečko** = zoom (orthographic scale), **WASD/šipky** = pan z klávesnice.
@@ -68,9 +70,15 @@ Rešerše vědeckého kontextu projektu (česky, srozumitelně i pro laika) je v
 **Performance decade 111–120** přinesla **~9× ticks/s @ 2 500 cells**
 přes target-cpu=native (S111), SIMD brain forward (S112, 2.1×), Bevy
 rayon paralelizaci (S113, 4.6× per fáze), SIMD field diffusion (S117,
-4×), plus PGO infrastructure (S119, opt-in). Aktuální baseline na
-i5-12400F (12 vláken, target-cpu=native, lto=fat): 1k cells = 2 994
-ticks/s, 2,5k = 1 408, 5k = 598. Detail: [`docs/sprints/111-120-perf.md`](docs/sprints/111-120-perf.md).
+4×), plus PGO infrastructure (S119, opt-in). Baseline na i5-12400F
+(12 vláken, target-cpu=native, lto=fat): 1k cells = 2 994 ticks/s,
+2,5k = 1 408, 5k = 598. Detail: [`docs/sprints/111-120-perf.md`](docs/sprints/111-120-perf.md).
+
+**Decade 128–137 (renderer-side perf)** navazuje: per-system scratch
+reuse v hot loopech (Local + persistent Resources, ~30–40 alloc/tick →
+0), `--gpu-full` single-Wait pipeline default-on v rendereru (nahrazuje
+fragmentovaný S132 path), `eat_food` solo-skip přes sensor cache.
+Detail: [`docs/sprints/128-137-perf.md`](docs/sprints/128-137-perf.md).
 
 Detailní stav po sprintech: [`docs/sprints/`](docs/sprints/).
 
