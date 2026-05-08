@@ -35,6 +35,18 @@ struct Params {
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> hidden: array<f32>;
 @group(0) @binding(4) var<storage, read_write> outputs: array<f32>;
+@group(0) @binding(5) var<storage, read> hidden_n: array<u32>;
+
+// Padé(3,2) tanh approximation matching CPU `tanh_fast` for the active
+// hidden range that lands in full chunks of 8. Tail neurons within the
+// active region use the WGSL builtin `tanh` to mirror the scalar fallback
+// on CPU. Without this split, CPU and GPU diverge by up to ~2 % per neuron
+// (Padé approximation error), which busts the 1e-4 parity threshold.
+fn tanh_fast(x: f32) -> f32 {
+    let cx = clamp(x, -3.0, 3.0);
+    let x2 = cx * cx;
+    return cx * (27.0 + x2) / (27.0 + 9.0 * x2);
+}
 
 @compute @workgroup_size(64)
 fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -48,13 +60,23 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h_off = cell * BRAIN_HIDDEN;
     let o_off = cell * BRAIN_OUTPUTS;
 
+    let h_n = hidden_n[cell];
+    let chunk_end = (h_n / 8u) * 8u;
+
     var hid: array<f32, 64>;
     for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
         var sum: f32 = weights[w_off + B1_OFFSET + h];
         for (var i: u32 = 0u; i < BRAIN_INPUTS; i = i + 1u) {
             sum = sum + weights[w_off + W1_OFFSET + h * BRAIN_INPUTS + i] * inputs[i_off + i];
         }
-        let act = tanh(sum);
+        var act: f32;
+        if (h < chunk_end) {
+            act = tanh_fast(sum);
+        } else if (h < h_n) {
+            act = tanh(sum);
+        } else {
+            act = 0.0;
+        }
         hid[h] = act;
         hidden[h_off + h] = act;
     }

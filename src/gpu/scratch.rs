@@ -24,6 +24,7 @@ pub struct GpuFullScratch {
     pub cooldowns: Vec<u32>,
     pub body_dims: Vec<[f32; 3]>,
     pub aux: Vec<[f32; 4]>,
+    pub hidden_ns: Vec<u32>,
     // Readback scratch — `CellsGpu::download_full_batch_into` zapisuje do těchto.
     pub dl_hiddens: Vec<[f32; BRAIN_HIDDEN]>,
     pub dl_outputs: Vec<[f32; BRAIN_OUTPUTS]>,
@@ -60,5 +61,6 @@ impl GpuFullScratch {
         cr!(self.cooldowns, n);
         cr!(self.body_dims, n);
         cr!(self.aux, n);
+        cr!(self.hidden_ns, n);
     }
 }

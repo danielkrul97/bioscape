@@ -61,6 +61,7 @@ pub(crate) fn cells_brain_act(
     mut coop_positions_scratch: Local<Vec<[f32; 3]>>,
     mut id_to_inputs_scratch: Local<FxHashMap<u64, [f32; BRAIN_INPUTS]>>,
     #[cfg(feature = "gpu")] mut inputs_by_slot_scratch: Local<Vec<[f32; BRAIN_INPUTS]>>,
+    #[cfg(feature = "gpu")] mut hidden_n_by_slot_scratch: Local<Vec<u32>>,
 ) {
     // Full GPU pipeline: separate `cells_brain_act_gpu_full` system handles
     // all of brain_act + motor + step + brownian on GPU; this CPU/GPU-brain-only
@@ -199,7 +200,10 @@ pub(crate) fn cells_brain_act(
         // pro n=2000) per tick.
         inputs_by_slot_scratch.clear();
         inputs_by_slot_scratch.resize(n, [0.0; BRAIN_INPUTS]);
+        hidden_n_by_slot_scratch.clear();
+        hidden_n_by_slot_scratch.resize(n, 0);
         let inputs_by_slot = &mut *inputs_by_slot_scratch;
+        let hidden_n_by_slot = &mut *hidden_n_by_slot_scratch;
         for (entity, cell) in cells.iter() {
             let Some(slot) = slot_map.slot_of(entity) else {
                 continue;
@@ -214,11 +218,12 @@ pub(crate) fn cells_brain_act(
                 }
                 id_to_inputs.get(&partner_id).copied()
             });
+            hidden_n_by_slot[slot] = cell.0.genome.brain.hidden_n;
         }
         let t_gpu = Instant::now();
         gpu.cells.upload_inputs(&inputs_by_slot);
         let gpu = &mut *gpu;
-        gpu.brain.forward_persistent(&gpu.cells, n);
+        gpu.brain.forward_persistent(&gpu.cells, n, hidden_n_by_slot);
         let (hiddens, outputs) = gpu.cells.download_hidden_outputs(n);
         diag.add_measurement(&DIAG_BRAIN_GPU_RT, || t_gpu.elapsed().as_secs_f64() * 1000.0);
         for (entity, mut cell) in &mut cells {

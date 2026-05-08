@@ -913,6 +913,7 @@ impl World {
                 cell.genome.vision_radius,
                 cell.last_outputs[6].max(0.0),
             ]);
+            s.hidden_ns.push(cell.genome.brain.hidden_n);
         }
         // Sprint 128: foods + coop_foods do single sensor pool.
         for food in self.foods.iter() {
@@ -1014,7 +1015,7 @@ impl World {
 
         // Phase 6: GPU brain forward_persistent. Čte `last_inputs_buf` direct,
         // píše last_hidden + last_outputs storage buffers.
-        gpu.brain.forward_persistent(&gpu.cells, n);
+        gpu.brain.forward_persistent(&gpu.cells, n, &gpu.scratch.hidden_ns);
 
         // Phase 7: GPU motor.dispatch_with_cells. Čte last_outputs + heading/
         // pitch/turn_rate/eff_radius/max_speed, mutuje velocity/angular_vel/

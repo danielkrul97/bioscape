@@ -26,12 +26,14 @@ pub struct BrainGpu {
     weights_buf: wgpu::Buffer,
     hidden_buf: wgpu::Buffer,
     outputs_buf: wgpu::Buffer,
+    hidden_n_buf: wgpu::Buffer,
     hidden_readback: wgpu::Buffer,
     outputs_readback: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     // Persistent CPU staging — reused per forward_batch, ne realokuje.
     inputs_packed: Vec<f32>,
     weights_packed: Vec<f32>,
+    hidden_n_packed: Vec<u32>,
     cached_persistent_bg: Option<wgpu::BindGroup>,
     cached_persistent_epoch: u64,
 }
@@ -113,6 +115,16 @@ impl BrainGpu {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -142,6 +154,7 @@ impl BrainGpu {
             weights_buf,
             hidden_buf,
             outputs_buf,
+            hidden_n_buf,
             hidden_readback,
             outputs_readback,
         ) = Self::alloc_buffers(&device, capacity);
@@ -154,6 +167,7 @@ impl BrainGpu {
             &weights_buf,
             &hidden_buf,
             &outputs_buf,
+            &hidden_n_buf,
         );
 
         Ok(Self {
@@ -167,11 +181,13 @@ impl BrainGpu {
             weights_buf,
             hidden_buf,
             outputs_buf,
+            hidden_n_buf,
             hidden_readback,
             outputs_readback,
             bind_group,
             inputs_packed: Vec::new(),
             weights_packed: Vec::new(),
+            hidden_n_packed: Vec::new(),
             cached_persistent_bg: None,
             cached_persistent_epoch: 0,
         })
@@ -187,11 +203,13 @@ impl BrainGpu {
         wgpu::Buffer,
         wgpu::Buffer,
         wgpu::Buffer,
+        wgpu::Buffer,
     ) {
         let inputs_size = (capacity * BRAIN_INPUTS * std::mem::size_of::<f32>()) as u64;
         let weights_size = (capacity * BRAIN_WEIGHTS_PER_CELL * std::mem::size_of::<f32>()) as u64;
         let hidden_size = (capacity * BRAIN_HIDDEN * std::mem::size_of::<f32>()) as u64;
         let outputs_size = (capacity * BRAIN_OUTPUTS * std::mem::size_of::<f32>()) as u64;
+        let hidden_n_size = (capacity * std::mem::size_of::<u32>()) as u64;
         let inputs_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("brain-inputs"),
             size: inputs_size,
@@ -216,6 +234,12 @@ impl BrainGpu {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let hidden_n_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("brain-hidden-n"),
+            size: hidden_n_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let hidden_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("brain-hidden-readback"),
             size: hidden_size,
@@ -233,6 +257,7 @@ impl BrainGpu {
             weights_buf,
             hidden_buf,
             outputs_buf,
+            hidden_n_buf,
             hidden_readback,
             outputs_readback,
         )
@@ -246,6 +271,7 @@ impl BrainGpu {
         weights: &wgpu::Buffer,
         hidden: &wgpu::Buffer,
         outputs: &wgpu::Buffer,
+        hidden_n: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("brain-bg"),
@@ -271,6 +297,10 @@ impl BrainGpu {
                     binding: 4,
                     resource: outputs.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: hidden_n.as_entire_binding(),
+                },
             ],
         })
     }
@@ -282,11 +312,12 @@ impl BrainGpu {
             return;
         }
         let new_cap = (self.capacity * 2).max(n);
-        let (i, w, h, o, hr, or_) = Self::alloc_buffers(&self.device, new_cap);
+        let (i, w, h, o, hn, hr, or_) = Self::alloc_buffers(&self.device, new_cap);
         self.inputs_buf = i;
         self.weights_buf = w;
         self.hidden_buf = h;
         self.outputs_buf = o;
+        self.hidden_n_buf = hn;
         self.hidden_readback = hr;
         self.outputs_readback = or_;
         self.bind_group = Self::make_bind_group(
@@ -297,6 +328,7 @@ impl BrainGpu {
             &self.weights_buf,
             &self.hidden_buf,
             &self.outputs_buf,
+            &self.hidden_n_buf,
         );
         self.capacity = new_cap;
     }
@@ -329,9 +361,11 @@ impl BrainGpu {
             self.inputs_packed.extend_from_slice(inp);
         }
 
-        // Pack weights per-cell. Layout musí matchnout WGSL shader.
+        // Pack weights + hidden_n per-cell. Layout musí matchnout WGSL shader.
         self.weights_packed.clear();
         self.weights_packed.reserve(n * BRAIN_WEIGHTS_PER_CELL);
+        self.hidden_n_packed.clear();
+        self.hidden_n_packed.reserve(n);
         let mut brains_seen = 0usize;
         for brain in brains.into_iter().take(n) {
             for row in brain.w1.iter() {
@@ -342,11 +376,13 @@ impl BrainGpu {
                 self.weights_packed.extend_from_slice(row);
             }
             self.weights_packed.extend_from_slice(&brain.b2);
+            self.hidden_n_packed.push(brain.hidden_n);
             brains_seen += 1;
         }
         assert_eq!(brains_seen, n, "brains iterator length mismatch");
         debug_assert_eq!(self.inputs_packed.len(), n * BRAIN_INPUTS);
         debug_assert_eq!(self.weights_packed.len(), n * BRAIN_WEIGHTS_PER_CELL);
+        debug_assert_eq!(self.hidden_n_packed.len(), n);
 
         let params = Params {
             num_cells: n as u32,
@@ -363,6 +399,11 @@ impl BrainGpu {
             &self.weights_buf,
             0,
             bytemuck::cast_slice(&self.weights_packed),
+        );
+        self.queue.write_buffer(
+            &self.hidden_n_buf,
+            0,
+            bytemuck::cast_slice(&self.hidden_n_packed),
         );
 
         let mut encoder = self
@@ -421,15 +462,16 @@ impl BrainGpu {
     /// Sprint 51: persistent-mode dispatch — bindujeme `CellsGpu` buffers
     /// (last_inputs jako vstup, brain_weights jako persistent storage,
     /// last_hidden + last_outputs jako write-back). **NULL upload weights**
-    /// — to je hlavní win sprintu.
-    pub fn forward_persistent(&mut self, cells_gpu: &CellsGpu, n: usize) {
+    /// — to je hlavní win sprintu. `hidden_n` je per-cell u32 array, uploaded
+    /// do `BrainGpu.hidden_n_buf` (shader binding 5).
+    pub fn forward_persistent(&mut self, cells_gpu: &CellsGpu, n: usize, hidden_n: &[u32]) {
         if n == 0 {
             return;
         }
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("brain-encoder-persistent"),
         });
-        self.forward_persistent_into(&mut encoder, cells_gpu, n);
+        self.forward_persistent_into(&mut encoder, cells_gpu, n, hidden_n);
         self.queue.submit(Some(encoder.finish()));
     }
 
@@ -438,15 +480,18 @@ impl BrainGpu {
         encoder: &mut wgpu::CommandEncoder,
         cells_gpu: &CellsGpu,
         n: usize,
+        hidden_n: &[u32],
     ) {
         if n == 0 {
             return;
         }
+        assert_eq!(hidden_n.len(), n, "hidden_n length must match cell count");
         let params = Params {
             num_cells: n as u32,
             ..Params::default()
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(&self.hidden_n_buf, 0, bytemuck::cast_slice(hidden_n));
         let cells_epoch = cells_gpu.epoch();
         if self.cached_persistent_bg.is_none() || self.cached_persistent_epoch != cells_epoch {
             self.cached_persistent_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -458,6 +503,7 @@ impl BrainGpu {
                     wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: self.hidden_n_buf.as_entire_binding() },
                 ],
             }));
             self.cached_persistent_epoch = cells_epoch;

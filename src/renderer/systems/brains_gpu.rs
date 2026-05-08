@@ -87,6 +87,7 @@ pub(crate) fn cells_brain_act_gpu_full(
             cell.genome.vision_radius,
             cell.last_outputs[6].max(0.0),
         ]);
+        s.hidden_ns.push(cell.genome.brain.hidden_n);
     }
     // Foods + coop_foods do single sensor pool.
     let s = &mut pipeline.scratch;
@@ -114,6 +115,7 @@ pub(crate) fn cells_brain_act_gpu_full(
     let cooldowns = pipeline.scratch.cooldowns.as_slice();
     let body_dims = pipeline.scratch.body_dims.as_slice();
     let aux = pipeline.scratch.aux.as_slice();
+    let hidden_ns = pipeline.scratch.hidden_ns.as_slice();
 
     // Phase 2: uploads.
     pipeline.cells.upload_metadata(
@@ -223,7 +225,7 @@ pub(crate) fn cells_brain_act_gpu_full(
     pipeline
         .populate
         .dispatch_into(&mut encoder, &pipeline.cells, &pipeline.sensor, populate_params);
-    pipeline.brain.forward_persistent_into(&mut encoder, &pipeline.cells, n);
+    pipeline.brain.forward_persistent_into(&mut encoder, &pipeline.cells, n, hidden_ns);
     pipeline.motor.dispatch_with_cells_into(
         &mut encoder,
         &pipeline.cells,
