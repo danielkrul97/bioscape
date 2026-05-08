@@ -168,10 +168,11 @@ pub const BOND_DAMPING: f32 = 0.6;
 /// kmitají), 2 = over-damped (rychle ztuhne). 0.6 ≈ critical pro typický mass.
 pub const MIN_BOND_DAMPING: f32 = 0.0;
 pub const MAX_BOND_DAMPING: f32 = 2.0;
-/// Bond se trhá při current_length > rest_length × factor. 2.5 = 150 % strain
-/// před break — silný stretch (cell se vlastní motorikou trhá z agregátu)
-/// vs naturální oscilace ne-rozbije bond.
-pub const BOND_BREAK_FACTOR: f32 = 2.5;
+/// Bond se trhá při current_length > rest_length × factor. 3.0 = 200 % strain
+/// před break — víc tolerance kolizním impulse v dense clusterech (Sprint 132+
+/// jemný bump z 2.5 pro stabilnější struktury), naturální oscilace stále uvnitř
+/// safe zone díky damping.
+pub const BOND_BREAK_FACTOR: f32 = 3.0;
 /// Násobitel kontaktní vzdálenosti pro rest_length. 1.05 = mírný "buffer"
 /// (kontakt drží trochu volněji než exact touching) → preventivní polštář
 /// proti inicial overlap při formaci.
@@ -181,8 +182,12 @@ pub const BOND_REST_LENGTH_SLACK: f32 = 1.05;
 pub const BOND_FORM_THRESHOLD: f32 = 0.0;
 /// Brain output[9] < tento threshold u některé z bonded cells → bond se
 /// explicit trhá tento tick. Negative = "pusť mě". Asymmetric: jeden silný
-/// negativní signál stačí (escape behavior).
-pub const BOND_BREAK_THRESHOLD: f32 = -0.5;
+/// negativní signál stačí (escape behavior). Sprint 132+ bump z -0.5 na -1.0
+/// — predchozí hodnota chytala náhodný brain noise (tanh distribuce přes 0
+/// dávala ~17 % per-tick šanci spadnout pod -0.5), takže clustery se rozpadaly
+/// dřív, než selekce stihla "naučit" bonding-positive brainy. -1.0 vyžaduje
+/// silnější negative drive — break je vědomé, ne stochastické.
+pub const BOND_BREAK_THRESHOLD: f32 = -1.0;
 /// Energy cost při formaci bondu (one-shot, paid by initiator). Ne-trivial,
 /// aby selekce váhala bonding vs free-roaming.
 pub const BOND_FORMATION_COST: f32 = 0.2;
@@ -190,8 +195,10 @@ pub const BOND_FORMATION_COST: f32 = 0.2;
 /// je výhoda (tissue stability), ale ne free. Sprint 74: 0.1 → 0.05 (2×
 /// cheaper). Sprint 73 ukázalo, že bonded 3-cell platí 3.0/gen vs solo
 /// 0.17/gen → 18× inverted. Halving maintenance + 2× hunt damage +
-/// 1.5× hunters target ~5× shrink toward break-even.
-pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.05;
+/// 1.5× hunters target ~5× shrink toward break-even. Sprint 132+ jemný bump
+/// down 0.05 → 0.04 (snižuje energy pressure pro disband při low food periods,
+/// dvojí selection: cluster benefit roste relativně k maintenance cost).
+pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.04;
 /// Sprint 78: food-share fraction per bond. Když bonded cell eats food
 /// (FOOD_VALUE energy), každý bonded partner dostane `FOOD_VALUE × FRAC`
 /// extra energy (free reward, no energy conservation — modeluje „tissue
