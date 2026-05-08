@@ -689,7 +689,7 @@ impl World {
             return;
         }
         let velocities: Vec<[f32; 3]> = self.cells.iter().map(|c| c.velocity).collect();
-        let gpu = self.gpu_full.as_ref().unwrap();
+        let gpu = self.gpu_full.as_mut().unwrap();
         gpu.cells.upload_velocities(&velocities);
         gpu.brownian.compute_persistent(
             &gpu.cells,

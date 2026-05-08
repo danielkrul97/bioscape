@@ -30,6 +30,8 @@ pub struct BrownianGpu {
     velocities_rb: wgpu::Buffer,
     state_rb: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    cached_persistent_bg: Option<wgpu::BindGroup>,
+    cached_persistent_epoch: u64,
 }
 
 impl BrownianGpu {
@@ -116,6 +118,8 @@ impl BrownianGpu {
         Ok(Self {
             device, queue, pipeline, bind_group_layout, capacity,
             params_buf, velocities_buf, state_buf, velocities_rb, state_rb, bind_group,
+            cached_persistent_bg: None,
+            cached_persistent_epoch: 0,
         })
     }
 
@@ -190,7 +194,7 @@ impl BrownianGpu {
     /// internal. Žádný upload/download, žádný realloc. Volá se v hot loopu
     /// po `cells_gpu.upload_velocities(...)`.
     pub fn compute_persistent(
-        &self,
+        &mut self,
         cells_gpu: &CellsGpu,
         n: usize,
         thermal_noise: f32,
@@ -208,7 +212,7 @@ impl BrownianGpu {
     }
 
     pub fn compute_persistent_into(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         cells_gpu: &CellsGpu,
         n: usize,
@@ -226,21 +230,26 @@ impl BrownianGpu {
             sqrt_dt: dt.sqrt(),
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("brownian-bg-persistent"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.velocities_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.xoshiro_state_buffer().as_entire_binding() },
-            ],
-        });
+        let cells_epoch = cells_gpu.epoch();
+        if self.cached_persistent_bg.is_none() || self.cached_persistent_epoch != cells_epoch {
+            self.cached_persistent_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("brownian-bg-persistent"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.velocities_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.xoshiro_state_buffer().as_entire_binding() },
+                ],
+            }));
+            self.cached_persistent_epoch = cells_epoch;
+        }
+        let bind_group = self.cached_persistent_bg.as_ref().unwrap();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("brownian-pass-persistent"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
     }
 }

@@ -1646,7 +1646,7 @@ fn cells_brain_act(
     coop_foods: Res<CoopFoodResource>,
     slot_map: Res<CellSlotMap>,
     clock: Res<Clock>,
-    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
+    #[cfg(feature = "gpu")] gpu_state: Option<ResMut<GpuBrainState>>,
     #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut diag: Diagnostics,
@@ -1779,7 +1779,7 @@ fn cells_brain_act(
     let id_to_inputs = &*id_to_inputs_scratch;
 
     #[cfg(feature = "gpu")]
-    if let Some(gpu) = gpu_state {
+    if let Some(mut gpu) = gpu_state {
         let n = slot_map.len();
         if n == 0 {
             diag.add_measurement(&DIAG_BRAIN_ACT, || _t_total.elapsed().as_secs_f64() * 1000.0);
@@ -1809,6 +1809,7 @@ fn cells_brain_act(
         }
         let t_gpu = Instant::now();
         gpu.cells.upload_inputs(&inputs_by_slot);
+        let gpu = &mut *gpu;
         gpu.brain.forward_persistent(&gpu.cells, n);
         let (hiddens, outputs) = gpu.cells.download_hidden_outputs(n);
         diag.add_measurement(&DIAG_BRAIN_GPU_RT, || t_gpu.elapsed().as_secs_f64() * 1000.0);

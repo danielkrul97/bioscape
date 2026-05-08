@@ -32,6 +32,8 @@ pub struct BrainGpu {
     // Persistent CPU staging — reused per forward_batch, ne realokuje.
     inputs_packed: Vec<f32>,
     weights_packed: Vec<f32>,
+    cached_persistent_bg: Option<wgpu::BindGroup>,
+    cached_persistent_epoch: u64,
 }
 
 impl BrainGpu {
@@ -170,6 +172,8 @@ impl BrainGpu {
             bind_group,
             inputs_packed: Vec::new(),
             weights_packed: Vec::new(),
+            cached_persistent_bg: None,
+            cached_persistent_epoch: 0,
         })
     }
 
@@ -418,7 +422,7 @@ impl BrainGpu {
     /// (last_inputs jako vstup, brain_weights jako persistent storage,
     /// last_hidden + last_outputs jako write-back). **NULL upload weights**
     /// — to je hlavní win sprintu.
-    pub fn forward_persistent(&self, cells_gpu: &CellsGpu, n: usize) {
+    pub fn forward_persistent(&mut self, cells_gpu: &CellsGpu, n: usize) {
         if n == 0 {
             return;
         }
@@ -430,7 +434,7 @@ impl BrainGpu {
     }
 
     pub fn forward_persistent_into(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         cells_gpu: &CellsGpu,
         n: usize,
@@ -443,23 +447,28 @@ impl BrainGpu {
             ..Params::default()
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("brain-bg-persistent"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.last_inputs_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
-            ],
-        });
+        let cells_epoch = cells_gpu.epoch();
+        if self.cached_persistent_bg.is_none() || self.cached_persistent_epoch != cells_epoch {
+            self.cached_persistent_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("brain-bg-persistent"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.last_inputs_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
+                ],
+            }));
+            self.cached_persistent_epoch = cells_epoch;
+        }
+        let bind_group = self.cached_persistent_bg.as_ref().unwrap();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("brain-pass-persistent"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_bind_group(0, bind_group, &[]);
         let workgroups = (n as u32 + 63) / 64;
         pass.dispatch_workgroups(workgroups, 1, 1);
     }

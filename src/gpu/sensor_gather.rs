@@ -55,6 +55,7 @@ pub struct SensorGatherGpu {
     output_rb: wgpu::Buffer,
     pos_packed: Vec<f32>,
     food_packed: Vec<f32>,
+    epoch: u64,
 }
 
 impl SensorGatherGpu {
@@ -170,7 +171,12 @@ impl SensorGatherGpu {
             output_rb,
             pos_packed: Vec::new(),
             food_packed: Vec::new(),
+            epoch: 0,
         })
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Sprint 61: accessory pro chained shadery (populate_inputs).

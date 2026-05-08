@@ -81,6 +81,7 @@ pub struct CellsGpu {
     swap_brain_temp: wgpu::Buffer,
     swap_xoshiro_temp: wgpu::Buffer,
     swap_turn_rate_temp: wgpu::Buffer,
+    epoch: u64,
 }
 
 impl CellsGpu {
@@ -200,7 +201,12 @@ impl CellsGpu {
             swap_brain_temp,
             swap_xoshiro_temp,
             swap_turn_rate_temp,
+            epoch: 0,
         }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub fn capacity(&self) -> usize {

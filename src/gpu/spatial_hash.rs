@@ -50,6 +50,7 @@ pub struct SpatialHashGpu {
     /// Persistent zero-buffer pro counts reset. Pre-fix: `vec![0u8; N*4]` per
     /// dispatch (32 KB alloc/free per spatial hash rebuild × 2 grids per tick).
     counts_zero: Vec<u8>,
+    epoch: u64,
 }
 
 impl SpatialHashGpu {
@@ -202,7 +203,12 @@ impl SpatialHashGpu {
             sorted_readback,
             bind_group,
             counts_zero: vec![0u8; GPU_HASH_NUM_BUCKETS * 4],
+            epoch: 0,
         })
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     fn alloc_buffers(
@@ -325,6 +331,7 @@ impl SpatialHashGpu {
             &self.sorted_buf,
         );
         self.capacity = new_cap;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Vrátí `(offsets[NUM_BUCKETS+1], sorted_cells[N])`. offsets[b] je

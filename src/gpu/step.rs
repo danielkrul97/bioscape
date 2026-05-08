@@ -80,6 +80,8 @@ pub struct StepGpu {
     cooldown_rb: wgpu::Buffer,
     energy_rb: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    cached_cells_bg: Option<wgpu::BindGroup>,
+    cached_cells_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +244,8 @@ impl StepGpu {
             cooldown_rb,
             energy_rb,
             bind_group,
+            cached_cells_bg: None,
+            cached_cells_epoch: 0,
         })
     }
 
@@ -413,30 +417,35 @@ impl StepGpu {
         params.num_cells = num_cells as u32;
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("step-bg-cells"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: cells.position_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: cells.velocities_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: cells.heading_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cells.pitch_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cells.angular_velocity_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: cells.pitch_velocity_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: cells.age_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: cells.cooldown_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: cells.energy_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: cells.body_dims_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: cells.aux_buffer().as_entire_binding() },
-            ],
-        });
+        let cells_epoch = cells.epoch();
+        if self.cached_cells_bg.is_none() || self.cached_cells_epoch != cells_epoch {
+            self.cached_cells_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("step-bg-cells"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: cells.position_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: cells.velocities_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: cells.heading_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: cells.pitch_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: cells.angular_velocity_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: cells.pitch_velocity_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: cells.age_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: cells.cooldown_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: cells.energy_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: cells.body_dims_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: cells.aux_buffer().as_entire_binding() },
+                ],
+            }));
+            self.cached_cells_epoch = cells_epoch;
+        }
+        let bind_group = self.cached_cells_bg.as_ref().unwrap();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("step-pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_bind_group(0, bind_group, &[]);
         let workgroups = (num_cells as u32 + 63) / 64;
         pass.dispatch_workgroups(workgroups, 1, 1);
     }
