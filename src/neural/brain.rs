@@ -39,9 +39,11 @@ impl Brain {
     /// self-loop query (from = to, sentinel = 0). The resulting brain has
     /// `hidden_n = BRAIN_HIDDEN_DEFAULT`.
     ///
-    /// The 4197 weight queries (45×72 + 45 + 12×45 + 12) dominate child
-    /// spawn cost; we batch in groups of 8 via `Cppn::forward_batch_x8` and
-    /// fall through to the scalar path for the remainder.
+    /// All 4197 substrate queries go through `Cppn::forward_batch_x8`.
+    /// Trailing partial batches (BRAIN_HIDDEN=45 has a 5-tail in L2 weights;
+    /// the bias passes have 5- and 4-tails) are padded with copies of the
+    /// last valid input so the SIMD lanes always do useful work; the
+    /// padded outputs are discarded.
     pub fn from_cppn(cppn: &Cppn) -> Brain {
         // Pre-compute substrate coordinates — otherwise input coords are
         // recomputed BRAIN_HIDDEN times, hidden coords BRAIN_OUTPUTS times.
@@ -59,11 +61,11 @@ impl Brain {
 
         let mut inputs_buf = [[0.0_f32; CPPN_INPUTS]; 8];
 
-        // L1: input → hidden.
+        // L1: input → hidden weights. BRAIN_INPUTS = 72 = 9 × 8 (no tail).
         for h in 0..BRAIN_HIDDEN {
             let to_c = hidden_coords[h];
             let mut i = 0usize;
-            while i + 8 <= BRAIN_INPUTS {
+            while i < BRAIN_INPUTS {
                 for k in 0..8 {
                     let from_c = input_coords[i + k];
                     inputs_buf[k] = [
@@ -80,31 +82,36 @@ impl Brain {
                 }
                 i += 8;
             }
-            while i < BRAIN_INPUTS {
-                let from_c = input_coords[i];
-                let out = cppn.forward([
-                    from_c[0], from_c[1], from_c[2],
-                    to_c[0], to_c[1], to_c[2],
-                    1.0,
-                ]);
-                if out[1] >= CPPN_LINK_EXISTS_THRESHOLD {
-                    w1[h][i] = out[0];
-                }
-                i += 1;
-            }
-            // Bias: self-loop sentinel (from = to, marker = 0). Dampened.
-            let out = cppn.forward([
-                to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0,
-            ]);
-            b1[h] = out[0] * 0.5;
         }
 
-        // L2: hidden → output.
+        // L1 biases: BRAIN_HIDDEN = 45 = 5 × 8 + 5 tail. Batch + pad.
+        let mut h = 0usize;
+        while h < BRAIN_HIDDEN {
+            let count = (BRAIN_HIDDEN - h).min(8);
+            for k in 0..count {
+                let to_c = hidden_coords[h + k];
+                inputs_buf[k] = [
+                    to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0,
+                ];
+            }
+            let pad = inputs_buf[count - 1];
+            for k in count..8 {
+                inputs_buf[k] = pad;
+            }
+            let out = cppn.forward_batch_x8(&inputs_buf);
+            for k in 0..count {
+                b1[h + k] = out[k][0] * 0.5;
+            }
+            h += 8;
+        }
+
+        // L2: hidden → output weights. BRAIN_HIDDEN = 45 has a 5-lane tail.
         for o in 0..BRAIN_OUTPUTS {
             let to_c = output_coords[o];
             let mut h = 0usize;
-            while h + 8 <= BRAIN_HIDDEN {
-                for k in 0..8 {
+            while h < BRAIN_HIDDEN {
+                let count = (BRAIN_HIDDEN - h).min(8);
+                for k in 0..count {
                     let from_c = hidden_coords[h + k];
                     inputs_buf[k] = [
                         from_c[0], from_c[1], from_c[2],
@@ -112,30 +119,39 @@ impl Brain {
                         1.0,
                     ];
                 }
+                let pad = inputs_buf[count - 1];
+                for k in count..8 {
+                    inputs_buf[k] = pad;
+                }
                 let out = cppn.forward_batch_x8(&inputs_buf);
-                for k in 0..8 {
+                for k in 0..count {
                     if out[k][1] >= CPPN_LINK_EXISTS_THRESHOLD {
                         w2[o][h + k] = out[k][0];
                     }
                 }
                 h += 8;
             }
-            while h < BRAIN_HIDDEN {
-                let from_c = hidden_coords[h];
-                let out = cppn.forward([
-                    from_c[0], from_c[1], from_c[2],
-                    to_c[0], to_c[1], to_c[2],
-                    1.0,
-                ]);
-                if out[1] >= CPPN_LINK_EXISTS_THRESHOLD {
-                    w2[o][h] = out[0];
-                }
-                h += 1;
+        }
+
+        // L2 biases: BRAIN_OUTPUTS = 12 = 1 × 8 + 4 tail. Batch + pad.
+        let mut o = 0usize;
+        while o < BRAIN_OUTPUTS {
+            let count = (BRAIN_OUTPUTS - o).min(8);
+            for k in 0..count {
+                let to_c = output_coords[o + k];
+                inputs_buf[k] = [
+                    to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0,
+                ];
             }
-            let out = cppn.forward([
-                to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0,
-            ]);
-            b2[o] = out[0] * 0.5;
+            let pad = inputs_buf[count - 1];
+            for k in count..8 {
+                inputs_buf[k] = pad;
+            }
+            let out = cppn.forward_batch_x8(&inputs_buf);
+            for k in 0..count {
+                b2[o + k] = out[k][0] * 0.5;
+            }
+            o += 8;
         }
 
         Brain {
