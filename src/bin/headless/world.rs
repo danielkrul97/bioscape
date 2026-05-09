@@ -31,7 +31,7 @@ use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
 #[cfg(feature = "gpu")]
 use bioscape::{
     gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuFullScratch, HebbianGpu, MotorGpu,
+        BrainGpu, BrownianGpu, CellsGpu, CppnGpu, FieldGpu, GpuFullScratch, HebbianGpu, MotorGpu,
         PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
         StepGpu, StepParamsGpu,
     },
@@ -283,6 +283,10 @@ pub struct GpuFullState {
     /// Sprint 63: step on GPU (kinematics + drag + energy + bounce).
     /// Fused do brain_act batch readback. Skip CPU `step` fáze v `--gpu-full`.
     pub step: StepGpu,
+    /// CPPN substrate query on GPU — dispatched per reproduce phase to
+    /// materialise child brain weights directly into `cells.brain_weights_buf`,
+    /// skipping per-child CPU `Brain::from_cppn`.
+    pub cppn: CppnGpu,
     /// Persistent CPU snapshots — reused per tick, zachovává kapacitu.
     pub scratch: GpuFullScratch,
 }
@@ -2662,6 +2666,26 @@ impl World {
         }
     }
 
+    /// Sync `Genome.brain` for every cell from the persistent GPU buffer
+    /// back to CPU. In `--gpu-full + GPU CPPN` mode child brains are produced
+    /// directly on the device and the CPU `Genome.brain` field stays at the
+    /// `Brain::zeros()` placeholder until something explicitly downloads.
+    /// Call this once per generation before serialisation / diagnostics
+    /// (`w1_frobenius_std` etc.) — single `Wait` barrier, ~few ms total.
+    #[cfg(feature = "gpu")]
+    pub fn sync_brains_from_gpu(&mut self) {
+        if let Some(gpu) = self.gpu_full.as_ref() {
+            let n = self.cells.len();
+            if n == 0 {
+                return;
+            }
+            let brains = gpu.cells.download_brains(n);
+            for (cell, brain) in self.cells.iter_mut().zip(brains) {
+                cell.genome.brain = brain;
+            }
+        }
+    }
+
     fn reproduce(&mut self, rng: &mut impl Rng) {
         let current_pop = self.cells.len();
         if current_pop >= self.max_population {
@@ -2677,12 +2701,30 @@ impl World {
         let n_births = to_spawn.len();
         self.births_gen += n_births as u64;
         self.cells.extend(to_spawn);
-        // Sprint 51: upload child brains + xoshiro state na GPU.
+        // GPU child upload. In `--gpu-full`, brain weights are produced
+        // directly on the device via `CppnGpu::dispatch`, so we skip the
+        // per-child `upload_brain_at` round-trip that the CPU path needed
+        // (saves ~16 KB × n_children write_buffer per reproduce phase).
+        // xoshiro seed + turn_rate uploads stay — they're independent of
+        // the brain materialisation path.
         #[cfg(feature = "gpu")]
-        if let Some(gpu) = self.gpu_full.as_ref() {
-            for (off, child) in self.cells[child_start..].iter().enumerate() {
+        if n_births > 0 && self.gpu_full.is_some() {
+            // Borrow split: build `pairs` from `self.cells` (immutable),
+            // then take `&mut self.gpu_full` for dispatch. Rust's disjoint
+            // field borrows handle this because `cells` and `gpu_full` are
+            // distinct fields of `self`.
+            let pairs: Vec<(usize, &bioscape::Cppn)> = (0..n_births)
+                .map(|off| {
+                    let slot = child_start + off;
+                    (slot, &self.cells[slot].genome.cppn)
+                })
+                .collect();
+            let gpu = self.gpu_full.as_mut().unwrap();
+            gpu.cppn.dispatch(&pairs, &gpu.cells);
+            drop(pairs);
+            for off in 0..n_births {
                 let slot = child_start + off;
-                gpu.cells.upload_brain_at(slot, &child.genome.brain);
+                let child = &self.cells[slot];
                 gpu.cells.upload_xoshiro_seed_at(
                     slot,
                     child.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
@@ -2719,6 +2761,11 @@ impl World {
         rng: &mut impl Rng,
     ) -> Vec<Cell> {
         // Sync parent brains z GPU (sprint 51 GPU Hebbian je canonical).
+        // In `--gpu-full + GPU CPPN` mode the parent brain isn't actually read
+        // by `make_mating_child_no_brain` (mating only touches `Genome.cppn`),
+        // but we keep the download for serialization parity — diagnostic
+        // metrics like `w1_frobenius_std` read `Genome.brain` and would be
+        // stale otherwise.
         #[cfg(feature = "gpu")]
         if let Some(gpu) = self.gpu_full.as_ref() {
             for &(a, b) in matings {
@@ -2737,6 +2784,13 @@ impl World {
                 id
             })
             .collect();
+        // In `--gpu-full` skip CPU `Brain::from_cppn` — child brain weights
+        // land on the device through the per-reproduce-phase
+        // `CppnGpu::dispatch` after `cells.extend(children)`.
+        #[cfg(feature = "gpu")]
+        let use_gpu_cppn = self.gpu_full.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let use_gpu_cppn = false;
         let mut children = Vec::with_capacity(matings.len());
         for (i, &(a, b)) in matings.iter().enumerate() {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
@@ -2752,9 +2806,12 @@ impl World {
             cell_b.energy *= 0.5;
             cell_a.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
             cell_b.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
-            children.push(bioscape::make_mating_child(
-                cell_a, cell_b, rng, child_ids[i],
-            ));
+            let child = if use_gpu_cppn {
+                bioscape::make_mating_child_no_brain(cell_a, cell_b, rng, child_ids[i])
+            } else {
+                bioscape::make_mating_child(cell_a, cell_b, rng, child_ids[i])
+            };
+            children.push(child);
         }
         children
     }

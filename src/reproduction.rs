@@ -107,10 +107,25 @@ pub fn make_mating_child(
     rng: &mut impl Rng,
     cell_id: u64,
 ) -> Cell {
+    let mut child = make_mating_child_no_brain(parent_a, parent_b, rng, cell_id);
+    child.genome.brain = Brain::from_cppn(&child.genome.cppn);
+    child
+}
+
+/// Same RNG sequence as `make_mating_child` but leaves `Cell.genome.brain`
+/// as `Brain::zeros()`. Callers that materialise the brain on the GPU
+/// (`CppnGpu::dispatch`) skip the CPU `Brain::from_cppn` cost — the
+/// dominant per-child reproduction work in `--gpu-full`.
+pub fn make_mating_child_no_brain(
+    parent_a: &Cell,
+    parent_b: &Cell,
+    rng: &mut impl Rng,
+    cell_id: u64,
+) -> Cell {
     // RNG draw order zachovává pre-refactor sekvenci: crossover/mutate FIRST,
     // pak direction. Změna pořadí by porušila CSV identity / reproducibility.
     let child_genome = Genome::crossover(&parent_a.genome, &parent_b.genome, rng)
-        .mutate(rng, &MUTATION_CONFIG);
+        .mutate_no_brain(rng, &MUTATION_CONFIG);
     let direction = rng.random_range(0.0..TAU);
     // Sprint 70: cluster-aware jitter. Draw vždycky (i když ho nepoužijeme)
     // — RNG draw order pak zůstane consistent napříč all children, ne jen

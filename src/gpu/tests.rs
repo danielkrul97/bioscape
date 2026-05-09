@@ -1260,3 +1260,65 @@ fn gpu_context_shared_across_subsystems() {
     let stats = stats_gpu.compute(&positions, &velocities, &energies);
     assert!(stats.sum_energy > 0.0);
 }
+
+/// CPPN GPU parity: CPU `Brain::from_cppn` vs GPU `CppnGpu::dispatch`.
+/// Tolerance 1e-3 — both paths use the same Padé tanh, but FMA reordering
+/// + GPU FP rounding can drift each weight by a few ulps; anything above
+/// 1e-3 indicates a bug (wrong substrate offset, wrong activation code,
+/// link-gate mismatch, …).
+#[test]
+fn cppn_from_cppn_gpu_matches_cpu() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
+    };
+
+    // Use a non-trivial CPPN with a few rounds of mutations so we exercise
+    // each activation function and structural growth.
+    let mut rng = StdRng::seed_from_u64(0xCFB1);
+    let mut cppn = Cppn::random(&mut rng);
+    for _ in 0..6 {
+        cppn = cppn.mutate(&mut rng, &CPPN_MUTATION_CONFIG);
+    }
+
+    let cpu_brain = Brain::from_cppn(&cppn);
+
+    let cells_gpu = CellsGpu::with_context(&ctx, 1);
+    let mut cppn_gpu = CppnGpu::with_context(&ctx, 1);
+    // Seed slot 0 with a sentinel so we can tell GPU actually wrote.
+    cells_gpu.upload_brains([&Brain::zeros()]);
+    cppn_gpu.dispatch(&[(0, &cppn)], &cells_gpu);
+    let gpu_brains = cells_gpu.download_brains(1);
+    assert_eq!(gpu_brains.len(), 1);
+    let gpu_brain = &gpu_brains[0];
+
+    let mut max_diff: f32 = 0.0;
+    for h in 0..BRAIN_HIDDEN {
+        for i in 0..BRAIN_INPUTS {
+            let d = (cpu_brain.w1[h][i] - gpu_brain.w1[h][i]).abs();
+            if d > max_diff { max_diff = d; }
+        }
+    }
+    for h in 0..BRAIN_HIDDEN {
+        let d = (cpu_brain.b1[h] - gpu_brain.b1[h]).abs();
+        if d > max_diff { max_diff = d; }
+    }
+    for o in 0..BRAIN_OUTPUTS {
+        for h in 0..BRAIN_HIDDEN {
+            let d = (cpu_brain.w2[o][h] - gpu_brain.w2[o][h]).abs();
+            if d > max_diff { max_diff = d; }
+        }
+    }
+    for o in 0..BRAIN_OUTPUTS {
+        let d = (cpu_brain.b2[o] - gpu_brain.b2[o]).abs();
+        if d > max_diff { max_diff = d; }
+    }
+    assert!(
+        max_diff < 1e-3,
+        "GPU CPPN drift exceeds tolerance: max |Δw| = {}",
+        max_diff
+    );
+}

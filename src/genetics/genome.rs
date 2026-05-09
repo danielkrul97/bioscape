@@ -233,8 +233,17 @@ impl Genome {
     }
 
     pub fn mutate(&self, rng: &mut impl Rng, cfg: &MutationConfig) -> Self {
+        let mut g = self.mutate_no_brain(rng, cfg);
+        g.brain = Brain::from_cppn(&g.cppn);
+        g
+    }
+
+    /// Same gene draws + RNG sequence as `mutate`, but leaves the brain as
+    /// `Brain::zeros()`. Callers that materialise the brain via the GPU
+    /// CPPN dispatch (or some other path) skip the CPU `Brain::from_cppn`
+    /// cost. Production hot path: `--gpu-full` reproduce in headless.
+    pub fn mutate_no_brain(&self, rng: &mut impl Rng, cfg: &MutationConfig) -> Self {
         let mutated_cppn = self.cppn.mutate(rng, &CPPN_MUTATION_CONFIG);
-        let derived_brain = Brain::from_cppn(&mutated_cppn);
         // Discrete adhesion-type flip — pick a uniform replacement that is
         // strictly different from the current type. Falls back to the
         // existing value when ADHESION_TYPE_COUNT == 1 (no other type exists).
@@ -349,7 +358,7 @@ impl Genome {
                 g
             },
             cppn: mutated_cppn,
-            brain: derived_brain,
+            brain: Brain::zeros(),
         }
     }
 

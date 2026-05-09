@@ -16,9 +16,8 @@ use bioscape::{
 };
 #[cfg(feature = "gpu")]
 use bioscape::gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, GpuFullScratch, HebbianGpu, MotorGpu,
-        PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu,
-        StepGpu,
+        BrainGpu, BrownianGpu, CellsGpu, CppnGpu, FieldGpu, GpuContext, GpuFullScratch,
+        HebbianGpu, MotorGpu, PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
     };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -236,6 +235,10 @@ fn main() {
             let populate = PopulateInputsGpu::with_context(&ctx)?;
             let motor = MotorGpu::with_context(&ctx, cap)?;
             let step = StepGpu::with_context(&ctx, cap)?;
+            // GPU CPPN materialises child brain weights direct → cells.brain_weights_buf.
+            // Capacity = cap (worst case: all cells reproduce in one tick after a
+            // mass extinction; init upload is cap children too).
+            let cppn = CppnGpu::with_context(&ctx, cap);
             // Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim
             // init; reproduce volá `upload_turn_rates` znovu (per-event sparse).
             let turn_rates: Vec<f32> = world.cells.iter().map(|c| c.genome.turn_rate).collect();
@@ -253,6 +256,7 @@ fn main() {
                 populate,
                 motor,
                 step,
+                cppn,
                 scratch: GpuFullScratch::default(),
             })
         };
@@ -340,6 +344,10 @@ fn main() {
             } else {
                 0.0
             };
+            // GPU CPPN keeps child brains GPU-resident; sync to CPU before the
+            // stats pass reads `Genome.brain` for diagnostic metrics.
+            #[cfg(feature = "gpu")]
+            world.sync_brains_from_gpu();
             write_stats(&mut log, &world, tps).unwrap();
             // Sprint 126: reset burst_accum aby každá generace měřila vlastní
             // tick-to-tick variance. Bez resetu by hodnoty monotonně rostly.
