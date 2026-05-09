@@ -552,6 +552,7 @@ impl World {
         // Sprint 94: pool last_hidden across bond network → cluster cells share
         // recurrent state. Must run before brain_act (which reads pooled_hidden).
         self.pool_bonded_hidden();
+        self.pool_bond_messages();
         timed!(brain_act, self.run_brain_act(dt));
         timed!(emit_pheromones, self.emit_pheromones(dt));
         timed!(apply_morph, self.apply_morph(dt));
@@ -1272,6 +1273,28 @@ impl World {
                 Some(snapshot[idx])
             });
             cell.pooled_hidden = pooled;
+        }
+    }
+
+    /// Pre-brain pass: aggregate bonded peers' last_outputs message channels
+    /// into cell.bonded_inbox. Mirrors pool_bonded_hidden flow (snapshot →
+    /// per-cell mean over partners). Sensors then read inbox into brain inputs.
+    fn pool_bond_messages(&mut self) {
+        if self.cells.is_empty() {
+            return;
+        }
+        let snapshot: Vec<[f32; bioscape::BRAIN_OUTPUTS]> =
+            self.cells.iter().map(|c| c.last_outputs).collect();
+        let id_to_idx = &self.id_to_idx_scratch;
+        for (i, cell) in self.cells.iter_mut().enumerate() {
+            let inbox = bioscape::pool_bond_messages(cell, |partner_id| {
+                let idx = id_to_idx.get(&partner_id).copied()?;
+                if idx == i {
+                    return None;
+                }
+                Some(snapshot[idx])
+            });
+            cell.bonded_inbox = inbox;
         }
     }
 
@@ -2316,11 +2339,25 @@ impl World {
     /// AKTIVNĚ emitovat pheromone (output[2] > threshold) aby reprodukovaly —
     /// selektuje proti free-riders na pheromone field.
     fn collect_fertile(&self) -> Vec<(usize, [f32; 3])> {
+        let n = self.cells.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        // Frequency-dependent reproduce threshold: common lineages musí mít
+        // víc energie aby reprodukovaly. Zachovává diverzitu proti monoculture
+        // bez hard cap na lineage size.
+        let inv_n = 1.0 / n as f32;
+        let mut freq: rustc_hash::FxHashMap<u64, f32> = rustc_hash::FxHashMap::default();
+        for c in &self.cells {
+            *freq.entry(c.lineage_id).or_insert(0.0) += inv_n;
+        }
         self.cells
             .iter()
             .enumerate()
             .filter(|(_, c)| {
-                c.energy >= REPRODUCE_THRESHOLD
+                let f = freq.get(&c.lineage_id).copied().unwrap_or(0.0);
+                let scaled = REPRODUCE_THRESHOLD * (1.0 + bioscape::LINEAGE_DIVERSITY_ALPHA * f);
+                c.energy >= scaled
                     && c.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
                     && c.reproduce_cooldown_ticks == 0
             })
