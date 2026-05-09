@@ -61,7 +61,7 @@ pub const BRAIN_INPUTS_SENSORY: usize = 27;
 // ~16 KB → 2500 cells = ~41 MB. Forward 4050 ops/cell × 2500 × 60Hz =
 // 600M ops/sec single-core, viable. Storage prostor pro NEAT add_neuron
 // (S104) + HyperNEAT CPPN-derived weights (S106).
-pub const BRAIN_HIDDEN: usize = 50;
+pub const BRAIN_HIDDEN: usize = 45;
 /// Initial active hidden count při spawn. Cell s `hidden_n = BRAIN_HIDDEN_DEFAULT`
 /// reprodukuje pre-Sprint-80 behavior byte-identical (dead zone weights = 0,
 /// nepřispívá). Structural mutace později rozhojnou na ≤ `BRAIN_HIDDEN`.

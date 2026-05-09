@@ -4,16 +4,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::*;
 
-/// Sprint 108: seed-namespace pro shock RNG. Hash s world seedem zajišťuje
-/// nezávislý stream — měnit shock plán nezmění RNG cellí logiky.
+/// Salt mixed into the world seed when seeding the shock RNG. Keeps the
+/// shock schedule on an independent stream so changing it doesn't shift
+/// the cell-logic RNG sequence.
 pub const SHOCK_SCHEDULE_SALT: u64 = 0xCAFE_F00D;
 
-/// Sprint 108: počet ShockKind variant. Drží sync s `ShockKind` enum size.
-/// Pokud přidáš variant, bumpni a uprav `ShockScheduleConfig.type_weights`.
+/// Must match the number of `ShockKind` variants. Adding a variant requires
+/// bumping this and extending `ShockScheduleConfig.type_weights`.
 pub const SHOCK_KIND_COUNT: usize = 3;
 
-/// Sprint 108: typy environmentálních shocků. Diskretní eventy s rampou
-/// (ne smooth cykly) — drží selekční tlak v dlouhých runech.
+/// Discrete environmental shocks with a ramped envelope — not smooth cycles
+/// — to keep selection pressure non-stationary across long runs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ShockKind {
     HazardPulse,
@@ -21,9 +22,9 @@ pub enum ShockKind {
     FoodCrash,
 }
 
-/// Sprint 108: jeden shock event v kalendáři. Aktivní v generačním okně
-/// `[start_gen, start_gen + duration_gen)`; rampa řízená `ramp_gens`.
-/// `center_xy`/`radius` `None` znamená globální dosah.
+/// One scheduled shock. Active over `[start_gen, start_gen + duration_gen)`;
+/// `ramp_gens` controls the rise/fall of the envelope. `None` for both
+/// `center_xy` and `radius` marks a globally-applied event.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ShockEvent {
     pub kind: ShockKind,
@@ -35,9 +36,9 @@ pub struct ShockEvent {
     pub radius: Option<f32>,
 }
 
-/// Sprint 108: parametry plánovače shocků. `mean_gens_between == 0`
-/// znamená no-op (default) — kalendář bude prázdný a integrace v Sprint 109+
-/// nemá efekt.
+/// Parameters for the shock scheduler. `mean_gens_between == 0` is a no-op
+/// (the default): the calendar stays empty and the per-tick lookups become
+/// trivial empty-slice iterations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShockScheduleConfig {
     pub mean_gens_between: u32,
@@ -69,8 +70,8 @@ impl Default for ShockScheduleConfig {
     }
 }
 
-/// Sprint 108: deterministicky vygenerovaný kalendář shocků pro celý run.
-/// Drží i `seed`, ze kterého byl odvozen — pro reproducibility checks.
+/// Deterministically generated shock calendar for the whole run. Stores
+/// the originating `seed` so reproducibility checks can verify it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventCalendar {
     pub events: Vec<ShockEvent>,
@@ -78,11 +79,11 @@ pub struct EventCalendar {
 }
 
 impl EventCalendar {
-    /// Pokud `cfg.mean_gens_between == 0`, vrací prázdný kalendář (no-op).
-    /// Jinak deterministicky generuje sekvenci shocků až do `max_gens`
-    /// přes Poisson-like inter-arrival times s mean `mean_gens_between`.
-    /// Použije `StdRng::seed_from_u64(seed ^ SHOCK_SCHEDULE_SALT)`.
-    /// Eventy jsou setříděné vzestupně podle `start_gen`.
+    /// Returns an empty calendar when `cfg.mean_gens_between == 0`.
+    /// Otherwise deterministically samples shocks up to `max_gens` using
+    /// Poisson-like inter-arrival times (mean = `mean_gens_between`) and
+    /// `StdRng::seed_from_u64(seed ^ SHOCK_SCHEDULE_SALT)`. The returned
+    /// `events` vector is sorted by `start_gen` ascending.
     pub fn generate(seed: u64, cfg: &ShockScheduleConfig, max_gens: u64) -> Self {
         let mut calendar = Self {
             events: Vec::new(),
@@ -160,9 +161,10 @@ impl EventCalendar {
         calendar
     }
 
-    /// Sprint 108: shock je aktivní v generačním okně `[start, start + duration)`.
-    /// `tick` je ignorován — rampa pracuje v gen units, aby byla nezávislá na
-    /// `FIXED_TIMESTEP_HZ`. Signature ho drží pro budoucí tick-level shocks.
+    /// Iterator of shocks active in the window `[start, start + duration)`.
+    /// `tick` is ignored — the ramp works in gen units so it doesn't depend
+    /// on `FIXED_TIMESTEP_HZ`. The parameter stays in the signature for
+    /// future tick-level shocks.
     pub fn active(&self, generation: u64, _tick: u64) -> impl Iterator<Item = &ShockEvent> {
         self.events.iter().filter(move |e| {
             let end = e.start_gen.saturating_add(e.duration_gen as u64);
@@ -191,9 +193,10 @@ fn pick_shock_kind(rng: &mut StdRng, weights: &[f32; SHOCK_KIND_COUNT]) -> Shock
     ShockKind::FoodCrash
 }
 
-/// Sprint 108: trapezoid (nebo triangle pokud `duration <= 2 * ramp_gens`)
-/// envelope shocku. Outside `[start, start + duration)` vrací 0.0; uvnitř
-/// 0..=1. Rampa v gen units, ne v sekundách — `FIXED_TIMESTEP_HZ` ji nemění.
+/// Trapezoidal envelope (or triangle when `duration <= 2 × ramp_gens`).
+/// Returns 0.0 outside `[start, start + duration)`, otherwise a value in
+/// `[0, 1]`. The ramp lives in gen units, so `FIXED_TIMESTEP_HZ` doesn't
+/// change its shape.
 pub fn shock_ramp_factor(event: &ShockEvent, generation: u64) -> f32 {
     let duration = event.duration_gen as u64;
     if duration == 0 || generation < event.start_gen {
@@ -230,22 +233,21 @@ pub fn shock_ramp_factor(event: &ShockEvent, generation: u64) -> f32 {
     }
 }
 
-/// Sprint 110: max bonus k drainu při peak intensity. drain_factor = 1.0 +
-/// intensity × ramp × HAZARD_PULSE_MAX_MULTIPLIER_BONUS. Při intensity=1 a
-/// peak ramp = 1.0 → drain × 2.0.
+/// Peak `drain_factor` bonus from a single HazardPulse:
+/// `1.0 + intensity × ramp × HAZARD_PULSE_MAX_MULTIPLIER_BONUS`. With
+/// intensity=1 and ramp=1, drain doubles.
 pub const HAZARD_PULSE_MAX_MULTIPLIER_BONUS: f32 = 1.0;
 
-/// Sprint 112: max temperature offset (°C) per ClimateShift při peak intensity
-/// a full spatial mask. Default direction = warming (signed positive).
-/// Peak case: intensity=1, ramp=1, mask=1 → +5°C nad baseline `temperature_at_z`.
+/// Peak temperature offset (°C) added by a single ClimateShift at full
+/// intensity / ramp / mask. Sign is positive (warming); cooling would need
+/// per-event signed intensity.
 pub const CLIMATE_SHIFT_MAX_OFFSET: f32 = 5.0;
 
-/// Sprint 110: multiplikátor hazard drainu na pozici `pos` při dané `(gen, tick)`.
-/// Default 1.0 (žádný HazardPulse aktivní). Pro každý active HazardPulse:
-/// `1.0 + intensity × ramp_factor × spatial_mask × HAZARD_PULSE_MAX_MULTIPLIER_BONUS`.
-/// Multiplicative compound přes všechny aktivní pulsy. Spatial mask je
-/// smoothstep falloff od center v xy (z se ignoruje — hazard je vertikálně
-/// uniformní), toroidal-aware přes `min_image_delta`. Pure fn, deterministic.
+/// Per-cell hazard-drain multiplier at `pos` for the given `(generation, tick)`.
+/// Returns 1.0 when no HazardPulse is active. Each active pulse contributes
+/// `1.0 + intensity × ramp × spatial_mask × HAZARD_PULSE_MAX_MULTIPLIER_BONUS`,
+/// compounded multiplicatively. Spatial mask is a smoothstep falloff in XY
+/// (z is uniform), with toroidal wrap via `min_image_delta`.
 pub fn hazard_shock_multiplier(
     pos: [f32; 3],
     events: &[ShockEvent],
@@ -285,13 +287,11 @@ pub fn hazard_shock_multiplier(
     multiplier
 }
 
-/// Sprint 112: signed temperature offset (°C) z ClimateShift shocků pro pozici
-/// `pos_xy`. Default 0.0 (žádný ClimateShift aktivní). Pro každý active event:
-/// `intensity × ramp_factor × spatial_mask × CLIMATE_SHIFT_MAX_OFFSET`.
-/// Spatial mask je smoothstep falloff přes xy plane (toroidal-aware), 1.0 pro
-/// global eventy bez center. Sčítá additivně přes všechny aktivní eventy
-/// (warming je positive — cooling by potřeboval per-event signed intensity,
-/// budoucí extension). Pure fn, deterministic.
+/// Signed temperature offset (°C) at `pos_xy` from active ClimateShift
+/// events. Returns 0.0 when none is active. Each active event adds
+/// `intensity × ramp × spatial_mask × CLIMATE_SHIFT_MAX_OFFSET` (additive).
+/// Spatial mask is a smoothstep falloff over XY (toroidal); global events
+/// without a center use mask = 1.0.
 pub fn climate_shock_offset(
     events: &[ShockEvent],
     generation: u64,
@@ -330,21 +330,19 @@ pub fn climate_shock_offset(
     total
 }
 
-/// Sprint 113: max drop multiplikátoru při peak intensity. Při intensity=1,
-/// peak ramp=1 → density_factor × 0.5 (= half food spawning).
+/// Peak fractional drop a single FoodCrash applies. With intensity=1 and
+/// ramp=1, the density factor halves.
 pub const FOOD_CRASH_MAX_DROP: f32 = 0.5;
 
-/// Sprint 113: hard floor pro density factor — i compound shocky nezpůsobí
-/// úplný food collapse (extinction). 0.1 = 10% baseline = survival possible
-/// pro adapted populace.
+/// Hard floor on the density factor — compound crashes can't drive food
+/// to zero. 10 % of baseline still leaves room for an adapted population.
 pub const FOOD_CRASH_MIN_FACTOR: f32 = 0.1;
 
-/// Sprint 113: globální food density multiplikátor z aktivních FoodCrash shocků.
-/// Default 1.0 (žádný FoodCrash aktivní). Pro každý active FoodCrash:
-/// `multiplier *= 1.0 - intensity × ramp_factor × FOOD_CRASH_MAX_DROP`.
-/// Multiplicative compound přes všechny active FoodCrash. Žádná spatial maska —
-/// global per-tick scalar. Min clamp na `FOOD_CRASH_MIN_FACTOR` aby populace
-/// měla šanci přežít. Pure fn, deterministic.
+/// Global food-density multiplier from active FoodCrash events. Returns
+/// 1.0 when none is active; otherwise compounds
+/// `multiplier *= 1.0 - intensity × ramp × FOOD_CRASH_MAX_DROP` across
+/// active events and clamps to `FOOD_CRASH_MIN_FACTOR`. No spatial mask —
+/// FoodCrash is a global per-tick scalar.
 pub fn food_density_shock_multiplier(events: &[ShockEvent], generation: u64) -> f32 {
     let mut mult = 1.0_f32;
     for event in events {
@@ -360,11 +358,10 @@ pub fn food_density_shock_multiplier(events: &[ShockEvent], generation: u64) -> 
     mult.max(FOOD_CRASH_MIN_FACTOR)
 }
 
-/// Sprint 112: shock-aware varianta `temperature_at_z`. K baseline gradientu
-/// přičítá sumu ClimateShift offsetů. Empty events nebo žádný ClimateShift
-/// aktivní → byte-identical s `temperature_at_z`. Renderer i headless volají
-/// tuto wrapper variantu, pure `temperature_at_z` zůstává nedotčená pro testy
-/// a backward-compat.
+/// Shock-aware variant of `temperature_at_z` — adds the active ClimateShift
+/// offset to the baseline gradient. With no active ClimateShift this is
+/// bit-identical with `temperature_at_z`. Production callers (renderer +
+/// headless) use this wrapper; tests still call the bare `temperature_at_z`.
 #[inline]
 pub fn temperature_at_z_with_shocks(
     z: f32,

@@ -54,36 +54,60 @@ pub fn vision_fov_factor(theta: f32) -> f32 {
     (1.0 - t.cos()) * 0.5
 }
 
-/// Sprint 85: lineární z-gradient teploty. Warm at top (`world_half[2]`),
-/// cold at bottom (`-world_half[2]`). Pro `world_half[2] == 0` (Sprint 32
-/// pre-3D baseline) vrací `THERMAL_REF_TEMP` → `metabolism_factor = 1.0` →
-/// drain backward-compat s pre-Sprint-85.
-///
-/// Sprint 86: time-varying. `tick` parametr aplikuje diurnal oscilaci
-/// (surface-weighted, hloubka neoscilluje), `generation` parametr aplikuje
-/// uniform seasonal shift (synchronní s food density cyklem). Při
-/// `tick = 0, generation = 0` jsou oba sin(0) = 0 → identical s pre-S86.
+/// Per-tick precomputed thermal terms shared across all cells. The diurnal
+/// and seasonal phases depend only on `tick` and `generation`, so they're
+/// computed once per dispatch rather than per cell. `temperature_at_z` builds
+/// one of these on every call; hot loops should call `ThermalCtx::for_tick`
+/// once and pass it to `temperature_at_z_with_ctx` instead.
+#[derive(Debug, Clone, Copy)]
+pub struct ThermalCtx {
+    pub seasonal_offset: f32,
+    /// `sin(TAU * diurnal_phase)` — kept un-scaled by `THERMAL_DIURNAL_AMP`
+    /// so the per-cell evaluation order matches the original
+    /// `temperature_at_z` formula bit-for-bit.
+    pub diurnal_phase_sin: f32,
+}
+
+impl ThermalCtx {
+    #[inline]
+    pub fn for_tick(tick: u64, generation: u64) -> Self {
+        let seasonal_phase =
+            (generation % CYCLE_GEN_PERIOD) as f32 / CYCLE_GEN_PERIOD as f32;
+        let seasonal_offset = THERMAL_SEASONAL_AMP * (TAU * seasonal_phase).sin();
+        let diurnal_phase =
+            (tick % THERMAL_DIURNAL_PERIOD_TICKS) as f32 / THERMAL_DIURNAL_PERIOD_TICKS as f32;
+        let diurnal_phase_sin = (TAU * diurnal_phase).sin();
+        Self { seasonal_offset, diurnal_phase_sin }
+    }
+}
+
+/// Linear z-gradient temperature: warm at the top (`+world_half[2]`), cold at
+/// the bottom (`-world_half[2]`). When `world_half[2] == 0` (2D baseline) the
+/// function returns `THERMAL_REF_TEMP` so `metabolism_factor` collapses to 1.
+/// Layered on top: a uniform seasonal shift driven by `generation`, and a
+/// surface-weighted diurnal oscillation driven by `tick`. With `tick = 0` and
+/// `generation = 0` both sins are 0 and the result reduces to the pure
+/// stratification.
 #[inline]
 pub fn temperature_at_z(z: f32, world_half: [f32; 3], tick: u64, generation: u64) -> f32 {
+    temperature_at_z_with_ctx(z, world_half, &ThermalCtx::for_tick(tick, generation))
+}
+
+/// Per-cell core of `temperature_at_z`. Hot loops compute the `ThermalCtx`
+/// once per tick and call this for each cell, saving two sin/modulo pairs
+/// per cell.
+#[inline]
+pub fn temperature_at_z_with_ctx(z: f32, world_half: [f32; 3], ctx: &ThermalCtx) -> f32 {
     if world_half[2] <= 0.0 {
         return THERMAL_REF_TEMP;
     }
     let normalized = ((z / world_half[2]) + 1.0) * 0.5;
     let normalized = normalized.clamp(0.0, 1.0);
     let base = THERMAL_BOTTOM + (THERMAL_TOP - THERMAL_BOTTOM) * normalized;
-    // Sprint 86: seasonal — uniform shift, period = CYCLE_GEN_PERIOD (50 gen).
-    // Modulo gen drží phase v [0, 1) bez f32 precision ztráty pro long runs.
-    let seasonal_phase =
-        (generation % CYCLE_GEN_PERIOD) as f32 / CYCLE_GEN_PERIOD as f32;
-    let seasonal_offset = THERMAL_SEASONAL_AMP * (TAU * seasonal_phase).sin();
-    // Sprint 86: diurnal — surface-weighted (× normalized), period 1 day =
-    // THERMAL_DIURNAL_PERIOD_TICKS. Bottom (normalized = 0) → no oscillation;
-    // surface (normalized = 1) → full AMP.
-    let diurnal_phase =
-        (tick % THERMAL_DIURNAL_PERIOD_TICKS) as f32 / THERMAL_DIURNAL_PERIOD_TICKS as f32;
-    let diurnal_offset =
-        THERMAL_DIURNAL_AMP * normalized * (TAU * diurnal_phase).sin();
-    base + seasonal_offset + diurnal_offset
+    // Same evaluation order as the original `THERMAL_DIURNAL_AMP * normalized
+    // * (TAU * diurnal_phase).sin()` so per-cell results stay bit-identical.
+    let diurnal_offset = THERMAL_DIURNAL_AMP * normalized * ctx.diurnal_phase_sin;
+    base + ctx.seasonal_offset + diurnal_offset
 }
 
 /// Sprint 85: Q10 metabolism multiplikátor. `Q10^((T − T_REF) / 10)`.

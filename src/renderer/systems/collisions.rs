@@ -160,7 +160,6 @@ pub(crate) fn resolve_cell_collisions(
     mut id_to_idx_scratch: Local<FxHashMap<u64, usize>>,
     mut results_scratch: Local<Vec<(Entity, [f32; 3], [f32; 3], Vec<u64>)>>,
     mut seen_pairs_scratch: Local<FxHashSet<(u64, u64)>>,
-    mut positions_scratch: Local<FxHashMap<u64, [f32; 3]>>,
     mut candidates_scratch: Local<Vec<(u64, u64)>>,
 ) {
     let t_total = Instant::now();
@@ -184,7 +183,6 @@ pub(crate) fn resolve_cell_collisions(
         entity_to_idx_scratch.insert(e, idx);
         id_to_idx_scratch.insert(c.0.cell_id, idx);
     }
-    let snapshot = snapshot_scratch.as_slice();
     let entity_to_idx = &*entity_to_idx_scratch;
     let id_to_idx = &*id_to_idx_scratch;
     let grid_ref = &grid.0;
@@ -194,6 +192,11 @@ pub(crate) fn resolve_cell_collisions(
     // results == n a indexy se zachovají. Reuse outer scratch je primary win;
     // inner Vec capacity přežije přes ticky.
     results_scratch.clear();
+    {
+        // Scoped `snapshot` borrow ends before Phase 2 mutates snapshot_scratch
+        // (folds the post-Phase-2 `positions_scratch` rebuild into the existing
+        // SoA snapshot).
+        let snapshot = snapshot_scratch.as_slice();
     snapshot
         .par_iter()
         .map(|s_a| {
@@ -207,7 +210,10 @@ pub(crate) fn resolve_cell_collisions(
             let broad_r = collision_r.max(adhesion_r);
             let mut delta = [0.0_f32, 0.0_f32, 0.0_f32];
             let mut vel_delta = [0.0_f32, 0.0_f32, 0.0_f32];
-            let mut local_contacts: Vec<u64> = Vec::new();
+            // Typical contact count per cell is 0–4 (kissing number bound for
+            // overlapping spheres in 3D ≈ 12); pre-allocating avoids the
+            // small-grow allocations on the rayon hot path.
+            let mut local_contacts: Vec<u64> = Vec::with_capacity(8);
             grid_ref.for_each_in_radius_toroidal(
                 pos_a,
                 broad_r,
@@ -227,12 +233,14 @@ pub(crate) fn resolve_cell_collisions(
                     let in_contact = d2 < pair_r2 && d2 > 0.0;
                     if in_contact {
                         let overlap = pair_r - d;
-                        let nx = d_vec[0] / d;
-                        let ny = d_vec[1] / d;
-                        let nz = d_vec[2] / d;
-                        delta[0] += nx * overlap * 0.5;
-                        delta[1] += ny * overlap * 0.5;
-                        delta[2] += nz * overlap * 0.5;
+                        let inv_d = 1.0 / d;
+                        let nx = d_vec[0] * inv_d;
+                        let ny = d_vec[1] * inv_d;
+                        let nz = d_vec[2] * inv_d;
+                        let half_overlap = overlap * 0.5;
+                        delta[0] += nx * half_overlap;
+                        delta[1] += ny * half_overlap;
+                        delta[2] += nz * half_overlap;
                         let vel_b = snapshot[j_idx].velocity;
                         let v_rel = [
                             vel_a[0] - vel_b[0],
@@ -283,6 +291,7 @@ pub(crate) fn resolve_cell_collisions(
             (entity_a, delta, vel_delta, local_contacts)
         })
         .collect_into_vec(&mut results_scratch);
+    } // end snapshot scope; Phase 2 below mutates snapshot_scratch
     let results = results_scratch.as_slice();
 
     // Phase 2 (sequential): apply deltas + bond age/prune + contact tracker
@@ -300,6 +309,15 @@ pub(crate) fn resolve_cell_collisions(
         cell.0.velocity[0] += vel_delta[0];
         cell.0.velocity[1] += vel_delta[1];
         cell.0.velocity[2] += vel_delta[2];
+        // Mirror the position update into the snapshot so the bond-pruning
+        // phase below can read post-Phase-2 partner positions through
+        // `id_to_idx` instead of rebuilding a separate cell_id→pos map.
+        if let Some(&idx) = entity_to_idx.get(entity) {
+            let snap_pos = &mut snapshot_scratch[idx].position;
+            snap_pos[0] += delta[0];
+            snap_pos[1] += delta[1];
+            snap_pos[2] += delta[2];
+        }
         let cell_id_a = cell.0.cell_id;
         for &other_id in contacts {
             let key = (cell_id_a, other_id);
@@ -308,12 +326,8 @@ pub(crate) fn resolve_cell_collisions(
             *entry = entry.saturating_add(1);
         }
     }
-    // Bond pruning + maintenance — re-snapshot positions po Phase 2.
-    positions_scratch.clear();
-    for (_, c) in cells.iter() {
-        positions_scratch.insert(c.0.cell_id, c.0.position);
-    }
-    let positions = &*positions_scratch;
+    // Bond pruning + maintenance — partner positions read from the synced
+    // snapshot (no separate HashMap rebuild).
     for (_, mut cell) in cells.iter_mut() {
         let outputs_9 = cell.0.last_outputs[9];
         let explicit_break = outputs_9 < BOND_BREAK_THRESHOLD;
@@ -325,9 +339,12 @@ pub(crate) fn resolve_cell_collisions(
                 cell.0.bonds[slot] = None;
                 continue;
             }
-            let Some(&pos_j) = positions.get(&bond.other_cell_id) else {
-                cell.0.bonds[slot] = None;
-                continue;
+            let pos_j = match id_to_idx.get(&bond.other_cell_id) {
+                Some(&idx) => snapshot_scratch[idx].position,
+                None => {
+                    cell.0.bonds[slot] = None;
+                    continue;
+                }
             };
             let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
             let d = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
@@ -362,6 +379,7 @@ pub(crate) fn resolve_cell_collisions(
             candidates_scratch.push(pair);
         }
     }
+    let snapshot = snapshot_scratch.as_slice();
     for &(id_a, id_b) in candidates_scratch.iter() {
         let Some(&i_a) = id_to_idx.get(&id_a) else { continue };
         let Some(&i_b) = id_to_idx.get(&id_b) else { continue };

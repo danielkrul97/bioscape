@@ -1,7 +1,3 @@
-use std::hash::Hash;
-
-use rustc_hash::FxHashMap;
-
 /// Sprint 54: minimum-image displacement na toroidal xy + bounded z.
 /// Vrátí signed delta `b - a` adjustnuté tak, že |dx|, |dy| ≤ `world_half`,
 /// dz beze změny (z-osa není wrapped — gravita + food sink + carrion drop
@@ -52,48 +48,87 @@ pub fn wrap_position_xy(pos: [f32; 3], world_half: [f32; 3]) -> [f32; 3] {
 /// Sprint 43: 3D uniform spatial hash. Generic přes `Id` (Bevy `Entity` v
 /// rendereru, `usize` v headless) a `P` (per-item payload, např. radius).
 ///
+/// Storage je flat `Vec<Vec<…>>` indexovaný `bx + by*nx + bz*nx*ny`; bucket
+/// počty jsou odvozené z `world_half` + `cell_size` při konstrukci. xy je
+/// toroidal (modulo wrap), z bounded (`bz` clamped na `[0, nz)`). Pro typický
+/// svět (1920×1080×200, cs=64) máme 30×17×4 ≈ 2 040 bucketů — flat Vec
+/// vyhrává nad `FxHashMap` per-bucket lookup tým, že se vyhne hashing/
+/// reprobing.
+///
 /// **Determinismus:** rebuild iteruje vstup v pořadí, ve kterém přijde, a Vec
-/// v každém bucketu drží push-order. `for_each_in_radius` iteruje 3³ buckets ve
-/// fixním (dx, dy, dz) pořadí; `HashMap::get(&key)` je lookup-deterministic.
-/// Caller, který předá rebuild items ve stable order (např. `cells.iter().enumerate()`),
-/// dostane reprodukovatelný traversal napříč runy. Floats z následných sumací
-/// nejsou bit-identical s O(N²) baseline kvůli jinému pořadí akumulace.
-pub struct SpatialGrid<Id: Copy + Eq + Hash, P: Copy> {
+/// v každém bucketu drží push-order. `for_each_in_radius` iteruje (dx,dy,dz)
+/// ve fixním pořadí. Caller, který předá rebuild items ve stable order
+/// (např. `cells.iter().enumerate()`), dostane reprodukovatelný traversal.
+pub struct SpatialGrid<Id: Copy, P: Copy> {
     cell_size: f32,
-    buckets: FxHashMap<(i32, i32, i32), Vec<(Id, [f32; 3], P)>>,
+    nx: i32,
+    ny: i32,
+    nz: i32,
+    buckets: Vec<Vec<(Id, [f32; 3], P)>>,
 }
 
-impl<Id: Copy + Eq + Hash, P: Copy> SpatialGrid<Id, P> {
-    pub fn new(cell_size: f32) -> Self {
+impl<Id: Copy, P: Copy> SpatialGrid<Id, P> {
+    /// Build a grid sized to wrap a world of `±world_half[i]` along each axis.
+    /// `world_half[2] == 0.0` collapses z to a single bucket (2D mode).
+    pub fn new(cell_size: f32, world_half: [f32; 3]) -> Self {
+        let nx = ((2.0 * world_half[0] / cell_size).ceil() as i32).max(1);
+        let ny = ((2.0 * world_half[1] / cell_size).ceil() as i32).max(1);
+        let nz = if world_half[2] > 0.0 {
+            ((2.0 * world_half[2] / cell_size).ceil() as i32).max(1)
+        } else {
+            1
+        };
+        let total = (nx * ny * nz) as usize;
         Self {
             cell_size,
-            buckets: FxHashMap::default(),
+            nx,
+            ny,
+            nz,
+            buckets: (0..total).map(|_| Vec::new()).collect(),
         }
     }
 
-    fn key_of(&self, pos: [f32; 3]) -> (i32, i32, i32) {
-        (
-            (pos[0] / self.cell_size).floor() as i32,
-            (pos[1] / self.cell_size).floor() as i32,
-            (pos[2] / self.cell_size).floor() as i32,
-        )
+    /// Toroidal-wrap a position component into `[0, n)`. Floor-divide makes
+    /// negative coords land in the correct (positive) bucket.
+    #[inline]
+    fn axis_bucket(pos_axis: f32, cell_size: f32, n: i32) -> i32 {
+        let raw = (pos_axis / cell_size).floor() as i32 + n / 2;
+        ((raw % n) + n) % n
+    }
+
+    #[inline]
+    fn bucket_idx(&self, bx: i32, by: i32, bz: i32) -> usize {
+        debug_assert!(bx >= 0 && bx < self.nx);
+        debug_assert!(by >= 0 && by < self.ny);
+        debug_assert!(bz >= 0 && bz < self.nz);
+        (bx + by * self.nx + bz * self.nx * self.ny) as usize
     }
 
     /// Drops stale entries z předchozího rebuildu, ale zachová bucket Vec
     /// kapacity — populace je per-tick relativně stabilní, takže reuse alokace
-    /// vyhrává nad clear() celé HashMap.
+    /// vyhrává nad realokací.
     pub fn rebuild<I: IntoIterator<Item = (Id, [f32; 3], P)>>(&mut self, items: I) {
-        for bucket in self.buckets.values_mut() {
+        for bucket in self.buckets.iter_mut() {
             bucket.clear();
         }
         for (id, pos, payload) in items {
-            let key = self.key_of(pos);
-            self.buckets.entry(key).or_default().push((id, pos, payload));
+            let bx = Self::axis_bucket(pos[0], self.cell_size, self.nx);
+            let by = Self::axis_bucket(pos[1], self.cell_size, self.ny);
+            let bz = if self.nz == 1 {
+                0
+            } else {
+                let raw = (pos[2] / self.cell_size).floor() as i32 + self.nz / 2;
+                raw.clamp(0, self.nz - 1)
+            };
+            let idx = self.bucket_idx(bx, by, bz);
+            self.buckets[idx].push((id, pos, payload));
         }
     }
 
     /// Volá `f(id, pos, payload)` pro každý item v 3³ buckets okolo `pos`.
     /// Caller musí narrow-phase distance test dělat sám (grid vrací overestimate).
+    /// Bucket walk auto-wraps v xy (toroidal); v z clampuje, takže items mimo
+    /// vertical range se nikdy nevidí.
     pub fn for_each_in_radius<F: FnMut(Id, [f32; 3], P)>(
         &self,
         pos: [f32; 3],
@@ -101,67 +136,43 @@ impl<Id: Copy + Eq + Hash, P: Copy> SpatialGrid<Id, P> {
         mut f: F,
     ) {
         let r_cells = (radius / self.cell_size).ceil() as i32;
-        let (cx, cy, cz) = self.key_of(pos);
-        for dx in -r_cells..=r_cells {
+        let cx_raw = (pos[0] / self.cell_size).floor() as i32 + self.nx / 2;
+        let cy_raw = (pos[1] / self.cell_size).floor() as i32 + self.ny / 2;
+        let cz_raw = if self.nz == 1 {
+            0
+        } else {
+            (pos[2] / self.cell_size).floor() as i32 + self.nz / 2
+        };
+        for dz in -r_cells..=r_cells {
+            let bz_raw = cz_raw + dz;
+            if bz_raw < 0 || bz_raw >= self.nz {
+                continue;
+            }
             for dy in -r_cells..=r_cells {
-                for dz in -r_cells..=r_cells {
-                    if let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy, cz + dz)) {
-                        for &(id, p, payload) in bucket {
-                            f(id, p, payload);
-                        }
+                let by = (((cy_raw + dy) % self.ny) + self.ny) % self.ny;
+                for dx in -r_cells..=r_cells {
+                    let bx = (((cx_raw + dx) % self.nx) + self.nx) % self.nx;
+                    let idx = self.bucket_idx(bx, by, bz_raw);
+                    for &(id, p, payload) in &self.buckets[idx] {
+                        f(id, p, payload);
                     }
                 }
             }
         }
     }
 
-    /// Sprint 54: toroidal-aware query přes ghost positions. Pokud je `pos`
-    /// blízko xy-boundary (do `radius`), vyšleme dodatečné lookup queries do
-    /// "ghost" pozic na opačné straně světa. Z není wrapped (cylinder topology).
-    /// Stejný `f` callback se může volat na duplicate items pokud je radius
-    /// > world_half — caller musí narrow-phase použít `min_image_delta` aby
-    /// duplicates filtroval.
+    /// Toroidal query — kept as a thin wrapper for backward compatibility.
+    /// `for_each_in_radius` already wraps xy internally now (the grid is
+    /// bounded), so the explicit ghost-position walk that the FxHashMap
+    /// version needed is redundant.
     pub fn for_each_in_radius_toroidal<F: FnMut(Id, [f32; 3], P)>(
         &self,
         pos: [f32; 3],
         radius: f32,
-        world_half: [f32; 3],
-        mut f: F,
+        _world_half: [f32; 3],
+        f: F,
     ) {
-        // Center query.
-        self.for_each_in_radius(pos, radius, &mut f);
-        let wx = 2.0 * world_half[0];
-        let wy = 2.0 * world_half[1];
-        let near_left = pos[0] < -world_half[0] + radius;
-        let near_right = pos[0] > world_half[0] - radius;
-        let near_bot = pos[1] < -world_half[1] + radius;
-        let near_top = pos[1] > world_half[1] - radius;
-        // Edges (4 ghost positions).
-        if near_left {
-            self.for_each_in_radius([pos[0] + wx, pos[1], pos[2]], radius, &mut f);
-        }
-        if near_right {
-            self.for_each_in_radius([pos[0] - wx, pos[1], pos[2]], radius, &mut f);
-        }
-        if near_bot {
-            self.for_each_in_radius([pos[0], pos[1] + wy, pos[2]], radius, &mut f);
-        }
-        if near_top {
-            self.for_each_in_radius([pos[0], pos[1] - wy, pos[2]], radius, &mut f);
-        }
-        // Corners (4 ghost positions).
-        if near_left && near_bot {
-            self.for_each_in_radius([pos[0] + wx, pos[1] + wy, pos[2]], radius, &mut f);
-        }
-        if near_left && near_top {
-            self.for_each_in_radius([pos[0] + wx, pos[1] - wy, pos[2]], radius, &mut f);
-        }
-        if near_right && near_bot {
-            self.for_each_in_radius([pos[0] - wx, pos[1] + wy, pos[2]], radius, &mut f);
-        }
-        if near_right && near_top {
-            self.for_each_in_radius([pos[0] - wx, pos[1] - wy, pos[2]], radius, &mut f);
-        }
+        self.for_each_in_radius(pos, radius, f);
     }
 }
 

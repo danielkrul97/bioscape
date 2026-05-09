@@ -6,9 +6,8 @@ use wgpu::util::DeviceExt;
 use crate::*;
 use super::*;
 
-// ============================================================================
-// Sprint 50: GPU predate — herd_count + attack passes, atomic float CAS
-// ============================================================================
+// GPU predate — runs the herd_count and attack compute passes; atomic
+// float CAS handles the multi-attacker → victim energy/damage accumulation.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -25,7 +24,6 @@ pub struct PredateParamsGpu {
     pub spike_bonus: f32,
     pub dilution_k: f32,
     pub _pad0: u32,
-    /// Sprint 55: toroidal world bounds.
     pub world_half_x: f32,
     pub world_half_y: f32,
     pub _pad1: u32,
@@ -50,15 +48,15 @@ pub struct PredateGpu {
     pos_buf: wgpu::Buffer,
     eff_radii_buf: wgpu::Buffer,
     headings_buf: wgpu::Buffer,
-    /// Sprint 126: per-cell n × SPIKE_SLOTS × vec4<f32> (length, azim, elev, complexity).
+    /// Per-cell `SPIKE_SLOTS × vec4<f32>` (length, azim, elev, complexity).
     spikes_packed_buf: wgpu::Buffer,
     attack_buf: wgpu::Buffer,
     herd_buf: wgpu::Buffer,
     energy_delta_buf: wgpu::Buffer,
     damage_delta_buf: wgpu::Buffer,
-    /// Sprint 126: per-cell aktivní spike count (`u32`).
+    /// Per-cell active spike count (`u32`).
     spike_counts_buf: wgpu::Buffer,
-    /// Sprint 126: per-cell pitch (rad) — multi-spike potřebuje 3D forward
+    /// Per-cell pitch (rad) — multi-spike needs the full 3D forward
     /// direction (yaw + azim, pitch + elev).
     pitches_buf: wgpu::Buffer,
     herd_rb: wgpu::Buffer,
@@ -87,11 +85,11 @@ impl PredateGpu {
             label: Some("predate"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/predate.wgsl").into()),
         });
-        // Sprint 126: 13 bindings total (1 uniform + 12 storage). Storage 1..=7
-        // a 11..=12 jsou read-only (positions, eff_radii, headings, spikes_packed,
+        // 13 bindings: 1 uniform + 12 storage. Bindings 1..=7 and 11..=12
+        // are read-only (positions, eff_radii, headings, spikes_packed,
         // attack_signals, hash_offsets, hash_sorted, spike_counts, pitches);
-        // 8..=10 jsou read_write (herd_counts, energy_delta atomic, damage_delta
-        // atomic).
+        // 8..=10 are read_write (herd_counts, energy_delta atomic,
+        // damage_delta atomic).
         let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13)
             .map(|i| {
                 let ty = if i == 0 {
@@ -160,7 +158,7 @@ impl PredateGpu {
         let pos_buf = mk("predate-pos", n * 3 * f, stor_dst);
         let eff_radii_buf = mk("predate-eff", n * f, stor_dst);
         let headings_buf = mk("predate-heading", n * f, stor_dst);
-        // Sprint 126: SPIKE_SLOTS × vec4<f32> = 5 × 4 × 4 B = 80 B per cell.
+        // SPIKE_SLOTS × vec4<f32> = 5 × 16 B = 80 B per cell.
         let spike_slots = SPIKE_SLOTS as u64;
         let spikes_packed_buf = mk("predate-spikes-packed", n * spike_slots * 4 * f, stor_dst);
         let attack_buf = mk("predate-attack", n * f, stor_dst);
@@ -198,10 +196,10 @@ impl PredateGpu {
         })
     }
 
-    /// Sprint 126: full multi-spike. `spikes_packed[i*SPIKE_SLOTS + slot]` =
-    /// `[length, azimuth_offset, elevation_offset, complexity]`. `spike_counts[i]`
-    /// určuje aktivní sloty (rest zero-init). `pitches[i]` per cell pro 3D
-    /// forward direction.
+    /// Multi-spike attack pass. `spikes_packed[i*SPIKE_SLOTS + slot]` is
+    /// `[length, azimuth_offset, elevation_offset, complexity]`;
+    /// `spike_counts[i]` marks how many slots are active (the rest stay
+    /// zero-initialized); `pitches[i]` provides the 3D forward direction.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,

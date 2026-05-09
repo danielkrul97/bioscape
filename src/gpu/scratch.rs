@@ -1,7 +1,8 @@
-//! Sdílená persistent-scratch struktura pro `--gpu-full` pipeline (headless +
-//! renderer). Pre-fix path měla 17 fresh `Vec::collect()` per tick + 9 fresh
-//! `Vec` po readbacku. Persistent reuse zachovává kapacitu napříč ticky → 0
-//! alloc/free v hot loop (bar capacity grow při pop spike).
+//! Persistent scratch buffers for the `--gpu-full` pipeline (headless +
+//! renderer). The naive path allocated ~17 upload `Vec`s per tick plus ~9
+//! more on readback; this struct reuses them across ticks so the hot loop
+//! does zero allocations except when a population spike forces a capacity
+//! grow.
 
 use crate::{BRAIN_HIDDEN, BRAIN_OUTPUTS};
 
@@ -62,5 +63,44 @@ impl GpuFullScratch {
         cr!(self.body_dims, n);
         cr!(self.aux, n);
         cr!(self.hidden_ns, n);
+    }
+
+    /// Resize all per-cell snapshot fields to exactly `n` elements (filling
+    /// new slots with zero/default). Used when the caller writes by slot
+    /// index instead of pushing — see `cells_brain_act_gpu_full`'s parallel
+    /// snapshot path.
+    pub fn resize_snapshot(&mut self, n: usize) {
+        self.positions.clear();
+        self.positions.resize(n, [0.0; 3]);
+        self.eff_radii.clear();
+        self.eff_radii.resize(n, 0.0);
+        self.vision_radii.clear();
+        self.vision_radii.resize(n, 0.0);
+        self.energies.clear();
+        self.energies.resize(n, 0.0);
+        self.headings.clear();
+        self.headings.resize(n, 0.0);
+        self.pitches.clear();
+        self.pitches.resize(n, 0.0);
+        self.damage_accums.clear();
+        self.damage_accums.resize(n, 0.0);
+        self.max_speeds.clear();
+        self.max_speeds.resize(n, 0.0);
+        self.velocities.clear();
+        self.velocities.resize(n, [0.0; 3]);
+        self.angular_vels.clear();
+        self.angular_vels.resize(n, 0.0);
+        self.pitch_vels.clear();
+        self.pitch_vels.resize(n, 0.0);
+        self.ages.clear();
+        self.ages.resize(n, 0);
+        self.cooldowns.clear();
+        self.cooldowns.resize(n, 0);
+        self.body_dims.clear();
+        self.body_dims.resize(n, [0.0; 3]);
+        self.aux.clear();
+        self.aux.resize(n, [0.0; 4]);
+        self.hidden_ns.clear();
+        self.hidden_ns.resize(n, 0);
     }
 }

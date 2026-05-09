@@ -1,20 +1,18 @@
-// Sprint 50: GPU mirror headless::predate. 2 passes:
-//   herd_count — per cell, count neighbors v HERD_RADIUS (write-only per i).
-//   attack     — per attacker s `attack > threshold`, find smaller cells v
-//                pair_r, compute gain (size + multi-spike + dilution), atomic-add
-//                drain do victim energy_delta + damage_delta. Self-gain
-//                accumulated lokálně, atomic-add na konci.
+// GPU mirror of `headless::predate` — two compute kernels:
+//   herd_count — per cell, count neighbors within HERD_RADIUS (write-only).
+//   attack     — per attacker (with attack > threshold), find smaller cells
+//                inside pair_r, compute gain (size + multi-spike cone +
+//                herd-density dilution), atomic-add drain to victim's
+//                energy_delta and damage_delta. Self-gain accumulates
+//                locally, single atomic-add at the end.
 //
-// Sprint 126: full multi-spike. `spikes_packed` per cell = 5×vec4 (length, azim,
-// elev, complexity), `spike_counts` u32 určuje aktivní sloty. Per attacker
-// iterace přes 0..min(spike_count, 5), per slot 3D forward (yaw + azim,
-// pitch + elev), 3D cone test, per-spike `length × (1 + COMPLEXITY_ATTACK_GAIN
-// × complexity) × spike_bonus` akumulace. Single atomic CAS per (i,j) pair —
-// žádná regrese contention.
+// `spikes_packed` per cell = 5 × vec4 (length, azim, elev, complexity);
+// `spike_counts[i]` u32 marks how many slots are active.
 //
-// Atomic float add: WGSL CAS loop přes `atomicCompareExchangeWeak` +
-// `bitcast<u32>` ↔ `bitcast<f32>`. Storage pointer ne-passable do funkce
-// (Naga validation), takže CAS je inlined per call site (3× v `attack`).
+// Atomic float-add is implemented via a CAS loop over `atomicCompareExchangeWeak`
+// with `bitcast` between u32 / f32 storage. Naga rejects passing storage
+// pointers into functions, so the CAS is inlined at each call site rather
+// than factored into a helper.
 
 const GRID_NX: i32 = 64;
 const GRID_NY: i32 = 32;
@@ -24,8 +22,7 @@ const HALF_NY: i32 = 16;
 const HALF_NZ: i32 = 2;
 
 const SPIKE_SLOTS: u32 = 5u;
-// Sprint 126: matches `lib.rs::COMPLEXITY_ATTACK_GAIN`. Inlined jako WGSL const
-// — pokud lib.rs hodnotu změní, tady taky.
+// Must match `lib.rs::COMPLEXITY_ATTACK_GAIN` — keep in sync manually.
 const COMPLEXITY_ATTACK_GAIN: f32 = 0.5;
 
 struct PredateParams {
@@ -41,7 +38,6 @@ struct PredateParams {
     spike_bonus: f32,
     dilution_k: f32,
     _pad0: u32,
-    /// Sprint 55: toroidal bounds.
     world_half_x: f32,
     world_half_y: f32,
     _pad1: u32,
@@ -55,7 +51,7 @@ fn min_image_xy(d: f32, half: f32) -> f32 {
     return d;
 }
 
-fn bucket_id_wrapped(pos: vec3<f32>) -> u32 {
+fn bucket_coords_of(pos: vec3<f32>) -> vec3<i32> {
     let wx = 2.0 * params.world_half_x;
     let wy = 2.0 * params.world_half_y;
     let pos_wx = pos.x - floor((pos.x + params.world_half_x) / wx) * wx;
@@ -63,10 +59,11 @@ fn bucket_id_wrapped(pos: vec3<f32>) -> u32 {
     let bx = i32(floor(pos_wx / params.cell_size)) + HALF_NX;
     let by = i32(floor(pos_wy / params.cell_size)) + HALF_NY;
     let bz = i32(floor(pos.z / params.cell_size)) + HALF_NZ;
-    let bx_c = clamp(bx, 0, GRID_NX - 1);
-    let by_c = clamp(by, 0, GRID_NY - 1);
-    let bz_c = clamp(bz, 0, GRID_NZ - 1);
-    return u32(bx_c + by_c * GRID_NX + bz_c * GRID_NX * GRID_NY);
+    return vec3<i32>(
+        clamp(bx, 0, GRID_NX - 1),
+        clamp(by, 0, GRID_NY - 1),
+        clamp(bz, 0, GRID_NZ - 1),
+    );
 }
 
 @group(0) @binding(0) var<uniform> params: PredateParams;
@@ -94,20 +91,23 @@ fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
         positions[i * 3u + 1u],
         positions[i * 3u + 2u],
     );
-    let herd_r = sqrt(params.herd_radius_sq);
-    let r_cells = i32(ceil(herd_r / params.cell_size));
     let cs = params.cell_size;
+    let r_cells = i32(ceil(sqrt(params.herd_radius_sq) / cs));
     var count: u32 = 0u;
-    // Sprint 55: ghost positions + bucket_id_wrapped + min-image distance.
-    for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
+    // Resolve the center bucket once and walk neighbors via integer ±wrap on
+    // xy (z clamped) — replaces the per-iteration `bucket_id_wrapped` chain.
+    let center = bucket_coords_of(pos_i);
+    for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
+        let bz = clamp(center.z + dz, 0, GRID_NZ - 1);
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
-            for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-                let nbr_pos = vec3<f32>(
-                    pos_i.x + f32(dx) * cs,
-                    pos_i.y + f32(dy) * cs,
-                    pos_i.z + f32(dz) * cs,
-                );
-                let b = bucket_id_wrapped(nbr_pos);
+            var by = center.y + dy;
+            if (by < 0) { by = by + GRID_NY; }
+            else if (by >= GRID_NY) { by = by - GRID_NY; }
+            for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
+                var bx = center.x + dx;
+                if (bx < 0) { bx = bx + GRID_NX; }
+                else if (bx >= GRID_NX) { bx = bx - GRID_NX; }
+                let b = u32(bx + by * GRID_NX + bz * GRID_NX * GRID_NY);
                 let start = hash_offsets[b];
                 let end = hash_offsets[b + 1u];
                 for (var k = start; k < end; k = k + 1u) {
@@ -135,39 +135,6 @@ fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     herd_counts[i] = count;
 }
 
-// Sprint 126: per-attacker spike bonus akumulátor pro single (i,j) pair.
-// `to_target` je unit vector od attackera k cíli. Iteruje přes aktivní spike
-// sloty, per slot 3D forward přes (yaw + azim, pitch + elev), cone test, sum.
-fn multi_spike_bonus(
-    spike_count: u32,
-    base_offset: u32,
-    yaw: f32,
-    pitch: f32,
-    to_target: vec3<f32>,
-) -> f32 {
-    let n = min(spike_count, SPIKE_SLOTS);
-    var acc: f32 = 0.0;
-    for (var s: u32 = 0u; s < n; s = s + 1u) {
-        let spk = spikes_packed[base_offset + s];
-        let length = spk.x;
-        if (length <= 0.0) {
-            continue;
-        }
-        let yaw_s = yaw + spk.y;
-        let pit_s = pitch + spk.z;
-        let cos_p = cos(pit_s);
-        let dir = vec3<f32>(cos(yaw_s) * cos_p, sin(yaw_s) * cos_p, sin(pit_s));
-        let cos_a = dot(dir, to_target);
-        if (cos_a < params.spike_dot_threshold) {
-            continue;
-        }
-        let cmplx = clamp(spk.w, 0.0, 1.0);
-        let attack_factor = 1.0 + COMPLEXITY_ATTACK_GAIN * cmplx;
-        acc = acc + length * attack_factor * params.spike_bonus;
-    }
-    return acc;
-}
-
 @compute @workgroup_size(64)
 fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -184,29 +151,57 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
         positions[i * 3u + 2u],
     );
     let r_i = eff_radii[i];
+    let crc = params.cell_radius_const;
+    let crc_r_i = crc * r_i;
     let yaw_i = headings[i];
     let pitch_i = pitches[i];
-    let n_spikes = spike_counts[i];
+    let n_spikes = min(spike_counts[i], SPIKE_SLOTS);
     let spikes_base = i * SPIKE_SLOTS;
 
-    // Search radius: pair_r = CELL_RADIUS × (r_i + r_j). Předpoklad r_j ≤ r_i
-    // (size ratio threshold předtím), tedy max pair_r = 2 × CELL_RADIUS × r_i.
-    let max_pair_r = 2.0 * params.cell_radius_const * r_i;
-    let r_cells = i32(ceil(max_pair_r / params.cell_size));
+    // Precompute spike world-space directions and per-spike attack factors.
+    // These depend only on the attacker's pose and spike geometry, not on
+    // the victim — without the hoist, every (i, j) pair recomputes 4 trig
+    // calls per spike inside the bucket walk.
+    var spike_dir: array<vec3<f32>, SPIKE_SLOTS>;
+    var spike_factor: array<f32, SPIKE_SLOTS>;
+    var spike_active: u32 = 0u;
+    for (var s: u32 = 0u; s < n_spikes; s = s + 1u) {
+        let spk = spikes_packed[spikes_base + s];
+        if (spk.x <= 0.0) {
+            continue;
+        }
+        let yaw_s = yaw_i + spk.y;
+        let pit_s = pitch_i + spk.z;
+        let cos_p = cos(pit_s);
+        spike_dir[spike_active] =
+            vec3<f32>(cos(yaw_s) * cos_p, sin(yaw_s) * cos_p, sin(pit_s));
+        let cmplx = clamp(spk.w, 0.0, 1.0);
+        spike_factor[spike_active] =
+            spk.x * (1.0 + COMPLEXITY_ATTACK_GAIN * cmplx) * params.spike_bonus;
+        spike_active = spike_active + 1u;
+    }
+
+    // Size-ratio threshold guarantees r_j ≤ r_i, so 2·CELL_RADIUS·r_i is
+    // the largest pair_r this attacker can encounter.
     let cs = params.cell_size;
+    let r_cells = i32(ceil(2.0 * crc_r_i / cs));
 
     var self_gain: f32 = 0.0;
 
-    // Sprint 55: ghost positions + bucket_id_wrapped + min-image distance.
-    for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
+    // Resolve the center bucket once, walk neighbors via integer ±wrap on xy
+    // (z clamped). Halves bucket-coord overhead vs the ghost-position pattern.
+    let center = bucket_coords_of(pos_i);
+    for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
+        let bz = clamp(center.z + dz, 0, GRID_NZ - 1);
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
-            for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-                let nbr_pos = vec3<f32>(
-                    pos_i.x + f32(dx) * cs,
-                    pos_i.y + f32(dy) * cs,
-                    pos_i.z + f32(dz) * cs,
-                );
-                let b = bucket_id_wrapped(nbr_pos);
+            var by = center.y + dy;
+            if (by < 0) { by = by + GRID_NY; }
+            else if (by >= GRID_NY) { by = by - GRID_NY; }
+            for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
+                var bx = center.x + dx;
+                if (bx < 0) { bx = bx + GRID_NX; }
+                else if (bx >= GRID_NX) { bx = bx - GRID_NX; }
+                let b = u32(bx + by * GRID_NX + bz * GRID_NX * GRID_NY);
                 let start = hash_offsets[b];
                 let end = hash_offsets[b + 1u];
                 for (var k = start; k < end; k = k + 1u) {
@@ -218,7 +213,7 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (r_i < params.size_ratio_threshold * r_j) {
                         continue;
                     }
-                    let pair_r = params.cell_radius_const * (r_i + r_j);
+                    let pair_r = crc_r_i + crc * r_j;
                     let pair_r2 = pair_r * pair_r;
                     let pj = vec3<f32>(
                         positions[j * 3u + 0u],
@@ -233,21 +228,19 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let d2 = dot(d, d);
                     if (d2 < pair_r2) {
                         var gain = params.predation_gain;
-                        if (n_spikes > 0u && d2 > 0.0) {
+                        if (spike_active > 0u && d2 > 0.0) {
                             let inv_d = inverseSqrt(d2);
-                            // d je (pos_i - pj), takže to_target = -d * inv_d.
-                            let to_target = vec3<f32>(
-                                -d.x * inv_d,
-                                -d.y * inv_d,
-                                -d.z * inv_d,
-                            );
-                            let spike_bonus = multi_spike_bonus(
-                                n_spikes,
-                                spikes_base,
-                                yaw_i,
-                                pitch_i,
-                                to_target,
-                            );
+                            // d = pos_i - pj, so the unit vector toward the
+                            // victim is -d * inv_d.
+                            let to_target =
+                                vec3<f32>(-d.x * inv_d, -d.y * inv_d, -d.z * inv_d);
+                            var spike_bonus: f32 = 0.0;
+                            for (var s: u32 = 0u; s < spike_active; s = s + 1u) {
+                                let cos_a = dot(spike_dir[s], to_target);
+                                if (cos_a >= params.spike_dot_threshold) {
+                                    spike_bonus = spike_bonus + spike_factor[s];
+                                }
+                            }
                             gain = gain + params.predation_gain * spike_bonus;
                         }
                         let n_neigh = f32(herd_counts[j]);
@@ -255,7 +248,9 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                         gain = gain * dilution;
                         self_gain = self_gain + gain;
 
-                        // Atomic add -drain to energy_delta[j].
+                        // Float atomic add via CAS: old → bitcast<f32>, modify,
+                        // bitcast back to u32, swap. Naga rejects passing the
+                        // storage pointer to a helper, so each site is inlined.
                         var old_e: u32 = atomicLoad(&energy_delta[j]);
                         loop {
                             let new_e: u32 =
@@ -266,7 +261,6 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                             }
                             old_e = r.old_value;
                         }
-                        // Atomic add +drain to damage_delta[j].
                         var old_d: u32 = atomicLoad(&damage_delta[j]);
                         loop {
                             let new_d: u32 =
@@ -283,7 +277,8 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Self-gain atomic add (cell i mohl být zároveň target jiného attacker).
+    // Self-gain still goes through an atomic — cell `i` can simultaneously
+    // be a victim of another attacker writing to energy_delta[i].
     if (self_gain != 0.0) {
         var old_s: u32 = atomicLoad(&energy_delta[i]);
         loop {

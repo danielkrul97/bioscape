@@ -1,12 +1,14 @@
-//! Sprint 44: GPU compute scaffolding pro batch brain forward pass.
+//! GPU compute scaffolding for batch brain forward + the wider per-tick
+//! pipeline (sensor gather, motor, brownian, predate, step, hebbian, …).
 //!
-//! Ohraničeno feature gate `gpu` — bez `--features gpu` modul vůbec
-//! nezkompiluje wgpu, takže build na strojích bez GPU stacku zůstává štíhlý.
+//! Gated behind the `gpu` feature flag so machines without the wgpu stack
+//! get a slim build.
 //!
-//! Architektonicky drží `BrainGpu` perzistentní wgpu device + storage buffery
-//! sized na `capacity` cells. Per `forward_batch`: upload inputs + per-cell
-//! weights, dispatch compute, readback hidden + outputs. State on GPU mezi
-//! ticky **NE** drží — to je Sprint 47.
+//! Each subsystem here owns a wgpu pipeline, persistent storage buffers
+//! sized to `capacity` cells, and a per-call `compute` / `dispatch_*`
+//! entrypoint. The full-GPU path (`CellsGpu`) keeps state resident on the
+//! device across ticks; the legacy upload/readback path (`forward_batch`,
+//! etc.) is kept for tests and partial-GPU configurations.
 
 mod brain;
 mod brownian;

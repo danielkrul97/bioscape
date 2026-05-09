@@ -1,18 +1,14 @@
-// Sprint 45: GPU counting sort pro spatial hash. 3 passes:
-//   count       — atomicAdd na counts[bucket] per cell
-//   prefix_sum  — exclusive prefix sum counts → offsets, current resetuje
-//                 counts na 0 aby scatter mohl použít stejný buffer jako
-//                 per-bucket write counter
-//   scatter     — atomicAdd(&counts[bucket]) → write_pos relativní k
-//                 offsets[bucket]; sorted_cells[write_pos] = cell_idx
+// GPU counting sort over a fixed bucket grid:
+//   count       — per cell, atomicAdd(counts[bucket]).
+//   prefix_sum  — exclusive scan of counts → offsets, and reset counts to 0
+//                 so scatter can reuse the buffer as a per-bucket write
+//                 cursor. Two-phase workgroup-parallel scan; see kernel.
+//   scatter     — atomicAdd(counts[bucket]) yields write_pos relative to
+//                 offsets[bucket]; sorted_cells[write_pos] = cell_idx.
 //
-// Bucket grid je fixed 64×32×4 = 8192 buckets, krytí ±2048 / ±512 / ±128
-// world units při GRID_CELL_SIZE = 64. Cells mimo bounds jsou clampované do
-// boundary bucketů (Cell::step world_half clamp guarantuje ±960 / ±540 / ±2,
-// takže boundary clampu nikdy nevyužijeme — jen safety net).
-//
-// Lookup (Sprint 46+ shadery): pro pos compute bucket(pos), iteruj 3³
-// neighborů, pro každý čti offsets[b]..offsets[b+1] range v sorted_cells.
+// Bucket grid: 64×32×4 = 8192 buckets covering ±2048 / ±512 / ±128 world
+// units at GRID_CELL_SIZE = 64. World half is ±960 / ±540 / ±2, so the
+// boundary clamps in `bucket_id_of` are a safety net rather than a hot path.
 
 const GRID_NX: i32 = 64;
 const GRID_NY: i32 = 32;
@@ -20,12 +16,16 @@ const GRID_NZ: i32 = 4;
 const HALF_NX: i32 = 32;
 const HALF_NY: i32 = 16;
 const HALF_NZ: i32 = 2;
-const NUM_BUCKETS: u32 = 8192u; // = GRID_NX * GRID_NY * GRID_NZ
+const NUM_BUCKETS: u32 = 8192u; // GRID_NX * GRID_NY * GRID_NZ
+
+// Workgroup-parallel scan tuning: SCAN_WG threads, ELEMS_PER_THREAD per thread.
+// Product must equal NUM_BUCKETS so the dispatch covers the whole grid.
+const SCAN_WG: u32 = 256u;
+const ELEMS_PER_THREAD: u32 = 32u; // SCAN_WG * ELEMS_PER_THREAD = NUM_BUCKETS
 
 struct Params {
     num_cells: u32,
     cell_size: f32,
-    // Sprint 55: world_half xy pro toroidal wrap. z bounded (cylinder topology).
     world_half_x: f32,
     world_half_y: f32,
 }
@@ -36,9 +36,9 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> offsets: array<u32>;
 @group(0) @binding(4) var<storage, read_write> sorted_cells: array<u32>;
 
+// XY uses toroidal wrap (cylinder topology); Z is bounded by the floor/ceiling
+// clamp below.
 fn bucket_id_of(pos: vec3<f32>) -> u32 {
-    // Sprint 55: wrap xy do [-half, half) než spočítáme bucket — toroidal
-    // cylinder topology. z stále bounded (clamp).
     let wx = 2.0 * params.world_half_x;
     let wy = 2.0 * params.world_half_y;
     let pos_wx = pos.x - floor((pos.x + params.world_half_x) / wx) * wx;
@@ -67,22 +67,49 @@ fn count(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&counts[b], 1u);
 }
 
-// Single-thread serial exclusive scan. NUM_BUCKETS = 8192 → ~8 µs na
-// dnešním dGPU (memory-bound). Pro Sprint 45 stačí; Sprint 47+ může
-// nahradit hierarchical Blelloch scan, pokud benchmark ukáže potřebu.
-@compute @workgroup_size(1)
-fn prefix_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x != 0u) {
-        return;
-    }
+// Two-phase workgroup-parallel exclusive scan over NUM_BUCKETS = 8192.
+// Phase 1: each thread serially scans its ELEMS_PER_THREAD slice, resetting
+//   counts to 0 along the way, and writes its slice total to `partial[tid]`.
+// Phase 2: thread 0 serially scans `partial[0..SCAN_WG]` (cheap at 256
+//   elements; replaces the dominant 8192-element serial loop the older
+//   single-thread kernel did, leaving the heavy lifting in Phases 1/3).
+// Phase 3: each thread reads its block_offset = partial[tid] and writes
+//   block_offset + local[k] to offsets[base + k] for k in 0..ELEMS_PER_THREAD.
+// Host already dispatches (1, 1, 1) — workgroup_size(SCAN_WG) makes the
+// single workgroup multi-threaded; no host change required.
+var<workgroup> partial: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn prefix_sum(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let base = tid * ELEMS_PER_THREAD;
+
+    var local: array<u32, 32>;
     var sum: u32 = 0u;
-    for (var b: u32 = 0u; b < NUM_BUCKETS; b = b + 1u) {
-        offsets[b] = sum;
-        let c = atomicLoad(&counts[b]);
+    for (var k: u32 = 0u; k < ELEMS_PER_THREAD; k = k + 1u) {
+        let c = atomicLoad(&counts[base + k]);
+        local[k] = sum;
         sum = sum + c;
-        atomicStore(&counts[b], 0u);
+        atomicStore(&counts[base + k], 0u);
     }
-    offsets[NUM_BUCKETS] = sum;
+    partial[tid] = sum;
+    workgroupBarrier();
+
+    if (tid == 0u) {
+        var s: u32 = 0u;
+        for (var k: u32 = 0u; k < SCAN_WG; k = k + 1u) {
+            let p = partial[k];
+            partial[k] = s;
+            s = s + p;
+        }
+        offsets[NUM_BUCKETS] = s;
+    }
+    workgroupBarrier();
+
+    let block_offset = partial[tid];
+    for (var k: u32 = 0u; k < ELEMS_PER_THREAD; k = k + 1u) {
+        offsets[base + k] = block_offset + local[k];
+    }
 }
 
 @compute @workgroup_size(64)
@@ -97,9 +124,9 @@ fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
         positions[i * 3u + 2u],
     );
     let b = bucket_id_of(pos);
-    // counts byl resetnut na 0 v prefix_sum; teď ho používáme jako per-bucket
-    // running write index. Ne-atomic offset[b] read je safe — prefix_sum už
-    // doběhl (separate dispatch barrier).
+    // counts was reset to 0 by prefix_sum; here it acts as a per-bucket
+    // running write cursor. The non-atomic offsets[b] read is safe because
+    // the separate dispatch supplies a memory barrier between the two passes.
     let local = atomicAdd(&counts[b], 1u);
     let write_pos = offsets[b] + local;
     sorted_cells[write_pos] = i;

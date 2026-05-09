@@ -5,9 +5,8 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 47: GPU stats reduction (single-workgroup tree reduce)
-// ============================================================================
+// GPU stats reduction (single-workgroup tree reduce). Currently exercised
+// only by tests — no production caller, see `cell_stats.wgsl` analysis.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -267,8 +266,9 @@ impl StatsGpu {
         self.capacity = new_cap;
     }
 
-    /// Compute reduction over per-cell SoA. Single workgroup tree reduce → 5
-    /// floats v `output[0..5]`. Caller obvykle dělí sumy `n` aby získal mean.
+    /// Reduce over the per-cell SoA — single workgroup tree reduce, output
+    /// is 5 sums in `output[0..5]`. The caller typically divides by `n` to
+    /// turn them into means.
     pub fn compute(
         &mut self,
         positions: &[[f32; 3]],

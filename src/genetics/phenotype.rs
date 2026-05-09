@@ -14,10 +14,10 @@ pub struct PhysicsConfig {
     pub angular_energy_cost: f32,
     pub vision_cost_per_radius: f32,
     pub body_cost_factor: f32,
-    /// Sprint 87: drain rate koeficient pro thermal_optimum penalty.
-    /// `dev² × penalty × dt` kde dev = (temp − optimum) / 13.0 (normalized
-    /// half-range). Default 1.0; tests mohou override 0.0 pro disable
-    /// (např. `step_gpu_matches_cpu` parita — GPU shader nepočítá penalty).
+    /// Drain rate for the thermal-optimum penalty: `dev² × penalty × dt`
+    /// where `dev = (temp − optimum) / 13.0` (normalized half-range).
+    /// Tests override this to 0 when comparing against the GPU step shader,
+    /// which does not compute the penalty.
     pub thermal_optimum_penalty: f32,
 }
 
@@ -31,27 +31,26 @@ pub const PHYSICS_CONFIG: PhysicsConfig = PhysicsConfig {
     thermal_optimum_penalty: THERMAL_OPTIMUM_PENALTY,
 };
 
-/// Runtime tělesný tvar buňky. Inicializuje se z `Genome` při spawnu /
-/// reprodukci (template) a může se měnit za běhu života přes `apply_morph`
-/// (řízeno brain output[3..6]). **Genotyp/fenotyp split**: runtime morph
-/// modifikuje `Phenotype`, ne `Genome`. Dítě dostane svůj fresh phenotype
-/// z rodičovského genomu — žádný Lamarckismus.
+/// Runtime body shape of a cell. Seeded from `Genome` at spawn / reproduction
+/// and mutated during life by `apply_morph` (driven by brain output[3..6]).
+/// Genotype/phenotype split: runtime morph touches `Phenotype` only, never
+/// `Genome` — children receive a fresh phenotype from the parent's genome,
+/// no Lamarckism.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Phenotype {
     pub body_length: f32,
     pub body_width: f32,
-    /// Sprint 34: vertikální rozměr ellipsoidu.
     pub body_height: f32,
-    /// Sprint 121: per-spike runtime stav. `length` je morphable přes brain
-    /// output[5] (Sprint 122 aggregate signal); `azimuth_offset`,
-    /// `elevation_offset`, `complexity` jsou snapshot z genomu (pure-genetic,
-    /// žádný runtime morph). `spike_count` je snapshot — discrete add/remove
-    /// se děje jen na reprodukci (mutace).
+    /// Per-spike runtime state. `length` is morphable via the aggregate
+    /// brain output (see `apply_spike_morph`); `azimuth_offset`,
+    /// `elevation_offset`, and `complexity` are pure-genetic snapshots.
+    /// `spike_count` is also a snapshot — slots only activate / deactivate
+    /// at reproduction via mutation.
     #[serde(default = "default_spikes")]
     pub spikes: [Spike; SPIKE_SLOTS],
     #[serde(default = "default_spike_count")]
     pub spike_count: u8,
-    /// Sprint 41: snapshot z genomu, runtime morph zatím neexistuje.
+    /// Genome snapshot — no runtime morph for shell yet.
     pub shell_thickness: f32,
 }
 
@@ -67,8 +66,7 @@ impl Phenotype {
         }
     }
 
-    /// Sprint 121: primary spike length (slot 0). Pre-S121 callers které
-    /// četly `phenotype.spike_length` čtou tohle.
+    /// Length of slot 0, or 0 if no spikes are active.
     pub fn primary_spike_length(&self) -> f32 {
         if self.spike_count > 0 {
             self.spikes[0].length
@@ -77,8 +75,6 @@ impl Phenotype {
         }
     }
 
-    /// Sprint 121: sum length přes všechny aktivní spiky. V S121 (spike_count=1)
-    /// identické s `primary_spike_length`. Sprint 122+ začne divergovat.
     pub fn total_spike_length(&self) -> f32 {
         let n = self.spike_count.min(SPIKE_SLOTS as u8) as usize;
         self.spikes[..n].iter().map(|s| s.length).sum()
@@ -89,10 +85,8 @@ impl Phenotype {
         &self.spikes[..n]
     }
 
-    /// Sprint 124: aggregate spike maintenance cost factor pro GPU step shader
-    /// aux[0]. CPU energy drain semantika:
-    /// `total_spike_cost_factor × SPIKE_COST_PER_SEC × dt_eff`. S spike_count=1
-    /// a complexity=0 redukuje na pre-S121 `spike_length`.
+    /// Aggregate maintenance-cost factor passed to the GPU step shader as
+    /// `aux[0]`. Energy drain is `factor × SPIKE_COST_PER_SEC × dt_eff`.
     pub fn total_spike_cost_factor(&self) -> f32 {
         let mut acc = 0.0;
         for spike in self.active_spikes() {
@@ -101,10 +95,9 @@ impl Phenotype {
         acc
     }
 
-    /// Sprint 124: primary spike attack factor pro GPU predate shader
-    /// `spike_lengths[i]` semantiku. `length × attack_complexity_factor`
-    /// pro slot 0 (single-direction predicate). Multi-spike non-primary
-    /// sloty na GPU nedostávají bonus — CPU path je multi-spike-faithful.
+    /// Slot-0 attack factor (`length × attack_complexity_factor`) consumed
+    /// by the GPU predate shader. The GPU only bonuses the primary spike;
+    /// the CPU path applies the per-spike bonus across all active slots.
     pub fn primary_spike_attack_factor(&self) -> f32 {
         if self.spike_count == 0 {
             return 0.0;
@@ -113,32 +106,29 @@ impl Phenotype {
         s.length * spike_complexity_attack_factor(s.complexity)
     }
 
-    /// Proxy pro circular-collision codepaths (eat radius, broad phase).
-    /// Sprint 34: aritmetický průměr 3 os; když length=width=height=s, dostane s
-    /// — backward compat s pre-Sprint-34 izotropním tělem.
+    /// Arithmetic mean of the three axes — proxy used by circular-collision
+    /// code paths (eat radius, broad phase). For an isotropic body
+    /// (length = width = height = s) it returns s.
     pub fn effective_radius(&self) -> f32 {
         (self.body_length + self.body_width + self.body_height) / 3.0
     }
 
-    /// Sprint 41: nejvyšší ze tří os — pro broad-phase bucketing eat zóny,
-    /// kde ellipsoid může extending podél long axis a sféra `effective_radius`
-    /// by ho missnula.
+    /// Largest of the three axes. Broad-phase bucketing for the eat zone
+    /// uses this because an elongated ellipsoid can extend past the
+    /// `effective_radius` sphere along its long axis.
     pub fn max_axis(&self) -> f32 {
         self.body_length.max(self.body_width).max(self.body_height)
     }
 
-    /// Sprint 34: 3D volume = length × width × height. Když length=width=height
-    /// =s, dostane s³. Pro pre-Sprint-34 srovnatelnost: tělo s body_height=1
-    /// dává area_pre × 1 = area_pre, tj. backward compat při height=1.
     pub fn volume(&self) -> f32 {
         self.body_length * self.body_width * self.body_height
     }
 
-    /// Aplikuje 4 brain morph signály na dimenze tvaru. Signály pod
-    /// `MORPH_ACTIVATION_THRESHOLD` v absolutní hodnotě jsou deadzonovány
-    /// (no-op) — random brain noise neovlivní phenotype, jen deliberátní
-    /// signály z trénovaného brainu. Vrací sumu |Δ| napříč dimenzemi (po
-    /// clampu) pro výpočet morph cost.
+    /// Applies the four morph signals from the brain to body dimensions.
+    /// Signals below `MORPH_ACTIVATION_THRESHOLD` in absolute value are
+    /// dead-zoned to zero so untrained random-brain noise doesn't drift the
+    /// phenotype — only deliberate output reshapes the body. Returns the
+    /// sum of post-clamp `|Δ|` across all dimensions for the morph cost.
     pub fn apply_morph(&mut self, morph: [f32; 4], rate: f32, dt: f32) -> f32 {
         let gate = |s: f32| -> f32 {
             if s.abs() < MORPH_ACTIVATION_THRESHOLD {
@@ -164,10 +154,8 @@ impl Phenotype {
         self.body_width = new_wid;
         self.body_height = new_hgt;
 
-        // Sprint 121: morph[3] aggregate spike length signal — proporčně přes
-        // všechny aktivní spiky (per-spike rate ∝ length / sum_lengths). S121
-        // s spike_count=1 redukuje na pre-S121 single spike. S122 multi-spike
-        // smysluplně rozvrhuje delta.
+        // morph[3] is an aggregate signal split across active spikes
+        // proportionally to their current length.
         let actual_ds = self.apply_spike_morph(raw_ds);
 
         actual_dl + actual_dw + actual_dh + actual_ds
@@ -186,9 +174,9 @@ impl Phenotype {
             } else {
                 1.0 / n as f32
             };
-            // Sprint 123: high-complexity spike morphuje pomaleji — geometric
-            // structure je commitment, ne behavioral knob. complexity=1 → 50 %
-            // rate, complexity=0 → 100 % (pre-S123 sémantika).
+            // High-complexity spikes morph slower — geometric structure is
+            // a commitment, not a behavioral knob. complexity=1 → 50 % rate,
+            // complexity=0 → 100 %.
             let rate_factor = 1.0 - 0.5 * self.spikes[i].complexity.clamp(0.0, 1.0);
             let delta = raw_ds * weight * rate_factor;
             let new_len = (self.spikes[i].length + delta)

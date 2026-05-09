@@ -1,12 +1,12 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Sprint 53: 3D volumetric scalar field s explicit-Jacobi diffusion + decay.
-/// Resolution per-axis (`[res_x, res_y, res_z]`) — typicky `[64, 64, 16]` aby
-/// matchne aspect rátia tenkého z-sliceu (`world_half_z << world_half_xy`).
-/// Grid layout: `idx = z*W*H + y*W + x`. 7-point stencil pro 3D Laplacian.
-/// Stabilní při `diffusion < 1/6` (vs `< 1/4` v 2D — pre-Sprint-53 SmellField
-/// měl 2D stencil). `SMELL_DIFFUSION = 0.15` zůstává pod oběma limity.
+/// 3D volumetric scalar field with explicit-Jacobi diffusion + decay. Per-axis
+/// resolution `[res_x, res_y, res_z]` — typically `[64, 64, 16]` to match the
+/// thin-slab aspect ratio (`world_half_z << world_half_xy`). Grid layout:
+/// `idx = z*W*H + y*W + x`. The 7-point Laplacian stencil is stable for
+/// `diffusion < 1/6` (the 2D version was `< 1/4`); `SMELL_DIFFUSION = 0.15`
+/// sits below both bounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmellField {
     pub resolution: [usize; 3],
@@ -30,8 +30,8 @@ impl SmellField {
         (2.0 * self.world_half[axis]) / self.resolution[axis] as f32
     }
 
-    /// Sprint 54: xy wrap (toroidal), z bounded. Mimo z-volume vrací `None`;
-    /// xy je vždy modulo zarovnaný do gridu.
+    /// XY wraps toroidally; Z is bounded. Returns `None` when `pos.z` is
+    /// outside the z-volume; XY positions always project into the grid.
     fn idx_of(&self, pos: [f32; 3]) -> Option<usize> {
         let cs_x = self.cell_size(0);
         let cs_y = self.cell_size(1);
@@ -58,23 +58,24 @@ impl SmellField {
         }
     }
 
-    /// 7-point Jacobi stencil + multiplicative decay. Sprint 54: toroidal v
-    /// xy (left at i=0 čte sloupec i=nx-1, atd.), Neumann zero-flux na z
-    /// (z=0 a z=nz-1 fallback na center — odpovídá ground/ceiling, ne wrap).
-    /// Stable pro `diffusion < 1/6`.
+    /// 7-point Jacobi stencil + multiplicative decay; stable for
+    /// `diffusion < 1/6`. XY uses toroidal wrap (left at i=0 reads column
+    /// i=nx-1, etc.); Z is Neumann zero-flux (z=0 and z=nz-1 fall back to
+    /// the center plane — ground/ceiling, not wrap).
     ///
-    /// Sprint 57: paralelizováno přes z-roviny — každá rovina čte své okolí
-    /// (xy stencil + back/front z grid) a zapisuje pouze do své části scratch,
-    /// takže žádný write conflict. Pro 12-core CPU + 16 rovin je load balanced.
+    /// Parallelized over z-planes via rayon: each plane reads its own xy
+    /// stencil plus the back/front planes and writes only its slice of the
+    /// scratch buffer, so there's no write conflict.
     ///
-    /// Sprint 117: SIMD inner loop přes `wide::f32x8`. Per row (k, j) si
-    /// pre-extract row offsets pro center/up/down/back/front (back/front s
-    /// Neumann fallback na current plane), pak SIMD chunks po 8 buňkách na
-    /// interior `i ∈ [1, nx-9]` (8 lanes × 7 chunks = 56 cells s nx=64).
-    /// Boundary cells `i=0` a `i ∈ [nx-7, nx-1]` (8 z 64) scalar fallback —
-    /// jediná místa, kde left/right wrap přes x-boundary. Sequential adds
-    /// `(((l+r)+u)+d)+b)+f` → bit-identical s pre-S117 scalar verzí (žádný
-    /// reduce_add); FP drift jen pokud nx<9.
+    /// Inner loop is SIMD via `wide::f32x8`. Per row (k, j) we pre-extract
+    /// the row offsets for center/up/down/back/front (back/front with
+    /// Neumann fallback to the current plane), then process 8-wide chunks
+    /// over the interior `i ∈ [1, simd_end)`. Boundary cells (i=0 and
+    /// i ∈ [simd_end, nx-1]) fall back to the scalar path — these are the
+    /// only places where left/right wrap across the x-boundary is possible.
+    /// The sequential `((((l+r)+u)+d)+b)+f` add chain is preserved so the
+    /// SIMD result stays bit-identical with the scalar reference (no
+    /// `reduce_add` reordering).
     pub fn step(&mut self, diffusion: f32, decay_per_sec: f32, dt: f32) {
         use wide::f32x8;
         let nx = self.resolution[0];
@@ -86,9 +87,9 @@ impl SmellField {
         let diffusion_v = f32x8::splat(diffusion);
         let decay_v = f32x8::splat(decay);
         let six_v = f32x8::splat(6.0);
-        // SIMD pokrývá `i ∈ [1, simd_end)`, kde simd_end je největší
-        // násobek 8 + 1 takový, že i+7 ≤ nx-2 (right read at i+8 ≤ nx-1).
-        // Pro nx=64: simd_end = 1 + 7*8 = 57 → chunky i = 1, 9, …, 49.
+        // Largest multiple-of-8 + 1 such that i+7 ≤ nx-2 (right read at i+8
+        // must stay ≤ nx-1). For nx=64 → simd_end = 57, covering chunks at
+        // i = 1, 9, …, 49.
         let simd_end = if nx >= 9 {
             1 + ((nx - 9) / 8 + 1) * 8
         } else {
@@ -184,9 +185,10 @@ impl SmellField {
         &self.grid
     }
 
-    /// Sprint 59: replace grid contents from external source (GPU readback).
-    /// Used for FieldGpu wire-up — GPU computes diffuse+deposit, downloads
-    /// snapshot, CPU SmellField holds it pro sensor gather (`gradient_at` + `sample`).
+    /// Overwrite grid contents from an external source. Used for the
+    /// `FieldGpu` wire-up: GPU computes diffuse + deposit, downloads the
+    /// snapshot, and the CPU `SmellField` holds it so `gradient_at` and
+    /// `sample` keep working from the sensor stage.
     pub fn replace_grid_from(&mut self, data: &[f32]) {
         debug_assert_eq!(data.len(), self.grid.len());
         self.grid.copy_from_slice(data);

@@ -5,9 +5,8 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 50: GPU sensor gather — chains 2× SpatialHashGpu + 2× FieldGpu
-// ============================================================================
+// GPU sensor gather. Chains 2× `SpatialHashGpu` (cells, foods) + 2×
+// `FieldGpu` (smell, pheromone) into a single per-cell pass.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -18,7 +17,6 @@ pub struct SensorParamsGpu {
     pub world_half_x: f32,
     pub world_half_y: f32,
     pub world_half_z: f32,
-    /// Sprint 56: per-axis 3D field params.
     pub field_res_x: u32,
     pub field_res_y: u32,
     pub field_res_z: u32,
@@ -34,7 +32,6 @@ pub struct SensorRow {
     pub nearest_food: Option<[f32; 3]>,
     pub nearest_cell: Option<([f32; 3], f32)>,
     pub neighbors_in_vision: u32,
-    /// Sprint 56: 3D gradient (z-axis added).
     pub smell_grad: [f32; 3],
     pub pheromone_grad: [f32; 3],
 }
@@ -151,7 +148,9 @@ impl SensorGatherGpu {
         let eff_radii_buf = mk("sensor-eff", nc * f, stor_dst);
         let vision_radii_buf = mk("sensor-vision", nc * f, stor_dst);
         let food_positions_buf = mk("sensor-food-pos", nf * 3 * f, stor_dst);
-        // Sprint 56: stride 15 (smell_grad.z + pheromone_grad.z).
+        // 15 floats per cell: nearest_food (3) + nearest_cell delta (3) +
+        // size (1) + neighbors_count (1) + smell_grad (3) + phero_grad (3) +
+        // padding to land on a vec4 boundary.
         let output_buf = mk("sensor-output", nc * 15 * f, stor_src);
         let output_rb = mk("sensor-output-rb", nc * 15 * f, read);
 
@@ -179,7 +178,7 @@ impl SensorGatherGpu {
         self.epoch
     }
 
-    /// Sprint 61: accessory pro chained shadery (populate_inputs).
+    /// Output buffer accessor for chained shaders (`populate_inputs`).
     pub fn output_buffer(&self) -> &wgpu::Buffer {
         &self.output_buf
     }
@@ -187,9 +186,10 @@ impl SensorGatherGpu {
         &self.vision_radii_buf
     }
 
-    /// Sprint 61: variant of `compute()` bez Vec<SensorRow> readback. Submit
-    /// only — sensor output zůstává v `output_buf` storage buffer pro chained
-    /// `PopulateInputsGpu` shader. Eliminuje 60 KB readback × 1 round-trip/tick.
+    /// Variant of `compute()` that skips the `Vec<SensorRow>` readback —
+    /// the sensor output stays in `output_buf` for the chained
+    /// `PopulateInputsGpu` shader to consume. Saves a ~60 KB readback /
+    /// device round-trip per tick.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_no_readback(
         &mut self,
@@ -389,11 +389,11 @@ impl SensorGatherGpu {
         for i in 0..n {
             let off = i * 15;
             let has_food = f[off + 3] > 0.5;
-            // Sprint 60: SensorRow nese signed min-image delta (toroidal-aware,
-            // matches `BrainSensors.nearest_food/cell` Sprint 54 sémantiku).
-            // Pre-Sprint-60 byla `positions[i] + delta` rekonstrukce absolutní
-            // pozice — chybné přes wrap (cell na x=-950 + delta=60 = -890,
-            // ne ghost +1010). Caller ukládá delta direct do BrainSensors.
+            // `SensorRow` carries a signed min-image delta (toroidal-aware,
+            // matches `BrainSensors.nearest_food/cell`). Reconstructing an
+            // absolute position via `positions[i] + delta` was wrong across
+            // a wrap — e.g. cell at x=-950 with delta=60 lands at -890
+            // instead of the ghost +1010 — so callers store the delta as-is.
             let nearest_food = if has_food {
                 Some([f[off], f[off + 1], f[off + 2]])
             } else {

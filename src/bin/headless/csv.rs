@@ -440,7 +440,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     // pokud nikdo není, double až po WORLD diagonal — typický nn dist je < 50,
     // takže first try téměř vždy najde souseda.
     let nn_dist_m = if n >= 2 {
-        let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE);
+        let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF);
         grid.rebuild(
             world
                 .cells

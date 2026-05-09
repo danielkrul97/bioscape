@@ -1,9 +1,10 @@
-// Sprint 50: GPU mirror Cell::apply_brain_motor.
-// Sprint 42 mass = effective_radius (smoke-tuned z volume()).
-// Mutuje per-cell velocity (3D), angular_velocity, pitch_velocity.
-// Outputs read-only — výsledky jiného passu (typicky brain forward).
+// Per-cell motor update — mirrors CPU `Cell::apply_brain_motor`. Reads
+// brain output slots 0 (turn), 1 (thrust), 7 (pitch); the remaining slots
+// are written by other consumers. Mass = `effective_radius` (the arithmetic
+// mean of the three body axes), not full volume — smoke-tuned for inertia
+// scaling without quadratic cost shock on untrained brains.
 
-const BRAIN_OUTPUTS: u32 = 12u; // Sprint 126 (+2 ch1/ch2 emit slots, motor čte jen 0/1/7)
+const BRAIN_OUTPUTS: u32 = 12u;
 
 struct Params {
     num_cells: u32,
@@ -35,21 +36,23 @@ fn motor(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let mass = max(effective_radii[i], 0.01);
+    let inv_mass = 1.0 / mass;
     let turn_rate = turn_rates[i];
     let max_speed = max_speeds[i];
+    let dt = params.dt;
     let turn_signal = outputs_in[i * BRAIN_OUTPUTS + 0u];
     let thrust_norm = (outputs_in[i * BRAIN_OUTPUTS + 1u] + 1.0) * 0.5;
     let pitch_signal = outputs_in[i * BRAIN_OUTPUTS + 7u];
 
-    let ang_acc = turn_signal * turn_rate / mass;
-    angular_velocities[i] = angular_velocities[i] + ang_acc * params.dt;
-    let pitch_acc = pitch_signal * turn_rate / mass;
-    pitch_velocities[i] = pitch_velocities[i] + pitch_acc * params.dt;
+    let ang_acc = turn_signal * turn_rate * inv_mass;
+    angular_velocities[i] = angular_velocities[i] + ang_acc * dt;
+    let pitch_acc = pitch_signal * turn_rate * inv_mass;
+    pitch_velocities[i] = pitch_velocities[i] + pitch_acc * dt;
 
-    let a_max = params.drag_coefficient * max_speed * max_speed / mass;
-    let a = thrust_norm * a_max;
+    let a_max = params.drag_coefficient * max_speed * max_speed * inv_mass;
+    let a_dt = thrust_norm * a_max * dt;
     let fwd = forward_vector(headings[i], pitches[i]);
-    velocities[i * 3u + 0u] = velocities[i * 3u + 0u] + a * fwd.x * params.dt;
-    velocities[i * 3u + 1u] = velocities[i * 3u + 1u] + a * fwd.y * params.dt;
-    velocities[i * 3u + 2u] = velocities[i * 3u + 2u] + a * fwd.z * params.dt;
+    velocities[i * 3u + 0u] = velocities[i * 3u + 0u] + a_dt * fwd.x;
+    velocities[i * 3u + 1u] = velocities[i * 3u + 1u] + a_dt * fwd.y;
+    velocities[i * 3u + 2u] = velocities[i * 3u + 2u] + a_dt * fwd.z;
 }

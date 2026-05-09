@@ -2184,7 +2184,7 @@ fn spatial_grid_finds_all_neighbors_in_radius() {
         })
         .collect();
 
-    let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE);
+    let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF);
     grid.rebuild(points.iter().copied());
 
     let query_pos = [0.0_f32, 0.0, 0.0];
@@ -2225,7 +2225,7 @@ fn spatial_grid_finds_all_neighbors_in_radius() {
 
 #[test]
 fn spatial_grid_rebuild_clears_old_buckets() {
-    let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(50.0);
+    let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(50.0, WORLD_HALF);
     grid.rebuild(vec![(0_usize, [0.0, 0.0, 0.0], ()), (1, [10.0, 10.0, 0.0], ())]);
 
     let mut first: Vec<usize> = Vec::new();
@@ -2252,7 +2252,7 @@ fn spatial_grid_query_order_is_stable() {
     let points: Vec<(usize, [f32; 3], ())> = (0..50)
         .map(|i| (i, [i as f32 * 5.0, (i % 7) as f32 * 3.0, 0.0], ()))
         .collect();
-    let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(20.0);
+    let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(20.0, WORLD_HALF);
     grid.rebuild(points.iter().copied());
 
     let mut a: Vec<usize> = Vec::new();
@@ -2859,7 +2859,7 @@ fn pair_fertile_hunters_respects_radius() {
 }
 
 fn build_test_cell_grid(cells: &[Cell]) -> SpatialGrid<usize, ()> {
-    let mut g: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE);
+    let mut g: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF);
     g.rebuild(cells.iter().enumerate().map(|(i, c)| (i, c.position, ())));
     g
 }

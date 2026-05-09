@@ -4,33 +4,31 @@ use std::sync::Arc;
 use crate::*;
 use super::*;
 
-// ============================================================================
-// Sprint 51: CellsGpu persistent SoA state — drží brain weights + last_*
-// + xoshiro RNG na GPU mezi ticky. Eliminuje 30 MB/tick brain upload bottleneck
-// ze Sprintu 44.
-// ============================================================================
+// CellsGpu persistent SoA state. Keeps brain weights, last_inputs/hidden/
+// outputs, velocities, and the per-cell xoshiro128++ RNG resident on the GPU
+// across ticks. The original upload-each-tick path moved 30 MB/tick of brain
+// weights — this struct removes that bottleneck.
 
-/// Persistent SoA cell state na GPU. Drží brain forward state (last_inputs,
-/// last_hidden, last_outputs, brain weights) + velocities (pro brownian
-/// mutation) + per-cell xoshiro128++ RNG state. Per Sprint 51 scope:
-/// **NE-drží** position/heading/etc. (ty zůstávají na CPU pro sensor/motor/
-/// step/collision/predate fáze — Sprint 50 standalone shadery jsou ready
-/// pro plnou migraci, kdyby se rozhodlo).
+/// Persistent per-cell GPU state. Holds the brain forward state
+/// (`last_inputs`, `last_hidden`, `last_outputs`, brain weights) plus
+/// velocities (for brownian) and the per-cell xoshiro128++ RNG. Subsequent
+/// fields were added so the full-GPU pipeline (motor, step, sensor gather)
+/// can also bind shared buffers without internal duplicates.
 ///
 /// Lifecycle:
-/// 1. `new(ctx, capacity)` alokuje buffers + initializuje xoshiro state.
-/// 2. `upload_brains(brains, init_xoshiro_seed)` na sim init.
+/// 1. `new(ctx, capacity)` allocates buffers and seeds the xoshiro state.
+/// 2. `upload_brains(brains, init_xoshiro_seed)` at simulation init.
 /// 3. Hot loop:
-///    - `upload_inputs(last_inputs)` před brain forward.
-///    - `forward_batch_persistent(brain_gpu)` — channels/persistent.
-///    - `download_hidden_outputs() -> (Vec<hidden>, Vec<outputs>)` po brain.
-///    - `upload_velocities(velocities)` před brownian.
-///    - `brownian_persistent(brownian_gpu, ...)` — mutuje velocities + state.
-///    - `download_velocities() -> Vec<velocities>` po brownian.
-///    - `upload_rewards(rewards)` po eat_food.
-///    - `hebbian_persistent(hebbian_gpu, lr)` — mutuje brain weights in-place.
-/// 4. `upload_brain_at(idx, brain)` po reproduce (nová cell na slot idx).
-/// 5. `download_brains() -> Vec<Brain>` pro checkpoint nebo introspection.
+///    - `upload_inputs(last_inputs)` before brain forward.
+///    - `forward_batch_persistent(brain_gpu)`.
+///    - `download_hidden_outputs() -> (Vec<hidden>, Vec<outputs>)`.
+///    - `upload_velocities(velocities)` before brownian.
+///    - `brownian_persistent(...)` — mutates velocities + RNG in place.
+///    - `download_velocities()` after brownian.
+///    - `upload_rewards(rewards)` after eat_food.
+///    - `hebbian_persistent(lr)` — mutates brain weights in place.
+/// 4. `upload_brain_at(idx, brain)` after a reproduction event.
+/// 5. `download_brains()` for checkpointing or introspection.
 pub struct CellsGpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -42,28 +40,27 @@ pub struct CellsGpu {
     velocities_buf: wgpu::Buffer,
     xoshiro_state_buf: wgpu::Buffer,
     rewards_buf: wgpu::Buffer,
-    /// Sprint 61: cell metadata pro GPU populate_brain_inputs shader.
-    /// energy / heading / pitch / damage_accum mutable per tick (CPU upload),
-    /// max_speed / eff_radius zpravidla constant po reproduce/morph (CPU upload
-    /// per tick je ale levný — ~4 KB × 6 = 24 KB při N=1000).
+    /// Cell metadata fed to the `populate_brain_inputs` shader.
+    /// `energy`, `heading`, `pitch`, `damage_accum` are uploaded per tick;
+    /// `max_speed` and `eff_radius` only change on reproduce / morph but the
+    /// per-tick upload is cheap (~24 KB total at N=1000).
     energy_buf: wgpu::Buffer,
     heading_buf: wgpu::Buffer,
     pitch_buf: wgpu::Buffer,
     damage_accum_buf: wgpu::Buffer,
     max_speed_buf: wgpu::Buffer,
     eff_radius_buf: wgpu::Buffer,
-    /// Sprint 62: motor on GPU — turn_rate per-cell konstanta (genome),
-    /// angular/pitch velocities mutated by motor shader.
+    /// Motor pipeline buffers. `turn_rate` is a per-cell genome constant;
+    /// `angular_velocity` and `pitch_velocity` are mutated by the motor
+    /// shader.
     turn_rate_buf: wgpu::Buffer,
     angular_velocity_buf: wgpu::Buffer,
     pitch_velocity_buf: wgpu::Buffer,
-    /// Sprint 62: motor batch readback. velocity_rb už existuje (Sprint 51).
     angular_velocity_rb: wgpu::Buffer,
     pitch_velocity_rb: wgpu::Buffer,
-    /// Sprint 63: step on GPU — kinematics + drag + energy + bounce per cell.
-    /// Position mutated each tick (integrate_kinematics + bounce). Age/cooldown
-    /// incremented. Body_dims (length/width/height) constant per cell post-morph.
-    /// Aux (spike/shell/vision/attack) per-tick recomputed (attack from outputs).
+    /// Step pipeline buffers. Position is mutated each tick by integrate +
+    /// bounce; age/cooldown are incremented; `body_dims` only changes on
+    /// morph; `aux` (spike/shell/vision/attack) is recomputed each tick.
     position_buf: wgpu::Buffer,
     age_buf: wgpu::Buffer,
     cooldown_buf: wgpu::Buffer,
@@ -77,7 +74,7 @@ pub struct CellsGpu {
     last_outputs_rb: wgpu::Buffer,
     velocities_rb: wgpu::Buffer,
     brain_weights_rb: wgpu::Buffer,
-    /// Sprint 51: staging pro `swap_to` — wgpu zakazuje same-buffer copy.
+    /// Staging buffers for `swap_to` — wgpu disallows same-buffer copies.
     swap_brain_temp: wgpu::Buffer,
     swap_xoshiro_temp: wgpu::Buffer,
     swap_turn_rate_temp: wgpu::Buffer,
@@ -120,20 +117,20 @@ impl CellsGpu {
             n * f,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
-        // Sprint 61: cell metadata pro populate_inputs shader.
+        // populate_inputs metadata.
         let energy_buf = mk("cells-energy", n * f, stor_dst_src);
         let heading_buf = mk("cells-heading", n * f, stor_dst_src);
         let pitch_buf = mk("cells-pitch", n * f, stor_dst_src);
         let damage_accum_buf = mk("cells-damage", n * f, stor_dst_src);
         let max_speed_buf = mk("cells-max-speed", n * f, stor_dst_src);
         let eff_radius_buf = mk("cells-eff-radius", n * f, stor_dst_src);
-        // Sprint 62: motor shader buffers.
+        // Motor.
         let turn_rate_buf = mk("cells-turn-rate", n * f, stor_dst_src);
         let angular_velocity_buf = mk("cells-ang-vel", n * f, stor_dst_src);
         let pitch_velocity_buf = mk("cells-pitch-vel", n * f, stor_dst_src);
         let angular_velocity_rb = mk("cells-ang-vel-rb", n * f, read);
         let pitch_velocity_rb = mk("cells-pitch-vel-rb", n * f, read);
-        // Sprint 63: step shader buffers.
+        // Step.
         let position_buf = mk("cells-position", n * 3 * f, stor_dst_src);
         let age_buf = mk("cells-age", n * 4, stor_dst_src);
         let cooldown_buf = mk("cells-cooldown", n * 4, stor_dst_src);
@@ -228,59 +225,55 @@ impl CellsGpu {
     pub fn velocities_buffer(&self) -> &wgpu::Buffer { &self.velocities_buf }
     pub fn xoshiro_state_buffer(&self) -> &wgpu::Buffer { &self.xoshiro_state_buf }
     pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
-    /// Sprint 61: cell metadata buffery pro populate_inputs shader binding.
+    /// `populate_inputs` metadata buffer accessors.
     pub fn energy_buffer(&self) -> &wgpu::Buffer { &self.energy_buf }
     pub fn heading_buffer(&self) -> &wgpu::Buffer { &self.heading_buf }
     pub fn pitch_buffer(&self) -> &wgpu::Buffer { &self.pitch_buf }
     pub fn damage_accum_buffer(&self) -> &wgpu::Buffer { &self.damage_accum_buf }
     pub fn max_speed_buffer(&self) -> &wgpu::Buffer { &self.max_speed_buf }
     pub fn eff_radius_buffer(&self) -> &wgpu::Buffer { &self.eff_radius_buf }
-    /// Sprint 62: motor shader buffery (turn_rate read, angular/pitch velocities rw).
+    /// Motor accessors. `turn_rate` is read-only; angular/pitch velocities
+    /// are read-write.
     pub fn turn_rate_buffer(&self) -> &wgpu::Buffer { &self.turn_rate_buf }
     pub fn angular_velocity_buffer(&self) -> &wgpu::Buffer { &self.angular_velocity_buf }
     pub fn pitch_velocity_buffer(&self) -> &wgpu::Buffer { &self.pitch_velocity_buf }
-    /// Sprint 63: step shader buffery.
+    /// Step accessors.
     pub fn position_buffer(&self) -> &wgpu::Buffer { &self.position_buf }
     pub fn age_buffer(&self) -> &wgpu::Buffer { &self.age_buf }
     pub fn cooldown_buffer(&self) -> &wgpu::Buffer { &self.cooldown_buf }
     pub fn body_dims_buffer(&self) -> &wgpu::Buffer { &self.body_dims_buf }
     pub fn aux_buffer(&self) -> &wgpu::Buffer { &self.aux_buf }
 
-    /// Sprint 63: upload positions (3D per cell, packed).
+    /// Upload positions (3 × f32 per cell, packed AoS).
     pub fn upload_positions(&self, positions: &[[f32; 3]]) {
-        let mut packed: Vec<f32> = Vec::with_capacity(positions.len() * 3);
-        for p in positions { packed.extend_from_slice(p); }
-        self.queue.write_buffer(&self.position_buf, 0, bytemuck::cast_slice(&packed));
+        // `[f32; 3]` is Pod; reinterpret the slice directly to avoid a per-tick
+        // repacking Vec.
+        self.queue.write_buffer(&self.position_buf, 0, bytemuck::cast_slice(positions));
     }
 
-    /// Sprint 63: upload age + cooldown (u32 per cell).
+    /// Upload age + cooldown (u32 per cell).
     pub fn upload_age_cooldown(&self, ages: &[u32], cooldowns: &[u32]) {
         debug_assert_eq!(ages.len(), cooldowns.len());
         self.queue.write_buffer(&self.age_buf, 0, bytemuck::cast_slice(ages));
         self.queue.write_buffer(&self.cooldown_buf, 0, bytemuck::cast_slice(cooldowns));
     }
 
-    /// Sprint 63: upload body dimensions (3 × f32 per cell: length, width, height).
+    /// Upload body dimensions (length, width, height per cell).
     pub fn upload_body_dims(&self, body_dims: &[[f32; 3]]) {
-        let mut packed: Vec<f32> = Vec::with_capacity(body_dims.len() * 3);
-        for d in body_dims { packed.extend_from_slice(d); }
-        self.queue.write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(&packed));
+        self.queue.write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(body_dims));
     }
 
-    /// Sprint 63: upload aux (4 × f32 per cell: spike, shell, vision, attack).
-    /// Attack je per-tick recomputed z brain output[6]; ostatní jsou per-cell
-    /// konstanty (genome). Lazy per-tick upload pro consistency.
+    /// Upload aux (spike, shell, vision, attack per cell). Attack is the
+    /// only per-tick element (recomputed from `output[6]`); the rest are
+    /// genome constants but uploaded together for cache simplicity.
     pub fn upload_aux(&self, aux: &[[f32; 4]]) {
-        let mut packed: Vec<f32> = Vec::with_capacity(aux.len() * 4);
-        for a in aux { packed.extend_from_slice(a); }
-        self.queue.write_buffer(&self.aux_buf, 0, bytemuck::cast_slice(&packed));
+        self.queue.write_buffer(&self.aux_buf, 0, bytemuck::cast_slice(aux));
     }
 
-    /// Sprint 63: combined batch readback po brain_act + step pipeline.
-    /// Single Wait barrier pro all 9 buffers, výsledek se zapisuje do volajícím
-    /// poskytnutých scratch Vec slotů (clear+extend pattern). Pre-fix path
-    /// alokovala 9 fresh Vec na výstupu — nyní 0 alloc/free per call při
-    /// stable capacity.
+    /// Combined batch readback after the brain_act + step pipeline. Single
+    /// `Wait` barrier covers all 9 buffers; results are written into the
+    /// caller-provided scratch slots (clear + extend pattern) so a stable
+    /// capacity yields zero allocations per tick.
     #[allow(clippy::too_many_arguments)]
     pub fn download_full_batch_into(
         &self,
@@ -424,20 +417,16 @@ impl CellsGpu {
         let age_u: &[u32] = bytemuck::cast_slice(&age_data);
         let cd_u: &[u32] = bytemuck::cast_slice(&cd_data);
         let e_f: &[f32] = bytemuck::cast_slice(&e_data);
-        hidden_out.reserve(n);
-        outputs_out.reserve(n);
-        velocities_out.reserve(n);
-        positions_out.reserve(n);
-        for i in 0..n {
-            let mut h = [0.0_f32; BRAIN_HIDDEN];
-            h.copy_from_slice(&h_f[i * BRAIN_HIDDEN..(i + 1) * BRAIN_HIDDEN]);
-            hidden_out.push(h);
-            let mut o = [0.0_f32; BRAIN_OUTPUTS];
-            o.copy_from_slice(&o_f[i * BRAIN_OUTPUTS..(i + 1) * BRAIN_OUTPUTS]);
-            outputs_out.push(o);
-            velocities_out.push([v_f[i * 3], v_f[i * 3 + 1], v_f[i * 3 + 2]]);
-            positions_out.push([pos_f[i * 3], pos_f[i * 3 + 1], pos_f[i * 3 + 2]]);
-        }
+        // Reinterpret flat readback slices as arrays of fixed-size chunks; one
+        // memcpy per output Vec instead of per-element pushes.
+        let hidden_chunks: &[[f32; BRAIN_HIDDEN]] = bytemuck::cast_slice(h_f);
+        hidden_out.extend_from_slice(&hidden_chunks[..n]);
+        let outputs_chunks: &[[f32; BRAIN_OUTPUTS]] = bytemuck::cast_slice(o_f);
+        outputs_out.extend_from_slice(&outputs_chunks[..n]);
+        let vel_chunks: &[[f32; 3]] = bytemuck::cast_slice(v_f);
+        velocities_out.extend_from_slice(&vel_chunks[..n]);
+        let pos_chunks: &[[f32; 3]] = bytemuck::cast_slice(pos_f);
+        positions_out.extend_from_slice(&pos_chunks[..n]);
         angular_out.extend_from_slice(&a_f[..n]);
         pitch_out.extend_from_slice(&p_f[..n]);
         ages_out.extend_from_slice(&age_u[..n]);
@@ -456,9 +445,10 @@ impl CellsGpu {
         self.energy_rb.unmap();
     }
 
-    /// Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim init +
-    /// při reproduce (sparse). Sprint 61 `upload_metadata` je per-tick mutable
-    /// (energy/heading/pitch/damage/max_speed/eff_radius).
+    /// `turn_rate` is a per-cell genome constant — uploaded once at sim
+    /// init and again on reproduce (sparse). For per-tick mutable metadata
+    /// (energy / heading / pitch / damage / max_speed / eff_radius) use
+    /// `upload_metadata`.
     pub fn upload_turn_rates(&self, turn_rates: &[f32]) {
         self.queue.write_buffer(&self.turn_rate_buf, 0, bytemuck::cast_slice(turn_rates));
     }
@@ -469,17 +459,17 @@ impl CellsGpu {
         self.queue.write_buffer(&self.turn_rate_buf, offset, bytemuck::cast_slice(&[turn_rate]));
     }
 
-    /// Sprint 62: upload current angular + pitch velocity (Cell::angular_velocity,
-    /// Cell::pitch_velocity). Volá se před brain_act_gpu_full.
+    /// Upload current angular + pitch velocities. Run before
+    /// `brain_act_gpu_full`.
     pub fn upload_angular_pitch(&self, angular: &[f32], pitches: &[f32]) {
         debug_assert_eq!(angular.len(), pitches.len());
         self.queue.write_buffer(&self.angular_velocity_buf, 0, bytemuck::cast_slice(angular));
         self.queue.write_buffer(&self.pitch_velocity_buf, 0, bytemuck::cast_slice(pitches));
     }
 
-    /// Sprint 62: batch readback motor results (velocities + angular + pitch).
-    /// Single Wait barrier místo 3× separate downloads. Volá se po motor +
-    /// brownian dispatch v brain_act_gpu_full.
+    /// Batch readback of motor results (velocities + angular + pitch) under
+    /// a single `Wait` barrier instead of three separate downloads. Run
+    /// after the motor + brownian dispatches in `brain_act_gpu_full`.
     pub fn download_motor_state(
         &self,
         n: usize,
@@ -525,9 +515,9 @@ impl CellsGpu {
         (velocities, angular, pitch_vels)
     }
 
-    /// Sprint 62: combined batch readback hidden + outputs + motor state v
-    /// jediném Wait barrier. Volá se na konci brain_act_gpu_full po
-    /// brain.forward + motor.dispatch + brownian.dispatch sequence.
+    /// Combined batch readback of hidden + outputs + motor state under one
+    /// `Wait` barrier. Run at the end of `brain_act_gpu_full` after the
+    /// `brain.forward` + `motor.dispatch` + `brownian.dispatch` sequence.
     pub fn download_brain_motor_batch(
         &self,
         n: usize,
@@ -609,8 +599,8 @@ impl CellsGpu {
         (hidden, outputs, velocities, angular, pitch_vels)
     }
 
-    /// Sprint 61: bulk upload metadata pro populate_inputs shader. Sloučeno
-    /// do jediného call pro jasnost — všechna pole jsou per-cell f32.
+    /// Bulk upload of `populate_inputs` metadata. Six per-cell f32 arrays
+    /// in one call — slice lengths must all match.
     pub fn upload_metadata(
         &self,
         energies: &[f32],
@@ -708,23 +698,22 @@ impl CellsGpu {
     }
 
     pub fn upload_inputs(&self, inputs: &[[f32; BRAIN_INPUTS]]) {
-        let flat: Vec<f32> = inputs.iter().flatten().copied().collect();
-        self.queue.write_buffer(&self.last_inputs_buf, 0, bytemuck::cast_slice(&flat));
+        self.queue.write_buffer(&self.last_inputs_buf, 0, bytemuck::cast_slice(inputs));
     }
 
     pub fn upload_velocities(&self, velocities: &[[f32; 3]]) {
-        let flat: Vec<f32> = velocities.iter().flatten().copied().collect();
-        self.queue.write_buffer(&self.velocities_buf, 0, bytemuck::cast_slice(&flat));
+        self.queue.write_buffer(&self.velocities_buf, 0, bytemuck::cast_slice(velocities));
     }
 
     pub fn upload_rewards(&self, rewards: &[f32]) {
         self.queue.write_buffer(&self.rewards_buf, 0, bytemuck::cast_slice(rewards));
     }
 
-    /// Sprint 51: GPU-side copy slot[src] → slot[dst] pro brain_weights +
-    /// xoshiro_state. Použito v die_and_drop_carrion swap_remove pattern —
-    /// keď cell v dst slotu zemřela, src je poslední živá cell, která se
-    /// přesune. NIC se ne-stahuje, NIC se ne-uploaduje — pure GPU memcpy.
+    /// GPU-side copy `slot[src] → slot[dst]` for `brain_weights`,
+    /// `xoshiro_state`, and `turn_rate`. Used by the swap-remove pattern in
+    /// `die_and_drop_carrion`: when the cell at `dst` dies, `src` is the
+    /// last live cell moved into its place. Pure on-device memcpy — no
+    /// upload or download.
     pub fn swap_to(&self, dst: usize, src: usize) {
         assert!(dst < self.capacity && src < self.capacity);
         if dst == src {
@@ -788,8 +777,8 @@ impl CellsGpu {
         self.queue.submit(Some(encoder.finish()));
     }
 
-    /// Sprint 51: seed xoshiro state pro konkrétní slot. Použito po reproduce
-    /// (nová cell potřebuje fresh state).
+    /// Seed the xoshiro state for a single slot. Used after reproduction so
+    /// the new cell starts on an independent RNG stream.
     pub fn upload_xoshiro_seed_at(&self, slot: usize, seed: u64) {
         assert!(slot < self.capacity);
         fn splitmix(z: &mut u64) -> u64 {

@@ -1,7 +1,26 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use wide::f32x8;
 
 use crate::*;
+
+/// Padé(3,2) tanh approximation, clamped to ±3. Mirror of the f32x8
+/// version in `neural::brain` — having both gives bit-identical output
+/// between the scalar `Cppn::forward` and the SIMD `forward_batch_x8`,
+/// which `Brain::from_cppn` mixes when handling tails.
+#[inline]
+fn tanh_fast_scalar(x: f32) -> f32 {
+    let cx = x.clamp(-3.0, 3.0);
+    let x2 = cx * cx;
+    cx * (27.0 + x2) / (27.0 + 9.0 * x2)
+}
+
+#[inline]
+fn tanh_fast_simd(x: f32x8) -> f32x8 {
+    let x = x.fast_max(f32x8::splat(-3.0)).fast_min(f32x8::splat(3.0));
+    let x2 = x * x;
+    x * (f32x8::splat(27.0) + x2) / (f32x8::splat(27.0) + f32x8::splat(9.0) * x2)
+}
 
 // ─── Sprint 105: HyperNEAT CPPN scaffolding ─────────────────────────────────
 //
@@ -28,7 +47,9 @@ impl ActivationFn {
         match self {
             ActivationFn::Linear => x,
             ActivationFn::Sigmoid => 1.0 / (1.0 + (-x).exp()),
-            ActivationFn::Tanh => x.tanh(),
+            // Padé approximation, matches the SIMD lane to keep
+            // `Cppn::forward` and `forward_batch_x8` bit-identical.
+            ActivationFn::Tanh => tanh_fast_scalar(x),
             ActivationFn::Gaussian => (-x * x).exp(),
             ActivationFn::Sine => x.sin(),
             ActivationFn::Abs => x.abs(),
@@ -38,6 +59,32 @@ impl ActivationFn {
                 } else {
                     0.0
                 }
+            }
+        }
+    }
+
+    /// f32x8 lane-parallel version of `apply`. Same activation applied to
+    /// 8 batched samples that all share the node (so dispatch is once per
+    /// node, not per lane).
+    #[inline]
+    fn apply_simd(&self, x: f32x8) -> f32x8 {
+        match self {
+            ActivationFn::Linear => x,
+            ActivationFn::Sigmoid => f32x8::splat(1.0) / (f32x8::splat(1.0) + (-x).exp()),
+            ActivationFn::Tanh => tanh_fast_simd(x),
+            ActivationFn::Gaussian => (-(x * x)).exp(),
+            ActivationFn::Sine => x.sin(),
+            ActivationFn::Abs => x.abs(),
+            // wide 1.3 has no `cmp_ge`; scalar fallback for the rare Step
+            // case avoids a flaky bit-hack that would mishandle negative
+            // zero (`-0.0 >= 0.0` is true in IEEE-754).
+            ActivationFn::Step => {
+                let arr = x.to_array();
+                let mut out = [0.0_f32; 8];
+                for i in 0..8 {
+                    out[i] = if arr[i] >= 0.0 { 1.0 } else { 0.0 };
+                }
+                f32x8::new(out)
             }
         }
     }
@@ -274,13 +321,17 @@ impl Cppn {
     /// CPPN_INPUTS nodů. Outputs returned ze posledních CPPN_OUTPUTS.
     /// Layer-wise computation; cycles unsupported (add_link mutace
     /// preventuje cykly — viz `mutate_add_link`).
+    ///
+    /// Activations are stored in a flat `[f32; CPPN_MAX_NODES]` indexed by
+    /// node id — `mutate_add_node` only ever assigns ids in `[0, num_nodes)`
+    /// and `num_nodes ≤ CPPN_MAX_NODES`, so the index is always in range.
+    /// Replaces a per-call `FxHashMap` heap allocation that dominated
+    /// `Brain::from_cppn` (~4200 forwards per child).
     pub fn forward(&self, inputs: [f32; CPPN_INPUTS]) -> [f32; CPPN_OUTPUTS] {
-        let mut activations: rustc_hash::FxHashMap<u32, f32> =
-            rustc_hash::FxHashMap::default();
-        // Inputs occupy nodes[0..CPPN_INPUTS] per random() layout.
+        let mut activations = [0.0_f32; CPPN_MAX_NODES];
         for i in 0..CPPN_INPUTS {
             if let Some(n) = self.nodes[i] {
-                activations.insert(n.id, inputs[i]);
+                activations[n.id as usize] = inputs[i];
             }
         }
         let max_layer = self.iter_nodes().map(|n| n.layer).max().unwrap_or(0);
@@ -294,18 +345,60 @@ impl Cppn {
                     if !link.enabled || link.to != n.id {
                         continue;
                     }
-                    if let Some(&x) = activations.get(&link.from) {
-                        sum += link.weight * x;
-                    }
+                    sum += link.weight * activations[link.from as usize];
                 }
-                activations.insert(n.id, n.activation.apply(sum));
+                activations[n.id as usize] = n.activation.apply(sum);
             }
         }
         let mut out = [0.0; CPPN_OUTPUTS];
-        // Outputs occupy nodes[CPPN_INPUTS..CPPN_INPUTS+CPPN_OUTPUTS].
         for o in 0..CPPN_OUTPUTS {
             if let Some(n) = self.nodes[CPPN_INPUTS + o] {
-                out[o] = *activations.get(&n.id).unwrap_or(&0.0);
+                out[o] = activations[n.id as usize];
+            }
+        }
+        out
+    }
+
+    /// Batch forward — evaluates 8 input vectors through the same topology
+    /// using `f32x8` lanes. Activation functions are applied per-node
+    /// (one dispatch, all 8 lanes vectorised). `Brain::from_cppn` chunks its
+    /// 4197 weight queries into groups of 8 for ~6× speedup vs scalar.
+    pub fn forward_batch_x8(
+        &self,
+        inputs: &[[f32; CPPN_INPUTS]; 8],
+    ) -> [[f32; CPPN_OUTPUTS]; 8] {
+        let mut activations = [f32x8::ZERO; CPPN_MAX_NODES];
+        for i in 0..CPPN_INPUTS {
+            if let Some(n) = self.nodes[i] {
+                activations[n.id as usize] = f32x8::new([
+                    inputs[0][i], inputs[1][i], inputs[2][i], inputs[3][i],
+                    inputs[4][i], inputs[5][i], inputs[6][i], inputs[7][i],
+                ]);
+            }
+        }
+        let max_layer = self.iter_nodes().map(|n| n.layer).max().unwrap_or(0);
+        for layer in 1..=max_layer {
+            for n in self.iter_nodes() {
+                if n.layer != layer {
+                    continue;
+                }
+                let mut sum = f32x8::splat(n.bias);
+                for link in self.iter_links() {
+                    if !link.enabled || link.to != n.id {
+                        continue;
+                    }
+                    sum += f32x8::splat(link.weight) * activations[link.from as usize];
+                }
+                activations[n.id as usize] = n.activation.apply_simd(sum);
+            }
+        }
+        let mut out = [[0.0_f32; CPPN_OUTPUTS]; 8];
+        for o in 0..CPPN_OUTPUTS {
+            if let Some(n) = self.nodes[CPPN_INPUTS + o] {
+                let lanes = activations[n.id as usize].to_array();
+                for b in 0..8 {
+                    out[b][o] = lanes[b];
+                }
             }
         }
         out

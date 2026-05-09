@@ -77,11 +77,12 @@ pub fn run() {
     // (asset by se loadnul ale shader by se nezkompiloval).
     app.add_plugins(MaterialPlugin::<BioMaterial>::default());
 
+    // FrameTimeDiagnosticsPlugin runs unconditionally so the stats overlay
+    // can show FPS — its overhead is just a few timestamps per frame. The
+    // verbose log spam and custom per-system diagnostics stay behind `--diag`.
+    app.add_plugins(FrameTimeDiagnosticsPlugin::default());
     if want_diag {
-        app.add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin::default(),
-        ));
+        app.add_plugins(LogDiagnosticsPlugin::default());
         diagnostics::register_diagnostics(&mut app);
     }
 

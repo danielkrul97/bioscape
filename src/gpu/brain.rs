@@ -30,7 +30,7 @@ pub struct BrainGpu {
     hidden_readback: wgpu::Buffer,
     outputs_readback: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    // Persistent CPU staging — reused per forward_batch, ne realokuje.
+    // Persistent CPU staging — reused across `forward_batch` calls.
     inputs_packed: Vec<f32>,
     weights_packed: Vec<f32>,
     hidden_n_packed: Vec<u32>,
@@ -305,8 +305,8 @@ impl BrainGpu {
         })
     }
 
-    /// Roste storage buffery, pokud `n` přesahuje aktuální `capacity`. Volá se
-    /// na začátku `forward_batch` před uploadem.
+    /// Grows the storage buffers when `n` exceeds the current `capacity`.
+    /// Called at the start of `forward_batch` before any upload.
     fn ensure_capacity(&mut self, n: usize) {
         if n <= self.capacity {
             return;
@@ -333,10 +333,11 @@ impl BrainGpu {
         self.capacity = new_cap;
     }
 
-    /// Spočítá forward pass všem `inputs.len()` cells. Délky všech vstupů musí
-    /// být shodné. `brains` je iterátor (typicky `cells.iter().map(|c| &c.genome.brain)`)
-    /// aby se vyhnula intermediate `Vec<Brain>` (~3 KB/cell × 10 k = 30 MB).
-    /// Výsledky se zapíšou do `hiddens_out` + `outputs_out`.
+    /// Forward pass over all `inputs.len()` cells. `brains` is an iterator
+    /// (typically `cells.iter().map(|c| &c.genome.brain)`) to avoid
+    /// materializing an intermediate `Vec<Brain>` — at ~3 KB/cell × 10 k
+    /// cells the copy alone would be ~30 MB. Results are written into
+    /// `hiddens_out` + `outputs_out`.
     pub fn forward_batch<'a, I>(
         &mut self,
         inputs: &[[f32; BRAIN_INPUTS]],
@@ -361,7 +362,7 @@ impl BrainGpu {
             self.inputs_packed.extend_from_slice(inp);
         }
 
-        // Pack weights + hidden_n per-cell. Layout musí matchnout WGSL shader.
+        // Pack weights + hidden_n per-cell. Layout must match the WGSL shader.
         self.weights_packed.clear();
         self.weights_packed.reserve(n * BRAIN_WEIGHTS_PER_CELL);
         self.hidden_n_packed.clear();
@@ -459,11 +460,11 @@ impl BrainGpu {
         self.outputs_readback.unmap();
     }
 
-    /// Sprint 51: persistent-mode dispatch — bindujeme `CellsGpu` buffers
-    /// (last_inputs jako vstup, brain_weights jako persistent storage,
-    /// last_hidden + last_outputs jako write-back). **NULL upload weights**
-    /// — to je hlavní win sprintu. `hidden_n` je per-cell u32 array, uploaded
-    /// do `BrainGpu.hidden_n_buf` (shader binding 5).
+    /// Persistent-mode dispatch: binds the `CellsGpu` buffers directly
+    /// (`last_inputs` as input, `brain_weights` as persistent storage,
+    /// `last_hidden` + `last_outputs` as write-back). The point is **no
+    /// weight upload** — they live on the device across ticks. `hidden_n`
+    /// is uploaded each call into `BrainGpu.hidden_n_buf` (binding 5).
     pub fn forward_persistent(&mut self, cells_gpu: &CellsGpu, n: usize, hidden_n: &[u32]) {
         if n == 0 {
             return;

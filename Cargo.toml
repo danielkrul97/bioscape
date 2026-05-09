@@ -111,3 +111,12 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 opt-level = 3
+
+# Profile pro `cargo flamegraph` / perf — `thin` LTO + 16 codegen units zkrátí
+# build z ~10 min na ~2 min, debug-info zachová symboly a callstacky se rozliší
+# i bez DWARF unwinding (force-frame-pointers v RUSTFLAGS, viz scripts/profile.sh).
+[profile.release-debug]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+debug = true

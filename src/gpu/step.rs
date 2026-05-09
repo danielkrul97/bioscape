@@ -5,9 +5,8 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 50: GPU step — kinematic + drag + energy + bounce per cell
-// ============================================================================
+// GPU step — kinematics, drag, thermal-modulated energy drains, and world
+// bounce, per cell. Mirror of `Cell::step_with_climate`.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -33,22 +32,29 @@ pub struct StepParamsGpu {
     pub shell_cost_per_sec: f32,
     pub attack_cost_per_sec: f32,
     pub pitch_clamp: f32,
-    /// Sprint 85: thermal stratification params. Mirror constanty z `lib.rs`
-    /// (THERMAL_TOP/BOTTOM/Q10/REF_TEMP). Compute z-gradient temperature →
-    /// Q10 metabolism multiplikátor → škálování všech drains.
+    /// Thermal stratification — mirrors the `THERMAL_*` constants in `lib`.
+    /// Drives the z-gradient temperature, Q10 metabolism multiplier, and
+    /// scales all energy drains in the shader.
     pub thermal_top: f32,
     pub thermal_bottom: f32,
     pub thermal_q10: f32,
     pub thermal_ref_temp: f32,
-    /// Sprint 86: time-varying thermal — diurnal (per-tick, surface-weighted)
-    /// + seasonal (per-generation, uniform shift). Periody jsou pre-computed
-    /// jako f32 reciprocals aby shader nemusel dělit u32.
+    /// Time-varying thermal: diurnal (per-tick, surface-weighted) and
+    /// seasonal (per-generation, uniform shift).
     pub thermal_diurnal_amp: f32,
     pub thermal_seasonal_amp: f32,
-    /// Phase fraction (tick mod period) / period, [0, 1) — caller už spočítal
-    /// aby se vyhnulo u64 → f32 cast precision loss pro long runs.
+    /// Phase fraction `(tick mod period) / period` in `[0, 1)` — the caller
+    /// precomputes this so the shader doesn't lose precision casting `u64`
+    /// directly to `f32` on long runs.
     pub thermal_diurnal_phase: f32,
     pub thermal_seasonal_phase: f32,
+    /// `log2(thermal_q10)` precomputed on CPU. Lets the shader replace
+    /// `pow(q10, x)` with `exp2(x * thermal_log2_q10)` (one log2 saved per cell
+    /// per tick). Callers must keep this in sync with `thermal_q10`.
+    pub thermal_log2_q10: f32,
+    pub _pad_b0: u32,
+    pub _pad_b1: u32,
+    pub _pad_b2: u32,
 }
 
 pub struct StepGpu {
@@ -284,14 +290,9 @@ impl StepGpu {
         let mut params = params;
         params.num_cells = n as u32;
 
-        let pos_flat: Vec<f32> = positions.iter().flatten().copied().collect();
-        let vel_flat: Vec<f32> = velocities.iter().flatten().copied().collect();
-        let body_flat: Vec<f32> = body_dims.iter().flatten().copied().collect();
-        let aux_flat: Vec<f32> = aux.iter().flatten().copied().collect();
-
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue.write_buffer(&self.pos_buf, 0, bytemuck::cast_slice(&pos_flat));
-        self.queue.write_buffer(&self.vel_buf, 0, bytemuck::cast_slice(&vel_flat));
+        self.queue.write_buffer(&self.pos_buf, 0, bytemuck::cast_slice(positions));
+        self.queue.write_buffer(&self.vel_buf, 0, bytemuck::cast_slice(velocities));
         self.queue.write_buffer(&self.heading_buf, 0, bytemuck::cast_slice(headings));
         self.queue.write_buffer(&self.pitch_buf, 0, bytemuck::cast_slice(pitches));
         self.queue.write_buffer(&self.ang_vel_buf, 0, bytemuck::cast_slice(angular_velocities));
@@ -299,8 +300,8 @@ impl StepGpu {
         self.queue.write_buffer(&self.age_buf, 0, bytemuck::cast_slice(ages));
         self.queue.write_buffer(&self.cooldown_buf, 0, bytemuck::cast_slice(cooldowns));
         self.queue.write_buffer(&self.energy_buf, 0, bytemuck::cast_slice(energies));
-        self.queue.write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(&body_flat));
-        self.queue.write_buffer(&self.aux_buf, 0, bytemuck::cast_slice(&aux_flat));
+        self.queue.write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(body_dims));
+        self.queue.write_buffer(&self.aux_buf, 0, bytemuck::cast_slice(aux));
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("step-encoder"),
@@ -383,10 +384,11 @@ impl StepGpu {
         result
     }
 
-    /// Sprint 63: persistent variant — bind CellsGpu shared buffery (position,
+    /// Persistent variant: binds the shared `CellsGpu` buffers (position,
     /// velocity, heading, pitch, ang_vel, pitch_vel, age, cooldown, energy,
-    /// body_dims, aux) místo vlastních duplikátů. Step shader mutuje vše
-    /// in-place; readback je v hot loop přes `download_full_batch`.
+    /// body_dims, aux) instead of internal duplicates. The step shader
+    /// mutates all of them in place; the hot loop reads back later via
+    /// `download_full_batch`.
     pub fn dispatch_with_cells(
         &mut self,
         cells: &CellsGpu,

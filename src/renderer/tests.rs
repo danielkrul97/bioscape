@@ -1,4 +1,12 @@
 use super::*;
+use super::config::{
+    CAMERA_OFFSET_DISTANCE, CAMERA_PITCH_INITIAL, CAMERA_PITCH_MAX, CAMERA_PITCH_MIN,
+    CAMERA_SCALE_INITIAL,
+};
+use bioscape::{
+    HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
+};
+use std::time::Duration;
 
 const FLT_EPS: f32 = 1e-5;
 

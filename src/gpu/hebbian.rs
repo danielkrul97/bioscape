@@ -230,10 +230,10 @@ impl HebbianGpu {
         &self.weights_buf
     }
 
-    /// Sprint 51: persistent-mode dispatch — bindujeme CellsGpu buffers
-    /// (last_inputs, last_hidden, last_outputs, rewards, brain_weights), což
-    /// znamená že brain_weights ZŮSTÁVAJÍ na GPU mezi ticky a tato funkce je
-    /// mutuje in-place. Volá se po `upload_rewards()`.
+    /// Persistent-mode dispatch: binds the `CellsGpu` buffers
+    /// (`last_inputs`, `last_hidden`, `last_outputs`, `rewards`,
+    /// `brain_weights`). Brain weights stay resident on the GPU across
+    /// ticks; this call mutates them in place. Run after `upload_rewards()`.
     pub fn compute_persistent(
         &self,
         cells_gpu: &CellsGpu,

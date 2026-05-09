@@ -317,6 +317,7 @@ pub(crate) fn resolve_hunter_collisions(
     mut vel_deltas_scratch: Local<Vec<[f32; 3]>>,
     mut in_contact_pairs_scratch: Local<FxHashSet<(u64, u64)>>,
     mut new_progress_scratch: Local<FxHashMap<(u64, u64), u32>>,
+    mut bond_candidates_scratch: Local<Vec<(u64, u64)>>,
 ) {
     // R-#9: persistent Local scratchy. Pre-fix: 6 fresh allocs per tick.
     alive_scratch.clear();
@@ -432,16 +433,17 @@ pub(crate) fn resolve_hunter_collisions(
         h.velocity[2] += vd[2];
     }
 
-    // Bond formation — kandidáti se filtrují přímo do iteration; ad-hoc snapshot
-    // do Vec by byl jen zbytečná indirection.
-    for (&(id_a, id_b), _) in contact
-        .0
-        .iter()
-        .filter(|(_, &t)| t >= bioscape::BOND_FORM_TICKS)
-        .map(|(p, t)| (p, t))
-        .collect::<Vec<_>>()
-        .iter()
-    {
+    // Bond formation — collect candidate pair IDs into a persistent scratch
+    // so the immutable borrow on `contact` ends before we mutate `alive_scratch`.
+    bond_candidates_scratch.clear();
+    bond_candidates_scratch.extend(
+        contact
+            .0
+            .iter()
+            .filter(|(_, &t)| t >= bioscape::BOND_FORM_TICKS)
+            .map(|(&pair, _)| pair),
+    );
+    for &(id_a, id_b) in bond_candidates_scratch.iter() {
         let (Some(&a_idx), Some(&b_idx)) =
             (id_to_pos.get(&id_a), id_to_pos.get(&id_b))
         else {

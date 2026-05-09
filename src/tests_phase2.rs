@@ -47,7 +47,7 @@ fn make_hunter_at(pos: [f32; 3], vel: [f32; 3]) -> Hunter {
 }
 
 fn cell_grid_from(cells: &[Cell]) -> SpatialGrid<usize, ()> {
-    let mut g: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE);
+    let mut g: SpatialGrid<usize, ()> = SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF);
     g.rebuild(cells.iter().enumerate().map(|(i, c)| (i, c.position, ())));
     g
 }

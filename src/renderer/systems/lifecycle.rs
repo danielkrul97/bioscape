@@ -25,8 +25,11 @@ pub(crate) fn cell_reproduces_on_threshold(
     #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
     mut commands: Commands,
     mut fertile_scratch: Local<Vec<(Entity, [f32; 3])>>,
+    mut to_spawn_scratch: Local<Vec<Cell>>,
 ) {
-    let current_pop = cells.iter().count();
+    // `slot_map` tracks every live (non-Dying) cell — equivalent to walking the
+    // `Query<_, Without<Dying>>` but in O(1).
+    let current_pop = slot_map.len();
     if current_pop >= MAX_POPULATION {
         return;
     }
@@ -76,7 +79,7 @@ pub(crate) fn cell_reproduces_on_threshold(
     }
 
     let mut rng = rand::rng();
-    let mut to_spawn: Vec<Cell> = Vec::new();
+    to_spawn_scratch.clear();
     for (a, b) in matings {
         let Ok([(_, mut cell_a), (_, mut cell_b)]) = cells.get_many_mut([a, b]) else {
             continue;
@@ -88,13 +91,13 @@ pub(crate) fn cell_reproduces_on_threshold(
         // Sprint 66: child gets stable cell_id from monotonic counter.
         let child_id = next_cell_id.0;
         next_cell_id.0 += 1;
-        to_spawn.push(bioscape::make_mating_child(
+        to_spawn_scratch.push(bioscape::make_mating_child(
             &cell_a.0, &cell_b.0, &mut rng, child_id,
         ));
     }
 
     let mesh = cell_mesh.0.clone();
-    for cell in to_spawn {
+    for cell in to_spawn_scratch.drain(..) {
         let mat = adhesion_material(
             &mut adhesion_materials,
             &mut bio_materials,

@@ -28,13 +28,11 @@ pub(crate) fn step_cells(
     let half = extent.as_array();
     let tick = clock.0.tick;
     let gen = clock.0.generation;
-    // Sprint 112: per-cell ClimateShift offset (default 0.0 → step_with_climate
-    // je byte-identical s step). Computed inline před step aby nebyl rebuild
-    // celé Cell::step signature potřeba.
-    // Sprint 113: par_iter_mut — Cell::step_with_climate je čistě self-mutating,
-    // climate_shock_offset jen čte event_slice (sdílený &). Bevy TaskPool
-    // work-stealing pokrývá heterogenní workload (climate offset vs. step).
+    // ClimateShift offset is per-cell; thermal phase terms are uniform across
+    // the dispatch, so we precompute the `ThermalCtx` once and let
+    // `step_with_thermal` reuse it (saves two sin / modulo pairs per cell).
     let event_slice = events.0.events.as_slice();
+    let thermal_ctx = bioscape::ThermalCtx::for_tick(tick, gen);
     cells.par_iter_mut().for_each(|mut cell| {
         let climate_offset = bioscape::climate_shock_offset(
             event_slice,
@@ -43,7 +41,7 @@ pub(crate) fn step_cells(
             half,
         );
         cell.0
-            .step_with_climate(dt, half, tick, gen, &PHYSICS_CONFIG, climate_offset);
+            .step_with_thermal(dt, half, &thermal_ctx, &PHYSICS_CONFIG, climate_offset);
     });
 }
 

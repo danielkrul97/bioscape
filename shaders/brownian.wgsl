@@ -1,11 +1,9 @@
-// Sprint 51: GPU mirror Cell::apply_brownian. Per-cell xoshiro128++ RNG state
-// (4× u32) v `xoshiro_state` buffer, mutuje velocities[N×3] adicí
-// `gaussian × thermal_noise × sqrt(dt)` na každou složku (z jen pokud
-// world_half_z > 0).
+// Sprint 51: GPU mirror of Cell::apply_brownian. Per-cell xoshiro128++ RNG
+// state (vec4<u32>) mutates velocities[N×3] by adding
+// gaussian × thermal_noise × sqrt(dt) on each axis (z only when has_z != 0).
 //
-// xoshiro128++ je deterministic per-cell — stejný state seed → stejná RNG
-// sekvence napříč běhy (řeší part-of Sprint 48 GPU determinismus goalu pro
-// stochastic phases).
+// Deterministic per-cell: same seed → same sequence across runs
+// (part of Sprint 48 GPU determinism goal for stochastic phases).
 
 struct BrownianParams {
     num_cells: u32,
@@ -16,13 +14,12 @@ struct BrownianParams {
 
 @group(0) @binding(0) var<uniform> params: BrownianParams;
 @group(0) @binding(1) var<storage, read_write> velocities: array<f32>;
-@group(0) @binding(2) var<storage, read_write> xoshiro_state: array<u32>;
+@group(0) @binding(2) var<storage, read_write> xoshiro_state: array<vec4<u32>>;
 
 fn rotl_u32(x: u32, k: u32) -> u32 {
     return (x << k) | (x >> (32u - k));
 }
 
-// Inline xoshiro128++ next. Vrací u32, mutuje state in place.
 fn xoshiro_next(state: ptr<function, vec4<u32>>) -> u32 {
     let s = *state;
     let result = rotl_u32(s.x + s.w, 7u) + s.x;
@@ -37,17 +34,22 @@ fn xoshiro_next(state: ptr<function, vec4<u32>>) -> u32 {
     return result;
 }
 
+// Build a float in [1, 2) via IEEE-754 bit pattern (sign=0, exp=127,
+// mantissa from RNG), then subtract 1. Avoids the FP multiply of the
+// classic `bits * 2^-24` form. 23-bit precision in [0, 1).
 fn uniform01(state: ptr<function, vec4<u32>>) -> f32 {
     let bits = xoshiro_next(state);
-    // 24-bit mantisa precision; shift na [0, 1).
-    return f32(bits >> 8u) * (1.0 / 16777216.0);
+    return bitcast<f32>((bits >> 9u) | 0x3F800000u) - 1.0;
 }
 
-// Box-Muller gaussian. epsilon na u1 brání log(0).
-fn gaussian(state: ptr<function, vec4<u32>>) -> f32 {
+// Box-Muller: two independent gaussians per pair of uniforms.
+// epsilon clamp on u1 prevents log(0) → -inf.
+fn gaussian_pair(state: ptr<function, vec4<u32>>) -> vec2<f32> {
     let u1 = max(uniform01(state), 1.1920929e-7);
     let u2 = uniform01(state);
-    return sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
+    let r = sqrt(-2.0 * log(u1));
+    let theta = 6.28318530718 * u2;
+    return vec2<f32>(r * cos(theta), r * sin(theta));
 }
 
 @compute @workgroup_size(64)
@@ -56,23 +58,19 @@ fn brownian(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_cells) {
         return;
     }
-    var s = vec4<u32>(
-        xoshiro_state[i * 4u + 0u],
-        xoshiro_state[i * 4u + 1u],
-        xoshiro_state[i * 4u + 2u],
-        xoshiro_state[i * 4u + 3u],
-    );
+    var s = xoshiro_state[i];
     let scale = params.thermal_noise * params.sqrt_dt;
-    let g_x = gaussian(&s);
-    let g_y = gaussian(&s);
-    velocities[i * 3u + 0u] = velocities[i * 3u + 0u] + g_x * scale;
-    velocities[i * 3u + 1u] = velocities[i * 3u + 1u] + g_y * scale;
+
+    let g_xy = gaussian_pair(&s);
+    velocities[i * 3u + 0u] = velocities[i * 3u + 0u] + g_xy.x * scale;
+    velocities[i * 3u + 1u] = velocities[i * 3u + 1u] + g_xy.y * scale;
+
     if (params.has_z != 0u) {
-        let g_z = gaussian(&s);
-        velocities[i * 3u + 2u] = velocities[i * 3u + 2u] + g_z * scale;
+        // Second pair yields two gaussians; we use one and drop the other
+        // to keep the RNG sequence stateless across dispatches.
+        let g_z = gaussian_pair(&s);
+        velocities[i * 3u + 2u] = velocities[i * 3u + 2u] + g_z.x * scale;
     }
-    xoshiro_state[i * 4u + 0u] = s.x;
-    xoshiro_state[i * 4u + 1u] = s.y;
-    xoshiro_state[i * 4u + 2u] = s.z;
-    xoshiro_state[i * 4u + 3u] = s.w;
+
+    xoshiro_state[i] = s;
 }

@@ -5,9 +5,7 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 50: GPU collision — per-cell delta accumulation, chains SpatialHashGpu
-// ============================================================================
+// GPU collision pass — per-cell delta accumulation, chained off `SpatialHashGpu`.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -16,7 +14,6 @@ struct CollisionParams {
     cell_size: f32,
     cell_radius_const: f32,
     _pad0: u32,
-    /// Sprint 55: toroidal world bounds.
     world_half_x: f32,
     world_half_y: f32,
     _pad1: u32,
@@ -31,7 +28,6 @@ pub struct CollisionGpu {
     capacity: usize,
     cell_size: f32,
     cell_radius_const: f32,
-    /// Sprint 55: toroidal bounds.
     world_half_xy: [f32; 2],
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,

@@ -1,24 +1,22 @@
-// Sprint 51: GPU mirror Brain::hebbian_update. Per-cell pokud reward != 0,
-// updates brain weights (w1, b1, w2, b2) in-place podle reward × pre × post
-// rule. CPU equivalent v lib.rs Brain::hebbian_update.
+// Per-cell reward-modulated Hebbian update — mirrors CPU
+// `Brain::hebbian_update`. For cells with non-zero reward:
+//   w1[h][in] += lr · last_hidden[h] · last_inputs[in];   b1[h] += lr · last_hidden[h]
+//   w2[o][h] += lr · last_outputs[o] · last_hidden[h];    b2[o] += lr · last_outputs[o]
+// where lr = params.learning_rate · reward. Weight buffer layout must match
+// the brain_forward shader; see those constants below.
 //
-// Layout brain weights musí matchnout `lib::gpu::BRAIN_WEIGHTS_PER_CELL`
-// packing (Sprint 44 brain_forward.wgsl). Sprint 80 storage bump HIDDEN 16→32:
-//   [0..1696)    w1 row-major (HIDDEN × INPUTS)
-//   [1696..1728) b1
-//   [1728..2048) w2 row-major (OUTPUTS × HIDDEN) — 10*32 = 320
-//   [2048..2058) b2
-// Dead zone neurons (hidden_n..BRAIN_HIDDEN) bezpečně self-bound: mají
-// last_hidden = 0, takže `lr × h_val × x = 0`, weights nemodifikují.
+// The shader iterates the full BRAIN_HIDDEN range regardless of `hidden_n`:
+// dead-zone neurons have `last_hidden = 0`, so their updates resolve to
+// `lr · 0 · x = 0` and leave weights untouched.
 
-const BRAIN_INPUTS: u32 = 77u;       // Sprint 126: 27 sensory + 50 recurrent
-const BRAIN_HIDDEN: u32 = 50u;
-const BRAIN_OUTPUTS: u32 = 12u;      // Sprint 126: +2 (ch1, ch2 emit)
+const BRAIN_INPUTS: u32 = 72u;
+const BRAIN_HIDDEN: u32 = 45u;
+const BRAIN_OUTPUTS: u32 = 12u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3850u;        // Sprint 126: BRAIN_HIDDEN * BRAIN_INPUTS = 50*77
-const W2_OFFSET: u32 = 3900u;
-const B2_OFFSET: u32 = 4500u;
-const WEIGHTS_PER_CELL: u32 = 4512u;
+const B1_OFFSET: u32 = 3240u;        // BRAIN_HIDDEN * BRAIN_INPUTS
+const W2_OFFSET: u32 = 3285u;        // B1_OFFSET + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 3825u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
+const WEIGHTS_PER_CELL: u32 = 3837u; // B2_OFFSET + BRAIN_OUTPUTS
 
 struct HebbianParams {
     num_cells: u32,
@@ -50,27 +48,40 @@ fn hebbian(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hid_off = i * BRAIN_HIDDEN;
     let out_off = i * BRAIN_OUTPUTS;
 
-    // w1[h][in] += lr × hidden[h] × inputs[in]; b1[h] += lr × hidden[h]
-    for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
-        let h_val = last_hidden[hid_off + h];
-        for (var in_i: u32 = 0u; in_i < BRAIN_INPUTS; in_i = in_i + 1u) {
-            let x = last_inputs[inp_off + in_i];
-            let w_idx = w_off + W1_OFFSET + h * BRAIN_INPUTS + in_i;
-            brain_weights[w_idx] = brain_weights[w_idx] + lr * h_val * x;
-        }
-        let b_idx = w_off + B1_OFFSET + h;
-        brain_weights[b_idx] = brain_weights[b_idx] + lr * h_val;
+    // Cache pre-activations once. Without this, the L1 inner loop re-reads
+    // last_inputs BRAIN_HIDDEN× and L2 re-reads last_hidden BRAIN_OUTPUTS×.
+    var in_local: array<f32, BRAIN_INPUTS>;
+    for (var k: u32 = 0u; k < BRAIN_INPUTS; k = k + 1u) {
+        in_local[k] = last_inputs[inp_off + k];
+    }
+    var hid_local: array<f32, BRAIN_HIDDEN>;
+    for (var k: u32 = 0u; k < BRAIN_HIDDEN; k = k + 1u) {
+        hid_local[k] = last_hidden[hid_off + k];
     }
 
-    // w2[o][h] += lr × output[o] × hidden[h]; b2[o] += lr × output[o]
-    for (var o: u32 = 0u; o < BRAIN_OUTPUTS; o = o + 1u) {
-        let o_val = last_outputs[out_off + o];
-        for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
-            let h_val = last_hidden[hid_off + h];
-            let w_idx = w_off + W2_OFFSET + o * BRAIN_HIDDEN + h;
-            brain_weights[w_idx] = brain_weights[w_idx] + lr * o_val * h_val;
+    let w1_base = w_off + W1_OFFSET;
+    let b1_base = w_off + B1_OFFSET;
+    for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
+        let lr_h = lr * hid_local[h];
+        let row_base = w1_base + h * BRAIN_INPUTS;
+        for (var in_i: u32 = 0u; in_i < BRAIN_INPUTS; in_i = in_i + 1u) {
+            let w_idx = row_base + in_i;
+            brain_weights[w_idx] = brain_weights[w_idx] + lr_h * in_local[in_i];
         }
-        let b_idx = w_off + B2_OFFSET + o;
-        brain_weights[b_idx] = brain_weights[b_idx] + lr * o_val;
+        let b_idx = b1_base + h;
+        brain_weights[b_idx] = brain_weights[b_idx] + lr_h;
+    }
+
+    let w2_base = w_off + W2_OFFSET;
+    let b2_base = w_off + B2_OFFSET;
+    for (var o: u32 = 0u; o < BRAIN_OUTPUTS; o = o + 1u) {
+        let lr_o = lr * last_outputs[out_off + o];
+        let row_base = w2_base + o * BRAIN_HIDDEN;
+        for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
+            let w_idx = row_base + h;
+            brain_weights[w_idx] = brain_weights[w_idx] + lr_o * hid_local[h];
+        }
+        let b_idx = b2_base + o;
+        brain_weights[b_idx] = brain_weights[b_idx] + lr_o;
     }
 }

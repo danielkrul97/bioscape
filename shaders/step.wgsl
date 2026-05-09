@@ -1,10 +1,13 @@
-// Sprint 50: GPU mirror Cell::step — integrate_kinematics + anisotropic drag
-// + angular drag + energy costs + world bounce. Per-cell, no neighbor lookup.
+// Per-cell `Cell::step` mirror: integrate kinematics, anisotropic + angular
+// drag, thermal-modulated energy costs, world bounce. No neighbor lookup.
 //
-// CPU sekvence: apply_brain_motor (Sprint 50 motor.wgsl) → apply_morph
-// (CPU stays) → apply_brownian (CPU stays — RNG) → step (THIS SHADER).
+// Pipeline order on the host: apply_brain_motor (motor.wgsl) → apply_morph
+// (CPU) → apply_brownian (CPU, RNG-bound) → this shader.
 //
-// Bindings: 11 storage (limit_max=12 v GpuContext) + 1 uniform = 12 total.
+// Bindings: 11 storage + 1 uniform = 12 total — at the per-pipeline limit
+// (`GpuContext` caps at 12). Adding a binding here forces a SoA refactor.
+
+const TAU: f32 = 6.28318530717958647692;
 
 struct StepParams {
     num_cells: u32,
@@ -34,6 +37,10 @@ struct StepParams {
     thermal_seasonal_amp: f32,
     thermal_diurnal_phase: f32,
     thermal_seasonal_phase: f32,
+    thermal_log2_q10: f32,
+    pad_b0: u32,
+    pad_b1: u32,
+    pad_b2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: StepParams;
@@ -55,7 +62,10 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_cells) {
         return;
     }
-    ages[i] = ages[i] + 1u;
+    let is_3d = params.world_half_z > 0.0;
+    let dt = params.dt;
+    let new_age = ages[i] + 1u;
+    ages[i] = new_age;
     if (cooldowns[i] > 0u) {
         cooldowns[i] = cooldowns[i] - 1u;
     }
@@ -83,55 +93,51 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vision = aux[i * 4u + 2u];
     let attack = aux[i * 4u + 3u];
 
-    // integrate_kinematics
-    pos = pos + vel * params.dt;
-    heading = heading + ang_vel * params.dt;
-    if (params.world_half_z > 0.0) {
-        vel.z = vel.z - params.gravity * params.dt;
+    pos = pos + vel * dt;
+    heading = heading + ang_vel * dt;
+    if (is_3d) {
+        vel.z = vel.z - params.gravity * dt;
     }
-    pitch = clamp(pitch + pitch_vel * params.dt, -params.pitch_clamp, params.pitch_clamp);
+    pitch = clamp(pitch + pitch_vel * dt, -params.pitch_clamp, params.pitch_clamp);
 
-    // apply_anisotropic_drag
     let cp = cos(pitch);
     let fwd = vec3<f32>(cos(heading) * cp, sin(heading) * cp, sin(pitch));
     let v_par = dot(vel, fwd);
     let v_perp = vel - v_par * fwd;
     let v_perp_mag = length(v_perp);
-    let drag_par_factor = params.drag * abs(v_par) * body_w * params.dt;
-    let drag_perp_factor = params.drag * v_perp_mag * body_l * params.dt;
+    let drag_par_factor = params.drag * abs(v_par) * body_w * dt;
+    let drag_perp_factor = params.drag * v_perp_mag * body_l * dt;
     let new_v_par = v_par - drag_par_factor * v_par;
     let new_v_perp = v_perp - drag_perp_factor * v_perp;
     vel = new_v_par * fwd + new_v_perp;
 
-    // apply_angular_drag
-    let ang_drag_factor = max(1.0 - params.angular_drag * params.dt, 0.0);
+    let ang_drag_factor = max(1.0 - params.angular_drag * dt, 0.0);
     ang_vel = ang_vel * ang_drag_factor;
     pitch_vel = pitch_vel * ang_drag_factor;
 
-    // apply_energy_costs
-    // Sprint 85: thermal stratification — z-gradient teplota × Q10 metabolism
-    // multiplikátor na all drains. Mirror CPU `temperature_at_z` +
-    // `metabolism_factor`. Při world_half_z = 0 fallback na ref temp = 1.0×.
-    // Sprint 86: time-varying — seasonal uniform shift (per gen) + diurnal
-    // surface-weighted oscilace (per tick). Phases pre-computed CPU-side.
-    let TAU = 6.28318530717958647692;
-    var temp = params.thermal_ref_temp;
-    if (params.world_half_z > 0.0) {
+    // Thermal-modulated metabolism: z-stratified base temp + seasonal (per gen)
+    // and diurnal (per tick) oscillations, fed through Q10. In 2D mode
+    // (world_half_z = 0) temp = ref → metabolism = 1.0; fold the entire branch
+    // away to skip the pow when the simulation is non-thermal.
+    var dt_eff = dt;
+    if (is_3d) {
         var norm = (pos.z / params.world_half_z + 1.0) * 0.5;
         norm = clamp(norm, 0.0, 1.0);
         let base = params.thermal_bottom + (params.thermal_top - params.thermal_bottom) * norm;
         let seasonal_offset = params.thermal_seasonal_amp * sin(TAU * params.thermal_seasonal_phase);
         let diurnal_offset = params.thermal_diurnal_amp * norm * sin(TAU * params.thermal_diurnal_phase);
-        temp = base + seasonal_offset + diurnal_offset;
+        let temp = base + seasonal_offset + diurnal_offset;
+        // `pow(q10, x) == exp2(x * log2(q10))`; CPU-side `thermal_log2_q10`
+        // turns the per-cell pow into a single mul + exp2.
+        let metabolism = exp2((temp - params.thermal_ref_temp) * 0.1 * params.thermal_log2_q10);
+        dt_eff = dt * metabolism;
     }
-    let metabolism = pow(params.thermal_q10, (temp - params.thermal_ref_temp) / 10.0);
-    let dt_eff = params.dt * metabolism;
     let v_mag_sq = dot(vel, vel);
     energy = energy - v_mag_sq * params.energy_cost_per_v_sq * dt_eff;
     let eff_r = (body_l + body_w + body_h) / 3.0;
     energy = energy - eff_r * eff_r * ang_vel * ang_vel * params.angular_energy_cost * dt_eff;
     energy = energy - vision * params.vision_cost_per_radius * dt_eff;
-    let age_sec = f32(ages[i]) / params.fixed_timestep_hz;
+    let age_sec = f32(new_age) / params.fixed_timestep_hz;
     let aging_factor = 1.0 + params.age_decay_per_sec * age_sec;
     let volume = body_l * body_w * body_h;
     energy = energy - volume * params.body_cost_factor * aging_factor * dt_eff;
@@ -140,8 +146,8 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let attack_strength = max(attack, 0.0);
     energy = energy - attack_strength * params.attack_cost_per_sec * dt_eff;
 
-    // Sprint 54: toroidal xy wrap (cylinder topology), z bounce. Matches
-    // CPU `Cell::apply_world_bounce` Sprint 54 semantiku.
+    // Toroidal XY wrap (cylinder topology) + Z bounce. Mirror of CPU
+    // `Cell::apply_world_bounce`.
     let wx = 2.0 * params.world_half_x;
     let wy = 2.0 * params.world_half_y;
     if (pos.x >= params.world_half_x || pos.x < -params.world_half_x) {
@@ -152,7 +158,7 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
         let p = pos.y + params.world_half_y;
         pos.y = p - floor(p / wy) * wy - params.world_half_y;
     }
-    if (params.world_half_z > 0.0 && abs(pos.z) > params.world_half_z) {
+    if (is_3d && abs(pos.z) > params.world_half_z) {
         vel.z = -vel.z;
         pos.z = clamp(pos.z, -params.world_half_z, params.world_half_z);
     }

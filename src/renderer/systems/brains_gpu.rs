@@ -27,7 +27,7 @@ use super::super::resources_gpu::GpuFullPipeline;
 /// `pool_bonded_hidden_cells`); CPU `cells_brain_act` se sám skipuje pokud
 /// `GpuFullPipeline` resource existuje.
 pub(crate) fn cells_brain_act_gpu_full(
-    mut cells: Query<&mut CellEntity, Without<Dying>>,
+    mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     foods: Query<&FoodEntity>,
     coop_foods: Res<CoopFoodResource>,
     slot_map: Res<CellSlotMap>,
@@ -50,53 +50,102 @@ pub(crate) fn cells_brain_act_gpu_full(
     // unblockne split borrows (Rust borrow checker rozumí přes `&mut *T`).
     let pipeline = &mut *pipeline;
 
-    // Phase 1: CPU snapshot — iterujeme cells v slot order (slot_map.slot_to_entity)
-    // aby buffer indexy odpovídaly GPU slotům. apply_shell_absorb mutuje
-    // damage_accum předem; last_best_food_d2 = 0.0 disable eat_food skip
-    // (sensor běžel na GPU, CPU nemá přístup k best_food_d2).
+    // Phase 1a: resize SoA scratch + push food positions sequentially (small
+    // pool — typically O(food_target)).
     let food_n = foods.iter().count() + coop_foods.0.len();
-    pipeline.scratch.clear_and_reserve(n, food_n);
-    for slot in 0..n {
-        let entity = slot_map.slot_to_entity[slot];
-        let Ok(mut cell_entity) = cells.get_mut(entity) else { continue };
+    pipeline.scratch.food_positions.clear();
+    pipeline.scratch.food_positions.reserve(food_n);
+    for food in &foods {
+        pipeline.scratch.food_positions.push(food.0.position);
+    }
+    for coop in coop_foods.0.iter() {
+        pipeline.scratch.food_positions.push(coop.position);
+    }
+    pipeline.scratch.resize_snapshot(n);
+
+    // Phase 1b: parallel snapshot. Each closure invocation owns its slot
+    // (`slot_map.slot_of(entity)` is one-to-one for live cells), so writing
+    // to per-slot raw pointers is race-free even though the pointers
+    // themselves are shared. `par_iter_mut` already serialises the mutable
+    // `Cell` access per entity.
+    //
+    // `MutPtr<T>` / `ConstPtr<T>` wrap raw pointers into Send+Sync newtypes
+    // so Rust 2021 disjoint capture in the closure can capture each field
+    // without re-tripping the auto-trait check on `*mut T` / `*const T`.
+    #[derive(Copy, Clone)]
+    struct MutPtr<T>(*mut T);
+    // SAFETY: parallel tasks index disjoint slots; no aliasing.
+    unsafe impl<T> Send for MutPtr<T> {}
+    unsafe impl<T> Sync for MutPtr<T> {}
+    impl<T> MutPtr<T> {
+        #[inline]
+        unsafe fn add(self, n: usize) -> *mut T {
+            unsafe { self.0.add(n) }
+        }
+    }
+    #[derive(Copy, Clone)]
+    struct ConstPtr<T>(*const T);
+    unsafe impl<T> Send for ConstPtr<T> {}
+    unsafe impl<T> Sync for ConstPtr<T> {}
+    impl<T> ConstPtr<T> {
+        #[inline]
+        unsafe fn add(self, n: usize) -> *const T {
+            unsafe { self.0.add(n) }
+        }
+    }
+
+    let snap_positions = MutPtr(pipeline.scratch.positions.as_mut_ptr());
+    let snap_eff_radii = MutPtr(pipeline.scratch.eff_radii.as_mut_ptr());
+    let snap_vision_radii = MutPtr(pipeline.scratch.vision_radii.as_mut_ptr());
+    let snap_energies = MutPtr(pipeline.scratch.energies.as_mut_ptr());
+    let snap_headings = MutPtr(pipeline.scratch.headings.as_mut_ptr());
+    let snap_pitches = MutPtr(pipeline.scratch.pitches.as_mut_ptr());
+    let snap_damage_accums = MutPtr(pipeline.scratch.damage_accums.as_mut_ptr());
+    let snap_max_speeds = MutPtr(pipeline.scratch.max_speeds.as_mut_ptr());
+    let snap_velocities = MutPtr(pipeline.scratch.velocities.as_mut_ptr());
+    let snap_angular_vels = MutPtr(pipeline.scratch.angular_vels.as_mut_ptr());
+    let snap_pitch_vels = MutPtr(pipeline.scratch.pitch_vels.as_mut_ptr());
+    let snap_ages = MutPtr(pipeline.scratch.ages.as_mut_ptr());
+    let snap_cooldowns = MutPtr(pipeline.scratch.cooldowns.as_mut_ptr());
+    let snap_body_dims = MutPtr(pipeline.scratch.body_dims.as_mut_ptr());
+    let snap_aux = MutPtr(pipeline.scratch.aux.as_mut_ptr());
+    let snap_hidden_ns = MutPtr(pipeline.scratch.hidden_ns.as_mut_ptr());
+    let slot_map_ref = &*slot_map;
+    cells.par_iter_mut().for_each(|(entity, mut cell_entity)| {
+        let Some(slot) = slot_map_ref.slot_of(entity) else { return };
         let cell = &mut cell_entity.0;
         cell.apply_shell_absorb(dt);
         cell.last_best_food_d2 = 0.0;
-        let s = &mut pipeline.scratch;
-        s.positions.push(cell.position);
-        s.eff_radii.push(cell.phenotype.effective_radius());
-        s.vision_radii.push(cell.genome.vision_radius);
-        s.energies.push(cell.energy);
-        s.headings.push(cell.heading);
-        s.pitches.push(cell.pitch);
-        s.damage_accums.push(cell.damage_accum);
-        s.max_speeds.push(cell.genome.max_speed);
-        s.velocities.push(cell.velocity);
-        s.angular_vels.push(cell.angular_velocity);
-        s.pitch_vels.push(cell.pitch_velocity);
-        s.ages.push(cell.age as u32);
-        s.cooldowns.push(cell.reproduce_cooldown_ticks);
-        s.body_dims.push([
-            cell.phenotype.body_length,
-            cell.phenotype.body_width,
-            cell.phenotype.body_height,
-        ]);
-        s.aux.push([
-            cell.phenotype.total_spike_cost_factor(),
-            cell.phenotype.shell_thickness,
-            cell.genome.vision_radius,
-            cell.last_outputs[6].max(0.0),
-        ]);
-        s.hidden_ns.push(cell.genome.brain.hidden_n);
-    }
-    // Foods + coop_foods do single sensor pool.
-    let s = &mut pipeline.scratch;
-    for food in &foods {
-        s.food_positions.push(food.0.position);
-    }
-    for coop in coop_foods.0.iter() {
-        s.food_positions.push(coop.position);
-    }
+        // SAFETY: `slot < n` (guaranteed by slot_map invariant) and each slot
+        // is touched by exactly one closure invocation per tick.
+        unsafe {
+            *snap_positions.add(slot) = cell.position;
+            *snap_eff_radii.add(slot) = cell.phenotype.effective_radius();
+            *snap_vision_radii.add(slot) = cell.genome.vision_radius;
+            *snap_energies.add(slot) = cell.energy;
+            *snap_headings.add(slot) = cell.heading;
+            *snap_pitches.add(slot) = cell.pitch;
+            *snap_damage_accums.add(slot) = cell.damage_accum;
+            *snap_max_speeds.add(slot) = cell.genome.max_speed;
+            *snap_velocities.add(slot) = cell.velocity;
+            *snap_angular_vels.add(slot) = cell.angular_velocity;
+            *snap_pitch_vels.add(slot) = cell.pitch_velocity;
+            *snap_ages.add(slot) = cell.age as u32;
+            *snap_cooldowns.add(slot) = cell.reproduce_cooldown_ticks;
+            *snap_body_dims.add(slot) = [
+                cell.phenotype.body_length,
+                cell.phenotype.body_width,
+                cell.phenotype.body_height,
+            ];
+            *snap_aux.add(slot) = [
+                cell.phenotype.total_spike_cost_factor(),
+                cell.phenotype.shell_thickness,
+                cell.genome.vision_radius,
+                cell.last_outputs[6].max(0.0),
+            ];
+            *snap_hidden_ns.add(slot) = cell.genome.brain.hidden_n;
+        }
+    });
 
     // Aliases pro split borrow — upload_* berou &[T] sliced ze scratch fields.
     let positions = pipeline.scratch.positions.as_slice();
@@ -199,6 +248,10 @@ pub(crate) fn cells_brain_act_gpu_full(
             / bioscape::THERMAL_DIURNAL_PERIOD_TICKS as f32,
         thermal_seasonal_phase: (clock.0.generation % CYCLE_GEN_PERIOD) as f32
             / CYCLE_GEN_PERIOD as f32,
+        thermal_log2_q10: bioscape::THERMAL_Q10.log2(),
+        _pad_b0: 0,
+        _pad_b1: 0,
+        _pad_b2: 0,
     };
 
     let mut encoder = pipeline
@@ -264,24 +317,34 @@ pub(crate) fn cells_brain_act_gpu_full(
         &mut pipeline.scratch.dl_energies,
     );
 
-    // Phase 11: writeback to ECS — iterujeme slot order, get_mut entity, write
-    // back fields. damage_accum reset (mirror populate_inputs shader behavior).
-    let dl = &pipeline.scratch;
-    for slot in 0..n {
-        let entity = slot_map.slot_to_entity[slot];
-        let Ok(mut cell_entity) = cells.get_mut(entity) else { continue };
+    // Phase 11: parallel writeback. Each cell's fields come from `slot` in
+    // each `dl_*` Vec — same per-slot ownership invariant as the snapshot.
+    let wb_hiddens = ConstPtr::<[f32; BRAIN_HIDDEN]>(pipeline.scratch.dl_hiddens.as_ptr());
+    let wb_outputs = ConstPtr::<[f32; bioscape::BRAIN_OUTPUTS]>(pipeline.scratch.dl_outputs.as_ptr());
+    let wb_velocities = ConstPtr::<[f32; 3]>(pipeline.scratch.dl_velocities.as_ptr());
+    let wb_angular = ConstPtr::<f32>(pipeline.scratch.dl_angular.as_ptr());
+    let wb_pitch = ConstPtr::<f32>(pipeline.scratch.dl_pitch.as_ptr());
+    let wb_positions = ConstPtr::<[f32; 3]>(pipeline.scratch.dl_positions.as_ptr());
+    let wb_ages = ConstPtr::<u32>(pipeline.scratch.dl_ages.as_ptr());
+    let wb_cooldowns = ConstPtr::<u32>(pipeline.scratch.dl_cooldowns.as_ptr());
+    let wb_energies = ConstPtr::<f32>(pipeline.scratch.dl_energies.as_ptr());
+    cells.par_iter_mut().for_each(|(entity, mut cell_entity)| {
+        let Some(slot) = slot_map_ref.slot_of(entity) else { return };
         let cell = &mut cell_entity.0;
-        cell.last_hidden = dl.dl_hiddens[slot];
-        cell.last_outputs = dl.dl_outputs[slot];
-        cell.velocity = dl.dl_velocities[slot];
-        cell.angular_velocity = dl.dl_angular[slot];
-        cell.pitch_velocity = dl.dl_pitch[slot];
-        cell.position = dl.dl_positions[slot];
-        cell.age = dl.dl_ages[slot] as u64;
-        cell.reproduce_cooldown_ticks = dl.dl_cooldowns[slot];
-        cell.energy = dl.dl_energies[slot];
+        // SAFETY: `slot < n` and each slot is consumed by one closure.
+        unsafe {
+            cell.last_hidden = *wb_hiddens.add(slot);
+            cell.last_outputs = *wb_outputs.add(slot);
+            cell.velocity = *wb_velocities.add(slot);
+            cell.angular_velocity = *wb_angular.add(slot);
+            cell.pitch_velocity = *wb_pitch.add(slot);
+            cell.position = *wb_positions.add(slot);
+            cell.age = (*wb_ages.add(slot)) as u64;
+            cell.reproduce_cooldown_ticks = *wb_cooldowns.add(slot);
+            cell.energy = *wb_energies.add(slot);
+        }
         cell.damage_accum = 0.0;
-    }
+    });
 
     diag.add_measurement(&DIAG_BRAIN_ACT, || t_total.elapsed().as_secs_f64() * 1000.0);
 }

@@ -5,22 +5,20 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 49: GPU broad-phase neighbors query (chains SpatialHashGpu output)
-// ============================================================================
+// GPU broad-phase neighbors query. Chains the `SpatialHashGpu` output to
+// pick the nearest neighbor inside each cell's `vision_radius`.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 struct NeighborsParams {
     num_cells: u32,
     cell_size: f32,
-    /// Sprint 55: toroidal bounds.
     world_half_x: f32,
     world_half_y: f32,
 }
 
-/// Per-cell broad-phase result. `nearest_cell` = None pokud žádný neighbor
-/// uvnitř `vision_radius` neexistuje.
+/// Per-cell broad-phase result. `nearest_cell` is `None` when no neighbor
+/// sits inside `vision_radius`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NeighborResult {
     pub nearest_cell: Option<([f32; 3], f32)>,
@@ -34,7 +32,6 @@ pub struct NeighborsGpu {
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
     cell_size: f32,
-    /// Sprint 55: toroidal bounds.
     world_half_xy: [f32; 2],
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
@@ -256,9 +253,9 @@ impl NeighborsGpu {
         self.capacity = new_cap;
     }
 
-    /// Sprint 49: bind cell hash + cells data, dispatch, readback.
-    /// Caller je zodpovědný za to, že `cell_hash` byl rebuildnut s těmi
-    /// samými positions (jinak GPU dostane mismatch indices).
+    /// Bind the cell hash + per-cell data, dispatch, then read back. The
+    /// caller is responsible for rebuilding `cell_hash` with the *same*
+    /// `positions` — a mismatch hands the GPU stale indices.
     pub fn compute(
         &mut self,
         positions: &[[f32; 3]],
@@ -298,7 +295,7 @@ impl NeighborsGpu {
         self.queue
             .write_buffer(&self.vision_buf, 0, bytemuck::cast_slice(vision_radii));
 
-        // Bind group musí refekrencovat cell_hash buffery — vytváří se per call.
+        // The bind group has to reference `cell_hash` buffers, so it's built per call.
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("neighbors-bg"),
             layout: &self.bind_group_layout,

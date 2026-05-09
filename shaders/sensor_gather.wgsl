@@ -1,17 +1,16 @@
-// Sprint 50: GPU mirror celého sensor gather kroku z `World::brain_act`
-// (headless). Per cell:
-//   - cell_hash query → nearest cell + neighbors_in_vision
+// Sprint 50: GPU mirror of World::brain_act sensor gather (headless). Per cell:
+//   - cell_hash query → nearest cell + neighbors_in_vision count
 //   - food_hash query → nearest food
-//   - sample smell + pheromone fields (finite-diff gradient at pos.xy)
+//   - sample 3D smell + pheromone gradients via finite difference
 //
-// Konzumuje výstupy:
-//   SpatialHashGpu (cells) — Sprint 45
-//   SpatialHashGpu (foods) — separate instance
-//   FieldGpu × 2 (smell, pheromone) — Sprint 46, čteme grid jako array<u32>
-//                                     a bitcastujeme na f32.
+// Consumes:
+//   SpatialHashGpu (cells)        — Sprint 45
+//   SpatialHashGpu (foods)        — separate instance
+//   FieldGpu × 2 (smell, pheromone) — Sprint 46, grids read as array<u32>
+//                                     and bitcast to f32.
 //
-// Output layout per cell (15 f32, stride 15 — Sprint 56 přidal z-složky gradientů):
-//   [0..3]   nearest_food.dx,dy,dz   (0 pokud has_food == 0)
+// Output layout per cell (15 f32, stride 15 — Sprint 56 added z gradient slots):
+//   [0..3]   nearest_food.dx,dy,dz   (0 if has_food == 0)
 //   [3]      has_food (0.0 / 1.0)
 //   [4..7]   nearest_cell.dx,dy,dz
 //   [7]      nearest_cell radius (-1.0 = no cell — sentinel)
@@ -33,7 +32,6 @@ struct SensorParams {
     world_half_x: f32,
     world_half_y: f32,
     world_half_z: f32,
-    // Sprint 56: 3D field params (per-axis resolution + bounds).
     field_res_x: u32,
     field_res_y: u32,
     field_res_z: u32,
@@ -57,21 +55,7 @@ struct SensorParams {
 @group(0) @binding(10) var<storage, read> pheromone_grid: array<u32>;
 @group(0) @binding(11) var<storage, read_write> output: array<f32>;
 
-// Sprint 55: hash bucket wrap (toroidal).
-fn bucket_id_wrapped(pos: vec3<f32>) -> u32 {
-    let wx = 2.0 * params.world_half_x;
-    let wy = 2.0 * params.world_half_y;
-    let pos_wx = pos.x - floor((pos.x + params.world_half_x) / wx) * wx;
-    let pos_wy = pos.y - floor((pos.y + params.world_half_y) / wy) * wy;
-    let bx = i32(floor(pos_wx / params.hash_cell_size)) + HALF_NX;
-    let by = i32(floor(pos_wy / params.hash_cell_size)) + HALF_NY;
-    let bz = i32(floor(pos.z / params.hash_cell_size)) + HALF_NZ;
-    let bx_c = clamp(bx, 0, GRID_NX - 1);
-    let by_c = clamp(by, 0, GRID_NY - 1);
-    let bz_c = clamp(bz, 0, GRID_NZ - 1);
-    return u32(bx_c + by_c * GRID_NX + bz_c * GRID_NX * GRID_NY);
-}
-
+// Toroidal minimum-image displacement (used for both x and y).
 fn min_image_xy(d: f32, half: f32) -> f32 {
     let w = 2.0 * half;
     if (d > half) { return d - w; }
@@ -79,42 +63,54 @@ fn min_image_xy(d: f32, half: f32) -> f32 {
     return d;
 }
 
-// Sprint 56: 3D field sample. xy modulo wrap (toroidal), z out-of-range → 0.
-fn sample_field_3d(grid_kind: u32, pos: vec3<f32>) -> f32 {
-    let nx = i32(params.field_res_x);
-    let ny = i32(params.field_res_y);
-    let nz = i32(params.field_res_z);
-    let cell_x = (2.0 * params.field_world_half_x) / f32(nx);
-    let cell_y = (2.0 * params.field_world_half_y) / f32(ny);
-    let cell_z = (2.0 * params.field_world_half_z) / f32(nz);
-    let zi = i32(floor((pos.z + params.field_world_half_z) / cell_z));
-    if (zi < 0 || zi >= nz) {
-        return 0.0;
-    }
-    let xi_raw = i32(floor((pos.x + params.field_world_half_x) / cell_x));
-    let yi_raw = i32(floor((pos.y + params.field_world_half_y) / cell_y));
-    let xi = ((xi_raw % nx) + nx) % nx;
-    let yi = ((yi_raw % ny) + ny) % ny;
-    let idx = u32(zi * nx * ny + yi * nx + xi);
-    if (grid_kind == 0u) {
-        return bitcast<f32>(smell_grid[idx]);
-    }
-    return bitcast<f32>(pheromone_grid[idx]);
+// Bucket coordinates for a position. xy is wrapped to [-half, half) before
+// bucketing (toroidal); z is clamped (not toroidal).
+fn bucket_coords_of(pos: vec3<f32>) -> vec3<i32> {
+    let wx = 2.0 * params.world_half_x;
+    let wy = 2.0 * params.world_half_y;
+    let pos_wx = pos.x - floor((pos.x + params.world_half_x) / wx) * wx;
+    let pos_wy = pos.y - floor((pos.y + params.world_half_y) / wy) * wy;
+    let bx = i32(floor(pos_wx / params.hash_cell_size)) + HALF_NX;
+    let by = i32(floor(pos_wy / params.hash_cell_size)) + HALF_NY;
+    let bz = i32(floor(pos.z / params.hash_cell_size)) + HALF_NZ;
+    return vec3<i32>(
+        clamp(bx, 0, GRID_NX - 1),
+        clamp(by, 0, GRID_NY - 1),
+        clamp(bz, 0, GRID_NZ - 1),
+    );
 }
 
-fn gradient_at_3d(grid_kind: u32, pos: vec3<f32>) -> vec3<f32> {
-    let eps = params.field_eps;
-    let f_xp = sample_field_3d(grid_kind, vec3<f32>(pos.x + eps, pos.y, pos.z));
-    let f_xm = sample_field_3d(grid_kind, vec3<f32>(pos.x - eps, pos.y, pos.z));
-    let f_yp = sample_field_3d(grid_kind, vec3<f32>(pos.x, pos.y + eps, pos.z));
-    let f_ym = sample_field_3d(grid_kind, vec3<f32>(pos.x, pos.y - eps, pos.z));
-    let f_zp = sample_field_3d(grid_kind, vec3<f32>(pos.x, pos.y, pos.z + eps));
-    let f_zm = sample_field_3d(grid_kind, vec3<f32>(pos.x, pos.y, pos.z - eps));
-    let inv = 1.0 / (2.0 * eps);
-    return vec3<f32>(
-        (f_xp - f_xm) * inv,
-        (f_yp - f_ym) * inv,
-        (f_zp - f_zm) * inv,
+// Field grid constants — computed once and reused across all gradient samples.
+// Storing inverse cell sizes turns 18 per-sample divisions into 18 multiplies.
+struct FieldConsts {
+    nx: i32,
+    ny: i32,
+    nz: i32,
+    inv_cell_x: f32,
+    inv_cell_y: f32,
+    inv_cell_z: f32,
+};
+
+struct FieldSample {
+    smell: f32,
+    pheromone: f32,
+};
+
+// Single-position sample of both grids. xy is toroidal (modulo wrap); z out
+// of range yields a zero pair (matches CPU SmellField sample-on-bounds).
+fn sample_both_at(pos: vec3<f32>, fc: FieldConsts) -> FieldSample {
+    let zi = i32(floor((pos.z + params.field_world_half_z) * fc.inv_cell_z));
+    if (zi < 0 || zi >= fc.nz) {
+        return FieldSample(0.0, 0.0);
+    }
+    let xi_raw = i32(floor((pos.x + params.field_world_half_x) * fc.inv_cell_x));
+    let yi_raw = i32(floor((pos.y + params.field_world_half_y) * fc.inv_cell_y));
+    let xi = ((xi_raw % fc.nx) + fc.nx) % fc.nx;
+    let yi = ((yi_raw % fc.ny) + fc.ny) % fc.ny;
+    let idx = u32(zi * fc.nx * fc.ny + yi * fc.nx + xi);
+    return FieldSample(
+        bitcast<f32>(smell_grid[idx]),
+        bitcast<f32>(pheromone_grid[idx]),
     );
 }
 
@@ -131,29 +127,49 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let vr = vision_radii[i];
     let vr2 = vr * vr;
-    let r_cells = i32(ceil(vr / params.hash_cell_size));
-    let cs = params.hash_cell_size;
 
-    // Sprint 56: cell broad-phase přes ghost positions + bucket_id_wrapped
-    // (toroidal). Narrow-phase min-image distance.
+    // Resolve center bucket once and walk neighbors via integer ±wrap on xy
+    // (z clamped). Replaces the per-iteration bucket_id_wrapped() chain.
+    // Assumes r_cells < GRID_N/2 (vision radius < world half-extent).
+    let center = bucket_coords_of(pos_i);
+    let r_cells = i32(ceil(vr / params.hash_cell_size));
+
+    // Cell scan accumulators.
     var best_cell_d2 = vr2 + 1.0;
     var best_cell_dx: f32 = 0.0;
     var best_cell_dy: f32 = 0.0;
     var best_cell_dz: f32 = 0.0;
     var best_cell_radius: f32 = -1.0;
     var neighbors_count: u32 = 0u;
-    for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
+
+    // Food scan accumulators.
+    var best_food_d2 = vr2 + 1.0;
+    var best_food_dx: f32 = 0.0;
+    var best_food_dy: f32 = 0.0;
+    var best_food_dz: f32 = 0.0;
+    var has_food: f32 = 0.0;
+
+    // Uniform across the whole dispatch — no warp divergence on this branch.
+    let scan_foods = params.num_foods > 0u;
+
+    // Fused outer loop: each (dx,dy,dz) resolves one bucket id, then both
+    // hashes are queried at that bucket. Halves bucket-coord overhead.
+    for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
+        let bz = clamp(center.z + dz, 0, GRID_NZ - 1);
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
-            for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-                let nbr_pos = vec3<f32>(
-                    pos_i.x + f32(dx) * cs,
-                    pos_i.y + f32(dy) * cs,
-                    pos_i.z + f32(dz) * cs,
-                );
-                let b = bucket_id_wrapped(nbr_pos);
-                let start = cell_hash_offsets[b];
-                let end = cell_hash_offsets[b + 1u];
-                for (var k = start; k < end; k = k + 1u) {
+            var by = center.y + dy;
+            if (by < 0) { by = by + GRID_NY; }
+            else if (by >= GRID_NY) { by = by - GRID_NY; }
+            for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
+                var bx = center.x + dx;
+                if (bx < 0) { bx = bx + GRID_NX; }
+                else if (bx >= GRID_NX) { bx = bx - GRID_NX; }
+                let b = u32(bx + by * GRID_NX + bz * GRID_NX * GRID_NY);
+
+                // Cell scan: nearest neighbor + count.
+                let c_start = cell_hash_offsets[b];
+                let c_end = cell_hash_offsets[b + 1u];
+                for (var k = c_start; k < c_end; k = k + 1u) {
                     let j = cell_hash_sorted[k];
                     if (j == i) {
                         continue;
@@ -178,29 +194,12 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                         }
                     }
                 }
-            }
-        }
-    }
 
-    // Food broad-phase: nearest food (also toroidal).
-    var best_food_d2 = vr2 + 1.0;
-    var best_food_dx: f32 = 0.0;
-    var best_food_dy: f32 = 0.0;
-    var best_food_dz: f32 = 0.0;
-    var has_food: f32 = 0.0;
-    if (params.num_foods > 0u) {
-        for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
-            for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
-                for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-                    let nbr_pos = vec3<f32>(
-                        pos_i.x + f32(dx) * cs,
-                        pos_i.y + f32(dy) * cs,
-                        pos_i.z + f32(dz) * cs,
-                    );
-                    let b = bucket_id_wrapped(nbr_pos);
-                    let start = food_hash_offsets[b];
-                    let end = food_hash_offsets[b + 1u];
-                    for (var k = start; k < end; k = k + 1u) {
+                // Food scan: nearest only.
+                if (scan_foods) {
+                    let f_start = food_hash_offsets[b];
+                    let f_end = food_hash_offsets[b + 1u];
+                    for (var k = f_start; k < f_end; k = k + 1u) {
                         let f = food_hash_sorted[k];
                         let pf = vec3<f32>(
                             food_positions[f * 3u + 0u],
@@ -224,11 +223,35 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Sprint 56: 3D field gradient samples (xy wrapped via sample_field_3d).
-    let smell_grad = gradient_at_3d(0u, pos_i);
-    let pheromone_grad = gradient_at_3d(1u, pos_i);
+    // Field gradients: 6 dual-grid samples instead of 12 single-grid ones.
+    let fc = FieldConsts(
+        i32(params.field_res_x),
+        i32(params.field_res_y),
+        i32(params.field_res_z),
+        f32(params.field_res_x) / (2.0 * params.field_world_half_x),
+        f32(params.field_res_y) / (2.0 * params.field_world_half_y),
+        f32(params.field_res_z) / (2.0 * params.field_world_half_z),
+    );
+    let eps = params.field_eps;
+    let s_xp = sample_both_at(vec3<f32>(pos_i.x + eps, pos_i.y, pos_i.z), fc);
+    let s_xm = sample_both_at(vec3<f32>(pos_i.x - eps, pos_i.y, pos_i.z), fc);
+    let s_yp = sample_both_at(vec3<f32>(pos_i.x, pos_i.y + eps, pos_i.z), fc);
+    let s_ym = sample_both_at(vec3<f32>(pos_i.x, pos_i.y - eps, pos_i.z), fc);
+    let s_zp = sample_both_at(vec3<f32>(pos_i.x, pos_i.y, pos_i.z + eps), fc);
+    let s_zm = sample_both_at(vec3<f32>(pos_i.x, pos_i.y, pos_i.z - eps), fc);
+    let inv_2eps = 0.5 / eps;
 
-    // Pack output (stride 15: + smell_grad.z + pheromone_grad.z).
+    let smell_grad = vec3<f32>(
+        (s_xp.smell - s_xm.smell) * inv_2eps,
+        (s_yp.smell - s_ym.smell) * inv_2eps,
+        (s_zp.smell - s_zm.smell) * inv_2eps,
+    );
+    let pheromone_grad = vec3<f32>(
+        (s_xp.pheromone - s_xm.pheromone) * inv_2eps,
+        (s_yp.pheromone - s_ym.pheromone) * inv_2eps,
+        (s_zp.pheromone - s_zm.pheromone) * inv_2eps,
+    );
+
     let off = i * 15u;
     output[off + 0u] = best_food_dx;
     output[off + 1u] = best_food_dy;

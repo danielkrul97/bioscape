@@ -1,27 +1,30 @@
-// Sprint 44: per-cell forward pass mozku.
-// Layout musí matchnout `lib::gpu::BRAIN_WEIGHTS_PER_CELL` packing v Rustu.
+// Per-cell brain forward pass. Weights layout must match the Rust packing
+// in `lib::gpu` — keep BRAIN_WEIGHTS_PER_CELL in sync.
 //
-// Vstupy (binding 1): N × BRAIN_INPUTS f32, AoS po cells.
-// Váhy (binding 2): N × WEIGHTS_PER_CELL f32, AoS po cells. Per-cell layout:
-//   [0..3850)    w1 row-major (HIDDEN rows × INPUTS cols)
-//   [3850..3900) b1
-//   [3900..4500) w2 row-major (OUTPUTS rows × HIDDEN cols)
-//   [4500..4512) b2
-// Hidden (binding 3): N × BRAIN_HIDDEN f32, write-back.
-// Outputs (binding 4): N × BRAIN_OUTPUTS f32, write-back.
-// Per-cell active hidden count (`Brain.hidden_n`) je pro shader IRRELEVANT —
-// dead zone weights jsou zero (CPU-side init), tedy zero contribution k
-// hidden / output. Pre-Sprint-80 cells (hidden_n=16) produkují identický
-// výstup pre a post bump.
+// Bindings:
+//   1 inputs    N × BRAIN_INPUTS  (AoS)
+//   2 weights   N × WEIGHTS_PER_CELL (AoS); per-cell layout:
+//       [0..3240)    w1 row-major (HIDDEN × INPUTS)
+//       [3240..3285) b1
+//       [3285..3825) w2 row-major (OUTPUTS × HIDDEN)
+//       [3825..3837) b2
+//   3 hidden    N × BRAIN_HIDDEN  (write-back)
+//   4 outputs   N × BRAIN_OUTPUTS (write-back)
+//   5 hidden_n  N × u32 — per-cell active neuron count
+//
+// The shader iterates the full BRAIN_HIDDEN range regardless of `hidden_n`:
+// dead-zone weights are zero (enforced CPU-side), so inactive neurons
+// contribute nothing. `hidden_n` only gates which tanh path the activation
+// takes — see `tanh_fast` below.
 
-const BRAIN_INPUTS: u32 = 77u;       // Sprint 126: 27 sensory + 50 recurrent
-const BRAIN_HIDDEN: u32 = 50u;       // Sprint 103: 32 → 50 storage cap
-const BRAIN_OUTPUTS: u32 = 12u;      // Sprint 126: +2 (ch1, ch2 emit)
+const BRAIN_INPUTS: u32 = 72u;
+const BRAIN_HIDDEN: u32 = 45u;
+const BRAIN_OUTPUTS: u32 = 12u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3850u;        // Sprint 126: BRAIN_HIDDEN * BRAIN_INPUTS = 50*77
-const W2_OFFSET: u32 = 3900u;        // B1 + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 4500u;        // W2 + BRAIN_OUTPUTS * BRAIN_HIDDEN = 3900+12*50
-const WEIGHTS_PER_CELL: u32 = 4512u; // B2 + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 3240u;        // BRAIN_HIDDEN * BRAIN_INPUTS
+const W2_OFFSET: u32 = 3285u;        // B1_OFFSET + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 3825u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
+const WEIGHTS_PER_CELL: u32 = 3837u; // B2_OFFSET + BRAIN_OUTPUTS
 
 struct Params {
     num_cells: u32,
@@ -37,11 +40,10 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> outputs: array<f32>;
 @group(0) @binding(5) var<storage, read> hidden_n: array<u32>;
 
-// Padé(3,2) tanh approximation matching CPU `tanh_fast` for the active
-// hidden range that lands in full chunks of 8. Tail neurons within the
-// active region use the WGSL builtin `tanh` to mirror the scalar fallback
-// on CPU. Without this split, CPU and GPU diverge by up to ~2 % per neuron
-// (Padé approximation error), which busts the 1e-4 parity threshold.
+// Padé(3,2) tanh — mirrors the CPU `tanh_fast` SIMD path. Active neurons
+// in full 8-chunks use this; the scalar tail uses the WGSL builtin `tanh`
+// to match CPU's scalar fallback. Without the split the ~2 % Padé error
+// per neuron busts the 1e-4 CPU/GPU parity bound.
 fn tanh_fast(x: f32) -> f32 {
     let cx = clamp(x, -3.0, 3.0);
     let x2 = cx * cx;
@@ -63,11 +65,21 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h_n = hidden_n[cell];
     let chunk_end = (h_n / 8u) * 8u;
 
-    var hid: array<f32, 64>;
+    // Without this cache, every BRAIN_HIDDEN outer iteration re-reads the
+    // same 77 storage slots — 50× redundant load instructions per cell.
+    var in_local: array<f32, BRAIN_INPUTS>;
+    for (var i: u32 = 0u; i < BRAIN_INPUTS; i = i + 1u) {
+        in_local[i] = inputs[i_off + i];
+    }
+
+    let w1_base = w_off + W1_OFFSET;
+    let b1_base = w_off + B1_OFFSET;
+    var hid: array<f32, BRAIN_HIDDEN>;
     for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
-        var sum: f32 = weights[w_off + B1_OFFSET + h];
+        let row_base = w1_base + h * BRAIN_INPUTS;
+        var sum: f32 = weights[b1_base + h];
         for (var i: u32 = 0u; i < BRAIN_INPUTS; i = i + 1u) {
-            sum = sum + weights[w_off + W1_OFFSET + h * BRAIN_INPUTS + i] * inputs[i_off + i];
+            sum = sum + weights[row_base + i] * in_local[i];
         }
         var act: f32;
         if (h < chunk_end) {
@@ -81,10 +93,13 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
         hidden[h_off + h] = act;
     }
 
+    let w2_base = w_off + W2_OFFSET;
+    let b2_base = w_off + B2_OFFSET;
     for (var o: u32 = 0u; o < BRAIN_OUTPUTS; o = o + 1u) {
-        var sum: f32 = weights[w_off + B2_OFFSET + o];
+        let row_base = w2_base + o * BRAIN_HIDDEN;
+        var sum: f32 = weights[b2_base + o];
         for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
-            sum = sum + weights[w_off + W2_OFFSET + o * BRAIN_HIDDEN + h] * hid[h];
+            sum = sum + weights[row_base + h] * hid[h];
         }
         outputs[o_off + o] = tanh(sum);
     }

@@ -5,13 +5,12 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 61: PopulateInputsGpu — fuze sensor → brain forward
-// ============================================================================
+// `PopulateInputsGpu` — fuses the sensor stage into the brain forward
+// pipeline by writing brain inputs directly into `last_inputs` on the GPU.
 
-/// Sprint 61: shader params pro `populate_inputs.wgsl`. Konstanty mirroruje
-/// lib::populate_brain_inputs (BRAIN_INPUTS layout, normalizace gainy,
-/// REPRODUCE_THRESHOLD, DENSITY_NORM_COUNT).
+/// Shader params for `populate_inputs.wgsl`. Constants mirror
+/// `lib::populate_brain_inputs` (BRAIN_INPUTS layout, normalization gains,
+/// `HUNTER_REPRODUCE_THRESHOLD`, `DENSITY_NORM_COUNT`).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 pub struct PopulateInputsParams {
@@ -117,10 +116,12 @@ impl PopulateInputsGpu {
         })
     }
 
-    /// Sprint 61: dispatch populate_inputs shader. Caller pass:
-    /// - `cells`: CellsGpu (drží energy/heading/pitch/damage/max_speed/eff_radius/last_hidden/last_inputs/velocities buffery).
-    /// - `sensor`: SensorGatherGpu (output_buf + vision_radii_buf přes accessory).
-    /// Output = `cells.last_inputs_buf` populated; brain forward toto čte direct.
+    /// Dispatch the `populate_inputs` shader. Inputs:
+    /// - `cells`: holds energy / heading / pitch / damage / max_speed /
+    ///   eff_radius / last_hidden / last_inputs / velocities buffers.
+    /// - `sensor`: provides the per-cell sensor output and vision radii.
+    /// Output is written into `cells.last_inputs_buf`, which the brain
+    /// forward dispatch then reads directly.
     pub fn dispatch(
         &mut self,
         cells: &CellsGpu,

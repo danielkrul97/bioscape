@@ -3,11 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::*;
 
-/// Sprint 92: food kind tagged enum. Differentiates plant (ambient spawn,
-/// always available, baseline value), cell carrion (drops on cell death),
-/// hunter carrion (drops on hunter death, richest reward). Eat efficiency
-/// per kind je modulated by cell `genome.carnivore_score` ∈ [0, 1] —
-/// herbivore digestion vs carnivore digestion trade-off.
+/// Tagged food kind. `Plant` is the ambient spawn (always available,
+/// baseline value); `Carrion` drops on cell death; `HunterCarrion` drops on
+/// hunter death (richest reward). Per-kind digestion efficiency is gated by
+/// `genome.carnivore_score` — see `eat_efficiency`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum FoodKind {
@@ -25,53 +24,53 @@ impl Default for FoodKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Food {
     pub position: [f32; 3],
-    /// Sprint 42: ticks od spawnu. Drives decay of `value_factor`. Init 0
-    /// pro fresh food i carrion (univerzální decay, žádný carrion-specific
-    /// staleness offset).
+    /// Ticks since spawn. Drives `value_factor` decay; starts at 0 for both
+    /// fresh ambient food and carrion (no carrion-specific staleness offset).
     pub age_ticks: u32,
-    /// Sprint 92: food kind. `serde(default)` returns Plant pro backward-
-    /// compat s pre-S92 checkpointy.
     #[serde(default)]
     pub kind: FoodKind,
 }
 
-/// Sprint 92: base food value per kind. Carrion má vyšší value než plant
-/// (concentrated biomass), hunter carrion ještě víc (apex predator drop).
+/// Base food value per kind. Carrion is denser than plant (concentrated
+/// biomass) and hunter carrion is densest (apex predator drop).
 pub const PLANT_FOOD_VALUE: f32 = 20.0;
 pub const CARRION_FOOD_VALUE: f32 = 30.0;
 pub const HUNTER_CARRION_FOOD_VALUE: f32 = 50.0;
 
-/// Sprint 128: cooperative food node — high-value spawn, který nepřináší
-/// nic dokud N cells během time window nedorazí. Vytváří fitness coupling
-/// pro recruitment signaling: solo cells nedostanou nic, coordinated
-/// trio dostane high reward → selekce na "I see food, signal peers".
+// Cooperative food node — a high-value spawn that yields nothing until N
+// cells arrive within a time window. Creates fitness coupling for
+// recruitment signaling: solo cells get nothing, a coordinated trio gets
+// the full reward, so selection rewards "I see food, signal peers."
+
 pub const COOP_FOOD_REQUIRED_ARRIVALS: usize = 3;
-/// Time okno (ticks) od spawnu. Po vypršení: despawn bez reward.
+/// Time window (ticks) since spawn. After expiry, the node despawns with
+/// no reward distributed.
 pub const COOP_FOOD_TIME_WINDOW_TICKS: u32 = 120;
-/// Per-participant reward při úspěšné koordinaci. Asymetricky vysoký vůči
-/// regular Plant food (20) — incentive justifying loiter cost.
+/// Per-participant reward on a successful trigger. 4× the plant baseline —
+/// large enough to justify the loitering cost of waiting for peers.
 pub const COOP_FOOD_REWARD_PER_CELL: f32 = 80.0;
-/// Radius (sim units), v rámci kterého cell counts as "arrived". Větší než
-/// regular eat radius (~20) — coop food má vizuální/aroma signal "here is
-/// gathering point", cells nemusí stát přímo na něm.
+/// Acceptance radius for "arrived". Larger than the regular eat radius
+/// because the coop node represents a gathering point, not a literal
+/// food pickup — cells signal nearby, they don't need to overlap.
 pub const COOP_FOOD_ARRIVAL_RADIUS: f32 = 30.0;
-/// Spawn pravděpodobnost per tick (Poisson-like). Kalibrováno tak, aby vznikalo
-/// cca 10-15 coop nodes per generation (600 ticků). 0.02 → ~12 events/gen.
+/// Per-tick Poisson-like spawn rate, calibrated for ~10–15 coop nodes per
+/// 600-tick generation.
 pub const COOP_FOOD_SPAWN_RATE_PER_TICK: f32 = 0.02;
-/// Max simultaneous coop nodes ve světě. Cap pro ohraničení complexity
-/// (a paměť).
+/// Cap on simultaneously live coop nodes. Bounds memory and per-tick
+/// arrival-scan cost.
 pub const COOP_FOOD_MAX_CONCURRENT: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoopFood {
     pub position: [f32; 3],
     pub spawn_tick: u64,
-    /// Set unique cell_ids, které byly v `ARRIVAL_RADIUS` aspoň jeden tick.
-    /// Vec<u64> aby zachoval Serde + insertion order; lookup je O(N), ale
-    /// N je malé (typicky < 10).
+    /// Set of unique `cell_id`s that have been inside `ARRIVAL_RADIUS` for
+    /// at least one tick. Stored as `Vec<u64>` to preserve insertion order
+    /// for serde — lookup is O(N), acceptable because N stays small
+    /// (typically < 10).
     pub arrivals: Vec<u64>,
-    /// True pokud byl threshold dosažen → reward distribuován + bude
-    /// despawnut na konci aktuálního ticku.
+    /// True once the arrivals threshold was reached and the reward was
+    /// distributed; the node despawns at the end of that tick.
     pub triggered: bool,
 }
 
@@ -85,18 +84,18 @@ impl CoopFood {
         }
     }
 
-    /// True pokud věk > TIME_WINDOW. Caller volá po pokusu o trigger,
-    /// aby triggered nodes (které trigger zvládly přesně v expiry frame)
-    /// nebyly mylně klasifikovány jako "expired no reward".
+    /// True once `age >= TIME_WINDOW`. Callers test this *after* attempting
+    /// trigger so a node that triggers on its expiry tick isn't mis-classified
+    /// as "expired without reward".
     #[inline]
     pub fn is_expired(&self, current_tick: u64) -> bool {
         current_tick.saturating_sub(self.spawn_tick) >= COOP_FOOD_TIME_WINDOW_TICKS as u64
     }
 }
 
-/// Sprint 128: zaregistruj cell_id jako arrival. Insertion order zachovaná,
-/// duplikáty ignorovány (cell může být v radius víc ticků). Vrací true pokud
-/// byl id přidán, false pokud už evidoval.
+/// Register `cell_id` as having arrived. Insertion order is preserved;
+/// duplicates are ignored (a cell can be inside the radius for multiple
+/// ticks). Returns `true` only on the first registration.
 pub fn register_coop_arrival(coop: &mut CoopFood, cell_id: u64) -> bool {
     if coop.arrivals.iter().any(|id| *id == cell_id) {
         return false;
@@ -105,25 +104,33 @@ pub fn register_coop_arrival(coop: &mut CoopFood, cell_id: u64) -> bool {
     true
 }
 
-/// Sprint 128: pokus o trigger threshold. Vrací true pokud byl reward distribuován
-/// (= aspoň REQUIRED arrivals + ne-yet-triggered). Caller propaguje return value
-/// do per-gen counterů (coop_food_solved).
+/// Attempt to trigger the threshold and distribute rewards. Returns `true`
+/// only when the arrivals threshold was met and the node had not yet
+/// triggered. Callers propagate the return value into per-gen counters
+/// (`coop_food_solved`).
 pub fn try_trigger_coop(coop: &mut CoopFood, cells: &mut [Cell]) -> bool {
     if coop.triggered || coop.arrivals.len() < COOP_FOOD_REQUIRED_ARRIVALS {
         return false;
     }
+    // Build a `cell_id → idx` map once, then index in O(1). Avoids the previous
+    // O(arrivals × cells) `iter_mut().find` per arrival, which became visible
+    // at large populations.
+    let mut id_to_idx: rustc_hash::FxHashMap<u64, usize> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(cells.len(), Default::default());
+    for (i, c) in cells.iter().enumerate() {
+        id_to_idx.insert(c.cell_id, i);
+    }
     for cell_id in &coop.arrivals {
-        if let Some(cell) = cells.iter_mut().find(|c| c.cell_id == *cell_id) {
-            cell.energy += COOP_FOOD_REWARD_PER_CELL;
+        if let Some(&idx) = id_to_idx.get(cell_id) {
+            cells[idx].energy += COOP_FOOD_REWARD_PER_CELL;
         }
     }
     coop.triggered = true;
     true
 }
 
-/// Sprint 128: vyber random pozici uvnitř world bounds (toroidal world,
-/// stejná logika jako `Food::random`). Pokud `world_half[2] == 0`, z-osa
-/// vrací 0 — backward-compat s pre-S33 baseline.
+/// Random position inside the world bounds (toroidal XY, optionally
+/// non-zero Z). Mirrors `Food::random`.
 pub fn random_coop_position(rng: &mut impl Rng, world_half: [f32; 3]) -> [f32; 3] {
     let z = if world_half[2] > 0.0 {
         rng.random_range(-world_half[2]..world_half[2])
@@ -137,8 +144,8 @@ pub fn random_coop_position(rng: &mut impl Rng, world_half: [f32; 3]) -> [f32; 3
     ]
 }
 
-/// Sprint 128: per-tick scan + arrival registration pro každý coop node.
-/// Cell je v radius pokud (toroidal-aware) Euclidean distance ≤ ARRIVAL_RADIUS.
+/// Per-tick arrival scan: every cell within `ARRIVAL_RADIUS` (toroidal-aware)
+/// of each non-triggered coop node is registered as an arrival.
 pub fn register_coop_arrivals_for_all(coops: &mut [CoopFood], cells: &[Cell], world_half: [f32; 3]) {
     let r2 = COOP_FOOD_ARRIVAL_RADIUS * COOP_FOOD_ARRIVAL_RADIUS;
     for coop in coops.iter_mut() {
@@ -164,16 +171,10 @@ pub fn food_base_value(kind: FoodKind) -> f32 {
     }
 }
 
-/// Sprint 92: digestion efficiency per food kind × cell `carnivore_score`.
-/// Continuous trade-off: 0 = pure herbivore (plant only), 1 = pure carnivore
-/// (hunter carrion only), 0.5 = mixed (everything moderate).
-///
-/// - Plant + score 0.0 → 1.0 (full)
-/// - Plant + score 1.0 → 0.0 (can't digest plants at all)
-/// - HunterCarrion + score 0.0 → 0.0 (can't digest)
-/// - HunterCarrion + score 1.0 → 1.0 (full)
-/// - Carrion (cell) → 0.5 universally — semi-digestible by both diets
-///   (compromise food, doesn't drive specialization)
+/// Digestion efficiency for `(kind, carnivore_score)`. Continuous trade-off:
+/// `score = 0` is a pure herbivore (Plant only), `score = 1` is a pure
+/// carnivore (HunterCarrion only). `Carrion` (cell remains) sits at 0.5 for
+/// every score so it doesn't drive specialization in either direction.
 #[inline]
 pub fn eat_efficiency(kind: FoodKind, carnivore_score: f32) -> f32 {
     let s = carnivore_score.clamp(0.0, 1.0);
@@ -186,8 +187,8 @@ pub fn eat_efficiency(kind: FoodKind, carnivore_score: f32) -> f32 {
 
 impl Food {
     pub fn random(rng: &mut impl Rng, world_half: [f32; 3]) -> Self {
-        // Sprint 32: z-osa conditional pro deterministický CSV; world_half[2]=0
-        // → z=0 bez RNG draw.
+        // Skip the z-axis RNG draw when the world is 2D so the RNG stream
+        // matches the pre-3D baseline byte-for-byte.
         let z = if world_half[2] > 0.0 {
             rng.random_range(-world_half[2]..world_half[2])
         } else {
@@ -204,8 +205,8 @@ impl Food {
         }
     }
 
-    /// Sprint 38: aplikuje gravitační drift food (sink). Pouze pokud je
-    /// z-volume aktivní; jinak no-op (Sprint 32 z=0 setup).
+    /// Sink the food downward at `FOOD_SINK_RATE`, clamped to the floor.
+    /// No-op when the z-volume is inactive.
     pub fn apply_gravity(&mut self, dt: f32, world_half_z: f32) {
         if world_half_z <= 0.0 {
             return;
@@ -213,16 +214,14 @@ impl Food {
         self.position[2] = (self.position[2] - FOOD_SINK_RATE * dt).max(-world_half_z);
     }
 
-    /// Sprint 42: lineární decay value factor podle stáří. Pro age=0 vrací 1.0,
-    /// klesá lineárně k nule, pak clampnuto na 0.
+    /// Linear value decay by age, clamped at 0.
     pub fn value_factor(&self) -> f32 {
         let age_sec = self.age_ticks as f32 / FIXED_TIMESTEP_HZ;
         (1.0 - CARRION_DECAY_PER_SEC * age_sec).max(0.0)
     }
 
-    /// Sprint 42: age tick increment. Vrací `false` pokud food expiroval
-    /// (value_factor ≤ 0) — caller despawne. Volá se po `apply_gravity`
-    /// v hot loopu binárek.
+    /// Increment age by one tick. Returns `false` once the food has
+    /// expired (value_factor ≤ 0) so the caller can despawn it.
     pub fn age_step(&mut self) -> bool {
         self.age_ticks = self.age_ticks.saturating_add(1);
         self.value_factor() > 0.0

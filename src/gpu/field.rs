@@ -5,9 +5,8 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 46: GPU field diffusion (smell + pheromone na ekvivalentní compute path)
-// ============================================================================
+// GPU field diffusion shared by smell and pheromone fields — same compute
+// path, separate `FieldGpu` instances.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -39,10 +38,10 @@ pub struct FieldGpu {
     grid_readback: wgpu::Buffer,
     bg_round_a: wgpu::BindGroup,
     bg_round_b: wgpu::BindGroup,
-    pending_sources: Vec<f32>, // [px, py, pz, amount] * N (Sprint 56: 4 floats per source)
+    pending_sources: Vec<f32>, // [px, py, pz, amount] × N
     capacity_sources: usize,
     current_is_a: bool,
-    /// Sprint 56: 3D resolution + world bounds (xy toroidal, z bounded).
+    /// 3D resolution and world bounds. XY is toroidal, Z is bounded.
     resolution: [usize; 3],
     world_half: [f32; 3],
 }
@@ -172,7 +171,7 @@ impl FieldGpu {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // Inicializuj oba buffery na 0.
+        // Zero both grids so the first ping-pong reads from a clean slate.
         queue.write_buffer(&grid_a, 0, &vec![0u8; grid_size_bytes as usize]);
         queue.write_buffer(&grid_b, 0, &vec![0u8; grid_size_bytes as usize]);
 
@@ -181,7 +180,7 @@ impl FieldGpu {
             contents: bytemuck::bytes_of(&FieldParams::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        // Sprint 56: source = 4 floats (px, py, pz, amount).
+        // 4 floats per source (px, py, pz, amount).
         let sources_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("field-sources"),
             size: (sources_capacity * 4 * std::mem::size_of::<f32>()) as u64,
@@ -256,8 +255,9 @@ impl FieldGpu {
         (2.0 * self.world_half[axis]) / self.resolution[axis] as f32
     }
 
-    /// Mirror `SmellField::add_source` 3D. Sprint 56: 4 floats per source
-    /// (px, py, pz, amount). Bude flushnut na GPU při dalším `step()`.
+    /// 3D mirror of `SmellField::add_source` — 4 floats per source
+    /// (px, py, pz, amount). Pending sources are flushed to the GPU on the
+    /// next `step()` call.
     pub fn add_source(&mut self, pos: [f32; 3], amount: f32) {
         self.pending_sources.push(pos[0]);
         self.pending_sources.push(pos[1]);
@@ -265,8 +265,8 @@ impl FieldGpu {
         self.pending_sources.push(amount);
     }
 
-    /// Realloc sources buffer, pokud `add_source` nahromadil víc než current
-    /// capacity. Geometric (×2).
+    /// Reallocates the sources buffer when pending source count exceeds
+    /// current capacity. Geometric (×2) growth.
     fn ensure_sources_capacity(&mut self, num_sources: usize) {
         if num_sources <= self.capacity_sources {
             return;
@@ -279,7 +279,7 @@ impl FieldGpu {
             mapped_at_creation: false,
         });
         self.capacity_sources = new_cap;
-        // Bind groups zachycují sources_buf — musíme je rebuildnout.
+        // Bind groups capture `sources_buf`, so they must be rebuilt.
         let make_bg = |grid_in: &wgpu::Buffer, grid_out: &wgpu::Buffer, label: &str| {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
@@ -308,10 +308,10 @@ impl FieldGpu {
         self.bg_round_b = make_bg(&self.grid_b, &self.grid_a, "field-bg-round-b");
     }
 
-    /// Mirror `SmellField::step` 3D. Sprint 56: 7-point Jacobi (xy toroidal,
-    /// z bounded). `decay_per_sec` → `(1 - decay × dt).max(0)`.
+    /// 3D mirror of `SmellField::step`: 7-point Jacobi stencil with
+    /// toroidal XY and bounded Z. `decay_per_sec` is converted to a
+    /// per-step factor `(1 - decay × dt).max(0)`.
     pub fn step(&mut self, diffusion: f32, decay_per_sec: f32, dt: f32) {
-        // Sprint 56: 4 floats per source (px, py, pz, amount).
         let num_sources = self.pending_sources.len() / 4;
         self.ensure_sources_capacity(num_sources.max(1));
         if num_sources > 0 {
@@ -366,7 +366,7 @@ impl FieldGpu {
             });
             pass.set_pipeline(&self.pipeline_diffuse);
             pass.set_bind_group(0, bg, &[]);
-            // Sprint 56: 3D dispatch (workgroup_size 4×4×4 v shaderu).
+            // 3D dispatch — shader uses `@workgroup_size(4, 4, 4)`.
             let wg_x = ((self.resolution[0] as u32) + 3) / 4;
             let wg_y = ((self.resolution[1] as u32) + 3) / 4;
             let wg_z = ((self.resolution[2] as u32) + 3) / 4;
@@ -378,8 +378,8 @@ impl FieldGpu {
         self.pending_sources.clear();
     }
 
-    /// Sprint 50: accessor pro chained shadery (sensor gather), které samplují
-    /// pole inline. Vrací buffer obsahující latest state (post-step).
+    /// Accessor used by chained shaders (sensor gather) that sample the
+    /// field inline. Returns the buffer holding the latest post-step state.
     pub fn current_grid_buffer(&self) -> &wgpu::Buffer {
         if self.current_is_a {
             &self.grid_a
@@ -388,14 +388,14 @@ impl FieldGpu {
         }
     }
 
-    /// Stáhne current grid (post-diffuse output buffer) jako Vec<f32>.
-    /// Pomalá operace — kvůli tests + visualization. Sprint 47+ sample přes
-    /// GPU compute, žádný readback.
+    /// Download the current grid (post-diffuse output) as a `Vec<f32>`.
+    /// Slow — used by tests and visualization. The hot sensor path samples
+    /// the buffer on the GPU instead and never reads it back.
     pub fn download(&mut self) -> Vec<f32> {
         let n = self.resolution[0] * self.resolution[1] * self.resolution[2];
         let bytes = (n * 4) as u64;
-        // Po step() je current_is_a inverted, takže "current" je teď grid_a
-        // pokud current_is_a=true (původně bylo b, swap -> a).
+        // After `step()` the swap has flipped `current_is_a`, so "current"
+        // refers to whichever grid was the *output* of the latest pass.
         let src = if self.current_is_a {
             &self.grid_a
         } else {

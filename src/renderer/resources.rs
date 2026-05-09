@@ -49,7 +49,7 @@ pub(super) struct CellGrid(pub(super) SpatialGrid<Entity, f32>);
 
 impl Default for CellGrid {
     fn default() -> Self {
-        Self(SpatialGrid::new(GRID_CELL_SIZE))
+        Self(SpatialGrid::new(GRID_CELL_SIZE, bioscape::WORLD_HALF))
     }
 }
 
@@ -58,7 +58,7 @@ pub(super) struct FoodGrid(pub(super) SpatialGrid<Entity, FoodKind>);
 
 impl Default for FoodGrid {
     fn default() -> Self {
-        Self(SpatialGrid::new(GRID_CELL_SIZE))
+        Self(SpatialGrid::new(GRID_CELL_SIZE, bioscape::WORLD_HALF))
     }
 }
 
@@ -105,7 +105,7 @@ pub(super) struct HunterCellGrid(pub(super) SpatialGrid<usize, ()>);
 
 impl Default for HunterCellGrid {
     fn default() -> Self {
-        Self(SpatialGrid::new(HUNTER_GRID_CELL_SIZE))
+        Self(SpatialGrid::new(HUNTER_GRID_CELL_SIZE, bioscape::WORLD_HALF))
     }
 }
 

@@ -5,13 +5,11 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 45: GPU spatial hash (counting sort)
-// ============================================================================
+// GPU spatial hash via counting sort. Layout pinned to
+// `shaders/spatial_hash.wgsl`; the bucket grid is fixed at
+// 64 × 32 × 4 = 8192 buckets covering ±2048 / ±512 / ±128 world units at
+// `GRID_CELL_SIZE = 64`.
 
-/// Layout musí matchnout `shaders/spatial_hash.wgsl`. Bucket grid je fixed
-/// 64×32×4 = 8192 cells krytí ±2048 / ±512 / ±128 world units při
-/// `GRID_CELL_SIZE = 64`.
 pub const GPU_HASH_GRID_NX: i32 = 64;
 pub const GPU_HASH_GRID_NY: i32 = 32;
 pub const GPU_HASH_GRID_NZ: i32 = 4;
@@ -23,7 +21,6 @@ pub const GPU_HASH_NUM_BUCKETS: usize =
 struct HashParams {
     num_cells: u32,
     cell_size: f32,
-    /// Sprint 55: xy world bounds pro toroidal bucket wrap.
     world_half_x: f32,
     world_half_y: f32,
 }
@@ -37,7 +34,6 @@ pub struct SpatialHashGpu {
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
     cell_size: f32,
-    /// Sprint 55: xy world bounds pro toroidal bucket wrap.
     world_half_xy: [f32; 2],
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
@@ -47,8 +43,9 @@ pub struct SpatialHashGpu {
     offsets_readback: wgpu::Buffer,
     sorted_readback: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    /// Persistent zero-buffer pro counts reset. Pre-fix: `vec![0u8; N*4]` per
-    /// dispatch (32 KB alloc/free per spatial hash rebuild × 2 grids per tick).
+    /// Persistent zero buffer used to reset `counts` between rebuilds.
+    /// Allocating 32 KB per rebuild (× 2 grids per tick) showed up in
+    /// profiles, so we keep one buffer alive for the lifetime of the hash.
     counts_zero: Vec<u8>,
     epoch: u64,
 }
@@ -431,11 +428,12 @@ impl SpatialHashGpu {
         (offsets, sorted)
     }
 
-    /// Sprint 60: variant of `rebuild()` bez per-tick readback. Just submits
-    /// count → prefix → scatter dispatch a vrací. Použito v full-GPU sensor
-    /// pipeline kde offsets/sorted čte SensorGatherGpu shader direct přes
-    /// `offsets_buffer()` / `sorted_buffer()` accessory. Eliminuje 2× `device.poll(Wait)`
-    /// round-trip per tick (cell hash + food hash).
+    /// `rebuild()` variant that skips the per-tick readback — submits the
+    /// count → prefix → scatter dispatch and returns. Used by the full-GPU
+    /// sensor pipeline where the chained `SensorGatherGpu` reads
+    /// `offsets`/`sorted` directly via the accessor methods. Eliminates
+    /// the two `device.poll(Wait)` round-trips that `rebuild` does for
+    /// the cell hash and food hash each tick.
     pub fn dispatch(&mut self, positions: &[[f32; 3]]) {
         if positions.is_empty() {
             return;
@@ -506,9 +504,9 @@ impl SpatialHashGpu {
         }
     }
 
-    /// Sprint 49: accessor pro chained shadery (NeighborsGpu) — bind hash
-    /// buffery jako read-only ne další pass. Buffery jsou platné dokud
-    /// SpatialHashGpu žije.
+    /// Accessors for chained shaders (`NeighborsGpu`, `SensorGatherGpu`)
+    /// — bind the hash buffers as read-only inputs to a downstream pass.
+    /// The buffers stay valid for the lifetime of `SpatialHashGpu`.
     pub fn offsets_buffer(&self) -> &wgpu::Buffer {
         &self.offsets_buf
     }
@@ -517,8 +515,8 @@ impl SpatialHashGpu {
         &self.sorted_buf
     }
 
-    /// CPU side mirror funkce `bucket_id_of` v shaderu. Useful pro testy a
-    /// pro callers, kteří chtějí dohnat GPU bucket layout.
+    /// CPU mirror of the shader's `bucket_id_of`. Useful for tests and for
+    /// CPU code that needs to match the GPU bucket layout.
     pub fn bucket_id_of(pos: [f32; 3], cell_size: f32) -> u32 {
         let bx = (pos[0] / cell_size).floor() as i32 + GPU_HASH_GRID_NX / 2;
         let by = (pos[1] / cell_size).floor() as i32 + GPU_HASH_GRID_NY / 2;

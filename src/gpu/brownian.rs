@@ -5,9 +5,7 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// ============================================================================
-// Sprint 51: GPU brownian (xoshiro128++ per-cell RNG) + Hebbian update
-// ============================================================================
+// GPU brownian (xoshiro128++ per-cell RNG) — perturbs velocities each tick.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -190,9 +188,9 @@ impl BrownianGpu {
         &self.state_buf
     }
 
-    /// Sprint 51: persistent-mode dispatch — bindujeme CellsGpu buffery místo
-    /// internal. Žádný upload/download, žádný realloc. Volá se v hot loopu
-    /// po `cells_gpu.upload_velocities(...)`.
+    /// Persistent-mode dispatch: binds the `CellsGpu` velocity + xoshiro
+    /// state buffers directly, with no upload or download. Used in the hot
+    /// loop after `cells_gpu.upload_velocities(...)`.
     pub fn compute_persistent(
         &mut self,
         cells_gpu: &CellsGpu,

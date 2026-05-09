@@ -6,9 +6,8 @@ use wgpu::util::DeviceExt;
 use crate::*;
 use super::*;
 
-// ============================================================================
-// Sprint 50: GPU motor — applies brain outputs to velocity / angular / pitch
-// ============================================================================
+// GPU motor — applies brain outputs to velocity / angular_velocity /
+// pitch_velocity. Mirror of `Cell::apply_brain_motor`.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -296,11 +295,12 @@ impl MotorGpu {
         (velocities, angular, pitch_vel)
     }
 
-    /// Sprint 62: persistent variant — bind CellsGpu shared buffery (last_outputs,
-    /// heading, pitch, max_speed, turn_rate, eff_radius, velocity, angular_velocity,
-    /// pitch_velocity) místo own duplicates. Brain forward už zapsal last_outputs,
-    /// motor čte direct + mutuje velocity buffers in-place. No readback — output
-    /// stays GPU-side pro chained brownian / batch readback v hot loop.
+    /// Persistent variant: binds the shared `CellsGpu` buffers (last_outputs,
+    /// heading, pitch, max_speed, turn_rate, eff_radius, velocity,
+    /// angular_velocity, pitch_velocity) instead of internal duplicates.
+    /// Brain forward already wrote `last_outputs`; motor reads it directly
+    /// and mutates the velocity buffers in place. No readback — the output
+    /// stays GPU-side for the chained brownian / batch readback.
     pub fn dispatch_with_cells(
         &mut self,
         cells: &CellsGpu,

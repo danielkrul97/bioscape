@@ -3,76 +3,69 @@ use serde::{Deserialize, Serialize};
 
 use crate::*;
 
-/// = jen 0.17 energy/cell/gen damage, což je 18× méně než bond
-/// maintenance 3.0/gen → solo dominuje. 12 hunterů + víc damage zvedá
-/// solo cost.
+/// Cap on simultaneously alive non-evolving hunters in the legacy spawn
+/// pool. With 12 hunters and current damage rates, solo cells absorb only
+/// ~0.17 energy/gen — 18× less than bond maintenance, so solo strategies
+/// still dominate without further pressure.
 pub const HUNTER_TARGET_COUNT: usize = 12;
-/// Vision range Hunteru — vidí cells v této vzdálenosti, aktivně k nim
-/// míří. Mimo range = random walk. Sprint 72 zvětšen 120 → 200 (větší
-/// než MATING_RADIUS=200, takže hunters detekují cells dřív než stihnou
-/// utéct přes broad-phase fail).
+/// Hunter detection range. Hunter actively pursues cells inside; outside
+/// range it random-walks. Set above `MATING_RADIUS` so hunters detect
+/// cells before broad-phase mating windows close.
 pub const HUNTER_VISION_RADIUS: f32 = 200.0;
-/// Attack range — Hunter dealuje damage cells uvnitř této vzdálenosti.
-/// Menší než vision, takže Hunter musí se sblížit (cells mají šanci utéct).
+/// Attack range — kept smaller than vision so hunters must close in and
+/// cells get a window to flee.
 pub const HUNTER_ATTACK_RADIUS: f32 = 18.0;
-/// Damage per tick, který Hunter působí cells v attack range. Aplikuje se
-/// jako energy loss + damage_accum (brain damage signal). Lineární per tick,
-/// no spike bonus (Hunter je sám bez evolved phenotype). Sprint 74: 4 → 8
-/// (2× lethaler). Sprint 73 ukázalo, že solo cells absorbovaly 0.17/gen
-/// damage bez problému; 2× zvýší to k ~0.35, což stále nemusí stačit, ale
-/// kombinováno s víc hunterů + levnějším bondem se dostávámě k flip pointu.
+/// Per-tick damage applied to cells in the attack range, both as energy
+/// loss and as an addition to `damage_accum` (the brain's damage signal).
+/// Linear, no spike bonus — non-evolving hunters have no evolved phenotype.
 pub const HUNTER_DAMAGE_PER_TICK: f32 = 8.0;
-/// Hunter top speed. Sprint 71 měl 220 — cells dotáhly průměr na 218 a
-/// outrun se ukázal jako viable escape route (asp 12.6 pure speedy cells).
-/// Sprint 72: 300, nad teoretický cell max_speed cap. Cells nemůžou outrun
-/// jen rychlostí — cluster path (≥3 bondy = immunity) musí být dominantní
-/// úniková strategie.
+/// Hunter top speed, intentionally above the cell `MAX_SPEED` cap so cells
+/// can't simply outrun pursuit; clustering (≥ 3 bonds = immunity) must be
+/// the dominant escape strategy.
 pub const HUNTER_MAX_SPEED: f32 = 300.0;
-/// Acceleration coefficient. Hunter nemá brain, jen target-seeking velocity
-/// adjustment. dt × ACC × (target_dir - current_dir) škáluje na max_speed.
+/// Acceleration coefficient for the simple seek-toward-target motion model
+/// used by non-evolving hunters: `velocity += dt × ACC × (target_dir −
+/// current_dir)`, then clamped to `MAX_SPEED`.
 pub const HUNTER_ACC: f32 = 80.0;
-/// Hunter random-walk noise při idle (no cell ve vision). Pomaly drift,
-/// brzy najde cell + zacílí.
+/// Random-walk noise applied to idle hunters (no cell in vision). Slow
+/// drift so the hunter eventually wanders into a target.
 pub const HUNTER_IDLE_DRIFT: f32 = 30.0;
-/// Bond count threshold pro **discoverability** Hunteru. Cells s ≥ tomuto
-/// počtu bondů Hunter nepronásleduje (`nearest_attackable_cell` vrací None) —
-/// cluster je „too deeply interior to bother". Sprint 92: 2 → 4 — replaces
-/// binary immunity s gradient damage. Hunters chase low-bond cells normally,
-/// vysoký bond count = invisible target (čisté efficiency rozhodnutí).
+/// Bond-count threshold for hunter discoverability. Cells with ≥ this
+/// many bonds drop out of `nearest_attackable_cell` — a cluster is
+/// considered "too deeply interior to bother".
 pub const HUNTER_BOND_IMMUNITY_THRESHOLD: u32 = 4;
-/// Sprint 92: per-bond exposure reduction. `exposure = max(0, 1 - n_bonds × this)²`.
-/// Sprint 132+ jemný bump 0.25 → 0.30: rychlejší ramp k immunity, menší cluster
-/// dosáhne plné protection. Linear values: 0/1/2/3 bonds dávají 1.0/0.7/0.4/0.1
-/// (squared 1.0/0.49/0.16/0.01). Cluster s 3 bondy je teď prakticky immune
-/// (1 % damage) místo 6 % v původním 0.25 — třídní imunita ramps in 1 bond
-/// dříve. Hunter immunity threshold (HUNTER_BOND_IMMUNITY_THRESHOLD) zůstává 4.
+/// Per-bond exposure reduction: `exposure = max(0, 1 − n_bonds × this)²`.
+/// At 0/1/2/3 bonds the linear factor lands on 1.0/0.7/0.4/0.1 (squared
+/// 1.0/0.49/0.16/0.01) — a 3-bond cluster takes only ~1 % damage. Ramps
+/// to near-immunity one bond earlier than `HUNTER_BOND_IMMUNITY_THRESHOLD`,
+/// which still gates the binary "is this cell visible" filter.
 pub const EXPOSURE_PER_BOND: f32 = 0.30;
 
-/// Sprint 97: per-tick energy drain coefficient pro sensor specialization.
-/// `drain = sum(sensor_gains) × this × dt`. Default sum = 3 × 1.0 = 3 →
-/// `3 × 0.3 = 0.9/sec` baseline drain (porovnatelný s body cost 0.5/sec).
-/// Cells, které sníží gains v category (turn off duplicate sensors v cluster),
-/// šetří proportionally — sensor specialization je net-positive.
+/// Per-tick drain coefficient for sensor specialization:
+/// `drain = sum(sensor_gains) × this × dt`. Default neutral sum is 3 × 1.0,
+/// so the baseline drain is ~0.9/s — comparable with body maintenance.
+/// Cells that turn off duplicate sensors in a cluster save proportionally,
+/// making specialization net-positive.
 pub const SENSOR_GAIN_COST: f32 = 0.3;
-/// Sprint 97: range pro `sensor_gains` per category. 0 = sensor effectively
-/// off, 1 = neutral, 2 = boosted (lepší detection range, vyšší cost).
+/// Per-category gain range. 0 = sensor effectively off, 1 = neutral, 2 =
+/// boosted (better detection, higher cost).
 pub const MIN_SENSOR_GAIN: f32 = 0.0;
 pub const MAX_SENSOR_GAIN: f32 = 2.0;
-/// Sprint 97: 3 sensor categories indexované do `Genome.sensor_gains`:
+/// Three sensor categories indexed into `Genome.sensor_gains`:
 /// 0 = Vision (food delta, cell delta, rel_size, density),
-/// 1 = Chemistry (smell, pheromone — chemical gradients ve fields),
-/// 2 = Defensive (damage signal, thermal_local).
-/// Proprio sensors (energy, speed, heading) jsou always-on, žádný gain
-/// — vlastní stav cell musí znát i v deep specialist módě.
+/// 1 = Chemistry (smell + pheromone gradients),
+/// 2 = Defensive (damage signal, thermal_local). Proprio sensors (energy,
+/// speed, heading) are always-on and not gained — a cell still needs its
+/// own state even in a deep-specialist mode.
 pub const SENSOR_CATEGORY_VISION: usize = 0;
 pub const SENSOR_CATEGORY_CHEMISTRY: usize = 1;
 pub const SENSOR_CATEGORY_DEFENSIVE: usize = 2;
 pub const N_SENSOR_CATEGORIES: usize = 3;
 
-/// Sprint 97: maps brain input slot index → sensor category. Returns `None`
-/// pro proprio slots (not gained, not pooled). Used by `apply_sensor_gains`
-/// (per-cell gain multiply) + `pool_bonded_sensors` (max-pool environmental
-/// slots přes bond network).
+/// Map a brain input slot index to its sensor category, or `None` for
+/// proprio slots (not gained, not pooled). Used by `apply_sensor_gains`
+/// (per-cell multiply) and `pool_bonded_sensors` (max-pool environmental
+/// slots over the bond network).
 #[inline]
 pub fn sensor_slot_category(slot: usize) -> Option<usize> {
     match slot {
@@ -87,29 +80,28 @@ pub fn sensor_slot_category(slot: usize) -> Option<usize> {
         _ => None,
     }
 }
-/// Sprint 84: hunter směrový FOV half-angle (rad). π/3 = 60° → 120° cone.
-/// Predátoři klasicky mají frontal eyes; cells mohou flank-uniknout do blind
-/// spotu. Pevná konstanta (Hunter nemá genom), ne pod selekcí.
+/// Half-angle (rad) of the directional FOV cone for non-evolving hunters.
+/// π/3 = 60° → 120° forward cone. Predators classically have frontal eyes,
+/// so cells can flank into the blind spot. Fixed constant — the legacy
+/// hunter has no genome.
 pub const HUNTER_VISION_FOV: f32 = core::f32::consts::PI / 3.0;
-/// Sprint 84: minimum speed² pro aktivní směrový vision. Pod threshold má
-/// hunter velocity ~ 0 → není definovaný forward → fallback na omnidirectional
-/// (idle hunter „spins around" hledá target). Threshold je sub-tick noise
-/// (1 unit/s² ≪ HUNTER_IDLE_DRIFT² = 900); reálně cone aktivní vždy v lovu
-/// nebo i drift, jen ne při startovním idle 0-vector.
+/// Minimum |velocity|² for the directional vision cone to engage. Below
+/// the threshold the forward direction is undefined and the hunter falls
+/// back to omnidirectional vision so an idle hunter can still find a
+/// target. Threshold is well below `HUNTER_IDLE_DRIFT²` so the cone is
+/// effectively always active during pursuit or drift.
 pub const HUNTER_FORWARD_SPEED_THRESHOLD_SQ: f32 = 1.0;
 
-// ─── Sprint 89: Hunter evolution v1 (parametric genome) ──────────────────────
-// Pre-Sprint-89 byl Hunter non-evolving — fixed const (HUNTER_VISION_RADIUS,
-// HUNTER_MAX_SPEED, HUNTER_DAMAGE_PER_TICK, …) řídily chování. Cells evolvovaly
-// proti hunteru, hunter nikdy zpět → asymmetric selection. Sprint 89 zavádí
-// `HunterGenome` + energy/reprodukce/smrt → biological arms race: hunter genes
-// drift dle predator success rate, cells continue evolving evasion.
-//
-// V1 = no brain. Behavior zůstává „seek nearest attackable" (S84), ale
-// parametry téhle behavior jsou per-hunter genové. Sprint 90 přidá brain.
+// ─── Heritable hunter genome (replaces non-evolving hunter) ──────────────────
+// The non-evolving hunter (fixed `HUNTER_*` constants) only ever applied
+// asymmetric selection: cells evolved to evade but predators didn't. The
+// genome below introduces a hunter lifecycle (energy, reproduction, death),
+// turning the dynamic into a biological arms race — predator parameters
+// drift with predation success while cells keep evolving evasion.
 
-/// Gene ranges. Konstanty z S71-S84 (`HUNTER_VISION_RADIUS=200`, …) zůstávají
-/// jako defaults v `HunterGenome::random` initial draw range middle.
+/// Gene ranges — the legacy `HUNTER_VISION_RADIUS`, `HUNTER_MAX_SPEED` etc.
+/// values sit roughly in the middle of these ranges and double as defaults
+/// for `HunterGenome::random`.
 pub const MIN_HUNTER_VISION_RADIUS: f32 = 50.0;
 pub const MAX_HUNTER_VISION_RADIUS: f32 = 400.0;
 pub const MIN_HUNTER_VISION_FOV: f32 = core::f32::consts::PI / 12.0;
@@ -125,85 +117,63 @@ pub const MAX_HUNTER_DAMAGE: f32 = 16.0;
 pub const MIN_HUNTER_BODY_SIZE: f32 = 0.5;
 pub const MAX_HUNTER_BODY_SIZE: f32 = 2.5;
 
-/// Initial energy při Hunter spawn / floor respawn. Vyšší než cell
-/// `INITIAL_ENERGY=100` — hunter potřebuje delší survival window než single
-/// chase cycle, který může trvat víc generation ticks bez kill.
+/// Initial energy at hunter spawn / floor respawn. Higher than cell
+/// `INITIAL_ENERGY=100` — a chase cycle can span many ticks without a
+/// kill, so hunters need a longer survival runway.
 pub const HUNTER_INITIAL_ENERGY: f32 = 500.0;
-/// Energy threshold pro reprodukci. Při dosažení parent splituje energy 50/50
-/// se child + clone-with-mutate genome.
-///
-/// Sprint 98 tune 1: 700 → 500 (= HUNTER_INITIAL_ENERGY). Sex vyžaduje
-/// dva fertile hunters současně v MATING_RADIUS — vzácná událost při
-/// max_pop 50. Při 700 dal smoke 70gen 0 births → pop crash; 600 dal
-/// 3 births za 300gen, taky kolaps. 500 = hunter je fertile od spawnu
-/// (cooldown 0), gate je pak jen prostorová proximity + cooldown po
-/// coupling. Re-fertility čeká jen na restore split-energy 250 → 500
-/// (~3-5 gen of hunting), což je rychlejší než dřívější 250 → 700.
+/// Energy threshold for reproduction. Set equal to `HUNTER_INITIAL_ENERGY`
+/// so a fresh hunter is fertile from spawn (cooldown 0); the only gate
+/// that remains is spatial proximity to a mate plus the post-coupling
+/// cooldown. Higher thresholds emptied the population in smoke runs
+/// because the rare proximity events couldn't keep up with mortality.
 pub const HUNTER_REPRODUCE_THRESHOLD: f32 = 500.0;
-/// Cap pro hunter populace. Bez něj by predator boom (mnoho cells eaten)
-/// → exponenciální růst → prey extinction. 50 = 4× initial S71 count, dostatek
-/// pro arms race signal ale prevent runaway.
+/// Hard cap on the hunter population. Without it a predator boom from a
+/// successful generation grows exponentially and drives prey extinction.
 pub const HUNTER_MAX_POP: usize = 50;
-/// Per-tick vision drain coefficient. `vision_radius × fov_factor × VISION_COST × dt`.
-/// Mírně vyšší než cell `VISION_COST_PER_RADIUS=0.02` — hunter má větší vision
-/// a musí investovat víc energie do detection.
+/// Per-tick vision drain: `vision_radius × fov_factor × VISION_COST × dt`.
 pub const HUNTER_VISION_COST: f32 = 0.01;
-/// Per-tick motion drain. `v² × MOTION_COST × dt`. Hunter má rychlejší pohyb
-/// + větší masu (body_size 1-2 vs cell ~1) → vyšší kinetic cost než cell
-/// `ENERGY_COST_PER_V_SQ=0.0008`.
+/// Per-tick kinetic drain: `|v|² × MOTION_COST × dt`.
 pub const HUNTER_MOTION_COST: f32 = 0.0001;
-/// Body maintenance per tick. `body_size³ × BODY_COST × dt`. Volume-scaled
-/// (jako cell). Bigger predator = víc tissue to maintain.
+/// Per-tick body maintenance: `body_size³ × BODY_COST × dt`.
 pub const HUNTER_BODY_COST: f32 = 0.5;
-/// Attack-mode upkeep, always-on. `damage_per_tick × ATTACK_UPKEEP × dt`.
-/// Hunter „claws out" continuously — lze trade-off-it nižší damage = nižší
-/// upkeep, vhodné pro low-energy survivors.
+/// Always-on attack upkeep: `damage_per_tick × ATTACK_UPKEEP × dt`. Hunters
+/// can trade-off lower damage for lower upkeep — useful for low-energy
+/// survivors when the prey field is sparse.
 pub const HUNTER_ATTACK_UPKEEP: f32 = 0.02;
-/// Energy gain per damage dealt (proportional). Sprint 89 v3 = 6.0.
-/// Sprint 93: 6.0 → 12.0 — kompenzace S92 exposure scaling (cells s 1-3
-/// bondy mají reduced damage = reduced gain). Pre-S93 smoke gen 20 ukázal
-/// hunter pop kolaps k 1 (cumulative net negative energy). 12.0 × avg
-/// exposure ~0.85 ≈ 10.2 effective gain ≈ 1.7× pre-S92 6.0 × 1.0 = 6.0,
-/// kompenzace partial defense + příležitost pro carnivore-niche cells
-/// dostat z hunter carrion.
+/// Energy gained per damage dealt. Calibrated to compensate for the
+/// `EXPOSURE_PER_BOND` defense scaling — at average exposure ~0.85 the
+/// effective gain (~10.2) sits just above the legacy non-defended value.
 pub const HUNTER_ENERGY_PER_DAMAGE: f32 = 12.0;
-/// Carrion drops při hunter death. Mirror cell death (Sprint 27 carrion).
-/// 2× value default — hunter větší než cell, víc biomasy.
+/// Carrion drops on hunter death. 2× the cell-death drop because hunters
+/// carry more biomass.
 pub const HUNTER_CARRION_DROP: usize = 2;
-/// Reproduce cooldown (ticks) po split. Brání instant re-reproduce před cell
-/// catch-up. ~1 generation = 600 ticks.
+/// Reproduce cooldown (ticks) after a split. Prevents instant re-reproduce
+/// before cells can catch up; ~half a generation.
 pub const HUNTER_REPRODUCE_COOLDOWN_TICKS: u32 = 300;
-/// Sprint 101: pack hunting payoff. Když bonded hunter zabije cell, každý
-/// jeho bonded partner dostane `gain × FRAC` extra energy (free reward, no
-/// energy conservation — modeluje "pack feed dynamic"). Mirror cells
-/// `BOND_FOOD_SHARE_FRAC` semantiky. 0.5 dává pack-of-6 ~3.5× total payoff
-/// vs solo (1 + 5×0.5 = 3.5), dostatek aby selekce favorizovala pack vs solo.
+/// Pack-hunting kill share: a bonded hunter scoring a kill gives each
+/// partner `gain × FRAC` extra energy — not conserved, models "pack feed
+/// dynamic". A pack of 6 collects ~3.5× the solo payoff, enough for
+/// selection to favor packs.
 pub const HUNTER_BOND_KILL_SHARE_FRAC: f32 = 0.5;
 
-/// Sprint 98: maximální vzdálenost dvou fertile hunterů, aby se spárovali.
-/// Cells mají MATING_RADIUS = 200; hunteři jsou mnohem řidší (max 50 vs
-/// max 2500 cells) → density je řádově nižší, takže menší mating radius
-/// znamená, že se rodiče nepotkají. Density math: 12 hunterů v 207M unit³
-/// dává mean nearest-neighbor ≈ 160 — pod 200 by žádný pár nepřekonal
-/// gate, hunter populace by sjela floor respawn loop. 200 = parita s
-/// HUNTER_VISION_RADIUS, biologicky „vidí na partnera".
+/// Maximum distance for two fertile hunters to pair. Hunter density is
+/// much lower than cell density (max 50 vs max 2500 in the same world
+/// volume); a smaller mating radius would mean parents simply never meet.
+/// Set to parity with `HUNTER_VISION_RADIUS` — biologically "they can see
+/// the partner".
 pub const HUNTER_MATING_RADIUS: f32 = 200.0;
-/// Sprint 90: brain output[0] turn_yaw multiplier (rad/sec). Hunter má
-/// pevnou turn_rate (ne gene); cells mají gene-encoded turn_rate ∈ [1, 5].
-/// 3.0 je mid-cell-range. Sprint 91+ může přidat jako gene.
+/// Brain `output[0]` turn-yaw rate (rad/s). Fixed, not gene-encoded —
+/// cells have `turn_rate ∈ [1, 5]`; this 3.0 sits mid-range.
 pub const HUNTER_TURN_RATE: f32 = 3.0;
-/// Sprint 90: brain output[7] turn_pitch multiplier (rad/sec). Pitch je
-/// klampovaný v Cell::integrate_kinematics; pro hunter pitch_velocity je
-/// volnější (no clamp), takže nižší rate brání overshoot.
+/// Brain `output[7]` turn-pitch rate (rad/s). Lower than `HUNTER_TURN_RATE`
+/// because hunter pitch is unclamped (cells have a ±π/12 cap), so a
+/// gentler rate avoids overshoot.
 pub const HUNTER_PITCH_RATE: f32 = 1.0;
 
-/// Sprint 89: per-hunter heritable parametry. Pre-Sprint-89 byly fixed
-/// const (HUNTER_VISION_RADIUS=200, HUNTER_MAX_SPEED=300, …); now drift
-/// per generation. Sprint 90: + `brain` (reuse cell Brain struct, hunter-
-/// specific input/output semantic mapping v `populate_hunter_brain_inputs`
-/// + `apply_brain_motor`). Adaptive chase behavior emerges from selection
-/// — random brains s positive INNATE_THRUST_BIAS startují s forward motion,
-/// úspěšní lovci reprodukují svůj brain.
+/// Per-hunter heritable parameters. Drift each generation under selection
+/// pressure from predation success and survival cost. The brain field
+/// reuses the cell `Brain` struct; slot semantics are re-mapped for the
+/// hunter in `populate_hunter_brain_inputs` and `apply_brain_motor`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HunterGenome {
     pub vision_radius: f32,
@@ -214,26 +184,21 @@ pub struct HunterGenome {
     pub damage_per_tick: f32,
     pub body_size: f32,
     pub color_hue: f32,
-    /// Sprint 99: cadherin-like recognition pro hunter-hunter bondy. 8 typů
-    /// (parita s cells). Same-type hunteři se přitahují adhesion forcou +
-    /// formují persistent bondy při kontaktu. Cross-type repulze. Žádný
-    /// hunter-cell bond — adhesion pool je per-druhový (cell vs hunter
-    /// bondy oddělené).
+    /// Cadherin-like recognition for hunter-hunter bonds (8 types, same as
+    /// cells). Same-type hunters attract via adhesion and form persistent
+    /// bonds on contact; cross-type pairs repel. The hunter and cell
+    /// adhesion pools are independent — no hunter-cell bonds.
     pub adhesion_type: u8,
-    /// Sprint 90: behavioral controller. Reuse cell `Brain` struct (BRAIN_INPUTS
-    /// = 53, BRAIN_HIDDEN = 32, BRAIN_OUTPUTS = 10) — slot semantics
-    /// re-mapped pro hunter v `populate_hunter_brain_inputs` (slot 0/1/15
-    /// = nearest_prey delta, slot 7-8/17 = smell, slot 9-10/18 = heading,
-    /// slot 4 = energy, slot 5 = speed, slot 6 = prey_size_relative,
-    /// slot 13 = density). Used outputs: 0 (turn), 1 (thrust), 7 (pitch).
-    /// Cell-only outputs (morph, attack, bond) ignored by hunter motor.
+    /// Behavioral controller. Cell-only outputs (morph, attack signal,
+    /// bond) are ignored by the hunter motor; the hunter only consumes
+    /// `output[0]` (turn), `[1]` (thrust), `[7]` (pitch).
     pub brain: Brain,
 }
 
 impl HunterGenome {
-    /// Initial random draw. Center middle ranges around S71-S84 const defaults
-    /// + ~30 % spread → initial population diversity dostatečná pro selekci
-    /// signal v 30-100 gen smoke.
+    /// Initial random draw — middle of each gene range with ~30 % spread,
+    /// enough population diversity to produce a selection signal in
+    /// 30–100 gen smoke runs.
     pub fn random(rng: &mut impl Rng) -> Self {
         Self {
             vision_radius: rng.random_range(100.0..300.0),
@@ -247,9 +212,9 @@ impl HunterGenome {
             body_size: rng.random_range(0.8..1.6),
             color_hue: rng.random_range(0.0..HUE_RANGE),
             adhesion_type: rng.random_range(0..ADHESION_TYPE_COUNT),
-            // Sprint 90: brain init s INNATE_THRUST_BIAS = 2.0 (z Brain::random).
-            // Random brains startují s positive thrust → forward motion. Selekce
-            // tuneuje turn/pitch outputs k ko-ordinovanému chase behavior.
+            // `Brain::random` applies `INNATE_THRUST_BIAS`, so fresh hunters
+            // start with positive thrust → forward motion; selection then
+            // tunes the turn/pitch outputs into coordinated chase behavior.
             brain: Brain::random(rng),
         }
     }
@@ -272,7 +237,6 @@ impl HunterGenome {
                 .clamp(MIN_HUNTER_BODY_SIZE, MAX_HUNTER_BODY_SIZE),
             color_hue: (self.color_hue + gaussian(rng) * cfg.sigma_color_hue)
                 .rem_euclid(HUE_RANGE),
-            // Sprint 99: occasional flip pro selekci na cluster-friendly types.
             adhesion_type: if cfg.adhesion_flip_rate > 0.0
                 && ADHESION_TYPE_COUNT > 1
                 && rng.random::<f32>() < cfg.adhesion_flip_rate
@@ -319,48 +283,40 @@ pub struct HunterMutationConfig {
     pub sigma_damage: f32,
     pub sigma_body_size: f32,
     pub sigma_color_hue: f32,
-    /// Sprint 90: brain weights gaussian sigma. Same magnitude jako cell
-    /// `sigma_brain = 0.2` — brain landscape je velký, drift je naturally
-    /// slow přes 2058 weights/cell.
+    /// Brain-weights gaussian sigma. Matches the cell `sigma_brain` — brain
+    /// landscape is large, drift is naturally slow.
     pub sigma_brain: f32,
-    /// Sprint 99: per-child probability flipu adhesion_type (na jiný typ
-    /// uniformně). Mirror cell `ADHESION_MUTATION_RATE`.
+    /// Per-child probability of flipping `adhesion_type` (uniform pick of a
+    /// different type). Mirrors the cell `adhesion_flip_rate`.
     pub adhesion_flip_rate: f32,
 }
 
-/// Sprint 89: hunter mutation rates. Vyšší než cell `MUTATION_CONFIG` (sigma
-/// 1-3 % range/gen) — hunter populace menší (12-50), evolution signal slabší
-/// per fewer offspring. ~3-4 % range/gen aby drift byl viditelný v 100-gen
-/// smoke.
+/// Hunter mutation rates — slightly higher than the cell config because the
+/// hunter population is small (12–50) so the per-generation evolution
+/// signal needs more drift to stay visible.
 pub const HUNTER_MUTATION_CONFIG: HunterMutationConfig = HunterMutationConfig {
-    sigma_vision_radius: 10.0,    // 2.9 % of [50, 400] range
+    sigma_vision_radius: 10.0,    // 2.9 % of [50, 400]
     sigma_vision_fov: 0.08,       // 2.8 % of FOV range
     sigma_max_speed: 12.0,        // 3.0 % of [100, 500]
     sigma_acceleration: 4.0,      // 3.3 % of [40, 160]
     sigma_attack_radius: 1.0,     // 3.3 % of [10, 40]
     sigma_damage: 0.4,            // 2.9 % of [2, 16]
     sigma_body_size: 0.06,        // 3.0 % of [0.5, 2.5]
-    sigma_color_hue: 5.0,         // 1.4 % HUE_RANGE — slow drift, lineage tracking
-    sigma_brain: 0.2,             // Sprint 90 — match cell sigma_brain
-    adhesion_flip_rate: ADHESION_MUTATION_RATE, // Sprint 99 — parita s cells
+    sigma_color_hue: 5.0,         // 1.4 % of HUE_RANGE — slow lineage drift
+    sigma_brain: 0.2,
+    adhesion_flip_rate: ADHESION_MUTATION_RATE,
 };
 
-/// Sprint 71: non-evolving environmental predator (Sprint 89 → evolving).
-/// Pohybuje se pseudo-AI (seek nejbližší cell ∈ vision range, jinak random
-/// drift). Atakuje cells s `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD` v
-/// attack range.
-///
-/// Sprint 89: + `genome` (8 heritable parameters), + `energy` (lifecycle),
-/// + lineage tracking.
-/// Sprint 90: + brain-driven motion. Heading + pitch (mirror Cell), brain
-/// state (last_inputs/hidden/outputs). Random brain s INNATE_THRUST_BIAS
-/// startuje s forward motion; turn/pitch outputs evolve k chase tactics.
+/// Evolving environmental predator. Per-tick behavior is brain-driven (with
+/// a hybrid seek-bootstrap, see `apply_brain_motor`); attacks land on cells
+/// with `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD` inside the attack
+/// radius.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Hunter {
     pub position: [f32; 3],
     pub velocity: [f32; 3],
-    /// Stable identifier (procedural, monotonic při init). Nepoužívá se pro
-    /// bond resolution — Hunter ≠ Cell.
+    /// Stable monotonic identifier. Not used for cell bond resolution —
+    /// hunter and cell ID spaces are independent.
     pub hunter_id: u64,
     pub genome: HunterGenome,
     pub energy: f32,
@@ -368,31 +324,30 @@ pub struct Hunter {
     pub reproduce_cooldown_ticks: u32,
     pub lineage_id: u64,
     pub lineage_birth_gen: u64,
-    /// Sprint 90: yaw heading (rad). Brain output[0] modifikuje
-    /// `angular_velocity`, ten integrate v `step` jako Cell.
+    /// Yaw heading (rad). `output[0]` drives `angular_velocity`, integrated
+    /// in `step` like the cell.
     pub heading: f32,
-    /// Sprint 90: pitch (rad), unbounded — hunter vertical motion volnější
-    /// než cell (Cell má clamp na ±π/12).
+    /// Pitch (rad), unclamped — hunters can move freely in z, while cells
+    /// are clamped to ±π/12.
     pub pitch: f32,
     pub angular_velocity: f32,
     pub pitch_velocity: f32,
-    /// Sprint 90: brain I/O state pro recurrent kanál + diagnostics.
+    /// Brain I/O state for the recurrent channel and diagnostics.
     #[serde(with = "serde_arr_inputs")]
     pub last_inputs: [f32; BRAIN_INPUTS],
     #[serde(with = "serde_arr_hidden")]
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
-    /// Sprint 99: persistent spring bondy mezi hunters (mirror Cell.bonds).
-    /// `Bond.other_cell_id` here stores the other hunter's `hunter_id`
-    /// (sémanticky `other_hunter_id`; field reused k zachování single Bond
-    /// struct). Same-type adhesion gating + spring physics. Cluster
-    /// představuje "wolf pack" — koordinovaná predace přijde v S101.
+    /// Persistent spring bonds between hunters (no hunter-cell bonds).
+    /// `Bond.other_cell_id` stores the partner's `hunter_id` here — the
+    /// field name is reused to keep a single `Bond` struct shared across
+    /// both bond pools.
     pub bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
-    /// Sprint 100: pack-level pooled hidden (mirror Cell.pooled_hidden z S94).
-    /// Mean(self.last_hidden + bonded partners.last_hidden) per tick.
-    /// Solo hunteři: kopie self.last_hidden (nemění chování).
-    /// Bonded hunteři: shared recurrent state napříč packem → proto-distributed
-    /// cognition pro koordinovaný hon.
+    /// Pack-level pooled hidden state (mirror of `Cell.pooled_hidden`).
+    /// Mean of `self.last_hidden` and all bonded partners' `last_hidden`,
+    /// recomputed per tick. Solo hunters get a copy of their own
+    /// `last_hidden` — no behavioral change. Bonded hunters share a
+    /// recurrent context for coordinated hunts.
     #[serde(default = "default_pooled_hidden", with = "serde_arr_hidden")]
     pub pooled_hidden: [f32; BRAIN_HIDDEN],
 }
@@ -410,9 +365,9 @@ impl Hunter {
         Self::from_genome(rng, genome, world_half, hunter_id, lineage_id, lineage_birth_gen)
     }
 
-    /// Sprint 89: spawn s explicit genome (used by clone-with-mutate v reprodukci
-    /// a floor respawn). Position random, velocity zero, energy = INITIAL.
-    /// Sprint 90: + heading random (TAU range), pitch 0, brain state zero.
+    /// Spawn with an explicit genome (used by clone-with-mutate during
+    /// reproduction and by the floor respawn). Position is random; velocity
+    /// starts as a 30 %-speed forward kick; brain state is zero.
     pub fn from_genome(
         rng: &mut impl Rng,
         genome: HunterGenome,
@@ -452,17 +407,14 @@ impl Hunter {
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
-            // Sprint 99: bondy se formují contact-based v hunter physics phase.
             bonds: [None; MAX_BONDS_PER_CELL],
-            // Sprint 100: pooled hidden init = zero, naplní se v
-            // `pool_bonded_hunter_hidden` před run_brain_act.
             pooled_hidden: [0.0; BRAIN_HIDDEN],
         }
     }
 
-    /// Sprint 89: per-tick energy drains. Vision (∝ radius × fov_factor),
-    /// motion (∝ v²), body maintenance (∝ size³), attack upkeep (∝ damage).
-    /// Bez aging ramp (Sprint 42 cells aging) — hunter lifecycle krátký.
+    /// Per-tick energy drains: vision (∝ `radius × fov_factor`), motion
+    /// (∝ `|v|²`), body maintenance (∝ `body_size³`), attack upkeep
+    /// (∝ `damage_per_tick`). No aging ramp — hunter lifecycles are short.
     pub fn apply_energy_costs(&mut self, dt: f32) {
         let fov_factor = vision_fov_factor(self.genome.vision_fov);
         self.energy -= self.genome.vision_radius * HUNTER_VISION_COST * fov_factor * dt;
@@ -475,18 +427,16 @@ impl Hunter {
         self.energy -= self.genome.damage_per_tick * HUNTER_ATTACK_UPKEEP * dt;
     }
 
-    /// Sprint 90: brain-driven motion s **hybrid seek bootstrap**. Brain
-    /// outputs[0] = turn_yaw modulator, [1] = thrust, [7] = turn_pitch
-    /// modulator. Cell-only outputs (morph, attack signal, bond) ignored.
+    /// Brain-driven motion with a hybrid seek bootstrap. Brain outputs
+    /// `[0]`=turn-yaw, `[1]`=thrust, `[7]`=turn-pitch; the rest are ignored.
     ///
-    /// Hybrid design pattern: seek-toward-prey direction (deterministic
-    /// oracle) je mixed s brain output (`HUNTER_BRAIN_SEEK_MIX = 0.6` seek
-    /// + 0.4 brain). Bez tohoto random initial brain neumí chase (random
-    /// turn output → spinning), populace kolabuje do floor respawn loop.
-    /// S hybridem brain modul dominantní seek direction (např. learned
-    /// ambush, prey selection, retreat při low energy). Když brain weights
-    /// evolvují k matching seek, mix se stane redundant; když brain learnuje
-    /// jiný strategy (cluster around hot zones, etc.), brain dominuje.
+    /// The hybrid mixes a deterministic seek-toward-prey direction (60 %)
+    /// with the brain output (40 %). Without it, random initial brains
+    /// can't chase — random turn outputs produce spinning and the
+    /// population collapses into the floor-respawn loop. As selection
+    /// shapes the brain to match seek, the mix becomes redundant; if the
+    /// brain learns a different strategy (cluster around hot zones, ambush,
+    /// retreat at low energy), it dominates.
     pub fn apply_brain_motor(
         &mut self,
         outputs: &[f32; BRAIN_OUTPUTS],
@@ -548,10 +498,9 @@ impl Hunter {
         }
     }
 
-    /// Sprint 90: kinematic integration + heading update + toroidal wrap.
-    /// Pre-Sprint-90 step měl seek-target logic (Sprint 89); ten se přesunul
-    /// do brain (caller volá `apply_brain_motor` před step). Step je teď
-    /// čistě passive — integrate position + heading + pitch.
+    /// Pure passive integration: position + heading + pitch update plus
+    /// toroidal wrap / z bounce. Active forces (`apply_brain_motor`) must
+    /// run before `step`.
     pub fn step(&mut self, dt: f32, world_half: [f32; 3]) {
         self.age = self.age.saturating_add(1);
         if self.reproduce_cooldown_ticks > 0 {
@@ -581,33 +530,34 @@ impl Hunter {
     }
 }
 
-/// Sprint 90: hunter sensor context (subset of cell `BrainSensors` adapted
-/// pro predator semantics). „Prey" = nearest attackable cell (genome
-/// vision_radius + fov filter + n_bonds < HUNTER_BOND_IMMUNITY_THRESHOLD).
+/// Hunter sensor context — predator-flavored subset of the cell
+/// `BrainSensors`. "Prey" means the nearest attackable cell (within
+/// `vision_radius`, inside the FOV cone, and with
+/// `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD`).
 #[derive(Debug, Clone, Copy)]
 pub struct HunterBrainSensors {
-    /// Min-image delta od hunter k nearest prey (cell.position − hunter.position).
+    /// Min-image delta from hunter to the nearest prey
+    /// (`cell.position − hunter.position`).
     pub nearest_prey: Option<[f32; 3]>,
-    /// Body size nearest prey (z `cell.phenotype.effective_radius`). Pre brain:
-    /// "kořist je menší / větší než já" → trade-off chase tactics.
+    /// `phenotype.effective_radius` of the nearest prey — gives the brain
+    /// a "smaller or larger than me" signal for chase-tactic trade-offs.
     pub nearest_prey_size: f32,
-    /// Počet attackable cells uvnitř vision range/cone (density signal).
+    /// Count of attackable cells inside the vision range / cone.
     pub neighbors_in_vision: u32,
-    /// Smell field gradient na hunter pozici. Cells emit smell when eating
-    /// food → chemical clue pro nearby cell activity.
+    /// Smell field gradient at the hunter's position. Cells emit smell when
+    /// they eat, so this acts as a chemical clue toward nearby cell activity.
     pub smell_grad: [f32; 3],
-    /// Sprint 100: delta k nearest same-type hunteru ve vision (= pack member
-    /// candidate / kontakt k bondu). Brain získá schopnost aktivně hledat
-    /// nebo se vyhýbat packu.
+    /// Delta to the nearest same-type hunter in vision — a pack-member /
+    /// bond-contact candidate. Lets the brain seek or avoid the pack.
     pub nearest_pack_member: Option<[f32; 3]>,
-    /// Sprint 100: počet same-type hunters ve vision (pack density signal).
+    /// Same-type hunters in vision (pack density signal).
     pub same_type_in_vision: u32,
 }
 
-/// Minimální snapshot huntera pro pack-sense scan v `gather_hunter_sensors`.
-/// Drží jen pozici, hunter_id a adhesion_type — to jediné, co same-type
-/// vision check potřebuje. Nahrazuje per-tick deep clone celého `Hunter`
-/// (genome + brain weights + bondy + recurrent state) na ~24-byte Copy.
+/// Minimal hunter snapshot for the pack-sense scan in
+/// `gather_hunter_sensors`. Holds only the fields the same-type vision
+/// check needs, so the caller can avoid a per-tick deep clone of the full
+/// `Hunter` struct (genome + brain weights + bonds + recurrent state).
 #[derive(Debug, Clone, Copy)]
 pub struct HunterSnapshotMin {
     pub hunter_id: u64,
@@ -625,12 +575,12 @@ impl HunterSnapshotMin {
     }
 }
 
-/// Sprint 102: hunter sensor gather na spatial gridu. `cell_grid` musí být
-/// rebuilded přes `cells.iter().enumerate().map(|(i, c)| (i, c.position, ()))`
-/// caller-side — funkce iteruje jen 3³ buckets v okolí huntera, narrow-phase
-/// distance + cone test. `other_hunters` zůstává brute force (n ≤ ~50 — H²
-/// je zanedbatelný), ale typ je `HunterSnapshotMin` místo `&[Hunter]` ⇒
-/// caller ušetří deep clone.
+/// Gather hunter sensors using the cell spatial grid. Caller rebuilds
+/// `cell_grid` from `cells.iter().enumerate().map(|(i, c)| (i, c.position, ()))`;
+/// this function only walks the 3³ buckets around the hunter and does the
+/// narrow-phase distance + cone test. `other_hunters` stays as brute force
+/// — `HUNTER_MAX_POP ≤ 50` so `H²` is trivial — but it's typed as
+/// `&[HunterSnapshotMin]` so the caller doesn't need a per-tick deep clone.
 pub fn gather_hunter_sensors(
     hunter: &Hunter,
     cells: &[Cell],
@@ -689,8 +639,8 @@ pub fn gather_hunter_sensors(
         },
     );
     let smell_grad = smell.gradient_at(hunter.position, SMELL_SAMPLE_EPSILON);
-    // Sprint 100: pack scan — same-type hunteři ve vision range. H² brute
-    // force OK: HUNTER_TARGET_COUNT je low (~12), grid by tu nebyl výhra.
+    // Pack scan — same-type hunters in vision. `HUNTER_MAX_POP ≤ 50`, so
+    // brute-force `H²` is fine; a spatial grid wouldn't help.
     let mut nearest_pack: Option<([f32; 3], f32)> = None;
     let mut same_type_count: u32 = 0;
     let own_type = hunter.genome.adhesion_type;
@@ -724,21 +674,20 @@ pub fn gather_hunter_sensors(
     }
 }
 
-/// Sprint 90: brain input vector pro hunter. Reuse cell's 21-slot layout
-/// s hunter semantics:
-///   0,1,15: nearest_prey delta (= cell food slots)
-///   2,3,16: nearest_pack_member delta (Sprint 100: same-type hunter pull)
-///   4: own_energy / HUNTER_REPRODUCE_THRESHOLD
-///   5: own_speed / max_speed
-///   6: prey_size_relative (prey/own — pre brain "small target" awareness)
-///   7,8,17: smell_grad x/y/z
-///   9,10,18: heading_x/y/z (forward vector)
-///   11: pack_size_norm (n_bonds / MAX_BONDS_PER_CELL — Sprint 100)
-///   12: pack_density_norm (same_type_in_vision / DENSITY_NORM_COUNT — Sprint 100)
-///   13: density_in_vision (count cells / DENSITY_NORM_COUNT)
-///   14: filler (cell uses damage)
-///   19, 20: filler
-///   21..52: recurrent — pooled_hidden (Sprint 100, S94 mirror)
+/// Populate the brain input vector for a hunter. Reuses the cell input
+/// layout with predator-specific slot semantics:
+///   0,1,15  nearest-prey delta (cell food slots)
+///   2,3,16  nearest-pack-member delta (same-type hunter pull)
+///   4       energy / `HUNTER_REPRODUCE_THRESHOLD`
+///   5       speed / max_speed
+///   6       prey-size relative (prey / own_size − 1)
+///   7,8,17  smell gradient x/y/z
+///   9,10,18 heading x/y/z (forward vector)
+///   11      pack size normalized (`n_bonds / MAX_BONDS_PER_CELL`)
+///   12      pack density (same-type cells / `DENSITY_NORM_COUNT`)
+///   13      cell density in vision (count / `DENSITY_NORM_COUNT`)
+///   14, 19, 20  filler (unused for hunters)
+///   21..52  recurrent slots — `pooled_hidden`
 pub fn populate_hunter_brain_inputs(
     hunter: &mut Hunter,
     sensors: &HunterBrainSensors,
@@ -756,7 +705,6 @@ pub fn populate_hunter_brain_inputs(
         let own_size = hunter.genome.body_size.max(0.01);
         inputs[6] = (sensors.nearest_prey_size - own_size) / own_size;
     }
-    // Sprint 100: pack member delta — informuje brain o směru k pack mate.
     if let Some(d) = sensors.nearest_pack_member {
         inputs[2] = d[0] / vision_r;
         inputs[3] = d[1] / vision_r;
@@ -771,22 +719,21 @@ pub fn populate_hunter_brain_inputs(
     inputs[9] = fwd[0];
     inputs[10] = fwd[1];
     inputs[18] = fwd[2];
-    // Sprint 100: pack size / density signals.
     let n_bonds = hunter.bonds.iter().filter(|b| b.is_some()).count() as f32;
     inputs[11] = (n_bonds / MAX_BONDS_PER_CELL as f32).min(1.0);
     inputs[12] = (sensors.same_type_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
     inputs[13] = (sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
-    // Sprint 100: pooled_hidden místo last_hidden — bonded hunteři sdílejí
-    // recurrent state. Solo hunter má pooled_hidden = self.last_hidden
-    // (gathered v `pool_bonded_hunter_hidden` před brain_act).
+    // Recurrent slots feed `pooled_hidden`, not `last_hidden`, so bonded
+    // hunters share recurrent state. Solo hunters end up with
+    // `pooled_hidden == last_hidden` from `pool_bonded_hunter_hidden`.
     inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
         .copy_from_slice(&hunter.pooled_hidden[..BRAIN_RECURRENT]);
     inputs
 }
 
-/// Sprint 100: pool last_hidden napříč bonded hunter packem (mirror S94
-/// `pool_bonded_hidden` for cells). Pre-brain_act fáze. Solo hunter dostane
-/// kopii vlastního last_hidden — žádná change vs pre-S100 chování.
+/// Pool `last_hidden` across each bonded hunter pack (hunter mirror of
+/// `pool_bonded_hidden` for cells). Runs before the brain forward pass.
+/// Solo hunters end up with a copy of their own `last_hidden`.
 pub fn pool_bonded_hunter_hidden(hunters: &mut [Hunter]) {
     let n = hunters.len();
     if n == 0 {
@@ -823,12 +770,10 @@ pub fn pool_bonded_hunter_hidden(hunters: &mut [Hunter]) {
     }
 }
 
-/// Sprint 89: asexual clone-with-mutate. Parent splituje energy 50/50
-/// se child, child dostává mutated genome + parent's lineage_id (lineage
-/// continuation). Caller sets cooldown + alloc hunter_id.
-///
-/// Sprint 98: solo cesta zachovaná pro floor respawn, ale primární repro
-/// path je teď sexuální (`make_hunter_mating_child`).
+/// Asexual clone-with-mutate, kept for the floor-respawn path. Parent
+/// splits energy 50/50 with the child; the child inherits a mutated genome
+/// and the parent's `lineage_id` (lineage continuity). The primary
+/// reproduction path is sexual (`make_hunter_mating_child`).
 pub fn make_hunter_child(
     parent: &Hunter,
     rng: &mut impl Rng,
@@ -845,22 +790,23 @@ pub fn make_hunter_child(
         parent.lineage_id,
         current_gen,
     );
-    // Spawn at parent position (later step + idle drift rozhází).
+    // Spawn at parent position; the next step + idle drift will scatter.
     child.position = parent.position;
     child.energy = parent.energy * 0.5;
     child.reproduce_cooldown_ticks = HUNTER_REPRODUCE_COOLDOWN_TICKS;
     child
 }
 
-/// Sprint 98: sexuální reprodukce hunterů — symetrická k `make_mating_child`
-/// pro buňky. Crossover obou rodičovských genomů (per-field 50/50 + brain
-/// crossover), pak mutace. Mirror cell semantiky: lineage = parent_a (single-
-/// parent inheritance), spawn position = midpoint, energy = a + b (caller
-/// halves oba pre-call), cooldown nastaven na child.
+/// Sexual reproduction for hunters, symmetric with cells'
+/// `make_mating_child`. Per-field 50/50 crossover plus a brain crossover,
+/// then mutation. Lineage follows `parent_a` (single-parent inheritance);
+/// spawn position is the midpoint and energy is `a + b` (callers halve
+/// both parents before calling).
 ///
-/// RNG draw order: crossover (gen-by-gen + Brain::crossover) → mutate →
-/// from_genome (3 position draws + 1 direction draw, hned overriden).
-/// Změna pořadí by porušila CSV reproducibility napříč seedy.
+/// RNG draw order is fixed at: crossover → mutate → `from_genome`
+/// (3 position draws + 1 direction draw, immediately overridden by the
+/// midpoint write below). Reordering here shifts the RNG stream and
+/// breaks CSV reproducibility across seeds.
 pub fn make_hunter_mating_child(
     parent_a: &Hunter,
     parent_b: &Hunter,
@@ -889,19 +835,12 @@ pub fn make_hunter_mating_child(
     child
 }
 
-/// Sprint 71: vrací `Some(cell_index)` nejbližší attackable cell ∈ vision
-/// range. „Attackable" = `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD`. Vrací
-/// nejbližší **z attackable** cells, ne nejbližší absolutně — Hunter nepronásleduje
-/// imune clustery (skill: cluster je viditelný, ale ne lovitelný; Hunter musí
-/// najít solo cell). Toroidal-aware přes `min_image_delta`.
-///
-/// Sprint 84: směrový FOV. `hunter.velocity` určuje forward; cells mimo
-/// `genome.vision_fov` kuželu nejsou viditelné. Idle hunter (velocity² <
-/// `HUNTER_FORWARD_SPEED_THRESHOLD_SQ`) má fallback na omni — bez toho by
-/// hunter zaseknutý v 0-velocity stavu nikdy nenašel target.
-///
-/// Sprint 89: vision_radius + vision_fov teď z `hunter.genome` místo const.
-/// Heritable predator detection range/cone — selekce drift per generation.
+/// Index of the nearest attackable cell in vision range, or `None`. A cell
+/// is attackable when `n_bonds() < HUNTER_BOND_IMMUNITY_THRESHOLD` — the
+/// hunter ignores immune clusters entirely. Vision uses the heritable
+/// `vision_radius` and `vision_fov` from the hunter's genome; below the
+/// `HUNTER_FORWARD_SPEED_THRESHOLD_SQ` speed floor the cone falls back to
+/// omnidirectional so a stalled hunter can still acquire a target.
 pub fn nearest_attackable_cell(
     hunter: &Hunter,
     cells: &[Cell],
@@ -935,10 +874,8 @@ pub fn nearest_attackable_cell(
             if c.n_bonds() >= HUNTER_BOND_IMMUNITY_THRESHOLD {
                 return;
             }
-            // Sprint 84: vector from hunter to cell (= c.position − hunter.pos).
-            // Pre-Sprint-84 byl `d` drženo jako hunter_pos − c.position (jen pro d²
-            // distance, kde znaménko nehraje); cone filter potřebuje směr.
-            // Sprint 102: ghost_pos je už toroidálně min-image pozice (grid wrapped).
+            // Vector from hunter to cell — sign matters for the cone test.
+            // `ghost_pos` is already toroidally min-image (grid-wrapped).
             let d = [
                 ghost_pos[0] - hunter.position[0],
                 ghost_pos[1] - hunter.position[1],

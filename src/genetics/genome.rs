@@ -17,47 +17,33 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     sigma_shell: 0.03,
     sigma_brain: 0.2,
     adhesion_flip_rate: ADHESION_MUTATION_RATE,
-    // Sprint 68: bond physics genes — pomalejší drift než body params kvůli
-    // sub-procentní bond_active_frac v Sprint 67.1 long-run smoke (selekce
-    // má slabý signál, větší sigma by způsobil random walk).
+    // Bond physics drift slower than body params: bond_active_frac runs
+    // sub-percent in long smokes, so selection has a weak signal — larger
+    // sigma would degenerate into random walk.
     sigma_bond_stiffness: 0.3,
     sigma_bond_damping: 0.05,
-    // Sprint 80 Sprint C: structural mutation off by default. Zapnutí přes
-    // local `MutationConfig { add_neuron_rate: 0.05, ..MUTATION_CONFIG }`
-    // v experimentech.
-    //
-    // Sprint 104: zapnuto pro NEAT-direct evoluci. 2-3 % rates dají ~1
-    // structural mutace per cell per 30-50 gen → pomalá topologická drift,
-    // selekce má čas vyhodnotit.
+    // Structural brain mutations: ~2 % rates land roughly one structural
+    // change per cell every 30–50 gens, giving selection time to evaluate.
     add_neuron_rate: 0.02,
     split_link_rate: 0.02,
     remove_neuron_rate: 0.01,
-    // Sprint 82: FOV gen dormant — Sprint 82 je pure infra (gen + cost factor).
-    // Sprint 83: 0.0 → 0.05 — modest drift jako sigma_bond_stiffness (0.3 / 10
-    // = 3 % range, sigma_vision_fov 0.05 / 2.88 ≈ 1.7 % FOV range per gen).
-    // Pomalejší než tělesné geny aby evoluce stihla najít optimum bez random
-    // walku do MIN_VISION_FOV.
+    // ~1.7 % FOV range / gen — slower than body genes so evolution finds an
+    // optimum before drifting into MIN_VISION_FOV.
     sigma_vision_fov: 0.05,
-    // Sprint 87: thermal_optimum drift. 0.5 sim-units / gen ≈ 1.9 % range
-    // (range = 26 sim-units = TOP - BOTTOM). Pomalý drift aby selekce stihla
-    // tlumit speciaci do depth-coupled niche, ne random walk.
+    // ~1.9 % range / gen across the 26-unit TOP–BOTTOM band; slow enough
+    // for selection to bias depth-coupled niches rather than random walk.
     sigma_thermal_optimum: 0.5,
-    // Sprint 92: carnivore_score drift. 0.02 = 2 % range/gen.
     sigma_carnivore_score: 0.02,
-    // Sprint 97: sensor_gains drift. 0.04 = 2 % range / gen.
     sigma_sensor_gain: 0.04,
-    // Sprint 122: zapnutí discrete spike_count mutace + per-spike orientation drift.
-    // ~5 % cells per gen mění spike_count o ±1 (clamp [0, 5]). 0.05 rad ≈ 3°
-    // drift v azimuth/elevation per gen — slow per-spike directional evolution.
+    // ~5 % of cells per gen flip spike_count by ±1 (clamped to [0, 5]).
+    // 0.05 rad ≈ 3° azimuth/elevation drift per gen.
     spike_count_mutation_rate: 0.05,
     sigma_spike_orientation: 0.05,
-    // Sprint 123: complexity drift aktivní. 0.02 = 2 % range/gen ([0, 1] range,
-    // 1000-gen drift dosáhne ~MAX). Slow drift aby selekce stihla najít
-    // intermediate sweet-spot (~0.4-0.6) místo random walk k extremům.
+    // 2 % range / gen on [0, 1] — slow enough for selection to settle
+    // around an intermediate sweet-spot instead of running to the extremes.
     sigma_spike_complexity: 0.02,
-    // Sprint 122: per-non-primary spike length drift. Když spike_count_mutation_rate
-    // aktivuje slot, dítě dostane init length = 0 (nový spike), který
-    // postupně mutuje. 0.03 stejně jako sigma_spike_length (slot 0).
+    // Newly activated non-primary spike slots start at length = 0; this
+    // sigma drives them away from zero. Same magnitude as `sigma_spike_length`.
     sigma_spike_length_secondary: 0.03,
 };
 
@@ -73,59 +59,46 @@ pub struct MutationConfig {
     pub sigma_spike_length: f32,
     pub sigma_shell: f32,
     pub sigma_brain: f32,
-    /// Sprint 66: pravděpodobnost flipu adhesion_type per dítě.
+    /// Probability of flipping `adhesion_type` per child.
     pub adhesion_flip_rate: f32,
-    /// Sprint 68: gaussian sigma pro bond_stiffness gen.
     pub sigma_bond_stiffness: f32,
-    /// Sprint 68: gaussian sigma pro bond_damping gen.
     pub sigma_bond_damping: f32,
-    /// Sprint 80 Sprint C: pravděpodobnost `add_neuron` structural mutace
-    /// per dítě. 0.0 = topology evoluce vypnutá (default; zachovává Sprint
-    /// B byte-identical trajectory). Tuning sweep příští sprint zkusí 0.02,
-    /// 0.05, 0.1.
+    /// Probability of an `add_neuron` structural mutation per child. Set to
+    /// 0 to disable topology evolution; non-zero values diverge the RNG
+    /// trajectory from a no-structural-mutation baseline.
     pub add_neuron_rate: f32,
-    /// Sprint 104: classic NEAT split_link mutation rate. Vyber random
-    /// active link (i,h) s |w|>SPLIT_LINK_THRESHOLD, insert nový hidden
-    /// k mezi nimi. Topology-preserving — forward output zachován.
+    /// NEAT-style split-link rate: pick a random active link (|w| above
+    /// `SPLIT_LINK_THRESHOLD`) and insert a hidden node between its
+    /// endpoints. Topology-preserving — forward output is unchanged at the
+    /// moment of insertion.
     pub split_link_rate: f32,
-    /// Sprint 104: remove_neuron mutation rate. Pick random hidden, zero out.
-    /// Pruning balance proti add_neuron + split_link růstu.
+    /// Pruning rate that zeros a random hidden neuron — balances the growth
+    /// driven by `add_neuron_rate` and `split_link_rate`.
     pub remove_neuron_rate: f32,
-    /// Sprint 82: gaussian sigma pro `vision_fov` mutaci. `MUTATION_CONFIG`
-    /// default = 0 (Sprint 82 pure-infra, FOV gen dormant). Sprint 83+ FOV
-    /// aktivuje a tuning experimenty mohou nastavit nenulový drift. Při
-    /// drift na MIN_VISION_FOV cells ztrácejí cells/food awareness, ale
-    /// platí minimální vision cost — selekční trade-off vstoupí v platnost
-    /// až s aktivním cone filterem.
+    /// Set to 0 to keep all cells at `INITIAL_VISION_FOV`; non-zero values
+    /// engage cone filtering in sensor gather, opening the info-loss vs.
+    /// energy-cost trade-off.
     pub sigma_vision_fov: f32,
-    /// Sprint 87: gaussian sigma pro `thermal_optimum` mutaci. ~0.5 sim-units
-    /// (~1.9 % range per gen) — pomalý drift relative k init populace
-    /// uniform ∈ [BOTTOM, TOP], nechává selekci tlumit speciaci.
     pub sigma_thermal_optimum: f32,
-    /// Sprint 92: digestion specialization gen sigma. 0.02 = 2 % range/gen.
-    /// Pomalejší než ostatní geny — diet shift vyžaduje food availability
-    /// signal (selekce přes eat efficiency × food_kind), který je sám pomalý.
+    /// Slower than most body genes — diet shifts need a food-availability
+    /// signal (selection via `eat_efficiency × food_kind`), which itself
+    /// changes only gradually.
     pub sigma_carnivore_score: f32,
-    /// Sprint 97: sensor_gains per-category gaussian sigma. 0.04 = 2 % of
-    /// [MIN, MAX] = [0, 2] range/gen. Drift k specializaci vyžaduje cluster
-    /// pooling signal — selekce je conditional na bond presence.
+    /// Per-category gain drift. Specialization needs a cluster-pooling
+    /// signal, so selection is conditional on bond presence.
     pub sigma_sensor_gain: f32,
-    /// Sprint 122: pravděpodobnost diskrétní mutace `spike_count` per dítě.
-    /// 0.05 = ~5 % cells per gen flip ±1 (clamp [0, SPIKE_SLOTS]). 0.0 = vypnuté
-    /// (Sprint 121 default — gen 0 spike_count=1 propaguje napříč evolucí).
-    /// Sprint 123: může enabled.
+    /// Probability of `spike_count` flipping by ±1 (clamped to
+    /// `[0, SPIKE_SLOTS]`). When 0, no RNG draw happens here — keeping the
+    /// RNG sequence byte-identical with the pre-multi-spike baseline.
     pub spike_count_mutation_rate: f32,
-    /// Sprint 122: gaussian sigma pro spike azimuth/elevation offsety
-    /// (rad/gen). 0.05 ≈ 3°/gen drift — slow per-spike directional evolution.
+    /// Gaussian sigma for spike azimuth/elevation offsets in radians/gen.
     pub sigma_spike_orientation: f32,
-    /// Sprint 123: gaussian sigma pro spike complexity ∈ [0, 1] mutaci.
-    /// 0.0 = vypnuté (Sprint 121/122 default — complexity zaseknutý na 0,
-    /// COMPLEXITY_*_GAIN multiplikátory vrací 1.0).
+    /// Gaussian sigma for spike complexity ∈ [0, 1]. When 0, complexity stays
+    /// pinned and the `COMPLEXITY_*_GAIN` multipliers degenerate to 1.0.
     pub sigma_spike_complexity: f32,
-    /// Sprint 122: gaussian sigma pro mutaci `length` na spike sloty 1..SPIKE_SLOTS
-    /// (= "non-primary" sloty, které pre-S122 byly drženy na 0). Slot 0 zachovává
-    /// existující `sigma_spike_length`. 0.0 = vypnuté → non-primary sloty
-    /// drift jen přes activation/deactivation pres `spike_count_mutation_rate`.
+    /// Length-drift sigma for slots 1..SPIKE_SLOTS. Slot 0 uses
+    /// `sigma_spike_length`. When 0, non-primary slots only ever drift via
+    /// activation/deactivation through `spike_count_mutation_rate`.
     pub sigma_spike_length_secondary: f32,
 }
 
@@ -137,58 +110,48 @@ pub struct Genome {
     pub turn_rate: f32,
     pub body_length: f32,
     pub body_width: f32,
-    /// Sprint 34: 3-axis ellipsoid — vertikální rozměr.
     pub body_height: f32,
-    /// Sprint 121: multi-spike. `spikes[0..spike_count]` aktivní, zbytek
-    /// zero-init. Pre-Sprint-121 single `spike_length` mapuje na
-    /// `spikes[0].length` se `spike_count = 1`.
+    /// Multi-spike storage. Active range is `spikes[0..spike_count]`; the
+    /// rest is zero-initialized and contributes nothing to predation.
     #[serde(default = "default_spikes")]
     pub spikes: [Spike; SPIKE_SLOTS],
     #[serde(default = "default_spike_count")]
     pub spike_count: u8,
-    /// Sprint 41: shell jako passive damage absorber.
     pub shell_thickness: f32,
-    /// Sprint 66: differential-adhesion CAM token (∈ 0..ADHESION_TYPE_COUNT).
-    /// Same-type cells na sebe atraktivně působí (Steinberg sorting), cross-type
-    /// pair má mírnou repulzi. Také gateway pro spring bond formation.
+    /// Differential-adhesion CAM token in `0..ADHESION_TYPE_COUNT`. Same-type
+    /// cells attract (Steinberg sorting), cross-type pairs mildly repel; also
+    /// gates spring bond formation.
     pub adhesion_type: u8,
-    /// Sprint 68: per-cell spring stiffness contribution. Bond mezi dvěma
-    /// cells používá průměr obou stiffness při formaci (uložený do Bond struct).
+    /// Per-cell spring stiffness; the formed `Bond` stores the pair-mean.
     pub bond_stiffness: f32,
-    /// Sprint 68: per-cell spring damping contribution. Stejná semantika jako
-    /// bond_stiffness — pair-mean uložený do Bond.
+    /// Per-cell spring damping; the formed `Bond` stores the pair-mean.
     pub bond_damping: f32,
-    /// Sprint 82: půl-úhel kuželu směrového FOV kolem `forward_vector` (rad).
-    /// Range `[MIN_VISION_FOV, MAX_VISION_FOV]`. Init = `INITIAL_VISION_FOV`
-    /// (= π = full sphere). Sprint 83+ aktivuje cone filter v sensor gather;
-    /// energy cost už v Sprint 82 škáluje s `vision_fov_factor(theta)`.
+    /// Half-angle (rad) of the directional FOV cone around `forward_vector`,
+    /// in `[MIN_VISION_FOV, MAX_VISION_FOV]`. Init = full sphere; cone
+    /// filtering applies in sensor gather and energy cost scales with
+    /// `vision_fov_factor(theta)`.
     #[serde(default = "default_vision_fov")]
     pub vision_fov: f32,
-    /// Sprint 87: per-cell preferovaná teplota (sim units, range
-    /// `[MIN_THERMAL_OPTIMUM, MAX_THERMAL_OPTIMUM]`). Cell platí kvadratický
-    /// penalty drain za |temp − optimum|. Init populace random uniform
-    /// across range → speciace mezi cold-prefer / warm-prefer fenotypy.
+    /// Per-cell preferred temperature. The cell pays a quadratic drain
+    /// proportional to `|temp − optimum|`, so an initial uniform draw
+    /// across the range seeds cold-prefer / warm-prefer speciation.
     #[serde(default = "default_thermal_optimum")]
     pub thermal_optimum: f32,
-    /// Sprint 92: digestion specialization gen ∈ [0, 1]. 0 = pure herbivore
-    /// (plant food only), 1 = pure carnivore (hunter carrion only). Continuous
-    /// trade-off — eat_efficiency(food_kind, score). Init populace bias
-    /// herbivore-leaning (cells potřebují plant food survive cold start).
+    /// Digestion specialization in [0, 1]: 0 = pure herbivore, 1 = pure
+    /// carnivore. Continuous trade-off via `eat_efficiency(food_kind, score)`.
     #[serde(default)]
     pub carnivore_score: f32,
-    /// Sprint 97: per-category sensor gain ∈ [MIN, MAX]. Index 0 = Vision,
-    /// 1 = Chemistry, 2 = Defensive. Modulates input strength + per-tick
-    /// energy drain (`sum × SENSOR_GAIN_COST`). Cluster cells s pooled sensors
-    /// mohou turn off duplicate sensors → save energy → role differentiation
-    /// emergent (scout cells vision-specialist, smell cells chemistry-specialist).
+    /// Per-category sensor gain in `[MIN_SENSOR_GAIN, MAX_SENSOR_GAIN]`.
+    /// Index 0 = Vision, 1 = Chemistry, 2 = Defensive. Scales input strength
+    /// and adds `sum × SENSOR_GAIN_COST` per-tick drain, creating room for
+    /// role differentiation when cluster cells pool sensors.
     #[serde(default = "default_sensor_gains")]
     pub sensor_gains: [f32; N_SENSOR_CATEGORIES],
     pub brain: Brain,
-    /// Sprint 106: HyperNEAT CPPN — innate template, ze kterého se Brain
-    /// derives při make_*_child. Hebbian během života modifies derived
-    /// brain, ale na reproduce se brain re-derives z child's CPPN. Non-
-    /// Lamarckian: Hebbian gains nepřechází do dalších generací, jen
-    /// CPPN topology + weights se dědí (S105 mutations + crossover).
+    /// HyperNEAT innate template. The `brain` field is derived from this
+    /// CPPN at reproduction time; Hebbian updates during life mutate the
+    /// derived brain only, never the CPPN. Non-Lamarckian: only the CPPN
+    /// is inherited.
     #[serde(default = "default_cppn")]
     pub cppn: Cppn,
 }
@@ -224,9 +187,8 @@ pub fn default_spike_count() -> u8 {
 
 impl Genome {
     pub fn random(rng: &mut impl Rng) -> Self {
-        // Default tělo je izotropní koule (length == width == height). Mutace
-        // mohou asymetrii vytvořit, ale jen pokud ji selekce odmění; gen 0
-        // nezavádí prior na ellipse fenotyp.
+        // Isotropic body at gen 0 — mutations can create asymmetry only when
+        // selection rewards it; no ellipsoid prior is baked in.
         let body_size = rng.random_range(0.7..1.3);
         let cppn = Cppn::random(rng);
         let brain = Brain::from_cppn(&cppn);
@@ -249,52 +211,33 @@ impl Genome {
                 spikes
             },
             spike_count: 1,
-            // Sprint 41: mírný počáteční mean, žádný extreme spawn — selekce
-            // si shell vytáhne nahoru, pokud má smysl.
             shell_thickness: rng.random_range(0.0..0.2),
-            // Sprint 66: uniform draw napříč ADHESION_TYPE_COUNT typů. Initial
-            // populace tak má rovnoměrnou type distribution; selekce + drift
-            // pak modifikují frekvence.
             adhesion_type: rng.random_range(0..ADHESION_TYPE_COUNT),
-            // Sprint 68: initial draw kolem global default ±50 %. Selekce +
-            // drift pak rozhrnou rozsah.
             bond_stiffness: rng.random_range(BOND_STIFFNESS * 0.5..BOND_STIFFNESS * 1.5),
             bond_damping: rng.random_range(BOND_DAMPING * 0.5..BOND_DAMPING * 1.5),
-            // Sprint 82: full-sphere baseline, žádný RNG draw — initial population
-            // kompletně omnidirectional. Cost faktor = 1.0, behavior matches
-            // pre-Sprint-82 baseline až do prvního sigma_vision_fov > 0 sprintu.
             vision_fov: INITIAL_VISION_FOV,
-            // Sprint 87: random uniform across [BOTTOM, TOP] — initial speciace.
-            // RNG draw je breaking change pro Sprint 86 baseline (BRAIN_INPUTS
-            // shape change už CSV reproducibility ztratila).
             thermal_optimum: rng.random_range(MIN_THERMAL_OPTIMUM..MAX_THERMAL_OPTIMUM),
-            // Sprint 92: bias toward herbivore (range [0, 0.3]) — cold start.
-            // Sprint 93: range [0, 0.5] — wider initial spread aby existoval
-            // immediate niche pro carnivore-leaning cells na hunter carrion
-            // drop sites. Bez tohoto je multi-trophic food chain dormant
-            // dokud sigma drift nedotlačí > 0.5 (mnoho gens).
+            // Range [0, 0.5] (not [0, 0.3]) so an immediate carnivore-leaning
+            // niche exists on hunter carrion drops; without it the multi-
+            // trophic food chain is dormant until sigma drift pushes any cell
+            // above 0.5, which can take many generations.
             carnivore_score: rng.random_range(0.0..0.5),
-            // Sprint 97: random uniform [0.7, 1.3] per category — small spread
-            // around neutral 1.0 aby initial population měla mírně varied
-            // sensor profiles bez immediate dramatic specialization.
             sensor_gains: [
                 rng.random_range(0.7..1.3),
                 rng.random_range(0.7..1.3),
                 rng.random_range(0.7..1.3),
             ],
-            // Sprint 106: brain je derived z cppn (innate template).
             brain,
             cppn,
         }
     }
 
     pub fn mutate(&self, rng: &mut impl Rng, cfg: &MutationConfig) -> Self {
-        // Sprint 106: cppn mutated first, brain derived po mutaci.
         let mutated_cppn = self.cppn.mutate(rng, &CPPN_MUTATION_CONFIG);
         let derived_brain = Brain::from_cppn(&mutated_cppn);
-        // Sprint 66: discrete adhesion_type. Při flipu náhodně vyberu jiný
-        // typ ≠ self.adhesion_type. Pokud ADHESION_TYPE_COUNT == 1, fallback
-        // ponechá hodnotu (žádný "jiný" typ neexistuje).
+        // Discrete adhesion-type flip — pick a uniform replacement that is
+        // strictly different from the current type. Falls back to the
+        // existing value when ADHESION_TYPE_COUNT == 1 (no other type exists).
         let adhesion_type = if cfg.adhesion_flip_rate > 0.0
             && ADHESION_TYPE_COUNT > 1
             && rng.random::<f32>() < cfg.adhesion_flip_rate
@@ -321,10 +264,13 @@ impl Genome {
                 .clamp(MIN_BODY_HEIGHT, MAX_BODY_HEIGHT),
             spikes: {
                 let mut spikes = self.spikes;
-                // Slot 0 (primary) — pre-S121 single-spike sémantika.
+                // Slot 0 keeps the original single-spike semantics (drives
+                // the pre-multi-spike RNG sequence when secondary sigmas are 0).
                 spikes[0].length = (spikes[0].length + gaussian(rng) * cfg.sigma_spike_length)
                     .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
-                // Sprint 122: secondary slots length drift (jen pokud sigma > 0).
+                // Each block is gated by its own sigma so the loop is skipped
+                // entirely when the feature is off — that preserves both the
+                // RNG sequence and the cycles for unchanged simulations.
                 if cfg.sigma_spike_length_secondary > 0.0 {
                     for i in 1..SPIKE_SLOTS {
                         spikes[i].length = (spikes[i].length
@@ -332,7 +278,6 @@ impl Genome {
                             .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
                     }
                 }
-                // Sprint 122: per-slot orientation drift (jen pokud sigma > 0).
                 if cfg.sigma_spike_orientation > 0.0 {
                     for i in 0..SPIKE_SLOTS {
                         spikes[i].azimuth_offset = (spikes[i].azimuth_offset
@@ -343,7 +288,6 @@ impl Genome {
                             .clamp(MIN_SPIKE_ELEVATION, MAX_SPIKE_ELEVATION);
                     }
                 }
-                // Sprint 123: per-slot complexity drift (jen pokud sigma > 0).
                 if cfg.sigma_spike_complexity > 0.0 {
                     for i in 0..SPIKE_SLOTS {
                         spikes[i].complexity = (spikes[i].complexity
@@ -354,9 +298,6 @@ impl Genome {
                 spikes
             },
             spike_count: {
-                // Sprint 122: discrete ±1 mutace s rate. Pokud rate = 0
-                // (Sprint 121 default), žádný RNG draw — byte-identical
-                // s pre-S122. Sprint 122 rate = 0.05 → ~5 % cells per gen flip.
                 if cfg.spike_count_mutation_rate > 0.0
                     && rng.random::<f32>() < cfg.spike_count_mutation_rate
                 {
@@ -375,33 +316,28 @@ impl Genome {
                 .clamp(MIN_BOND_STIFFNESS, MAX_BOND_STIFFNESS),
             bond_damping: (self.bond_damping + gaussian(rng) * cfg.sigma_bond_damping)
                 .clamp(MIN_BOND_DAMPING, MAX_BOND_DAMPING),
-            // Sprint 82: short-circuit pattern jako Sprint 80 add_neuron_rate —
-            // při `sigma_vision_fov = 0` se gaussian draw přeskočí, RNG sekvence
-            // zůstává byte-identical s pre-Sprint-82. Při sigma > 0 (Sprint 83+)
-            // je drift aktivní a CSV se rozejde od toho sprintu (expected).
+            // The remaining genes follow a `sigma > 0` short-circuit so that
+            // disabling drift skips the gaussian draw entirely — both for
+            // cycle savings and to keep the RNG sequence stable for fixtures
+            // captured before the gene was activated.
             vision_fov: if cfg.sigma_vision_fov > 0.0 {
                 (self.vision_fov + gaussian(rng) * cfg.sigma_vision_fov)
                     .clamp(MIN_VISION_FOV, MAX_VISION_FOV)
             } else {
                 self.vision_fov
             },
-            // Sprint 87: stejný short-circuit pattern. Při sigma=0 mutace
-            // přeskočí gaussian draw → cell drží initial uniform draw.
             thermal_optimum: if cfg.sigma_thermal_optimum > 0.0 {
                 (self.thermal_optimum + gaussian(rng) * cfg.sigma_thermal_optimum)
                     .clamp(MIN_THERMAL_OPTIMUM, MAX_THERMAL_OPTIMUM)
             } else {
                 self.thermal_optimum
             },
-            // Sprint 92: short-circuit pattern. sigma_carnivore_score = 0.02
-            // default → ~2 % range/gen drift. Clamp na [0, 1].
             carnivore_score: if cfg.sigma_carnivore_score > 0.0 {
                 (self.carnivore_score + gaussian(rng) * cfg.sigma_carnivore_score)
                     .clamp(0.0, 1.0)
             } else {
                 self.carnivore_score
             },
-            // Sprint 97: per-category gaussian drift, clamp [MIN, MAX].
             sensor_gains: {
                 let mut g = self.sensor_gains;
                 if cfg.sigma_sensor_gain > 0.0 {
@@ -412,17 +348,15 @@ impl Genome {
                 }
                 g
             },
-            // Sprint 106: HyperNEAT — cppn = innate template, brain derived.
             cppn: mutated_cppn,
             brain: derived_brain,
         }
     }
 
     /// Per-gene uniform crossover. Each scalar gene picks 50/50 from one
-    /// parent; brain uses its own per-row crossover.
+    /// parent; the brain is re-derived from the crossed-over CPPN rather
+    /// than copied — Hebbian gains are non-Lamarckian.
     pub fn crossover(a: &Genome, b: &Genome, rng: &mut impl Rng) -> Genome {
-        // Sprint 106: cppn crossover (NEAT innovation matching), brain derived
-        // z výsledku.
         let child_cppn = Cppn::crossover(&a.cppn, &b.cppn, rng);
         let derived_brain = Brain::from_cppn(&child_cppn);
         Genome {
@@ -435,17 +369,18 @@ impl Genome {
             body_height: if rng.random::<bool>() { a.body_height } else { b.body_height },
             spikes: {
                 let mut spikes = [Spike::ZERO; SPIKE_SLOTS];
-                // Slot 0: pre-S122 length-only crossover (zachovává byte-identity
-                // pro S121 testy s spike_count=1, complexity=0, orientation=0).
+                // Slot 0 length keeps the original single-spike crossover
+                // (an unconditional bool draw) so RNG fixtures captured before
+                // multi-spike still reproduce.
                 spikes[0].length = if rng.random::<bool>() {
                     a.spikes[0].length
                 } else {
                     b.spikes[0].length
                 };
-                // Sprint 122: per-slot multi-attribute crossover pro non-primary
-                // sloty + non-length atributy slotu 0. Short-circuit pokud rodiče
-                // mají identické hodnoty — žádný RNG draw, byte-identical když
-                // všechny S122 sigmy/rates = 0.
+                // The remaining spike attributes use a short-circuit: when
+                // the parents already agree, skip the RNG draw. This keeps
+                // the RNG sequence byte-identical with a baseline that left
+                // those attributes pinned (e.g., complexity = 0 throughout).
                 let pick_f32 = |a: f32, b: f32, rng: &mut dyn rand::RngCore| -> f32 {
                     if a == b {
                         a
@@ -477,9 +412,6 @@ impl Genome {
                 }
                 spikes
             },
-            // Sprint 121/122: short-circuit pokud parents shodné (pre-S122 vždy
-            // 1). Sprint 122 mutace začne flip ±1 → parents se rozejdou →
-            // bool draw aktivní.
             spike_count: if a.spike_count == b.spike_count {
                 a.spike_count
             } else if rng.random::<bool>() {
@@ -491,11 +423,6 @@ impl Genome {
             adhesion_type: if rng.random::<bool>() { a.adhesion_type } else { b.adhesion_type },
             bond_stiffness: if rng.random::<bool>() { a.bond_stiffness } else { b.bond_stiffness },
             bond_damping: if rng.random::<bool>() { a.bond_damping } else { b.bond_damping },
-            // Sprint 82: short-circuit při shodě hodnot — pokud `sigma_vision_fov
-            // = 0` (S82 default), všechny cells drží INITIAL_VISION_FOV a RNG
-            // bool draw se vyhne, takže pre-Sprint-82 CSV zůstává reprodukovatelný.
-            // Po Sprint 83+ aktivaci sigmy budou hodnoty divergovat → bool draw
-            // se zapne a CSV se rozejde (expected v behavior-change sprintu).
             vision_fov: if a.vision_fov == b.vision_fov {
                 a.vision_fov
             } else if rng.random::<bool>() {
@@ -503,21 +430,16 @@ impl Genome {
             } else {
                 b.vision_fov
             },
-            // Sprint 87: standard bool crossover. Init populace má unikátní
-            // optima (uniform random per cell) → values divergují hned od
-            // gen 0, bool draw aktivní vždy.
             thermal_optimum: if rng.random::<bool>() {
                 a.thermal_optimum
             } else {
                 b.thermal_optimum
             },
-            // Sprint 92: standard bool crossover.
             carnivore_score: if rng.random::<bool>() {
                 a.carnivore_score
             } else {
                 b.carnivore_score
             },
-            // Sprint 97: per-category bool crossover.
             sensor_gains: {
                 let mut g = [0.0_f32; N_SENSOR_CATEGORIES];
                 for k in 0..N_SENSOR_CATEGORIES {
@@ -529,8 +451,6 @@ impl Genome {
                 }
                 g
             },
-            // Sprint 106: HyperNEAT — brain re-derived z child's cppn,
-            // ne crossover parents' brains (Hebbian non-Lamarckian).
             brain: derived_brain,
             cppn: child_cppn,
         }

@@ -996,6 +996,7 @@ fn step_gpu_matches_cpu() {
         thermal_seasonal_amp: crate::THERMAL_SEASONAL_AMP,
         thermal_diurnal_phase: 0.0,
         thermal_seasonal_phase: 0.0,
+        thermal_log2_q10: THERMAL_Q10.log2(),
         ..StepParamsGpu::default()
     };
     let res = gpu.compute(
