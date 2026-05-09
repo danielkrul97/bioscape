@@ -41,8 +41,9 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   bonds_formed, bonds_broken, 21×0(bond..gain_def_dev), 0(cppn_compat),
             //   shock_active, shock_hazard_max, 0.000(climate), shock_food_factor,
             //   0(lineage_count), 0.000, 0.000, 3×0(spike),
-            //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3}",
+            //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
+            //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -449,9 +450,26 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     } else {
         0.0
     };
+    let bonded_attack_eff = if world.bonded_attacks_gen > 0 && world.solo_attacks_gen > 0 {
+        let b_avg = world.bonded_attack_gain_sum_gen / world.bonded_attacks_gen as f64;
+        let s_avg = world.solo_attack_gain_sum_gen / world.solo_attacks_gen as f64;
+        if s_avg > 0.0 { b_avg / s_avg } else { 0.0 }
+    } else {
+        0.0
+    };
+    let swarm_attack_frac = if world.attack_victims_gen > 0 {
+        world.swarm_attacks_gen as f64 / world.attack_victims_gen as f64
+    } else {
+        0.0
+    };
+    let pack_attack_frac = if world.swarm_attacks_gen > 0 {
+        world.pack_attacks_gen as f64 / world.swarm_attacks_gen as f64
+    } else {
+        0.0
+    };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -550,6 +568,9 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         world.coop_food_solved_gen,
         world.coop_food_failed_gen,
         coop_arrivals_avg,
+        bonded_attack_eff,
+        swarm_attack_frac,
+        pack_attack_frac,
     )
 }
 

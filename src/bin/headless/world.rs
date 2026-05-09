@@ -188,6 +188,21 @@ pub struct World {
     pub bonds_formed_gen: u64,
     /// Sprint 66 diagnostic — počet bondů přervaných v aktuální generaci.
     pub bonds_broken_gen: u64,
+    // Pack-hunting diagnostics. Per-gen totals — main.rs resetuje na gen end.
+    // `bonded_*` / `solo_*` rozlišuje útoky podle attacker.n_bonds() ≥ 1
+    // (selekční signál: bonded vs solo per-attack gain efficiency).
+    // `swarm_attacks_gen` = oběti zasažené ≥2 distinct attackery v 1 ticku;
+    // `pack_attacks_gen` = z toho subset, kde aspoň jedna dvojice attackerů
+    // je vzájemně bonded (behavioral signal: bondovaná koordinace, ne
+    // náhodný cluster overlap). `attack_victims_gen` = celkový počet
+    // distinct (victim, tick) párů — denominator pro swarm/pack fraction.
+    pub bonded_attacks_gen: u64,
+    pub solo_attacks_gen: u64,
+    pub bonded_attack_gain_sum_gen: f64,
+    pub solo_attack_gain_sum_gen: f64,
+    pub swarm_attacks_gen: u64,
+    pub pack_attacks_gen: u64,
+    pub attack_victims_gen: u64,
     pub mating_radius: f32,
     // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
     // může nastavit výš (potřeba pro bench při N > 1000).
@@ -335,6 +350,13 @@ impl World {
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
+            bonded_attacks_gen: 0,
+            solo_attacks_gen: 0,
+            bonded_attack_gain_sum_gen: 0.0,
+            solo_attack_gain_sum_gen: 0.0,
+            swarm_attacks_gen: 0,
+            pack_attacks_gen: 0,
+            attack_victims_gen: 0,
             mating_radius,
             max_population,
             events,
@@ -459,6 +481,13 @@ impl World {
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
+            bonded_attacks_gen: 0,
+            solo_attacks_gen: 0,
+            bonded_attack_gain_sum_gen: 0.0,
+            solo_attack_gain_sum_gen: 0.0,
+            swarm_attacks_gen: 0,
+            pack_attacks_gen: 0,
+            attack_victims_gen: 0,
             mating_radius: chk.mating_radius,
             max_population: chk.max_population,
             // Sprint 109: kalendář není v checkpointu (per-tick state je
@@ -1899,6 +1928,56 @@ impl World {
                 local
             })
             .collect();
+
+        // Pack-hunting metrics: per-victim attacker grouping + bonded vs solo
+        // per-attack gain. Done before energy mutation tak, aby `cells` shared
+        // borrow zůstal platný.
+        let mut by_victim: rustc_hash::FxHashMap<usize, Vec<usize>> = rustc_hash::FxHashMap::default();
+        let mut tick_bonded_n = 0u64;
+        let mut tick_solo_n = 0u64;
+        let mut tick_bonded_gain = 0.0_f64;
+        let mut tick_solo_gain = 0.0_f64;
+        for (i, j, gain, _) in &attack_events {
+            by_victim.entry(*j).or_default().push(*i);
+            if cells[*i].n_bonds() >= 1 {
+                tick_bonded_n += 1;
+                tick_bonded_gain += *gain as f64;
+            } else {
+                tick_solo_n += 1;
+                tick_solo_gain += *gain as f64;
+            }
+        }
+        let tick_victims = by_victim.len() as u64;
+        let mut tick_swarm = 0u64;
+        let mut tick_pack = 0u64;
+        for atks in by_victim.values() {
+            let mut uniq: Vec<usize> = atks.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            if uniq.len() < 2 {
+                continue;
+            }
+            tick_swarm += 1;
+            let bonded_pair = (0..uniq.len()).any(|a| {
+                let id_a = cells[uniq[a]].cell_id;
+                uniq[a + 1..].iter().any(|&b| {
+                    cells[b]
+                        .bonds
+                        .iter()
+                        .any(|opt| opt.is_some_and(|bond| bond.other_cell_id == id_a))
+                })
+            });
+            if bonded_pair {
+                tick_pack += 1;
+            }
+        }
+        self.bonded_attacks_gen += tick_bonded_n;
+        self.solo_attacks_gen += tick_solo_n;
+        self.bonded_attack_gain_sum_gen += tick_bonded_gain;
+        self.solo_attack_gain_sum_gen += tick_solo_gain;
+        self.swarm_attacks_gen += tick_swarm;
+        self.pack_attacks_gen += tick_pack;
+        self.attack_victims_gen += tick_victims;
 
         let events: u64 = attack_events.len() as u64;
         for (i, j, gain, defense) in attack_events {
