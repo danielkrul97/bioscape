@@ -8,13 +8,10 @@ use super::config::BIO_SHADER_PATH;
 use super::resources::AdhesionMaterials;
 
 /// Sprint 91: empty marker extension nad `StandardMaterial` — žádné custom
-/// uniformy. Shader detekuje hunter vs cell přes `emissive.r > 2.0` (hunter
-/// má LinearRgba(3.5, 0, 0)). Tím se vyhne Bevy 0.18 ExtendedMaterial uniform
-/// binding layout issue (binding 100 neproside validation v `pbr_opaque_mesh_pipeline`).
+/// uniformy. Tím se vyhne Bevy 0.18 ExtendedMaterial uniform binding layout
+/// issue (binding 100 neprošlo validation v `pbr_opaque_mesh_pipeline`).
 ///
-/// Pattern_kind se přepíná in-shader podle base material color → 1 shader
-/// handles obě cell + hunter. Hunter material má pure-red HDR emissive,
-/// cell materials max ~1.0 emissive intensity.
+/// Pattern_kind se přepíná in-shader podle base material color.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
 pub struct BioMaterialExt {}
 

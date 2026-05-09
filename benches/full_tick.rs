@@ -3,7 +3,7 @@
 // phases via lib.rs public API: per-cell brain forward + populate inputs +
 // kinematics step, plus smell/pheromone field diffusion. Approximates ≥80 %
 // of headless tick CPU cost without dragging the GPU pipeline / collisions /
-// reproduce / hunter logic into the bench harness.
+// reproduce logic into the bench harness.
 use bioscape::{
     forward_vector, populate_brain_inputs, Brain, BrainSensors, Cell, Food, PhysicsConfig,
     SmellField, WorldMap, PHEROMONE_DECAY, PHEROMONE_DIFFUSION, PHEROMONE_GRID_RES,

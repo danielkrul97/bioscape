@@ -5,7 +5,7 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 use bioscape::{
-    Cell, Food, Hunter, SmellField, WorldMap, CELL_RADIUS, CYCLE_AMPLITUDE, HUNTER_TARGET_COUNT,
+    Cell, Food, SmellField, WorldMap, CELL_RADIUS, CYCLE_AMPLITUDE,
     INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z,
     SMELL_GRID_RES, SMELL_GRID_RES_Z, WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z,
     WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, reject_food_for_richness,
@@ -17,11 +17,11 @@ use bioscape::gpu::{
 };
 use std::time::Duration;
 
-use super::components::{CellEntity, FoodEntity, HunterEntity, StatsRoot, StatsText, WorldMapOverlay};
+use super::components::{CellEntity, FoodEntity, StatsRoot, StatsText, WorldMapOverlay};
 use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
-use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial, BioMaterialExt};
+use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
-    AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh, HunterMaterial, HunterMesh,
+    AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh,
     OrbitCamera, PheromoneResource, SmellResource, WorldExtent, WorldMapResource,
 };
 #[cfg(feature = "gpu")]
@@ -54,7 +54,7 @@ pub(super) fn setup(
     // plane a vše by bylo culled.
     //
     // Sprint 88: HDR + Bloom + Tonemapping + DistanceFog atmospheric pass.
-    // HDR backbuffer dovolí emissive > 1.0 (cells/hunter glow), Bloom rozšíří
+    // HDR backbuffer dovolí emissive > 1.0 (cell glow), Bloom rozšíří
     // bright pixels na soft halos, Tonemapping namapuje HDR rozsah na sRGB.
     // DistanceFog přidá deep-ocean blue tint na vzdálené objekty (ortho má
     // limited depth differentiation, ale fade k floor overlay je signifikantní).
@@ -350,45 +350,6 @@ pub(super) fn setup(
     commands.insert_resource(FoodMesh(food_mesh_handle));
     commands.insert_resource(FoodMaterial(food_material));
 
-    // Sprint 71: macropredator setup. Hunter mesh = větší sphere (4× CELL_RADIUS),
-    // tmavě červený material — visually distinct od cells. HUNTER_TARGET_COUNT
-    // hunters spawnou na náhodné pozice; constant pop, žádný respawn.
-    // Sprint 88: bumped emissive na red glow s HDR > 1.0 hodnoty — Bloom catches
-    // hunter jako menacing red beacon viditelný z dálky.
-    // Sprint 88.4: pure-red emissive (zero green/blue). Reinhard tonemapper
-    // má dokumentované „lots of hue shifting" v brights — předchozí
-    // LinearRgba(2.5, 0.2, 0.1) se posouvalo směrem k oranžové. Pure red
-    // (3.5, 0.0, 0.0) zůstává nezpochybnitelně červené i pod tonemap +
-    // bloom redistribution. Brighter base 0.4 → 0.85 aby hunter byl viditelně
-    // červený i bez bloom kontribuce (např. v post-process toggle off).
-    let hunter_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS * 4.0).mesh().ico(2).unwrap());
-    // Sprint 91: hunter ExtendedMaterial s chitinous-scales pattern (kind=1).
-    // Scale 14 = denser scales than cells; intensity 1.0.
-    let hunter_material = bio_materials.add(BioMaterial {
-        base: StandardMaterial {
-            base_color: Color::srgb(0.85, 0.05, 0.05),
-            perceptual_roughness: 0.4,
-            // Sprint 91: emissive.r >= 3.5 → shader detekuje jako HUNTER pattern.
-            emissive: LinearRgba::new(3.5, 0.0, 0.0, 1.0),
-            ..default()
-        },
-        extension: BioMaterialExt {},
-    });
-    // Sprint 89: každý hunter dostává random genome + lineage. Initial
-    // population spawnuje se tady; Sprint 89+ lifecycle (death/reproduce)
-    // mění populaci dynamicky v `step_hunters`.
-    let mut hunter_rng = rand::rng();
-    for i in 0..HUNTER_TARGET_COUNT {
-        let h = Hunter::random(&mut hunter_rng, half, i as u64, i as u64, 0);
-        commands.spawn((
-            HunterEntity(h),
-            Mesh3d(hunter_mesh_handle.clone()),
-            MeshMaterial3d(hunter_material.clone()),
-            Transform::from_xyz(h.position[0], h.position[1], h.position[2]),
-        ));
-    }
-    commands.insert_resource(HunterMesh(hunter_mesh_handle));
-    commands.insert_resource(HunterMaterial(hunter_material));
     commands.insert_resource(SmellResource(SmellField::new(
         [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
         half,

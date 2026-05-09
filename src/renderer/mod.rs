@@ -128,13 +128,10 @@ pub fn run() {
         .insert_resource(EventCalendarResource(event_calendar))
         .init_resource::<CellGrid>()
         .init_resource::<FoodGrid>()
-        .init_resource::<HunterCellGrid>()
         .init_resource::<CellEntityLookups>()
         .init_resource::<FoodDensityFactor>()
         .init_resource::<NextCellId>()
-        .init_resource::<NextHunterId>()
         .init_resource::<ContactProgress>()
-        .init_resource::<HunterContactProgress>()
         .init_resource::<CoopFoodResource>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
@@ -166,11 +163,7 @@ pub fn run() {
                     apply_environmental_hazards,
                     rebuild_cell_grid,
                     resolve_cell_collisions,
-                    resolve_hunter_collisions,
-                    pool_bonded_hunter_hidden_system,
                     cell_predates_on_neighbor,
-                    step_hunters,
-                    hunters_lifecycle,
                     cell_eats_food,
                     spawn_food,
                     spawn_coop_food,
@@ -193,7 +186,6 @@ pub fn run() {
                 camera_pan_input,
                 update_orbit_camera_transform,
                 sync_transforms,
-                sync_hunter_transforms,
                 draw_bond_gizmos,
                 draw_cell_state_gizmos,
                 log_clock_events,

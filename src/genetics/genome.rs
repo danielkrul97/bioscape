@@ -218,9 +218,9 @@ impl Genome {
             vision_fov: INITIAL_VISION_FOV,
             thermal_optimum: rng.random_range(MIN_THERMAL_OPTIMUM..MAX_THERMAL_OPTIMUM),
             // Range [0, 0.5] (not [0, 0.3]) so an immediate carnivore-leaning
-            // niche exists on hunter carrion drops; without it the multi-
-            // trophic food chain is dormant until sigma drift pushes any cell
-            // above 0.5, which can take many generations.
+            // niche exists on cell-carrion drops; without it the multi-trophic
+            // food chain is dormant until sigma drift pushes any cell above
+            // 0.5, which can take many generations.
             carnivore_score: rng.random_range(0.0..0.5),
             sensor_gains: [
                 rng.random_range(0.7..1.3),

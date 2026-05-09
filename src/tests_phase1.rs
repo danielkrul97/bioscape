@@ -605,8 +605,8 @@ fn eat_efficiency_clamps_negative_score() {
 
 #[test]
 fn eat_efficiency_clamps_score_above_one() {
-    let v = eat_efficiency(FoodKind::HunterCarrion, 5.0);
-    assert_eq!(v, 1.0);
+    let v = eat_efficiency(FoodKind::Plant, 5.0);
+    assert_eq!(v, 0.0);
 }
 
 #[test]

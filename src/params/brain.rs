@@ -2,14 +2,10 @@ use core::f32::consts::PI;
 
 pub const HUE_RANGE: f32 = 360.0;
 pub const MIN_SPEED: f32 = 1.0;
-/// Sprint 73: horní cap pro `genome.max_speed`. Pre-Sprint-73 nebyl žádný cap,
-/// jen MIN_SPEED floor — sigma_speed=3.0 mutation drift v Sprint 72 1000-gen
-/// smoke produkoval mean spd 344 (12 % nad HUNTER_MAX_SPEED=300). Bez cap
-/// je arms race degenerative — outrun je vždy levnější než cluster path,
-/// takže multicelularita nikdy nepřijde. 200 = mírně pod Sprint 71 baseline
-/// 218 → HUNTER_MAX_SPEED=300 reálně neutekatelný → cluster path se stává
-/// jediná viable defense. Nominal cap, ne hard cieling — sigma_speed pořád
-/// dovoluje fluktuace v rámci capu.
+/// Horní cap pro `genome.max_speed`. Bez cap je arms race degenerative —
+/// outrun je vždy levnější než cluster path, takže multicelularita nikdy
+/// nepřijde. Nominal cap, ne hard ceiling — sigma_speed pořád dovoluje
+/// fluktuace v rámci capu.
 pub const MAX_SPEED: f32 = 200.0;
 pub const MIN_VISION: f32 = 1.0;
 /// Sprint 82: minimum half-angle směrového FOV (radiány). Pod ~17° je vidění
@@ -124,14 +120,10 @@ pub const INNATE_PHEROMONE_AUX_BIAS: f32 = 0.5;
 /// ne default. Záměrně 0 — chceme měřit, jestli selekce attack chování objeví
 /// sama, nebo zůstane utlumený. Negative bias by ho aktivně potlačoval.
 pub const INNATE_ATTACK_BIAS: f32 = 0.0;
-/// Sprint 66 bond signal bias (b2[9]). Sprint 75: 0 → 1.5. Sprint 74 1000-gen
-/// smoke ukázal, že bond density crashed na 0 nehledě na economy rebalance —
-/// real bottleneck není maintenance cost, ale **formation gating**: random
-/// brainy s bias=0 dávají output[9] > BOND_FORM_THRESHOLD=0.2 jen sporadicky,
-/// takže bondy se nikdy nestihnou hromadit do clusteru ≥3 (= immune
-/// k hunteru). Bias 1.5 znamená default tanh(b1[9] + 1.5) ≈ 0.9 → většina
-/// cells emituje signal nad threshold by default. Bondy se formují přes
-/// physics (contact + same adhesion_type), selekce může negativně tunit
-/// (cells co nechtějí bondovat se učí brain weights pull b1[9] dolů).
-/// Filozoficky stejný posun jako kdyby attack měl positive bias místo 0.
+/// Bond signal bias (b2[9]). Real bottleneck v emergence multicellularity
+/// není maintenance cost, ale formation gating: s bias=0 random brain dává
+/// output > BOND_FORM_THRESHOLD jen sporadicky, takže bondy se nikdy
+/// nestihnou hromadit do clusteru. Positive bias znamená většina cells
+/// emituje signal nad threshold by default; selekce pak negativně tuní
+/// (cells co nechtějí bondovat učí brain weights pull dolů).
 pub const INNATE_BOND_BIAS: f32 = 2.5;

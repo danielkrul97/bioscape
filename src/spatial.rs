@@ -181,9 +181,3 @@ impl<Id: Copy, P: Copy> SpatialGrid<Id, P> {
 /// méně kandidátů. Renderer v `main.rs` má svůj vlastní knob.
 pub const GRID_CELL_SIZE: f32 = 64.0;
 
-/// Sprint 102: hunter cell-grid bucket size. Hunter vision_radius je řádově
-/// větší než typická cell-cell interakce (100–400 vs ~20), takže `GRID_CELL_SIZE
-/// = 64` by dělalo r_cells = 5–7 → 1300+ HashMap lookupů per query a grid
-/// by byl pomalejší než brute force při běžné populaci. 200 odpovídá median
-/// hunter vision → r_cells = 1–2 → 27–125 lookupů.
-pub const HUNTER_GRID_CELL_SIZE: f32 = 200.0;

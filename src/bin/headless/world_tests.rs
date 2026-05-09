@@ -126,12 +126,6 @@ fn world_new_next_cell_id_above_initial_population() {
 }
 
 #[test]
-fn world_new_initial_hunters_match_target_count() {
-    let world = fresh_world(5);
-    assert_eq!(world.hunters.len(), bioscape::HUNTER_TARGET_COUNT);
-}
-
-#[test]
 fn world_tick_advances_clock_by_one() {
     let mut world = fresh_world(11);
     let mut rng = StdRng::seed_from_u64(11);
@@ -385,21 +379,10 @@ fn world_new_zero_carrion_lifecycle() {
     assert_eq!(world.fertile_ticks_gen, 0);
     assert_eq!(world.bonds_formed_gen, 0);
     assert_eq!(world.bonds_broken_gen, 0);
-    assert_eq!(world.hunter_attacks_gen, 0);
-    assert_eq!(world.hunter_births_gen, 0);
-    assert_eq!(world.hunter_deaths_gen, 0);
     assert_eq!(world.coop_food_solved_gen, 0);
     assert_eq!(world.coop_food_failed_gen, 0);
     assert_eq!(world.coop_food_arrivals_sum_gen, 0);
     assert_eq!(world.coop_food_events_gen, 0);
-}
-
-#[test]
-fn world_new_hunters_have_distinct_ids() {
-    let world = small_world(15, 5, 30);
-    let ids: std::collections::HashSet<u64> =
-        world.hunters.iter().map(|h| h.hunter_id).collect();
-    assert_eq!(ids.len(), world.hunters.len());
 }
 
 #[test]
@@ -431,12 +414,6 @@ fn world_new_initial_cells_within_bounds() {
         assert!(cell.position[1].abs() <= WORLD_HALF[1]);
         assert!(cell.position[2].abs() <= WORLD_HALF[2]);
     }
-}
-
-#[test]
-fn world_new_next_hunter_id_above_initial_population() {
-    let world = small_world(7, 5, 30);
-    assert_eq!(world.next_hunter_id, bioscape::HUNTER_TARGET_COUNT as u64);
 }
 
 // ============================================================================
@@ -605,49 +582,6 @@ fn shock_hazard_pulse_increases_damage_accum() {
     let damage_a: f32 = a.cells.iter().map(|c| c.damage_accum).sum();
     let damage_b: f32 = b.cells.iter().map(|c| c.damage_accum).sum();
     assert!(damage_b >= damage_a);
-}
-
-// ============================================================================
-// Hunters
-// ============================================================================
-
-#[test]
-fn hunter_count_stays_within_bounds_short_run() {
-    let mut world = small_world(77, 30, 100);
-    let mut rng = StdRng::seed_from_u64(77);
-    run_ticks(&mut world, &mut rng, 60);
-    assert!(world.hunters.len() <= bioscape::HUNTER_MAX_POP);
-}
-
-#[test]
-fn hunter_population_does_not_explode_after_full_generation() {
-    let mut world = small_world(79, 50, 100);
-    let mut rng = StdRng::seed_from_u64(79);
-    run_ticks(&mut world, &mut rng, TICKS_PER_GENERATION);
-    assert!(world.hunters.len() <= bioscape::HUNTER_MAX_POP);
-}
-
-#[test]
-fn hunter_lifecycle_counters_accumulate_over_long_run() {
-    let mut world = small_world(85, 60, 200);
-    let mut rng = StdRng::seed_from_u64(85);
-    run_ticks(&mut world, &mut rng, TICKS_PER_GENERATION);
-    let total = world.hunter_births_gen + world.hunter_deaths_gen;
-    let _ = total;
-}
-
-#[test]
-fn hunter_age_grows_monotonically_per_tick_for_survivors() {
-    let mut world = small_world(91, 30, 100);
-    let mut rng = StdRng::seed_from_u64(91);
-    let init_ids: std::collections::HashMap<u64, u64> =
-        world.hunters.iter().map(|h| (h.hunter_id, h.age)).collect();
-    run_ticks(&mut world, &mut rng, 5);
-    for h in &world.hunters {
-        if let Some(prev) = init_ids.get(&h.hunter_id) {
-            assert!(h.age >= *prev);
-        }
-    }
 }
 
 // ============================================================================
@@ -906,7 +840,6 @@ fn checkpoint_roundtrip_resets_transient_state() {
     let loaded = World::load_checkpoint(&path).expect("load");
     assert_eq!(loaded.bonds_formed_gen, 0);
     assert_eq!(loaded.bonds_broken_gen, 0);
-    assert_eq!(loaded.hunter_attacks_gen, 0);
     assert!(loaded.contact_progress.is_empty());
     let _ = std::fs::remove_file(&path);
 }
@@ -934,11 +867,6 @@ fn checkpoint_roundtrip_preserves_food_kinds() {
         age_ticks: 0,
         kind: bioscape::FoodKind::Carrion,
     });
-    world.foods.push(bioscape::Food {
-        position: [20.0, 20.0, 0.0],
-        age_ticks: 0,
-        kind: bioscape::FoodKind::HunterCarrion,
-    });
     let path = unique_temp_path("foodkind");
     world.save_checkpoint(&path).expect("save");
     let loaded = World::load_checkpoint(&path).expect("load");
@@ -946,9 +874,9 @@ fn checkpoint_roundtrip_preserves_food_kinds() {
         .foods
         .iter()
         .map(|f| f.kind)
-        .filter(|k| matches!(k, bioscape::FoodKind::Carrion | bioscape::FoodKind::HunterCarrion))
+        .filter(|k| matches!(k, bioscape::FoodKind::Carrion))
         .collect();
-    assert_eq!(kinds.len(), 2);
+    assert_eq!(kinds.len(), 1);
     let _ = std::fs::remove_file(&path);
 }
 

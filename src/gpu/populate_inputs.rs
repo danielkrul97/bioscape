@@ -10,7 +10,7 @@ use super::*;
 
 /// Shader params for `populate_inputs.wgsl`. Constants mirror
 /// `lib::populate_brain_inputs` (BRAIN_INPUTS layout, normalization gains,
-/// `HUNTER_REPRODUCE_THRESHOLD`, `DENSITY_NORM_COUNT`).
+/// `DENSITY_NORM_COUNT`).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 pub struct PopulateInputsParams {

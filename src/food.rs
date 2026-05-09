@@ -4,15 +4,13 @@ use serde::{Deserialize, Serialize};
 use crate::*;
 
 /// Tagged food kind. `Plant` is the ambient spawn (always available,
-/// baseline value); `Carrion` drops on cell death; `HunterCarrion` drops on
-/// hunter death (richest reward). Per-kind digestion efficiency is gated by
-/// `genome.carnivore_score` — see `eat_efficiency`.
+/// baseline value); `Carrion` drops on cell death. Per-kind digestion
+/// efficiency is gated by `genome.carnivore_score` — see `eat_efficiency`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum FoodKind {
     Plant = 0,
     Carrion = 1,
-    HunterCarrion = 2,
 }
 
 impl Default for FoodKind {
@@ -32,10 +30,9 @@ pub struct Food {
 }
 
 /// Base food value per kind. Carrion is denser than plant (concentrated
-/// biomass) and hunter carrion is densest (apex predator drop).
+/// biomass).
 pub const PLANT_FOOD_VALUE: f32 = 20.0;
 pub const CARRION_FOOD_VALUE: f32 = 30.0;
-pub const HUNTER_CARRION_FOOD_VALUE: f32 = 50.0;
 
 // Cooperative food node — a high-value spawn that yields nothing until N
 // cells arrive within a time window. Creates fitness coupling for
@@ -167,21 +164,19 @@ pub fn food_base_value(kind: FoodKind) -> f32 {
     match kind {
         FoodKind::Plant => PLANT_FOOD_VALUE,
         FoodKind::Carrion => CARRION_FOOD_VALUE,
-        FoodKind::HunterCarrion => HUNTER_CARRION_FOOD_VALUE,
     }
 }
 
 /// Digestion efficiency for `(kind, carnivore_score)`. Continuous trade-off:
-/// `score = 0` is a pure herbivore (Plant only), `score = 1` is a pure
-/// carnivore (HunterCarrion only). `Carrion` (cell remains) sits at 0.5 for
-/// every score so it doesn't drive specialization in either direction.
+/// `score = 0` is a pure herbivore (Plant only). `Carrion` (cell remains)
+/// sits at 0.5 for every score so it doesn't drive specialization in either
+/// direction.
 #[inline]
 pub fn eat_efficiency(kind: FoodKind, carnivore_score: f32) -> f32 {
     let s = carnivore_score.clamp(0.0, 1.0);
     match kind {
         FoodKind::Plant => 1.0 - s,
         FoodKind::Carrion => 0.5,
-        FoodKind::HunterCarrion => s,
     }
 }
 

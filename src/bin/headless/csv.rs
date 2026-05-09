@@ -21,22 +21,12 @@ use std::path::Path;
 pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::io::Result<()> {
     let n = world.cells.len();
     if n == 0 {
-        // 64 sloupců: gen + 12 cell metrics 0 + food + density + 10 spatial 0
-        // + 3 birth/death + 1 atk_emit 0 + predation + 6 brain/density 0 + 2
-        // bonds + 6 bond/adhesion 0 + 2 hunter + 1 immune_frac 0 +
-        // 3 cell_state 0 (Sprint 80) + 2 vision_fov 0 (Sprint 83) +
-        // 1 thermal 0 (Sprint 85) + 2 thermal_optimum 0 (Sprint 87) +
-        // 7 hunter genome 0 (Sprint 89) + 2 diet/exposure 0 (Sprint 93).
-        // Sprint 99: + 2 hunter bond means + 2 hunter bond formed/broken counters.
-        // Sprint 111: i v empty-pop branch reportujeme aktuální shock stav,
-        // protože shocky existují nezávisle na živé populaci.
+        // Empty-pop row: zero-padded cell metrics + actual world counters.
+        // Sprint 111: shocks exist nezávisle na cell pop, takže reportujeme.
+        // Sprint 128: coop events also independent.
         let (shock_active, shock_hazard_max) = shock_summary(world);
-        // Sprint 113: shock_food_factor reportuje i v empty-pop branch.
         let shock_food_factor =
             bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
-        // Sprint 128: i v empty-pop branch reportujeme coop counters
-        // (events probíhají nezávisle na cell pop > 0; pro extinction-on-empty
-        // řádek je smysl reportovat 0/0/0).
         let coop_arrivals_avg = if world.coop_food_events_gen > 0 {
             world.coop_food_arrivals_sum_gen as f64 / world.coop_food_events_gen as f64
         } else {
@@ -44,7 +34,15 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         };
         return writeln!(
             w,
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},0,{},{:.3},0.000,{:.3},0,0.000,0.000,{:.1},{},{},{:.3}",
+            // 82 columns total. Layout:
+            //   gen, cells, 11×0(cell metrics), food, density,
+            //   17×0(lineages..mean_y), 0(energy_avg), births, deaths, fertile_ticks,
+            //   0(atk_emit), predation, 6×0(recurrent..noise),
+            //   bonds_formed, bonds_broken, 21×0(bond..gain_def_dev), 0(cppn_compat),
+            //   shock_active, shock_hazard_max, 0.000(climate), shock_food_factor,
+            //   0(lineage_count), 0.000, 0.000, 3×0(spike),
+            //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3}",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -54,12 +52,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             world.predation_events_gen,
             world.bonds_formed_gen,
             world.bonds_broken_gen,
-            world.hunter_attacks_gen,
-            world.hunters.len(),
-            world.hunter_births_gen,
-            world.hunter_deaths_gen,
-            world.hunter_bonds_formed_gen,
-            world.hunter_bonds_broken_gen,
             shock_active,
             shock_hazard_max,
             shock_food_factor,
@@ -108,9 +100,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let mut bond_signal_sum = 0.0_f64;
     let mut total_bonds = 0_u64;
     let mut bonded_cells = 0_u64;
-    // Sprint 71: cells s ≥ HUNTER_BOND_IMMUNITY_THRESHOLD bondů — immune
-    // proti hunteru. Pop-level metric pro „kolik populace dosáhlo proto-tissue".
-    let mut immune_cells = 0_u64;
     let mut adhesion_hist = [0_u64; bioscape::ADHESION_TYPE_COUNT as usize];
     // Sprint 68: gene-level diagnostics — mean of bond_stiffness / bond_damping
     // přes celou populaci. Porovnáním s initial draw centerem (BOND_STIFFNESS=4.0,
@@ -139,16 +128,8 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     // (uniform sigma).
     let mut topt_sum = 0.0_f64;
     let mut topt_sumsq = 0.0_f64;
-    // Sprint 89: hunter genome diagnostics. Mean napříč alive hunters —
-    // arms race signal v drift těchto hodnot napříč gens.
-    let mut h_spd_sum = 0.0_f64;
-    let mut h_vis_sum = 0.0_f64;
-    let mut h_fov_sum = 0.0_f64;
-    let mut h_dmg_sum = 0.0_f64;
-    let mut h_size_sum = 0.0_f64;
-    // Sprint 93: per-cell diet + defense diagnostics.
+    // Sprint 93: per-cell diet diagnostic.
     let mut carnivore_sum = 0.0_f64;
-    let mut exposure_sum = 0.0_f64;
     // Sprint 97: per-category sensor_gain means + stddev. Specialization
     // signal — high stddev (bimodální distribuce) = role differentiation
     // mezi cells. Low stddev s drift v meanu = uniform shift, pokles bez
@@ -157,7 +138,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let mut gain_sumsq = [0.0_f64; bioscape::N_SENSOR_CATEGORIES];
     for c in &world.cells {
         carnivore_sum += c.genome.carnivore_score as f64;
-        exposure_sum += bioscape::cell_exposure(c.n_bonds()) as f64;
         for k in 0..bioscape::N_SENSOR_CATEGORIES {
             let g = c.genome.sensor_gains[k] as f64;
             gain_sum[k] += g;
@@ -166,7 +146,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     }
     let cell_count = world.cells.len();
     let carnivore_m = if cell_count > 0 { carnivore_sum / cell_count as f64 } else { 0.0 };
-    let exposure_m = if cell_count > 0 { exposure_sum / cell_count as f64 } else { 0.0 };
     let gain_mean_dev = |k: usize| -> (f64, f64) {
         if cell_count == 0 { return (0.0, 0.0); }
         let n = cell_count as f64;
@@ -205,40 +184,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
                 0.0
             }
         }
-    };
-    let n_hunters = world.hunters.len();
-    let mut h_bond_count_sum: u64 = 0;
-    let mut h_bonded_count: u64 = 0;
-    if n_hunters > 0 {
-        for h in &world.hunters {
-            h_spd_sum += h.genome.max_speed as f64;
-            h_vis_sum += h.genome.vision_radius as f64;
-            h_fov_sum += h.genome.vision_fov as f64;
-            h_dmg_sum += h.genome.damage_per_tick as f64;
-            h_size_sum += h.genome.body_size as f64;
-            // Sprint 99: hunter bond count
-            let nb = h.bonds.iter().filter(|b| b.is_some()).count() as u64;
-            h_bond_count_sum += nb;
-            if nb > 0 {
-                h_bonded_count += 1;
-            }
-        }
-    }
-    let nhf = n_hunters as f64;
-    let h_spd_m = if n_hunters > 0 { h_spd_sum / nhf } else { 0.0 };
-    let h_vis_m = if n_hunters > 0 { h_vis_sum / nhf } else { 0.0 };
-    let h_fov_m = if n_hunters > 0 { h_fov_sum / nhf } else { 0.0 };
-    let h_dmg_m = if n_hunters > 0 { h_dmg_sum / nhf } else { 0.0 };
-    let h_size_m = if n_hunters > 0 { h_size_sum / nhf } else { 0.0 };
-    let h_bond_n_m = if n_hunters > 0 {
-        h_bond_count_sum as f64 / nhf
-    } else {
-        0.0
-    };
-    let h_bond_active_f = if n_hunters > 0 {
-        h_bonded_count as f64 / nhf
-    } else {
-        0.0
     };
     let current_gen = world.clock.generation;
     for c in &world.cells {
@@ -344,10 +289,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         total_bonds += cell_bonds;
         if cell_bonds > 0 {
             bonded_cells += 1;
-        }
-        // Sprint 71: hunter-immune cells (≥3 bondy → cluster „too big to swallow").
-        if cell_bonds >= bioscape::HUNTER_BOND_IMMUNITY_THRESHOLD as u64 {
-            immune_cells += 1;
         }
         let t_idx = (c.genome.adhesion_type as usize) % adhesion_hist.len();
         adhesion_hist[t_idx] += 1;
@@ -476,7 +417,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     } else {
         0.0
     };
-    let immune_f = immune_cells as f64 / nf;
     // Sprint 111: shock observability + diversity metrics (Shannon attack
     // entropy, brain w1 frobenius std).
     let (shock_active, shock_hazard_max) = shock_summary(world);
@@ -511,7 +451,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{},{},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -566,10 +506,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         // Sprint 68 gene means.
         bond_stiff_m,
         bond_damp_m,
-        // Sprint 71 hunter diagnostics.
-        world.hunter_attacks_gen,
-        world.hunters.len(),
-        immune_f,
         // Sprint 80 cell_state diagnostics.
         state_m,
         state_d,
@@ -582,17 +518,8 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         // Sprint 87 thermal_optimum gen.
         topt_m,
         topt_d,
-        // Sprint 89 hunter genome + lifecycle.
-        world.hunter_births_gen,
-        world.hunter_deaths_gen,
-        h_spd_m,
-        h_vis_m,
-        h_fov_m,
-        h_dmg_m,
-        h_size_m,
-        // Sprint 93 diet + defense diagnostics.
+        // Sprint 93 diet diagnostic.
         carnivore_m,
-        exposure_m,
         // Sprint 97 sensor_gain category means + stddev.
         gain_vis_m,
         gain_chem_m,
@@ -600,11 +527,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         gain_vis_d,
         gain_chem_d,
         gain_def_d,
-        // Sprint 99 hunter bond stats.
-        h_bond_n_m,
-        h_bond_active_f,
-        world.hunter_bonds_formed_gen,
-        world.hunter_bonds_broken_gen,
         // Sprint 107: CPPN speciation distance.
         cppn_compat_m,
         // Sprint 111: shock state + diversity metrics.

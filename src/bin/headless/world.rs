@@ -7,8 +7,8 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    adhesion_velocity_delta, bond_velocity_delta, nearest_attackable_cell,
-    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, Hunter, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
+    adhesion_velocity_delta, bond_velocity_delta,
+    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
     ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
@@ -16,7 +16,7 @@ use bioscape::{
     COOP_FOOD_SPAWN_RATE_PER_TICK, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
     DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
     GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
-    HERD_RADIUS, HUNTER_GRID_CELL_SIZE, HUNTER_TARGET_COUNT, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MAX_BONDS_PER_CELL, MAX_SPAWN_ATTEMPTS,
+    HERD_RADIUS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MAX_BONDS_PER_CELL, MAX_SPAWN_ATTEMPTS,
     N_PHEROMONE_CHANNELS,
     PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE,
     PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH,
@@ -40,8 +40,7 @@ use bioscape::{
     PHEROMONE_NORMALIZATION_GAIN, SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN,
     SPIKE_COST_PER_SEC, THERMAL_NOISE,
 };
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -105,9 +104,7 @@ pub struct PhaseTimings {
     pub apply_food_gravity: f64,
     pub apply_hazards: f64,
     pub resolve_collisions: f64,
-    pub resolve_hunter_collisions: f64,
     pub predate: f64,
-    pub hunt: f64,
     pub eat_food: f64,
     pub spawn_food: f64,
     pub reproduce: f64,
@@ -154,8 +151,7 @@ pub struct World {
     pub eaten_scratch: Vec<bool>,
     /// Persistent cell_id → idx scratch. Built once at the start of each tick
     /// (`rebuild_id_to_idx`) and consumed by pool_bonded_hidden, brain_act,
-    /// resolve_collisions, eat_food, hunt pack_shares. Avoids 4–5 fresh
-    /// FxHashMap allocations per tick.
+    /// resolve_collisions, eat_food. Avoids fresh FxHashMap allocations per tick.
     pub id_to_idx_scratch: rustc_hash::FxHashMap<u64, usize>,
     /// Persistent contact-list scratch — outer index = cell idx, inner Vec
     /// drží `cell_id_j` (>i, dedupe). Pre-fix: `Vec<Vec<u64>>` collected per
@@ -174,20 +170,6 @@ pub struct World {
     /// jsou už bonded. O(1) lookup namísto lineárního scanu Cell.bonds per
     /// kandidáta.
     pub bonded_pairs_scratch: rustc_hash::FxHashSet<(u64, u64)>,
-    /// Sprint 102: hunter cell grid. Pre-fix `let mut g = SpatialGrid::new()`
-    /// uvnitř `hunt()` per tick → fresh FxHashMap allocation. Persistent reuse
-    /// zachová bucket Vec capacities.
-    pub hunter_cell_grid_scratch: SpatialGrid<usize, ()>,
-    /// Hunter-hunter spatial grid pro broad-phase v `resolve_hunter_collisions`.
-    /// Replaces O(N²) inner loop. Sdílí HUNTER_GRID_CELL_SIZE s hunter-cell grid.
-    pub hunter_grid_scratch: SpatialGrid<usize, ()>,
-    /// Hunters snapshot pro hunt sensor pack — minimální projekce
-    /// `HunterSnapshotMin` per hunter. Pre-fix: fresh Vec collected per tick.
-    pub hunter_snapshot_scratch: Vec<bioscape::HunterSnapshotMin>,
-    /// Hunt fáze: per-tick attack events `(victim_idx, damage)` + pack shares
-    /// `(partner_id, energy)`. Krátké, ale per-tick.
-    pub hunt_attacks_scratch: Vec<(usize, f32)>,
-    pub hunt_pack_shares_scratch: Vec<(u64, f32)>,
     pub hidden_snapshot_scratch: Vec<[f32; BRAIN_HIDDEN]>,
     pub inputs_scratch: Vec<[f32; BRAIN_INPUTS]>,
     pub births_gen: u64,
@@ -206,25 +188,6 @@ pub struct World {
     pub bonds_formed_gen: u64,
     /// Sprint 66 diagnostic — počet bondů přervaných v aktuální generaci.
     pub bonds_broken_gen: u64,
-    /// Sprint 71: macropredator entities (Hunter). Sprint 89: + heritable
-    /// genome + lifecycle (energy, reprodukce, smrt, floor respawn). Populace
-    /// dynamic [1, HUNTER_MAX_POP]; initial = HUNTER_TARGET_COUNT.
-    pub hunters: Vec<Hunter>,
-    /// Sprint 71 diagnostic — počet hunter útoků v aktuální generaci.
-    pub hunter_attacks_gen: u64,
-    /// Sprint 89: monotonic counter pro nové hunter_id při reproduce + floor
-    /// respawn. lineage_id = hunter_id pro nové lineage (floor respawn) nebo
-    /// parent.lineage_id (reproduce continuation).
-    pub next_hunter_id: u64,
-    /// Sprint 89: hunter lifecycle metrics per generation.
-    pub hunter_births_gen: u64,
-    pub hunter_deaths_gen: u64,
-    /// Sprint 99: hunter-hunter contact ticks (mirror cells `contact_progress`),
-    /// + bond formation/breaking counters. Persistent across ticks; rebuild
-    /// per `resolve_hunter_collisions` pass.
-    pub hunter_contact_progress: rustc_hash::FxHashMap<(u64, u64), u32>,
-    pub hunter_bonds_formed_gen: u64,
-    pub hunter_bonds_broken_gen: u64,
     pub mating_radius: f32,
     // Sprint 43: runtime override `MAX_POPULATION` consts. Default = const, CLI
     // může nastavit výš (potřeba pro bench při N > 1000).
@@ -357,11 +320,6 @@ impl World {
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
             bonded_pairs_scratch: rustc_hash::FxHashSet::default(),
-            hunter_cell_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE, WORLD_HALF),
-            hunter_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE, WORLD_HALF),
-            hunter_snapshot_scratch: Vec::new(),
-            hunt_attacks_scratch: Vec::new(),
-            hunt_pack_shares_scratch: Vec::new(),
             hidden_snapshot_scratch: Vec::new(),
             inputs_scratch: Vec::new(),
             births_gen: 0,
@@ -372,21 +330,6 @@ impl World {
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
-            // Sprint 71: spawn HUNTER_TARGET_COUNT hunterů na náhodné pozice.
-            // Sprint 89: každý hunter má random genome + lineage. lineage_id
-            // = hunter_id (initial population je zakladatelská sada).
-            hunters: (0..HUNTER_TARGET_COUNT)
-                .map(|i| Hunter::random(rng, WORLD_HALF, i as u64, i as u64, 0))
-                .collect(),
-            hunter_attacks_gen: 0,
-            // Sprint 89: hunter lifecycle counters.
-            next_hunter_id: HUNTER_TARGET_COUNT as u64,
-            hunter_births_gen: 0,
-            hunter_deaths_gen: 0,
-            // Sprint 99: hunter bond tracker + counters.
-            hunter_contact_progress: rustc_hash::FxHashMap::default(),
-            hunter_bonds_formed_gen: 0,
-            hunter_bonds_broken_gen: 0,
             mating_radius,
             max_population,
             events,
@@ -498,11 +441,6 @@ impl World {
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
             bonded_pairs_scratch: rustc_hash::FxHashSet::default(),
-            hunter_cell_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE, WORLD_HALF),
-            hunter_grid_scratch: SpatialGrid::new(HUNTER_GRID_CELL_SIZE, WORLD_HALF),
-            hunter_snapshot_scratch: Vec::new(),
-            hunt_attacks_scratch: Vec::new(),
-            hunt_pack_shares_scratch: Vec::new(),
             hidden_snapshot_scratch: Vec::new(),
             inputs_scratch: Vec::new(),
             births_gen: chk.births_gen,
@@ -513,23 +451,6 @@ impl World {
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
-            // Sprint 71: hunters nejsou v checkpointu — re-spawnou se fresh.
-            // Sprint 89: po refactor hunters mají genome — checkpoint by je
-            // měl serializovat, ale aktuální format nepodporuje. Fresh respawn
-            // s random genome (lineage reset).
-            hunters: {
-                let mut rng = StdRng::seed_from_u64(chk.mating_radius as u64);
-                (0..HUNTER_TARGET_COUNT)
-                    .map(|i| Hunter::random(&mut rng, WORLD_HALF, i as u64, i as u64, 0))
-                    .collect()
-            },
-            hunter_attacks_gen: 0,
-            next_hunter_id: HUNTER_TARGET_COUNT as u64,
-            hunter_births_gen: 0,
-            hunter_deaths_gen: 0,
-            hunter_contact_progress: rustc_hash::FxHashMap::default(),
-            hunter_bonds_formed_gen: 0,
-            hunter_bonds_broken_gen: 0,
             mating_radius: chk.mating_radius,
             max_population: chk.max_population,
             // Sprint 109: kalendář není v checkpointu (per-tick state je
@@ -584,7 +505,7 @@ impl World {
         timed!(update_smell, self.update_smell(dt));
         timed!(update_pheromone, self.update_pheromone(dt));
         // Persistent cell_id → idx — built once per tick, consumed v pool_bonded_hidden,
-        // brain_act, resolve_collisions, eat_food, hunt. Cell layout je stable
+        // brain_act, resolve_collisions, eat_food. Cell layout je stable
         // od tady přes eat_food; reproduce/die_and_drop_carrion na konci ticku
         // mapu invalidují, ale ta se rebuilduje další tick.
         self.rebuild_id_to_idx();
@@ -599,14 +520,7 @@ impl World {
         timed!(apply_food_gravity, self.apply_food_gravity(dt));
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
-        timed!(resolve_hunter_collisions, self.resolve_hunter_collisions());
-        // Sprint 100: pool last_hidden napříč hunter packem před hunt fází —
-        // tak `populate_hunter_brain_inputs` čte pooled state.
-        bioscape::pool_bonded_hunter_hidden(&mut self.hunters);
         timed!(predate, self.predate());
-        timed!(hunt, self.hunt(rng, dt));
-        // Sprint 89: hunter death + reproduce + floor respawn po hunt phase.
-        self.hunter_lifecycle(rng);
         timed!(eat_food, self.eat_food());
         timed!(spawn_food, self.spawn_food(rng));
         self.spawn_coop_food(rng);
@@ -1991,435 +1905,6 @@ impl World {
             cell.energy += energy_delta;
             cell.damage_accum += dmg_delta;
         }
-    }
-
-    /// Sprint 71: macropredator phase. Per Hunter: najdi nejbližší attackable
-    /// cell (vision range, n_bonds < threshold), pohni se k němu, pokud je
-    /// v attack range → action damage. Pokud nikdo není attackable (clustery
-    /// dominují, nebo cells utekly), random drift.
-    ///
-    /// Sprint 89: hunters mají genome + lifecycle. Per-tick:
-    ///   1. Find target (genome.vision_radius + genome.vision_fov).
-    ///   2. step (movement + age tick).
-    ///   3. Apply attack pokud target v attack_radius (genome).
-    ///   4. apply_energy_costs (vision + motion + body + attack upkeep).
-    ///   5. Energy gain ∝ damage dealt (ENERGY_PER_DAMAGE).
-    ///
-    /// Sprint 99: hunter-hunter physics — collision depenetration + adhesion
-    /// (same-type attractive, cross-type weak repulse) + spring bondy. Mirror
-    /// cell `resolve_collisions` strukturně, ale O(N²) pro N ≤ 50 hunterů
-    /// (žádný spatial grid, sequential, kompaktní). Bond formation gated jen
-    /// na contact ≥ BOND_FORM_TICKS + same adhesion_type + free slot —
-    /// brain output[9] gate odložen na S100.
-    fn resolve_hunter_collisions(&mut self) {
-        let n = self.hunters.len();
-        if n < 2 {
-            return;
-        }
-        let hunter_radius = |h: &Hunter| h.genome.body_size * CELL_RADIUS;
-        let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
-            .hunters
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (h.hunter_id, i))
-            .collect();
-
-        let mut pos_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
-        let mut vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
-        let mut in_contact_pairs: rustc_hash::FxHashSet<(u64, u64)> =
-            rustc_hash::FxHashSet::default();
-
-        // Broad-phase grid pro hunter-hunter páry — replace O(N²) inner loop.
-        // Query radius musí pokrýt collision (pair_r) + adhesion (pair_r × ADHESION_RANGE_FACTOR).
-        let max_radius = self
-            .hunters
-            .iter()
-            .map(hunter_radius)
-            .fold(0.0_f32, f32::max);
-        let query_radius = 2.0 * max_radius * ADHESION_RANGE_FACTOR;
-        self.hunter_grid_scratch.rebuild(
-            self.hunters
-                .iter()
-                .enumerate()
-                .map(|(i, h)| (i, h.position, ())),
-        );
-        let hunter_grid = &self.hunter_grid_scratch;
-
-        // Phase 1: per-pair forces (pos depenetrace + adhesion + bondy).
-        for i in 0..n {
-            let pos_i = self.hunters[i].position;
-            let vel_i = self.hunters[i].velocity;
-            let radius_i = hunter_radius(&self.hunters[i]);
-            let type_i = self.hunters[i].genome.adhesion_type;
-            let id_i = self.hunters[i].hunter_id;
-
-            hunter_grid.for_each_in_radius_toroidal(pos_i, query_radius, WORLD_HALF, |j, _gpos, _| {
-                if j == i {
-                    return;
-                }
-                let pos_j = self.hunters[j].position;
-                let radius_j = hunter_radius(&self.hunters[j]);
-                let pair_r = radius_i + radius_j;
-                let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
-                let d2 = d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2];
-                let d = d2.sqrt();
-                let in_contact = d2 < pair_r * pair_r && d2 > 0.0;
-                if in_contact {
-                    let overlap = pair_r - d;
-                    let nx = d_vec[0] / d;
-                    let ny = d_vec[1] / d;
-                    let nz = d_vec[2] / d;
-                    pos_deltas[i][0] -= nx * overlap * 0.5;
-                    pos_deltas[i][1] -= ny * overlap * 0.5;
-                    pos_deltas[i][2] -= nz * overlap * 0.5;
-                    let id_j = self.hunters[j].hunter_id;
-                    let pair = if id_i < id_j { (id_i, id_j) } else { (id_j, id_i) };
-                    in_contact_pairs.insert(pair);
-                } else if d > 0.0 {
-                    let type_j = self.hunters[j].genome.adhesion_type;
-                    let same_type = type_i == type_j;
-                    let dv = bioscape::adhesion_velocity_delta(d_vec, d, pair_r, same_type);
-                    vel_deltas[i][0] += dv[0];
-                    vel_deltas[i][1] += dv[1];
-                    vel_deltas[i][2] += dv[2];
-                }
-            });
-
-            // Apply own bond spring forces.
-            for bond_opt in self.hunters[i].bonds.iter() {
-                if let Some(bond) = bond_opt {
-                    if let Some(&j_idx) = id_to_idx.get(&bond.other_cell_id) {
-                        let pos_j = self.hunters[j_idx].position;
-                        let vel_j = self.hunters[j_idx].velocity;
-                        let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
-                        let dist = (d_vec[0] * d_vec[0]
-                            + d_vec[1] * d_vec[1]
-                            + d_vec[2] * d_vec[2])
-                            .sqrt();
-                        let (dv, _broken) =
-                            bioscape::bond_velocity_delta(bond, d_vec, dist, vel_i, vel_j);
-                        vel_deltas[i][0] += dv[0];
-                        vel_deltas[i][1] += dv[1];
-                        vel_deltas[i][2] += dv[2];
-                    }
-                }
-            }
-        }
-
-        // Phase 2: apply position + velocity deltas.
-        for ((h, pd), vd) in self
-            .hunters
-            .iter_mut()
-            .zip(pos_deltas.iter())
-            .zip(vel_deltas.iter())
-        {
-            h.position[0] += pd[0];
-            h.position[1] += pd[1];
-            h.position[2] += pd[2];
-            h.velocity[0] += vd[0];
-            h.velocity[1] += vd[1];
-            h.velocity[2] += vd[2];
-        }
-
-        // Phase 3: contact tracker update (increment for active pairs, decay
-        // for stale; drop pairs that decayed k 0).
-        let mut new_progress: rustc_hash::FxHashMap<(u64, u64), u32> =
-            rustc_hash::FxHashMap::default();
-        for &pair in &in_contact_pairs {
-            let prev = self.hunter_contact_progress.get(&pair).copied().unwrap_or(0);
-            new_progress.insert(pair, prev.saturating_add(1));
-        }
-        for (&pair, &val) in self.hunter_contact_progress.iter() {
-            if !in_contact_pairs.contains(&pair) && val > 1 {
-                new_progress.insert(pair, val - 1);
-            }
-        }
-        self.hunter_contact_progress = new_progress;
-
-        // Phase 4: bond formation. Gating: contact ≥ BOND_FORM_TICKS, same
-        // adhesion_type, neither already bonded to the other, oba mají free slot.
-        let candidates: Vec<(u64, u64)> = self
-            .hunter_contact_progress
-            .iter()
-            .filter(|(_, &t)| t >= BOND_FORM_TICKS)
-            .map(|(&pair, _)| pair)
-            .collect();
-        for (id_a, id_b) in candidates {
-            let (Some(&a_idx), Some(&b_idx)) = (id_to_idx.get(&id_a), id_to_idx.get(&id_b))
-            else {
-                continue;
-            };
-            if self.hunters[a_idx].genome.adhesion_type
-                != self.hunters[b_idx].genome.adhesion_type
-            {
-                continue;
-            }
-            // Sprint 100: brain output[9] gate — oba hunteři musí mít
-            // bond_signal > BOND_FORM_THRESHOLD. Default INNATE_BOND_BIAS=2.5
-            // dává tanh(2.5) ≈ 0.99 → většina random brainů gate překročí.
-            if self.hunters[a_idx].last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
-                || self.hunters[b_idx].last_outputs[9] < bioscape::BOND_FORM_THRESHOLD
-            {
-                continue;
-            }
-            let already = self.hunters[a_idx]
-                .bonds
-                .iter()
-                .any(|b| b.as_ref().map_or(false, |bb| bb.other_cell_id == id_b));
-            if already {
-                continue;
-            }
-            let slot_a = self.hunters[a_idx].bonds.iter().position(|b| b.is_none());
-            let slot_b = self.hunters[b_idx].bonds.iter().position(|b| b.is_none());
-            if let (Some(sa), Some(sb)) = (slot_a, slot_b) {
-                let pos_a = self.hunters[a_idx].position;
-                let pos_b = self.hunters[b_idx].position;
-                let d_vec = bioscape::min_image_delta(pos_b, pos_a, WORLD_HALF);
-                let dist =
-                    (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
-                let rest = dist * BOND_REST_LENGTH_SLACK;
-                let bond_a = Bond {
-                    other_cell_id: id_b,
-                    rest_length: rest,
-                    stiffness: bioscape::BOND_STIFFNESS,
-                    damping: bioscape::BOND_DAMPING,
-                    age_ticks: 0,
-                };
-                let bond_b = Bond {
-                    other_cell_id: id_a,
-                    rest_length: rest,
-                    stiffness: bioscape::BOND_STIFFNESS,
-                    damping: bioscape::BOND_DAMPING,
-                    age_ticks: 0,
-                };
-                self.hunters[a_idx].bonds[sa] = Some(bond_a);
-                self.hunters[b_idx].bonds[sb] = Some(bond_b);
-                self.hunter_bonds_formed_gen += 1;
-            }
-        }
-
-        // Phase 5: bond pruning — drop dangling (target dead), increment age.
-        let mut broken = 0u64;
-        for hunter in self.hunters.iter_mut() {
-            for bond_opt in hunter.bonds.iter_mut() {
-                if let Some(bond) = bond_opt {
-                    if !id_to_idx.contains_key(&bond.other_cell_id) {
-                        *bond_opt = None;
-                        broken += 1;
-                    } else {
-                        bond.age_ticks = bond.age_ticks.saturating_add(1);
-                    }
-                }
-            }
-        }
-        self.hunter_bonds_broken_gen += broken;
-    }
-
-    /// Two-pass kvůli borrow checkeru: pass 1 sbírá (cell_idx, damage) do
-    /// scratch Vec během iterace `&mut self.hunters`, pass 2 apply mutace na
-    /// `self.cells` po uvolnění hunter borrow.
-    fn hunt(&mut self, rng: &mut impl Rng, dt: f32) {
-        let _ = rng; // Sprint 90: brain replaces idle drift, no rng needed in hunt.
-        // Sprint 102: cell spatial grid + minimální hunter snapshot.
-        // P1-#10: persistent hunter_cell_grid + hunter_snapshot scratch reuse —
-        // pre-fix: fresh `SpatialGrid::new()` + fresh `Vec` collected per tick.
-        self.hunter_cell_grid_scratch.rebuild(
-            self.cells
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.position, ())),
-        );
-        self.hunter_snapshot_scratch.clear();
-        self.hunter_snapshot_scratch.extend(
-            self.hunters
-                .iter()
-                .map(bioscape::HunterSnapshotMin::from_hunter),
-        );
-        self.hunt_attacks_scratch.clear();
-        self.hunt_pack_shares_scratch.clear();
-        let cells_ref = &self.cells;
-        let smell = &self.smell;
-        let hunter_cell_grid = &self.hunter_cell_grid_scratch;
-        let hunters_snapshot = self.hunter_snapshot_scratch.as_slice();
-        let attacks = &mut self.hunt_attacks_scratch;
-        // Sprint 101: pack kill share. Při damage_dealt > 0 collected (partner_id,
-        // share_amount) — apply na partnery až po mut iter loop.
-        let pack_shares = &mut self.hunt_pack_shares_scratch;
-        for hunter in &mut self.hunters {
-            // Sprint 90: sensor gather + brain forward + hybrid motor (seek+brain) +
-            // step (kinematic). Replaces Sprint 89 seek-based step.
-            let sensors = bioscape::gather_hunter_sensors(
-                hunter,
-                cells_ref,
-                &hunter_cell_grid,
-                &hunters_snapshot,
-                smell,
-                WORLD_HALF,
-            );
-            let target_idx_pre =
-                nearest_attackable_cell(hunter, cells_ref, &hunter_cell_grid, WORLD_HALF);
-            let seek_target = target_idx_pre.map(|i| cells_ref[i].position);
-            let inputs = bioscape::populate_hunter_brain_inputs(hunter, &sensors);
-            let (hidden, outputs) = hunter.genome.brain.forward_with_state(&inputs);
-            hunter.last_inputs = inputs;
-            hunter.last_hidden = hidden;
-            hunter.last_outputs = outputs;
-            hunter.apply_brain_motor(&outputs, seek_target, dt, WORLD_HALF);
-            hunter.step(dt, WORLD_HALF);
-            // Attack check (post-step pozice).
-            let target_idx =
-                nearest_attackable_cell(hunter, cells_ref, &hunter_cell_grid, WORLD_HALF);
-            let attack_r = hunter.genome.attack_radius;
-            let attack_r2 = attack_r * attack_r;
-            let damage = hunter.genome.damage_per_tick;
-            let mut gain = 0.0_f32;
-            if let Some(i) = target_idx {
-                let d = bioscape::min_image_delta(
-                    hunter.position,
-                    cells_ref[i].position,
-                    WORLD_HALF,
-                );
-                let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                if d2 < attack_r2 {
-                    // Sprint 92: edge-vulnerability — damage scales s exposure
-                    // (= 1 - n_bonds × EXPOSURE_PER_BOND).
-                    let exposure = bioscape::cell_exposure(cells_ref[i].n_bonds());
-                    let damage_dealt = damage * exposure * dt;
-                    attacks.push((i, damage_dealt));
-                    gain = damage_dealt * bioscape::HUNTER_ENERGY_PER_DAMAGE;
-                    // Sprint 101: queue share pro každého bonded partnera.
-                    for bond_opt in hunter.bonds.iter() {
-                        if let Some(bond) = bond_opt {
-                            pack_shares.push((
-                                bond.other_cell_id,
-                                gain * bioscape::HUNTER_BOND_KILL_SHARE_FRAC,
-                            ));
-                        }
-                    }
-                }
-            }
-            hunter.apply_energy_costs(dt);
-            hunter.energy += gain;
-        }
-        // Sprint 101: distribute pack shares post-loop. (Hunter-side mapping;
-        // cell-level id_to_idx_scratch je různá doména, takže standalone build
-        // — typicky N ≤ 50, scratch jen ad-hoc.)
-        let n_attacks = attacks.len() as u64;
-        if !pack_shares.is_empty() {
-            let id_to_idx: rustc_hash::FxHashMap<u64, usize> = self
-                .hunters
-                .iter()
-                .enumerate()
-                .map(|(i, h)| (h.hunter_id, i))
-                .collect();
-            for &(id, energy) in self.hunt_pack_shares_scratch.iter() {
-                if let Some(&i) = id_to_idx.get(&id) {
-                    self.hunters[i].energy += energy;
-                }
-            }
-        }
-        self.hunter_attacks_gen += n_attacks;
-        for &(i, damage) in self.hunt_attacks_scratch.iter() {
-            let cell = &mut self.cells[i];
-            cell.energy -= damage;
-            cell.damage_accum += damage;
-        }
-    }
-
-    /// Sprint 89: hunter lifecycle — death + reproduce + floor respawn +
-    /// MAX_POP cap. Volá se po `hunt()` v step loop, takže hunters mají
-    /// up-to-date energy/cooldown.
-    fn hunter_lifecycle(&mut self, rng: &mut impl Rng) {
-        let current_gen = self.clock.generation;
-        // Death pass — drop carrion + remove hunter.
-        let mut i = 0;
-        while i < self.hunters.len() {
-            if self.hunters[i].energy <= 0.0 {
-                let pos = self.hunters[i].position;
-                for _ in 0..bioscape::HUNTER_CARRION_DROP {
-                    let p = [
-                        (pos[0] + rng.random_range(-CELL_RADIUS..CELL_RADIUS))
-                            .clamp(-WORLD_HALF[0], WORLD_HALF[0]),
-                        (pos[1] + rng.random_range(-CELL_RADIUS..CELL_RADIUS))
-                            .clamp(-WORLD_HALF[1], WORLD_HALF[1]),
-                        pos[2].clamp(-WORLD_HALF[2], WORLD_HALF[2]),
-                    ];
-                    self.foods.push(Food {
-                        position: p,
-                        age_ticks: 0,
-                        kind: bioscape::FoodKind::HunterCarrion,
-                    });
-                }
-                self.hunters.swap_remove(i);
-                self.hunter_deaths_gen += 1;
-            } else {
-                i += 1;
-            }
-        }
-        // Floor respawn — pokud all extinct, spawn 1 fresh genome.
-        if self.hunters.is_empty() {
-            let id = self.next_hunter_id;
-            self.next_hunter_id += 1;
-            self.hunters
-                .push(Hunter::random(rng, WORLD_HALF, id, id, current_gen));
-            self.hunter_births_gen += 1;
-            return;
-        }
-        // Sprint 98: sexual reproduction. Pair fertile hunters via spatial
-        // proximity (mirror cell mating), each pair → 1 mating child, both
-        // parents pay (halve energy + cooldown). Birth rate ~50 % vs old
-        // asexual path; floor respawn nahoře pokrývá total extinction.
-        let budget = bioscape::HUNTER_MAX_POP.saturating_sub(self.hunters.len());
-        if budget == 0 {
-            return;
-        }
-        let fertile: Vec<(usize, [f32; 3])> = self
-            .hunters
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| {
-                h.energy >= bioscape::HUNTER_REPRODUCE_THRESHOLD
-                    && h.reproduce_cooldown_ticks == 0
-            })
-            .map(|(i, h)| (i, h.position))
-            .collect();
-        if fertile.len() < 2 {
-            return;
-        }
-        let mating_r2 = bioscape::HUNTER_MATING_RADIUS * bioscape::HUNTER_MATING_RADIUS;
-        let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
-        let mut children: Vec<Hunter> = Vec::with_capacity(matings.len());
-        for &(a_idx, b_idx) in &matings {
-            let id = self.next_hunter_id;
-            self.next_hunter_id += 1;
-            // Mirror cell mating energy semantics: halve oba rodiče PŘED
-            // voláním make_*_mating_child. Function sets `child.energy =
-            // parent_a.energy + parent_b.energy`, takže pre-halve dává
-            // child = 0.5(a+b) a parents 0.5a, 0.5b → energy konzervovaná.
-            let (lo, hi) = if a_idx < b_idx {
-                (a_idx, b_idx)
-            } else {
-                (b_idx, a_idx)
-            };
-            let (left, right) = self.hunters.split_at_mut(hi);
-            let parent_lo = &mut left[lo];
-            let parent_hi = &mut right[0];
-            let (parent_a, parent_b) = if a_idx < b_idx {
-                (parent_lo, parent_hi)
-            } else {
-                (parent_hi, parent_lo)
-            };
-            parent_a.energy *= 0.5;
-            parent_b.energy *= 0.5;
-            parent_a.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
-            parent_b.reproduce_cooldown_ticks = bioscape::HUNTER_REPRODUCE_COOLDOWN_TICKS;
-            children.push(bioscape::make_hunter_mating_child(
-                parent_a, parent_b, rng, WORLD_HALF, id, current_gen,
-            ));
-        }
-        let n_children = children.len();
-        self.hunters.extend(children);
-        self.hunter_births_gen += n_children as u64;
     }
 
     fn eat_food(&mut self) {

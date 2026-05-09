@@ -21,9 +21,6 @@ pub use genetics::*;
 pub mod cell;
 pub use cell::*;
 
-pub mod predator;
-pub use predator::*;
-
 pub mod food;
 pub use food::*;
 
@@ -192,23 +189,16 @@ pub const BOND_BREAK_THRESHOLD: f32 = -1.0;
 /// aby selekce váhala bonding vs free-roaming.
 pub const BOND_FORMATION_COST: f32 = 0.2;
 /// Per-second cost udržování každého bondu (paid každý tick). Drobný — bond
-/// je výhoda (tissue stability), ale ne free. Sprint 74: 0.1 → 0.05 (2×
-/// cheaper). Sprint 73 ukázalo, že bonded 3-cell platí 3.0/gen vs solo
-/// 0.17/gen → 18× inverted. Halving maintenance + 2× hunt damage +
-/// 1.5× hunters target ~5× shrink toward break-even. Sprint 132+ jemný bump
-/// down 0.05 → 0.04 (snižuje energy pressure pro disband při low food periods,
-/// dvojí selection: cluster benefit roste relativně k maintenance cost).
+/// je výhoda (tissue stability), ale ne free. Tuned tak, aby cluster benefit
+/// rostl relativně k maintenance cost při low food periods.
 pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.04;
 /// Sprint 78: food-share fraction per bond. Když bonded cell eats food
 /// (FOOD_VALUE energy), každý bonded partner dostane `FOOD_VALUE × FRAC`
 /// extra energy (free reward, no energy conservation — modeluje „tissue
 /// metabolic cooperation"). Cluster s 2 bondy: eater +FOOD_VALUE,
 /// 2 partneři +0.6 × FOOD_VALUE = +12 each. Total cluster gain je
-/// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál
-/// pro bonding — fitness payoff přímo, ne přes hunter immunity proxy.
-/// Sprint 132+ jemný bump 1.0 → 1.3: silnější fitness gradient pro
-/// bonding lineage v middle-late generations (Sprint 132 30-gen smoke
-/// ukázalo bond_signal_avg drift k 0 po gen 15).
+/// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál pro
+/// bonding — fitness payoff přímo přes food share.
 pub const BOND_FOOD_SHARE_FRAC: f32 = 1.3;
 /// Sprint 87: cluster-size bonus pro food share fraction. Per-partner share =
 /// `FRAC × (1 + (n_bonds − 1) × BONUS) × donor_state`. Cells hluboko v tkáni
@@ -275,54 +265,6 @@ pub fn bond_defense_factor(n_bonds: u32) -> f32 {
     let capped = n_bonds.min(BOND_DEFENSE_CAP) as f32;
     1.0 - BOND_DEFENSE_FRAC * capped
 }
-
-/// Sprint 92: exposure factor pro hunter damage. Edge cells fully exposed,
-/// interior cells fully shielded — selection pressure favorizuje větší +
-/// 3D-spherical clusters.
-///
-/// Sprint 96: **non-linear quadratic falloff** — `((1 - n × EXPOSURE_PER_BOND))²`.
-/// Pre-S96 linear pomalu odměňovala 1-2 bondy (75/50% damage); selection
-/// favorizovala solo strategy. Quadratic dramaticky odměňuje first 1-2
-/// bondy (56/25% damage) → cost-benefit balance flips ve prospěch
-/// bonding. Sprint 95 negative result diagnosed nedostatečný defense
-/// reward jako kořen; S96 fixes přes funkční nelinearitu.
-///
-/// Linear (S92) → Quadratic (S96):
-/// - 0 bonds: 1.00 → 1.00 (unchanged)
-/// - 1 bond:  0.75 → **0.56** (33% better defense)
-/// - 2 bonds: 0.50 → **0.25** (50% better)
-/// - 3 bonds: 0.25 → **0.06** (76% better)
-/// - ≥4 bonds: 0.00 (still floor)
-#[inline]
-pub fn cell_exposure(n_bonds: u32) -> f32 {
-    let linear = (1.0 - (n_bonds as f32) * EXPOSURE_PER_BOND).max(0.0);
-    linear * linear
-}
-
-// ─── Sprint 71: macropredator (Hunter) ────────────────────────────────────────
-// Sprint 70 long-run odhalil emergent predator-extinction event: cell-vs-cell
-// predace zkolapsovala, jakmile byly bonded clustery dostatečně tough. Sprint
-// 71 zavádí non-evolving environmental predátora („Hunter") který běží mimo
-// Cell selection loop — nikdy nevyhyne, protože není pod evolučním tlakem.
-// Hunters atakují solo / lightly-bonded cells; cells s ≥3 bondy jsou immune
-// (cluster „too big to swallow" — Volvox/paramecium scenario z reálné biologie).
-// Tím dává sim persistent pressure na ≥3-bond clusters = exact tipping point
-// pro tissue formation.
-
-/// Cílový počet hunterů ve světě. Sprint 71 měl 3 = příliš sparse
-/// (escape-by-speed cells našly free corridors). Sprint 72: 8 hunterů
-/// pokrývá víc paths, solo cell má kratší survival window. Sprint 74:
-/// 12 — Sprint 73 1000-gen smoke ukázal, že 8 hunterů × 1500 atks/gen
-
-
-
-
-
-
-
-
-
-
 
 
 // Sdílené testovací fixtures. Není gated #[cfg(test)] aby je mohly importovat

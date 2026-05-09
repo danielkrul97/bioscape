@@ -96,6 +96,46 @@ pub fn populate_brain_inputs(
     inputs
 }
 
+/// Per-tick drain coefficient for sensor specialization:
+/// `drain = sum(sensor_gains) × this × dt`. Default neutral sum is 3 × 1.0,
+/// so the baseline drain is ~0.9/s — comparable with body maintenance.
+/// Cells that turn off duplicate sensors in a cluster save proportionally,
+/// making specialization net-positive.
+pub const SENSOR_GAIN_COST: f32 = 0.3;
+/// Per-category gain range. 0 = sensor effectively off, 1 = neutral, 2 =
+/// boosted (better detection, higher cost).
+pub const MIN_SENSOR_GAIN: f32 = 0.0;
+pub const MAX_SENSOR_GAIN: f32 = 2.0;
+/// Three sensor categories indexed into `Genome.sensor_gains`:
+/// 0 = Vision (food delta, cell delta, rel_size, density),
+/// 1 = Chemistry (smell + pheromone gradients),
+/// 2 = Defensive (damage signal, thermal_local). Proprio sensors (energy,
+/// speed, heading) are always-on and not gained — a cell still needs its
+/// own state even in a deep-specialist mode.
+pub const SENSOR_CATEGORY_VISION: usize = 0;
+pub const SENSOR_CATEGORY_CHEMISTRY: usize = 1;
+pub const SENSOR_CATEGORY_DEFENSIVE: usize = 2;
+pub const N_SENSOR_CATEGORIES: usize = 3;
+
+/// Map a brain input slot index to its sensor category, or `None` for
+/// proprio slots (not gained, not pooled). Used by `apply_sensor_gains`
+/// (per-cell multiply) and `pool_bonded_sensors` (max-pool environmental
+/// slots over the bond network).
+#[inline]
+pub fn sensor_slot_category(slot: usize) -> Option<usize> {
+    match slot {
+        // Food delta (slot 0,1,15) + cell delta (2,3,16) + rel_size (6) +
+        // density (13) → Vision
+        0 | 1 | 2 | 3 | 6 | 13 | 15 | 16 => Some(SENSOR_CATEGORY_VISION),
+        // Smell (7,8,17) + pheromone (11,12,19) → Chemistry
+        7 | 8 | 11 | 12 | 17 | 19 => Some(SENSOR_CATEGORY_CHEMISTRY),
+        // Damage (14) + thermal (20) → Defensive
+        14 | 20 => Some(SENSOR_CATEGORY_DEFENSIVE),
+        // Energy (4), speed (5), heading (9,10,18) → proprio, no gain
+        _ => None,
+    }
+}
+
 /// Sprint 97: in-place multiplication brain inputs × per-category sensor_gains.
 /// Applies gains to environmental + defensive slots, leaves proprio slots
 /// (energy, speed, heading) untouched. Solo cells s gain < 1.0 lose info,

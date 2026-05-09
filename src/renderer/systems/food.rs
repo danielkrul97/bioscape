@@ -264,8 +264,8 @@ pub(crate) fn cell_eats_food(
                     let ghost_pos = [pos[0] + md[0], pos[1] + md[1], food_pos[2]];
                     if bioscape::eat_test_pose(*pos, *heading, *pitch, *dims, ghost_pos, EAT_RADIUS) {
                         // Sprint 92: food value = base_value(kind) × multiplier × value_factor
-                        // × eat_efficiency(kind, carnivore_score). Hunter carrion má
-                        // vyšší base ale vyžaduje carnivore digestion; plant herbivore.
+                        // × eat_efficiency(kind, carnivore_score). Carrion vyžaduje
+                        // carnivore digestion; plant je herbivore-friendly.
                         let efficiency = bioscape::eat_efficiency(food_kind, carnivore_score);
                         let value = bioscape::food_base_value(food_kind)
                             * food_multiplier(

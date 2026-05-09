@@ -1,7 +1,6 @@
 use bevy::prelude::*;
 use bioscape::{
-    EventCalendar, FoodKind, SimClock, SmellField, SpatialGrid, WorldMap, HUNTER_GRID_CELL_SIZE,
-    HUNTER_TARGET_COUNT, INITIAL_CELLS,
+    EventCalendar, FoodKind, SimClock, SmellField, SpatialGrid, WorldMap, INITIAL_CELLS,
 };
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
@@ -95,20 +94,6 @@ impl CellEntityLookups {
     }
 }
 
-/// Sprint 102 mirror: persistent spatial grid pro hunter pack sensing
-/// (`gather_hunter_sensors`, `nearest_attackable_cell`). Větší cell size než
-/// `CellGrid` — typický hunter vision_radius je ~200, takže `r_cells` zůstane
-/// 1–2 → 27–125 bucket lookups vs ~1300 při `GRID_CELL_SIZE = 100`.
-/// Pre-fix: fresh `SpatialGrid::new()` per `step_hunters` tick.
-#[derive(Resource)]
-pub(super) struct HunterCellGrid(pub(super) SpatialGrid<usize, ()>);
-
-impl Default for HunterCellGrid {
-    fn default() -> Self {
-        Self(SpatialGrid::new(HUNTER_GRID_CELL_SIZE, bioscape::WORLD_HALF))
-    }
-}
-
 /// Sprint 66: monotonic counter pro Cell.cell_id přidělování. Initial pop
 /// uses ids 0..INITIAL_CELLS, takže start = INITIAL_CELLS. Children z
 /// reproduce čerpají odsud.
@@ -121,27 +106,11 @@ impl Default for NextCellId {
     }
 }
 
-/// Sprint 89: monotonic counter pro hunter_id + lineage_id při reproduce
-/// nebo floor respawn. Init seed uses ids 0..HUNTER_TARGET_COUNT.
-#[derive(Resource)]
-pub(super) struct NextHunterId(pub(super) u64);
-
-impl Default for NextHunterId {
-    fn default() -> Self {
-        Self(HUNTER_TARGET_COUNT as u64)
-    }
-}
-
 /// Sprint 66: per-pair contact tick tracker. Klíč je `(min_id, max_id)`
 /// stable Cell.cell_id páru. Resource žije celý běh — generation reset
 /// nemažeme (kontakt může běžet napříč generační hranicí).
 #[derive(Resource, Default)]
 pub(super) struct ContactProgress(pub(super) FxHashMap<(u64, u64), u32>);
-
-/// Sprint 99: hunter-hunter contact tracker (mirror cells). Survives
-/// across ticks — bond formation gates na BOND_FORM_TICKS consecutive.
-#[derive(Resource, Default)]
-pub(super) struct HunterContactProgress(pub(super) FxHashMap<(u64, u64), u32>);
 
 /// Sprint 109: deterministicky vygenerovaný kalendář environmentálních shocků
 /// pro celý běh rendereru. Default empty (no-op). Sprint 110+ integruje efekty
@@ -201,17 +170,6 @@ pub(super) struct FoodMesh(pub(super) Handle<Mesh>);
 
 #[derive(Resource)]
 pub(super) struct FoodMaterial(pub(super) Handle<StandardMaterial>);
-
-/// Sprint 71: shared mesh + material pro Hunter entities. Single resource —
-/// všichni hunters vypadají stejně, žádný cache potřeba. Resources drží
-/// handles při životě (Assets refcount); fields se přímo nečtou.
-#[derive(Resource)]
-#[allow(dead_code)]
-pub(super) struct HunterMesh(pub(super) Handle<Mesh>);
-
-#[derive(Resource)]
-#[allow(dead_code)]
-pub(super) struct HunterMaterial(pub(super) Handle<BioMaterial>);
 
 /// Sprint 36: per-lineage material cache. Lineage hue → handle do
 /// `Assets<StandardMaterial>`. Bevy automaticky deduplikuje stejné materialy

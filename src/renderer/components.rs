@@ -1,15 +1,11 @@
 use bevy::prelude::*;
-use bioscape::{Cell, Food, Hunter};
+use bioscape::{Cell, Food};
 
 #[derive(Component)]
 pub(super) struct CellEntity(pub(super) Cell);
 
 #[derive(Component)]
 pub(super) struct FoodEntity(pub(super) Food);
-
-/// Sprint 71: ECS component wrapping `Hunter` data pro renderer hot loop.
-#[derive(Component)]
-pub(super) struct HunterEntity(pub(super) Hunter);
 
 #[derive(Component)]
 pub(super) struct Dying {
