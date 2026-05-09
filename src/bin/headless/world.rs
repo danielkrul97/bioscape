@@ -200,6 +200,11 @@ pub struct World {
     // = pre-sweep behavior (BOND_FOOD_SHARE_FRAC, no kin filter).
     pub share_frac: f32,
     pub kin_filter: bool,
+    // Runtime multiplikátory pro intra-species predation experiment sweep.
+    // Default 1.0 = baseline behavior. Násobí se na site of use.
+    pub predation_gain_mult: f32,
+    pub predation_drain_mult: f32,
+    pub food_factor_mult: f32,
     pub bench_timings: PhaseTimings,
     // Sprint 44: pokud `Some`, brain_act offloaduje forward pass na GPU.
     // Sensor gather + populate_brain_inputs + apply_brain_motor zůstává CPU.
@@ -335,6 +340,9 @@ impl World {
             events,
             share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
+            predation_gain_mult: 1.0,
+            predation_drain_mult: 1.0,
+            food_factor_mult: 1.0,
             bench_timings: PhaseTimings::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -459,6 +467,9 @@ impl World {
             events: EventCalendar::default(),
             share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
+            predation_gain_mult: 1.0,
+            predation_drain_mult: 1.0,
+            food_factor_mult: 1.0,
             bench_timings: PhaseTimings::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -1814,6 +1825,8 @@ impl World {
         let herd_r2 = HERD_RADIUS * HERD_RADIUS;
         let cells = &self.cells;
         let cell_grid = &self.cell_grid;
+        let pred_gain_mult = self.predation_gain_mult;
+        let pred_drain_mult = self.predation_drain_mult;
         let herd_counts: Vec<u32> = (0..n)
             .into_par_iter()
             .map(|i| {
@@ -1878,7 +1891,7 @@ impl World {
                             // less energy. Group-defense benefit činí bondování
                             // evolučně positive (Sprint 67.1 ukázal opak bez něj).
                             let defense = bioscape::bond_defense_factor(cells[j].n_bonds());
-                            gain *= dilution * defense;
+                            gain *= dilution * defense * pred_gain_mult;
                             local.push((i, j, gain, defense));
                         }
                     },
@@ -1891,7 +1904,7 @@ impl World {
         for (i, j, gain, defense) in attack_events {
             self.energy_deltas_scratch[i] += gain;
             // Sprint 69: defense škáluje i drain + damage (consistent s gain).
-            let drain = PREDATION_DRAIN_PER_TICK * defense;
+            let drain = PREDATION_DRAIN_PER_TICK * defense * pred_drain_mult;
             self.energy_deltas_scratch[j] -= drain;
             self.damage_deltas_scratch[j] += drain;
         }
@@ -2102,7 +2115,7 @@ impl World {
     }
 
     fn spawn_food(&mut self, rng: &mut impl Rng) {
-        let target = food_target(self.density_factor);
+        let target = food_target(self.density_factor * self.food_factor_mult);
         if self.foods.len() >= target {
             return;
         }

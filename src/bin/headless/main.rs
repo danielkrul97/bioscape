@@ -55,6 +55,15 @@ fn main() {
         .iter()
         .find_map(|a| a.strip_prefix("--share-frac=").and_then(|s| s.parse().ok()));
     let kin_filter = raw_args.iter().any(|a| a == "--kin");
+    let pred_gain_override: Option<f32> = raw_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--pred-gain=").and_then(|s| s.parse().ok()));
+    let pred_drain_override: Option<f32> = raw_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--pred-drain=").and_then(|s| s.parse().ok()));
+    let food_mult_override: Option<f32> = raw_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--food=").and_then(|s| s.parse().ok()));
     // Sprint 109: `--shocks-mean-gens N` (space-separated) nebo
     // `--shocks-mean-gens=N` (= form). Default 0 = no-op (empty kalendář).
     // `consumed_value_idx` drží pozici následujícího raw arg pokud je flag
@@ -184,6 +193,15 @@ fn main() {
         world.share_frac = sf;
     }
     world.kin_filter = kin_filter;
+    if let Some(v) = pred_gain_override {
+        world.predation_gain_mult = v;
+    }
+    if let Some(v) = pred_drain_override {
+        world.predation_drain_mult = v;
+    }
+    if let Some(v) = food_mult_override {
+        world.food_factor_mult = v;
+    }
 
     #[cfg(feature = "gpu")]
     if want_gpu_full {
