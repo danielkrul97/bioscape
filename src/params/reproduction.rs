@@ -1,7 +1,11 @@
 pub const REPRODUCE_THRESHOLD: f32 = 150.0;
 pub const SIZE_RATIO_THRESHOLD: f32 = 1.3;
-pub const PREDATION_DRAIN_PER_TICK: f32 = 3.0;
-pub const PREDATION_GAIN_PER_TICK: f32 = 1.5;
+/// Post-Hunter rebalance: cell-on-cell predace je teď jediný predační režim.
+/// Drain ×2 + gain ×1.5 oproti pre-Hunter baseline → defense matters → bonded
+/// clusters jsou viable strategy → arms race mezi predátorskými lineages a
+/// defenzivními clustery emerguje napříč seedy (siege sweep, 6/7 seedů).
+pub const PREDATION_DRAIN_PER_TICK: f32 = 6.0;
+pub const PREDATION_GAIN_PER_TICK: f32 = 2.25;
 /// Sprint 27: attacker.last_outputs[6].max(0) musí být > THRESHOLD aby se
 /// predate-on-contact spustila. Bez aktivního brain signálu jsou `cell × cell`
 /// kolize jen kolize — energy se nepřevádí. Mirroruje semantiku

@@ -29,7 +29,10 @@ pub const BODY_COST_FACTOR: f32 = 0.8;
 
 pub const FOOD_VALUE: f32 = 20.0;
 pub const FOOD_SPAWN_RATE: usize = 5;
-pub const WORLD_UNITS_PER_FOOD: f32 = 2600.0;
+/// Plant food density. Pre-Hunter: 2600 (rich). Post-Hunter rebalance: 6500
+/// (40 % of pre baseline) — scarcer plants činí intra-cell predaci výnosnou
+/// strategií, jinak by herbivore + outrun zůstal dominantní attractor.
+pub const WORLD_UNITS_PER_FOOD: f32 = 6500.0;
 
 /// Sprint 38: gravitační zrychlení (sim units / sec²) působící na cells.
 /// Sprint 65: 5.0 → 0.0 (neutral buoyancy approximation). Pre-Sprint-65

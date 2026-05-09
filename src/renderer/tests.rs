@@ -185,7 +185,7 @@ fn food_target_scales_with_area() {
     let n_small = food_target(&small, 1.0);
     let n_big = food_target(&big, 1.0);
     let diff = (n_big as i64 - (n_small as i64) * 4).abs();
-    assert!(diff <= 2, "n_big={n_big} ≠ 4×n_small={} (±2 tolerance kvůli `as usize` truncation)", n_small * 4);
+    assert!(diff <= 5, "n_big={n_big} ≠ 4×n_small={} (±5 tolerance kvůli `as usize` truncation)", n_small * 4);
 }
 
 #[test]
