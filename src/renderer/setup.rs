@@ -292,6 +292,7 @@ pub(super) fn setup(
             let populate = PopulateInputsGpu::with_context(&ctx)?;
             let motor = MotorGpu::with_context(&ctx, cap)?;
             let step = StepGpu::with_context(&ctx, cap)?;
+            let cppn = bioscape::gpu::CppnGpu::with_context(&ctx, cap);
             Ok(GpuFullPipeline {
                 cells,
                 brain,
@@ -305,6 +306,7 @@ pub(super) fn setup(
                 populate,
                 motor,
                 step,
+                cppn,
                 scratch: bioscape::gpu::GpuFullScratch::default(),
             })
         };

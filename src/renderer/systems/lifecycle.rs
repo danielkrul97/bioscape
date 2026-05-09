@@ -22,10 +22,11 @@ pub(crate) fn cell_reproduces_on_threshold(
     mut slot_map: ResMut<CellSlotMap>,
     mut next_cell_id: ResMut<NextCellId>,
     #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
-    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
     mut fertile_scratch: Local<Vec<(Entity, [f32; 3])>>,
     mut to_spawn_scratch: Local<Vec<Cell>>,
+    #[cfg(feature = "gpu")] mut cppn_dispatch_scratch: Local<Vec<(usize, bioscape::Cppn)>>,
 ) {
     // `slot_map` tracks every live (non-Dying) cell — equivalent to walking the
     // `Query<_, Without<Dying>>` but in O(1).
@@ -50,6 +51,14 @@ pub(crate) fn cell_reproduces_on_threshold(
     let fertile = fertile_scratch.as_slice();
     let mating_r2 = MATING_RADIUS * MATING_RADIUS;
     let matings = bioscape::pair_fertile(fertile, mating_r2, budget, WORLD_HALF);
+
+    // In `--gpu-full` we materialise child brain weights via GPU CPPN
+    // dispatch after spawn; the chained `crossover().mutate()` already
+    // skips `Brain::from_cppn` via `make_mating_child_no_brain`.
+    #[cfg(feature = "gpu")]
+    let use_gpu_cppn = gpu_full.is_some();
+    #[cfg(not(feature = "gpu"))]
+    let use_gpu_cppn = false;
 
     // Sprint 52: před crossover sync parent brains z GPU (post-Hebbian je
     // canonical). Pokud GPU available; jinak no-op (CPU brain je canonical).
@@ -91,11 +100,16 @@ pub(crate) fn cell_reproduces_on_threshold(
         // Sprint 66: child gets stable cell_id from monotonic counter.
         let child_id = next_cell_id.0;
         next_cell_id.0 += 1;
-        to_spawn_scratch.push(bioscape::make_mating_child(
-            &cell_a.0, &cell_b.0, &mut rng, child_id,
-        ));
+        let child = if use_gpu_cppn {
+            bioscape::make_mating_child_no_brain(&cell_a.0, &cell_b.0, &mut rng, child_id)
+        } else {
+            bioscape::make_mating_child(&cell_a.0, &cell_b.0, &mut rng, child_id)
+        };
+        to_spawn_scratch.push(child);
     }
 
+    #[cfg(feature = "gpu")]
+    cppn_dispatch_scratch.clear();
     let mesh = cell_mesh.0.clone();
     for cell in to_spawn_scratch.drain(..) {
         let mat = adhesion_material(
@@ -103,6 +117,12 @@ pub(crate) fn cell_reproduces_on_threshold(
             &mut bio_materials,
             cell.genome.adhesion_type,
         );
+        // `Cppn` is `Copy`; clone the value before `spawn()` consumes `cell`
+        // so we can dispatch the GPU CPPN materialisation after the loop.
+        #[cfg(feature = "gpu")]
+        let cppn_copy = cell.genome.cppn;
+        let lineage_id = cell.lineage_id;
+        let turn_rate = cell.genome.turn_rate;
         let entity = commands
             .spawn((
                 CellEntity(cell),
@@ -114,25 +134,41 @@ pub(crate) fn cell_reproduces_on_threshold(
             ))
             .id();
         let slot = slot_map.allocate(entity);
-        // Sprint 52: upload child brain + xoshiro seed na nový slot.
         #[cfg(feature = "gpu")]
         if let Some(gpu) = gpu_state.as_ref() {
             gpu.cells.upload_brain_at(slot, &cell.genome.brain);
             gpu.cells.upload_xoshiro_seed_at(
                 slot,
-                cell.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
+                lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
             );
         }
         #[cfg(feature = "gpu")]
         if let Some(gpu) = gpu_full.as_ref() {
-            gpu.cells.upload_brain_at(slot, &cell.genome.brain);
+            // Skip `upload_brain_at` — the GPU CPPN dispatch below writes
+            // brain weights directly into `cells.brain_weights_buf`.
             gpu.cells.upload_xoshiro_seed_at(
                 slot,
-                cell.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
+                lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
             );
-            gpu.cells.upload_turn_rate_at(slot, cell.genome.turn_rate);
+            gpu.cells.upload_turn_rate_at(slot, turn_rate);
+            cppn_dispatch_scratch.push((slot, cppn_copy));
         }
         let _ = slot;
+    }
+
+    // Single GPU CPPN dispatch covers every child spawned this frame.
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu) = gpu_full {
+        if !cppn_dispatch_scratch.is_empty() {
+            // Build `&Cppn` references into the owned scratch Vec; the dispatch
+            // signature takes a slice of `(slot, &Cppn)` pairs.
+            let pairs: Vec<(usize, &bioscape::Cppn)> = cppn_dispatch_scratch
+                .iter()
+                .map(|(s, c)| (*s, c))
+                .collect();
+            let pipeline = &mut *gpu;
+            pipeline.cppn.dispatch(&pairs, &pipeline.cells);
+        }
     }
 }
 

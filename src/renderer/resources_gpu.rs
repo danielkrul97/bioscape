@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use bioscape::gpu::{
-    BrainGpu, BrownianGpu, CellsGpu, FieldGpu, HebbianGpu, MotorGpu, PopulateInputsGpu,
+    BrainGpu, BrownianGpu, CellsGpu, CppnGpu, FieldGpu, HebbianGpu, MotorGpu, PopulateInputsGpu,
     SensorGatherGpu, SpatialHashGpu, StepGpu,
 };
 
@@ -52,5 +52,9 @@ pub(super) struct GpuFullPipeline {
     pub(super) populate: PopulateInputsGpu,
     pub(super) motor: MotorGpu,
     pub(super) step: StepGpu,
+    /// GPU CPPN — materialises child brain weights direct → cells.brain_weights_buf
+    /// at child slots, replacing per-child `upload_brain_at`. Dispatched once
+    /// per `cell_reproduces_on_threshold` invocation.
+    pub(super) cppn: CppnGpu,
     pub(super) scratch: bioscape::gpu::GpuFullScratch,
 }
