@@ -18,6 +18,20 @@ fn tanh_fast(x: f32x8) -> f32x8 {
 }
 
 impl Brain {
+    /// All-zero brain. Used as a placeholder when the caller knows the
+    /// brain will be materialised by the very next operation (e.g.,
+    /// `Genome::crossover` returns this so the chained `.mutate()` can fill
+    /// in the real weights via `Brain::from_cppn` once — instead of twice).
+    pub const fn zeros() -> Self {
+        Brain {
+            hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
+            w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            b1: [0.0; BRAIN_HIDDEN],
+            w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            b2: [0.0; BRAIN_OUTPUTS],
+        }
+    }
+
     /// Derive brain weights from a CPPN substrate query. For each
     /// (input, hidden) and (hidden, output) pair the CPPN is queried with
     /// both substrate coordinates and a sentinel input (1.0); the output

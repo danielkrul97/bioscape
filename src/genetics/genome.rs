@@ -354,11 +354,14 @@ impl Genome {
     }
 
     /// Per-gene uniform crossover. Each scalar gene picks 50/50 from one
-    /// parent; the brain is re-derived from the crossed-over CPPN rather
-    /// than copied — Hebbian gains are non-Lamarckian.
+    /// parent; the brain is **not** materialised here — production callers
+    /// always chain `crossover().mutate()` and the mutate step replaces the
+    /// brain anyway, so the crossover-side `Brain::from_cppn` would be
+    /// thrown away. We return `Brain::zeros()` and trust the chained mutate
+    /// (or an explicit `Brain::from_cppn(&genome.cppn)` for non-chained
+    /// callers) to fill the brain. Doubles the speed of `make_mating_child`.
     pub fn crossover(a: &Genome, b: &Genome, rng: &mut impl Rng) -> Genome {
         let child_cppn = Cppn::crossover(&a.cppn, &b.cppn, rng);
-        let derived_brain = Brain::from_cppn(&child_cppn);
         Genome {
             max_speed: if rng.random::<bool>() { a.max_speed } else { b.max_speed },
             color_hue: if rng.random::<bool>() { a.color_hue } else { b.color_hue },
@@ -451,7 +454,7 @@ impl Genome {
                 }
                 g
             },
-            brain: derived_brain,
+            brain: Brain::zeros(),
             cppn: child_cppn,
         }
     }
