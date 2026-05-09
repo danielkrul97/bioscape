@@ -65,7 +65,7 @@ A scientific-context survey for the project (in Czech, accessible to laypeople t
 
 ## Status
 
-120+ sprints. Full 3D simulation: ellipsoid morphology (length × width × height + spike), 3D motion (yaw + pitch), gravity with buoyancy, predation with attack-gate + gradient exposure based on bond count, mating via pheromone signaling, food clustering in the world map, hazard zones, thermal field (vertical gradient + diurnal/seasonal oscillation, per-cell `thermal_optimum` gene), multi-trophic food (plant / carrion / hunter-carrion + evolutionary `carnivore_score`), recurrent brain (21 sensory + recurrent inputs × NEAT-grown hidden × 10 outputs, Elman feedback), HyperNEAT CPPN templates, cluster-shared brain pooling across bonded peers (proto-distributed cognition), persistent spring bonds → tissue regime, evolving Hunter with its own brain (biological arms race), bistable cell-state, periodic environmental shocks (HazardPulse / ClimateShift / FoodCrash). Headless harness for deterministic batch experiments, 3D renderer with orbit camera (HDR + bloom + fog + procedural bio-textures).
+120+ sprints. Full 3D simulation: ellipsoid morphology (length × width × height + spike), 3D motion (yaw + pitch), gravity with buoyancy, intra-cell predation with attack-gate + gradient exposure based on bond count, mating via pheromone signaling, food clustering in the world map, hazard zones, thermal field (vertical gradient + diurnal/seasonal oscillation, per-cell `thermal_optimum` gene), multi-trophic food (plant / carrion + evolutionary `carnivore_score`), recurrent brain (21 sensory + recurrent inputs × NEAT-grown hidden × 10 outputs, Elman feedback), HyperNEAT CPPN templates, cluster-shared brain pooling across bonded peers (proto-distributed cognition), persistent spring bonds → tissue regime, bistable cell-state, periodic environmental shocks (HazardPulse / ClimateShift / FoodCrash). Headless harness for deterministic batch experiments, 3D renderer with orbit camera (HDR + bloom + fog + procedural bio-textures).
 
 **Performance decade 111–120** delivered **~9× ticks/s @ 2,500 cells**
 via target-cpu=native (S111), SIMD brain forward (S112, 2.1×), Bevy
@@ -81,6 +81,15 @@ the fragmented S132 path), `eat_food` solo-skip via the sensor cache.
 Detail: [`docs/sprints/128-137-perf.md`](docs/sprints/128-137-perf.md).
 
 Detailed sprint-by-sprint status: [`docs/sprints/`](docs/sprints/).
+
+## Current behavior (2026-05-09)
+
+After macropredator (Hunter) removal and a parameter sweep that retuned the cell-on-cell regime — scarcer plants (`WORLD_UNITS_PER_FOOD` 2600 → 6500), ×2 predation drain, ×1.5 predation gain, bond food share 1.3 → 2.5 — 30-gen headless runs across 7 seeds show a **bistable system**:
+
+- **Predation attractor (6 / 7 seeds):** pop hits cap (~1500), dense bonded clusters form (`mean_bond_count` 2.1–3.1, 58–72 % cells bonded), intra-cell predation explodes to 140–230 k events/gen, attack output fires 65–92 % of ticks, 7–15 lineages persist with measurable carnivore divergence. Bond × predation correlation suggests emerging pack-style attacks.
+- **Herbivore basin (1 / 7 seeds):** pop sub-cap (~1000), no bonds, predation at noise floor, attack output ≤ 25 %.
+
+Spikes are present but modest (`spike_total_length_avg` 0.4–0.9). Long-run dynamics (>50 gen) and the renderer-side replay are not yet validated.
 
 ## Emergent behaviors
 
