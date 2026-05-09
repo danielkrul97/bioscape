@@ -61,12 +61,15 @@ impl Brain {
 
         let mut inputs_buf = [[0.0_f32; CPPN_INPUTS]; 8];
 
-        // L1: input → hidden weights. BRAIN_INPUTS = 72 = 9 × 8 (no tail).
+        // L1: input → hidden weights. BRAIN_INPUTS may have a tail (e.g. 74 =
+        // 9×8 + 2). Trailing partial batch padded by replicating last valid
+        // input; padded outputs are discarded.
         for h in 0..BRAIN_HIDDEN {
             let to_c = hidden_coords[h];
             let mut i = 0usize;
             while i < BRAIN_INPUTS {
-                for k in 0..8 {
+                let count = (BRAIN_INPUTS - i).min(8);
+                for k in 0..count {
                     let from_c = input_coords[i + k];
                     inputs_buf[k] = [
                         from_c[0], from_c[1], from_c[2],
@@ -74,8 +77,12 @@ impl Brain {
                         1.0,
                     ];
                 }
+                let pad = inputs_buf[count - 1];
+                for k in count..8 {
+                    inputs_buf[k] = pad;
+                }
                 let out = cppn.forward_batch_x8(&inputs_buf);
-                for k in 0..8 {
+                for k in 0..count {
                     if out[k][1] >= CPPN_LINK_EXISTS_THRESHOLD {
                         w1[h][i + k] = out[k][0];
                     }

@@ -72,6 +72,12 @@ pub struct Cell {
     /// `pooled_hidden == last_hidden`.
     #[serde(default = "default_pooled_hidden", with = "serde_arr_hidden")]
     pub pooled_hidden: [f32; BRAIN_HIDDEN],
+    /// Bond-mediated communication inbox. Mean of bonded peers' previous-tick
+    /// `last_outputs[12..14]` (= partneři brain output[BRAIN_OUTPUTS-2..]).
+    /// Computed pre-brain_act, read by populate_brain_inputs do slots [27..29].
+    /// Solo cells: zero (no bonds → no inbox).
+    #[serde(default = "default_bonded_inbox")]
+    pub bonded_inbox: [f32; N_BOND_MSG_CHANNELS],
     /// Involuntary energy drain accumulated this tick (predation + hazard).
     /// The brain reads it next tick as a damage input, then it resets to 0.
     /// Voluntary costs (driven by the cell's own outputs) are NOT written
@@ -203,6 +209,7 @@ impl Cell {
             last_emit: [0.0; N_PHEROMONE_CHANNELS],
             burst_accum: [0.0; N_PHEROMONE_CHANNELS],
             pooled_hidden: [0.0; BRAIN_HIDDEN],
+            bonded_inbox: [0.0; N_BOND_MSG_CHANNELS],
             damage_accum: 0.0,
             age: 0,
             reproduce_cooldown_ticks: 0,

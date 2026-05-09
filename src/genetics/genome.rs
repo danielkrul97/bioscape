@@ -173,6 +173,10 @@ pub fn default_pooled_hidden() -> [f32; BRAIN_HIDDEN] {
     [0.0; BRAIN_HIDDEN]
 }
 
+pub fn default_bonded_inbox() -> [f32; N_BOND_MSG_CHANNELS] {
+    [0.0; N_BOND_MSG_CHANNELS]
+}
+
 pub fn default_vision_fov() -> f32 {
     INITIAL_VISION_FOV
 }

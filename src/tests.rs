@@ -935,6 +935,7 @@ fn base_cell() -> Cell {
         last_emit: [0.0; N_PHEROMONE_CHANNELS],
         burst_accum: [0.0; N_PHEROMONE_CHANNELS],
         pooled_hidden: [0.0; BRAIN_HIDDEN],
+        bonded_inbox: [0.0; N_BOND_MSG_CHANNELS],
         damage_accum: 0.0,
         age: 0,
         reproduce_cooldown_ticks: 0,
@@ -2053,7 +2054,9 @@ fn motor_scales_inversely_with_mass() {
     tubby.phenotype.body_length = 2.0;
     tubby.phenotype.body_width = 2.0;
     tubby.phenotype.body_height = 2.0;
-    let outputs = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let outputs = [0.0; BRAIN_OUTPUTS];
+    let mut outputs = outputs;
+    outputs[1] = 1.0;
     unit.apply_brain_motor(&outputs, 1.0);
     tubby.apply_brain_motor(&outputs, 1.0);
     let unit_v = unit.velocity[0].abs();

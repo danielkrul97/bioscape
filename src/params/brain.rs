@@ -40,7 +40,12 @@ pub const INITIAL_ENERGY: f32 = 100.0;
 // Sprint 126 (multi-channel pheromones): 21 → 27 — sloty 21,22,23 = ch1
 // pheromone gradient xyz, 24,25,26 = ch2 pheromone gradient xyz. Nové kanály
 // umožňují diskriminovanou komunikaci (cells emitují mixturu, sensors rozliší).
-pub const BRAIN_INPUTS_SENSORY: usize = 27;
+/// Bond-mediated communication channels. Cell.brain output[BRAIN_OUTPUTS-2..]
+/// se zapisuje jako message. Sensor pass agreguje partner zprávy (mean přes
+/// bonded peers' last_outputs[12..14]) → inputs slots [27..29]. Selekce může
+/// využít k inter-cell signalizaci nad rámec broadcast pheromone fields.
+pub const N_BOND_MSG_CHANNELS: usize = 2;
+pub const BRAIN_INPUTS_SENSORY: usize = 27 + N_BOND_MSG_CHANNELS;
 // Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
 // hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
 // w1 z 28×8=224 na 36×16=576 weights (2.6×).
@@ -100,7 +105,10 @@ pub const BRAIN_INPUTS: usize = BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT;
 // Sprint 126 (multi-channel pheromones): 10=ch1 emit, 11=ch2 emit. Trojice
 // kanálů s různým decay (ch0 slow, ch1 medium, ch2 fast) → temporal patterning
 // + diskriminace.
-pub const BRAIN_OUTPUTS: usize = 12;
+// Sloty 12..14 = bond message emit (N_BOND_MSG_CHANNELS). Brain forward
+// generuje raw signal v [-1, 1] (tanh); recipient sensor čte tyto hodnoty
+// z partnerova last_outputs.
+pub const BRAIN_OUTPUTS: usize = 12 + N_BOND_MSG_CHANNELS;
 /// Inicializační bias na thrust output bin v `Brain::random`. Bez něj má ~½
 /// random brainů thrust output blízko nuly (cell se sotva hýbe), což vytvářelo
 /// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce

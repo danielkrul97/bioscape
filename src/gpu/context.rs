@@ -57,8 +57,8 @@ pub const B1_OFFSET: usize = BRAIN_HIDDEN * BRAIN_INPUTS;
 pub const W2_OFFSET: usize = B1_OFFSET + BRAIN_HIDDEN;
 pub const B2_OFFSET: usize = W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN;
 const _: () = assert!(W1_OFFSET == 0);
-const _: () = assert!(B1_OFFSET == 3240);
-const _: () = assert!(W2_OFFSET == 3285);
-const _: () = assert!(B2_OFFSET == 3825);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 3837);
+const _: () = assert!(B1_OFFSET == 3330);
+const _: () = assert!(W2_OFFSET == 3375);
+const _: () = assert!(B2_OFFSET == 4005);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4019);
 

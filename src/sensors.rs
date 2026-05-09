@@ -86,6 +86,11 @@ pub fn populate_brain_inputs(
     inputs[24] = (sensors.pheromone_grads[2][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
     inputs[25] = (sensors.pheromone_grads[2][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
     inputs[26] = (sensors.pheromone_grads[2][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    // Bond-mediated communication inbox (mean of partners' last_outputs[12..14]).
+    // Computed pre-brain_act by `pool_bond_messages`. Solo cells: 0.
+    for k in 0..N_BOND_MSG_CHANNELS {
+        inputs[27 + k] = cell.bonded_inbox[k];
+    }
     // Sprint 94: cluster-shared brain. Recurrent slots (21..52) čtou
     // `pooled_hidden` (mean self + bonded neighbors z předchozího ticku)
     // místo `last_hidden`. Solo cells: pool == self → behavior identical
@@ -217,6 +222,36 @@ where
     if count > 1.0 {
         let inv = 1.0 / count;
         for k in 0..BRAIN_HIDDEN {
+            acc[k] *= inv;
+        }
+    }
+    acc
+}
+
+/// Bond-mediated message inbox. Mean over bonded peers' last_outputs[12..14]
+/// (= partner brain message channels). Solo cell vrátí [0; N]. Used jako
+/// pre-brain_act pass: caller assigns výsledek do `cell.bonded_inbox`,
+/// `populate_brain_inputs` ho čte do slots [27..29].
+pub fn pool_bond_messages<F>(
+    cell: &Cell,
+    lookup_partner_outputs: F,
+) -> [f32; N_BOND_MSG_CHANNELS]
+where
+    F: Fn(u64) -> Option<[f32; BRAIN_OUTPUTS]>,
+{
+    let mut acc = [0.0_f32; N_BOND_MSG_CHANNELS];
+    let mut count = 0.0_f32;
+    for slot in cell.bonds.iter().flatten() {
+        if let Some(partner_outputs) = lookup_partner_outputs(slot.other_cell_id) {
+            for k in 0..N_BOND_MSG_CHANNELS {
+                acc[k] += partner_outputs[BRAIN_OUTPUTS - N_BOND_MSG_CHANNELS + k];
+            }
+            count += 1.0;
+        }
+    }
+    if count > 0.0 {
+        let inv = 1.0 / count;
+        for k in 0..N_BOND_MSG_CHANNELS {
             acc[k] *= inv;
         }
     }
