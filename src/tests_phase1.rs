@@ -935,8 +935,7 @@ fn fov_cone_accept_lateral_at_zero_threshold_borderline() {
     let fwd = forward_vector(0.0, 0.0);
     let lateral = [0.0, 10.0, 0.0];
     let d2 = 100.0;
-    let accepted = fov_cone_accept(lateral, d2, fwd, 0.0);
-    assert!(accepted || !accepted);
+    let _ = fov_cone_accept(lateral, d2, fwd, 0.0);
 }
 
 #[test]

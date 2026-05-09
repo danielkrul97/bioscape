@@ -349,6 +349,10 @@ impl Brain {
     /// zero-padded scratch lane. With `target-cpu=native` the inner mul_add
     /// lowers to a single FMA. tanh activation is also vectorized via
     /// `tanh_fast` over the active hidden range.
+    // L1_TAIL/L2_TAIL branches are statically dead when BRAIN_INPUTS /
+    // BRAIN_HIDDEN are multiples of 8, but kept defensive in case the
+    // dimensions change. Clippy lints flag the dead branch as unreachable.
+    #[allow(clippy::absurd_extreme_comparisons, clippy::out_of_bounds_indexing)]
     pub fn forward_with_state(
         &self,
         inputs: &[f32; BRAIN_INPUTS],
@@ -440,6 +444,7 @@ impl Brain {
     /// Updates iterate the full row width via `f32x8`. This is safe because
     /// dead-zone activations and inputs are zero, so `lr · 0 · x = 0` leaves
     /// those weights untouched.
+    #[allow(clippy::absurd_extreme_comparisons, clippy::out_of_bounds_indexing)]
     pub fn hebbian_update(
         &mut self,
         last_inputs: &[f32; BRAIN_INPUTS],
