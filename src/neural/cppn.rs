@@ -2,25 +2,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use wide::f32x8;
 
+use super::activation::{tanh_fast_scalar, tanh_fast_simd};
 use crate::*;
-
-/// Padé(3,2) tanh approximation, clamped to ±3. Mirror of the f32x8
-/// version in `neural::brain` — having both gives bit-identical output
-/// between the scalar `Cppn::forward` and the SIMD `forward_batch_x8`,
-/// which `Brain::from_cppn` mixes when handling tails.
-#[inline]
-fn tanh_fast_scalar(x: f32) -> f32 {
-    let cx = x.clamp(-3.0, 3.0);
-    let x2 = cx * cx;
-    cx * (27.0 + x2) / (27.0 + 9.0 * x2)
-}
-
-#[inline]
-fn tanh_fast_simd(x: f32x8) -> f32x8 {
-    let x = x.fast_max(f32x8::splat(-3.0)).fast_min(f32x8::splat(3.0));
-    let x2 = x * x;
-    x * (f32x8::splat(27.0) + x2) / (f32x8::splat(27.0) + f32x8::splat(9.0) * x2)
-}
 
 // ─── Sprint 105: HyperNEAT CPPN scaffolding ─────────────────────────────────
 //

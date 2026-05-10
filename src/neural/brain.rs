@@ -2,20 +2,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use wide::f32x8;
 
-use crate::*;
+use super::activation::tanh_fast_simd;
 use super::cppn::Cppn;
-
-/// Vectorized tanh approximation: (3,2) Padé rational form, clamped to ±3.
-/// At |x|=3 numerator and denominator both equal 108, so the function
-/// saturates cleanly to ±1. Max error ~2% inside the active range — not
-/// meaningful for tanh activation (signal is already saturating there).
-/// The win is replacing N scalar `f32::tanh` calls with one SIMD op.
-#[inline]
-fn tanh_fast(x: f32x8) -> f32x8 {
-    let x = x.fast_max(f32x8::splat(-3.0)).fast_min(f32x8::splat(3.0));
-    let x2 = x * x;
-    x * (f32x8::splat(27.0) + x2) / (f32x8::splat(27.0) + f32x8::splat(9.0) * x2)
-}
+use crate::*;
 
 impl Brain {
     /// All-zero brain. Used as a placeholder when the caller knows the
@@ -407,7 +396,7 @@ impl Brain {
         for c in 0..full_chunks {
             let start = c * 8;
             let arr: [f32; 8] = pre_hidden[start..start + 8].try_into().unwrap();
-            let activated = tanh_fast(f32x8::new(arr)).to_array();
+            let activated = tanh_fast_simd(f32x8::new(arr)).to_array();
             hidden[start..start + 8].copy_from_slice(&activated);
         }
         for i in full_chunks * 8..h_n {
