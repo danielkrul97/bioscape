@@ -50,6 +50,10 @@ pub struct CellsGpu {
     damage_accum_buf: wgpu::Buffer,
     max_speed_buf: wgpu::Buffer,
     eff_radius_buf: wgpu::Buffer,
+    /// Bond-mediated communication inbox per cell, written each tick from CPU
+    /// (mean of bonded peers' last_outputs message channels). Read by
+    /// populate_inputs shader into brain inputs slots [27..29].
+    bonded_inbox_buf: wgpu::Buffer,
     /// Motor pipeline buffers. `turn_rate` is a per-cell genome constant;
     /// `angular_velocity` and `pitch_velocity` are mutated by the motor
     /// shader.
@@ -124,6 +128,11 @@ impl CellsGpu {
         let damage_accum_buf = mk("cells-damage", n * f, stor_dst_src);
         let max_speed_buf = mk("cells-max-speed", n * f, stor_dst_src);
         let eff_radius_buf = mk("cells-eff-radius", n * f, stor_dst_src);
+        let bonded_inbox_buf = mk(
+            "cells-bonded-inbox",
+            n * (N_BOND_MSG_CHANNELS as u64) * f,
+            stor_dst_src,
+        );
         // Motor.
         let turn_rate_buf = mk("cells-turn-rate", n * f, stor_dst_src);
         let angular_velocity_buf = mk("cells-ang-vel", n * f, stor_dst_src);
@@ -177,6 +186,7 @@ impl CellsGpu {
             damage_accum_buf,
             max_speed_buf,
             eff_radius_buf,
+            bonded_inbox_buf,
             turn_rate_buf,
             angular_velocity_buf,
             pitch_velocity_buf,
@@ -232,6 +242,7 @@ impl CellsGpu {
     pub fn damage_accum_buffer(&self) -> &wgpu::Buffer { &self.damage_accum_buf }
     pub fn max_speed_buffer(&self) -> &wgpu::Buffer { &self.max_speed_buf }
     pub fn eff_radius_buffer(&self) -> &wgpu::Buffer { &self.eff_radius_buf }
+    pub fn bonded_inbox_buffer(&self) -> &wgpu::Buffer { &self.bonded_inbox_buf }
     /// Motor accessors. `turn_rate` is read-only; angular/pitch velocities
     /// are read-write.
     pub fn turn_rate_buffer(&self) -> &wgpu::Buffer { &self.turn_rate_buf }
@@ -699,6 +710,17 @@ impl CellsGpu {
 
     pub fn upload_inputs(&self, inputs: &[[f32; BRAIN_INPUTS]]) {
         self.queue.write_buffer(&self.last_inputs_buf, 0, bytemuck::cast_slice(inputs));
+    }
+
+    pub fn upload_bonded_inboxes(
+        &self,
+        inboxes: &[[f32; N_BOND_MSG_CHANNELS]],
+    ) {
+        self.queue.write_buffer(
+            &self.bonded_inbox_buf,
+            0,
+            bytemuck::cast_slice(inboxes),
+        );
     }
 
     pub fn upload_velocities(&self, velocities: &[[f32; 3]]) {

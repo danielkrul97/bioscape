@@ -4,7 +4,7 @@
 //! does zero allocations except when a population spike forces a capacity
 //! grow.
 
-use crate::{BRAIN_HIDDEN, BRAIN_OUTPUTS};
+use crate::{BRAIN_HIDDEN, BRAIN_OUTPUTS, N_BOND_MSG_CHANNELS};
 
 #[derive(Default)]
 pub struct GpuFullScratch {
@@ -26,6 +26,7 @@ pub struct GpuFullScratch {
     pub body_dims: Vec<[f32; 3]>,
     pub aux: Vec<[f32; 4]>,
     pub hidden_ns: Vec<u32>,
+    pub bonded_inboxes: Vec<[f32; N_BOND_MSG_CHANNELS]>,
     // Readback scratch — `CellsGpu::download_full_batch_into` zapisuje do těchto.
     pub dl_hiddens: Vec<[f32; BRAIN_HIDDEN]>,
     pub dl_outputs: Vec<[f32; BRAIN_OUTPUTS]>,
@@ -63,6 +64,7 @@ impl GpuFullScratch {
         cr!(self.body_dims, n);
         cr!(self.aux, n);
         cr!(self.hidden_ns, n);
+        cr!(self.bonded_inboxes, n);
     }
 
     /// Resize all per-cell snapshot fields to exactly `n` elements (filling
@@ -102,5 +104,7 @@ impl GpuFullScratch {
         self.aux.resize(n, [0.0; 4]);
         self.hidden_ns.clear();
         self.hidden_ns.resize(n, 0);
+        self.bonded_inboxes.clear();
+        self.bonded_inboxes.resize(n, [0.0; N_BOND_MSG_CHANNELS]);
     }
 }

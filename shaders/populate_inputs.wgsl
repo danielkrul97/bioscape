@@ -40,6 +40,7 @@ struct Params {
 @group(0) @binding(9) var<storage, read> vision_radii: array<f32>;
 @group(0) @binding(10) var<storage, read> last_hidden: array<f32>;           // n × hidden
 @group(0) @binding(11) var<storage, read_write> last_inputs: array<f32>;     // n × inputs
+@group(0) @binding(12) var<storage, read> bonded_inbox: array<f32>;          // n × N_BOND_MSG_CHANNELS
 
 fn forward_vector(yaw: f32, pitch: f32) -> vec3<f32> {
     let cy = cos(yaw);
@@ -132,6 +133,11 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 20u; k <= 26u; k = k + 1u) {
         last_inputs[inputs_off + k] = 0.0;
     }
+    // Bond-mediated communication inbox: slots 27..29 (N_BOND_MSG_CHANNELS=2).
+    // CPU pre-tick aggregates partner messages into bonded_inbox buffer.
+    let inbox_off = i * 2u;
+    last_inputs[inputs_off + 27u] = bonded_inbox[inbox_off];
+    last_inputs[inputs_off + 28u] = bonded_inbox[inbox_off + 1u];
 
     // Sprint 30: damage_accum reset after consume.
     damage_accums[i] = 0.0;

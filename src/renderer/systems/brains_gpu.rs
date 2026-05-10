@@ -110,6 +110,7 @@ pub(crate) fn cells_brain_act_gpu_full(
     let snap_body_dims = MutPtr(pipeline.scratch.body_dims.as_mut_ptr());
     let snap_aux = MutPtr(pipeline.scratch.aux.as_mut_ptr());
     let snap_hidden_ns = MutPtr(pipeline.scratch.hidden_ns.as_mut_ptr());
+    let snap_bonded_inboxes = MutPtr(pipeline.scratch.bonded_inboxes.as_mut_ptr());
     let slot_map_ref = &*slot_map;
     cells.par_iter_mut().for_each(|(entity, mut cell_entity)| {
         let Some(slot) = slot_map_ref.slot_of(entity) else { return };
@@ -144,6 +145,7 @@ pub(crate) fn cells_brain_act_gpu_full(
                 cell.last_outputs[6].max(0.0),
             ];
             *snap_hidden_ns.add(slot) = cell.genome.brain.hidden_n;
+            *snap_bonded_inboxes.add(slot) = cell.bonded_inbox;
         }
     });
 
@@ -183,6 +185,9 @@ pub(crate) fn cells_brain_act_gpu_full(
     pipeline.cells.upload_age_cooldown(ages, cooldowns);
     pipeline.cells.upload_body_dims(body_dims);
     pipeline.cells.upload_aux(aux);
+    pipeline
+        .cells
+        .upload_bonded_inboxes(pipeline.scratch.bonded_inboxes.as_slice());
 
     let sensor_params = SensorParamsGpu {
         num_cells: n as u32,

@@ -45,6 +45,32 @@ pub(crate) fn pool_bonded_hidden_cells(
     }
 }
 
+/// Pre-brain pass: aggregate bonded peers' `last_outputs` message channels
+/// into `cell.bonded_inbox`. Mirrors `pool_bonded_hidden_cells` flow. Runs
+/// before `cells_brain_act` so populate_brain_inputs reads fresh inbox.
+pub(crate) fn pool_bond_messages_cells(
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+    mut id_to_outputs_scratch: Local<FxHashMap<u64, [f32; bioscape::BRAIN_OUTPUTS]>>,
+) {
+    id_to_outputs_scratch.clear();
+    for c in cells.iter() {
+        id_to_outputs_scratch.insert(c.0.cell_id, c.0.last_outputs);
+    }
+    if id_to_outputs_scratch.is_empty() {
+        return;
+    }
+    let id_to_outputs = &*id_to_outputs_scratch;
+    for mut cell in &mut cells {
+        let inbox = bioscape::pool_bond_messages(&cell.0, |partner_id| {
+            if partner_id == cell.0.cell_id {
+                return None;
+            }
+            id_to_outputs.get(&partner_id).copied()
+        });
+        cell.0.bonded_inbox = inbox;
+    }
+}
+
 pub(crate) fn cells_brain_act(
     time: Res<Time>,
     cell_grid: Res<CellGrid>,

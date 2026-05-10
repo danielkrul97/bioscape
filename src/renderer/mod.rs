@@ -148,6 +148,7 @@ pub fn run() {
                     update_smell_field,
                     update_pheromone_field,
                     pool_bonded_hidden_cells,
+                    pool_bond_messages_cells,
                     #[cfg(feature = "gpu")]
                     cells_brain_act_gpu_full
                         .run_if(resource_exists::<GpuFullPipeline>),

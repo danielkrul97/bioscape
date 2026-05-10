@@ -59,9 +59,10 @@ impl PopulateInputsGpu {
                 include_str!("../../shaders/populate_inputs.wgsl").into(),
             ),
         });
-        // 12 bindings: 0 uniform, 1-10 storage read, 11 storage read_write,
-        // plus binding 6 (damage_accums) je read_write, binding 11 (last_inputs) read_write.
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..12u32)
+        // 13 bindings: 0 uniform, 1-10 + 12 storage read, 11 storage read_write,
+        // 6 (damage_accums) je read_write, 11 (last_inputs) read_write,
+        // 12 (bonded_inbox) je read-only.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13u32)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -172,6 +173,7 @@ impl PopulateInputsGpu {
                     wgpu::BindGroupEntry { binding: 9, resource: sensor.vision_radii_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 10, resource: cells.last_hidden_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 11, resource: cells.last_inputs_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: cells.bonded_inbox_buffer().as_entire_binding() },
                 ],
             }));
             self.cached_cells_epoch = cells_epoch;

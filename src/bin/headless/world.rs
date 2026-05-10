@@ -873,6 +873,7 @@ impl World {
                 cell.last_outputs[6].max(0.0),
             ]);
             s.hidden_ns.push(cell.genome.brain.hidden_n);
+            s.bonded_inboxes.push(cell.bonded_inbox);
         }
         // Sprint 128: foods + coop_foods do single sensor pool.
         for food in self.foods.iter() {
@@ -918,6 +919,7 @@ impl World {
         gpu.cells.upload_age_cooldown(&ages, &cooldowns);
         gpu.cells.upload_body_dims(&body_dims);
         gpu.cells.upload_aux(&aux);
+        gpu.cells.upload_bonded_inboxes(s.bonded_inboxes.as_slice());
 
         // Phase 3: GPU spatial hash dispatch (no readback).
         gpu.cell_hash.dispatch(&positions);

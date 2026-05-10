@@ -39,13 +39,25 @@ pub(crate) fn cell_reproduces_on_threshold(
     }
     let budget = MAX_POPULATION - current_pop;
 
+    // Frequency-dependent reproduce threshold: common lineages musí mít víc
+    // energie aby reprodukovaly. Cheap stabilizing force proti monoculture.
+    let n_total = current_pop;
+    let inv_n = if n_total > 0 { 1.0 / n_total as f32 } else { 0.0 };
+    let mut lineage_freq: rustc_hash::FxHashMap<u64, f32> = rustc_hash::FxHashMap::default();
+    for (_, c) in cells.iter() {
+        *lineage_freq.entry(c.0.lineage_id).or_insert(0.0) += inv_n;
+    }
+
     // R-#11: persistent Local fertile snapshot.
     fertile_scratch.clear();
     fertile_scratch.extend(
         cells
             .iter()
             .filter(|(_, c)| {
-                c.0.energy >= REPRODUCE_THRESHOLD
+                let f = lineage_freq.get(&c.0.lineage_id).copied().unwrap_or(0.0);
+                let scaled =
+                    REPRODUCE_THRESHOLD * (1.0 + bioscape::LINEAGE_DIVERSITY_ALPHA * f);
+                c.0.energy >= scaled
                     && c.0.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
                     && c.0.reproduce_cooldown_ticks == 0
             })
