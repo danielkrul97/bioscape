@@ -171,6 +171,12 @@ pub(super) struct FoodMesh(pub(super) Handle<Mesh>);
 #[derive(Resource)]
 pub(super) struct FoodMaterial(pub(super) Handle<StandardMaterial>);
 
+#[derive(Resource)]
+pub(super) struct SpikeMesh(pub(super) Handle<Mesh>);
+
+#[derive(Resource)]
+pub(super) struct SpikeMaterial(pub(super) Handle<StandardMaterial>);
+
 /// Sprint 36: per-lineage material cache. Lineage hue → handle do
 /// `Assets<StandardMaterial>`. Bevy automaticky deduplikuje stejné materialy
 /// na renderer instances draw call.

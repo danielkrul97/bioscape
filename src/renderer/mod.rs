@@ -186,6 +186,7 @@ pub fn run() {
                 camera_pan_input,
                 update_orbit_camera_transform,
                 sync_transforms,
+                sync_spikes,
                 draw_bond_gizmos,
                 draw_cell_state_gizmos,
                 log_clock_events,

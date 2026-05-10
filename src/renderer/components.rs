@@ -12,6 +12,15 @@ pub(super) struct Dying {
     pub(super) ticks_left: u32,
 }
 
+/// Decorative spike rendered as a top-level entity tracking its owner cell.
+/// Avoids ChildOf scale composition with the parent ellipsoid. `slot` selects
+/// which Phenotype.spikes[k] drives the transform.
+#[derive(Component)]
+pub(super) struct SpikeEntity {
+    pub(super) owner: Entity,
+    pub(super) slot: u8,
+}
+
 #[derive(Component)]
 pub(super) struct StatsRoot;
 

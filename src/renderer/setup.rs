@@ -7,8 +7,8 @@ use bevy::render::view::Hdr;
 use bioscape::{
     Cell, Food, SmellField, WorldMap, CELL_RADIUS, CYCLE_AMPLITUDE,
     INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z,
-    SMELL_GRID_RES, SMELL_GRID_RES_Z, WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z,
-    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, reject_food_for_richness,
+    SMELL_GRID_RES, SMELL_GRID_RES_Z, SPIKE_SLOTS, WORLD_HALF, WORLD_MAP_BASE_RES,
+    WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, reject_food_for_richness,
 };
 #[cfg(feature = "gpu")]
 use bioscape::gpu::{
@@ -17,12 +17,13 @@ use bioscape::gpu::{
 };
 use std::time::Duration;
 
-use super::components::{CellEntity, FoodEntity, StatsRoot, StatsText, WorldMapOverlay};
+use super::components::{CellEntity, FoodEntity, SpikeEntity, StatsRoot, StatsText, WorldMapOverlay};
 use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
     AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh,
-    OrbitCamera, PheromoneResource, SmellResource, WorldExtent, WorldMapResource,
+    OrbitCamera, PheromoneResource, SmellResource, SpikeMaterial, SpikeMesh, WorldExtent,
+    WorldMapResource,
 };
 #[cfg(feature = "gpu")]
 use super::resources_gpu::{GpuBrainState, GpuFieldState, GpuFullPipeline};
@@ -142,9 +143,21 @@ pub(super) fn setup(
     ));
 
     // Sprint 36: cell mesh = unit-radius sphere, scale aplikuje ellipsoid
-    // (length × width × height) per cell. Spike rendering vynechán (visual
-    // loss; predace mechanika beze změny).
+    // (length × width × height) per cell.
     let cell_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS).mesh().ico(2).unwrap());
+    // Spike mesh: unit cone (radius=1, height=1) v Bevy default orientation —
+    // apex +Y, base v origin. Sync system škáluje na (thickness, length, thickness)
+    // a rotuje tak, aby Y axis aligned se spike_direction.
+    let spike_mesh_handle = meshes.add(Cone {
+        radius: 1.0,
+        height: 1.0,
+    }.mesh());
+    let spike_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.85, 0.10, 0.10),
+        perceptual_roughness: 0.4,
+        metallic: 0.6,
+        ..default()
+    });
     // Sprint 53: jídlo decentnější — menší radius (10× větší food count po
     // 3D volume scaling jinak vytváří plný display) + ground-matching tint
     // (low-saturation green) místo skoro-černé proti bílému ClearColoru.
@@ -176,6 +189,15 @@ pub(super) fn setup(
                     .with_scale(cell_scale(&cell.phenotype)),
             ))
             .id();
+        for slot in 0..SPIKE_SLOTS as u8 {
+            commands.spawn((
+                SpikeEntity { owner: entity, slot },
+                Mesh3d(spike_mesh_handle.clone()),
+                MeshMaterial3d(spike_material.clone()),
+                Transform::default(),
+                Visibility::Hidden,
+            ));
+        }
         slot_map.allocate(entity);
         initial_cells.push(cell);
     }
@@ -349,6 +371,8 @@ pub(super) fn setup(
     commands.insert_resource(CellMesh(cell_mesh_handle));
     commands.insert_resource(FoodMesh(food_mesh_handle));
     commands.insert_resource(FoodMaterial(food_material));
+    commands.insert_resource(SpikeMesh(spike_mesh_handle));
+    commands.insert_resource(SpikeMaterial(spike_material));
 
     commands.insert_resource(SmellResource(SmellField::new(
         [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],

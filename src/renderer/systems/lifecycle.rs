@@ -1,15 +1,16 @@
 use bevy::prelude::*;
 use bioscape::{
     CARRION_FOOD_COUNT, CELL_RADIUS, Cell, Food, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD,
-    MATING_RADIUS, MAX_POPULATION, REPRODUCE_THRESHOLD, WORLD_HALF,
+    MATING_RADIUS, MAX_POPULATION, REPRODUCE_THRESHOLD, SPIKE_SLOTS, WORLD_HALF,
 };
 use rand::Rng;
 
-use super::super::components::{CellEntity, Dying, FoodEntity};
+use super::super::components::{CellEntity, Dying, FoodEntity, SpikeEntity};
 use super::super::config::DEATH_FADE_TICKS;
 use super::super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::super::resources::{
-    AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh, NextCellId, WorldExtent,
+    AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh, NextCellId, SpikeMaterial,
+    SpikeMesh, WorldExtent,
 };
 #[cfg(feature = "gpu")]
 use super::super::resources_gpu::{GpuBrainState, GpuFullPipeline};
@@ -17,6 +18,8 @@ use super::super::resources_gpu::{GpuBrainState, GpuFullPipeline};
 pub(crate) fn cell_reproduces_on_threshold(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     cell_mesh: Res<CellMesh>,
+    spike_mesh: Res<SpikeMesh>,
+    spike_material: Res<SpikeMaterial>,
     mut adhesion_materials: ResMut<AdhesionMaterials>,
     mut bio_materials: ResMut<Assets<BioMaterial>>,
     mut slot_map: ResMut<CellSlotMap>,
@@ -133,6 +136,15 @@ pub(crate) fn cell_reproduces_on_threshold(
                     .with_scale(cell_scale(&cell.phenotype)),
             ))
             .id();
+        for spike_slot in 0..SPIKE_SLOTS as u8 {
+            commands.spawn((
+                SpikeEntity { owner: entity, slot: spike_slot },
+                Mesh3d(spike_mesh.0.clone()),
+                MeshMaterial3d(spike_material.0.clone()),
+                Transform::default(),
+                Visibility::Hidden,
+            ));
+        }
         let slot = slot_map.allocate(entity);
         #[cfg(feature = "gpu")]
         if let Some(gpu) = gpu_state.as_ref() {
