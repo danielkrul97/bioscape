@@ -903,6 +903,7 @@ fn collision_gpu_matches_cpu() {
         bonds_per_cell: MAX_BONDS_PER_CELL as u32,
         break_factor: BOND_BREAK_FACTOR,
     };
+    let max_contacts: u32 = 32;
     let slots = MAX_BONDS_PER_CELL;
     // Random sparse bonds: each slot is empty (idx=-1) with 70% probability,
     // otherwise points at a random other cell. self-pointers are filtered.
@@ -937,10 +938,11 @@ fn collision_gpu_matches_cpu() {
         COLLISION_RESTITUTION,
         adhesion,
         bond_params,
+        max_contacts,
         [1000.0, 1000.0],
     )
     .expect("collision init");
-    let (gpu_deltas, gpu_vel_deltas) = col.compute(
+    let result = col.compute(
         &positions,
         &velocities,
         &eff_radii,
@@ -952,6 +954,8 @@ fn collision_gpu_matches_cpu() {
         &bond_damping,
         &hash,
     );
+    let gpu_deltas = &result.position_deltas;
+    let gpu_vel_deltas = &result.velocity_deltas;
 
     // CPU brute force — matches CPU resolve_collisions:
     // - in-contact: position depenetration (Sprint 50) + inelastic damping
@@ -962,6 +966,7 @@ fn collision_gpu_matches_cpu() {
     let damp_coeff = 0.5 * (1.0 - COLLISION_RESTITUTION);
     let mut cpu_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
     let mut cpu_vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let mut cpu_contacts: Vec<Vec<u32>> = vec![Vec::new(); n];
     for i in 0..n {
         for j in 0..n {
             if i == j { continue; }
@@ -989,6 +994,9 @@ fn collision_gpu_matches_cpu() {
                     cpu_vel_deltas[i][0] += damp * nx;
                     cpu_vel_deltas[i][1] += damp * ny;
                     cpu_vel_deltas[i][2] += damp * nz;
+                }
+                if i < j {
+                    cpu_contacts[i].push(j as u32);
                 }
             } else if d2 > 0.0 {
                 let adhesion_range = pair_r * ADHESION_RANGE_FACTOR;
@@ -1053,6 +1061,19 @@ fn collision_gpu_matches_cpu() {
             assert!(dv < 1e-3, "vel i={i} k={k} cpu={} gpu={} diff={}",
                 cpu_vel_deltas[i][k], gpu_vel_deltas[i][k], dv);
         }
+        // Contact events: counts must match exactly. Partner lists are
+        // compared as sorted sets — atomicAdd in the shader doesn't
+        // guarantee write order across threads.
+        let gpu_cnt = result.contact_count[i] as usize;
+        let cpu_cnt = cpu_contacts[i].len();
+        assert_eq!(gpu_cnt, cpu_cnt, "contact_count i={i} cpu={cpu_cnt} gpu={gpu_cnt}");
+        let mut gpu_partners: Vec<u32> = (0..gpu_cnt)
+            .map(|s| result.contact_partners[i * (max_contacts as usize) + s])
+            .collect();
+        let mut cpu_partners = cpu_contacts[i].clone();
+        gpu_partners.sort_unstable();
+        cpu_partners.sort_unstable();
+        assert_eq!(gpu_partners, cpu_partners, "contact partners mismatch i={i}");
     }
 }
 

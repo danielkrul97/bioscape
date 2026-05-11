@@ -27,7 +27,7 @@ struct CollisionParams {
     adhesion_range_factor: f32,
     bond_break_factor: f32,
     bonds_per_cell: u32,
-    _pad0: u32,
+    max_contacts_per_cell: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: CollisionParams;
@@ -44,6 +44,8 @@ struct CollisionParams {
 @group(0) @binding(11) var<storage, read> bond_rest: array<f32>;
 @group(0) @binding(12) var<storage, read> bond_stiffness: array<f32>;
 @group(0) @binding(13) var<storage, read> bond_damping: array<f32>;
+@group(0) @binding(14) var<storage, read_write> contact_count: array<atomic<u32>>;
+@group(0) @binding(15) var<storage, read_write> contact_partners: array<u32>;
 
 fn min_image_xy(d: f32, half: f32) -> f32 {
     let w = 2.0 * half;
@@ -160,6 +162,17 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
                             vdx_acc = vdx_acc + damp * n.x;
                             vdy_acc = vdy_acc + damp * n.y;
                             vdz_acc = vdz_acc + damp * n.z;
+                        }
+                        // Sprint 66: record per-pair contact events for bond
+                        // formation. Dedupe symmetric pair by keeping only
+                        // i < j; CPU resolves partner cell_ids via the
+                        // tick-stable id_to_idx map after readback.
+                        if (i < j) {
+                            let slot = atomicAdd(&contact_count[i], 1u);
+                            if (slot < params.max_contacts_per_cell) {
+                                let base = i * params.max_contacts_per_cell + slot;
+                                contact_partners[base] = j;
+                            }
                         }
                     } else if (d2 > 0.0) {
                         // Sprint 66 differential adhesion: out-of-contact pairs

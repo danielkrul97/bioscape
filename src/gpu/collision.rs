@@ -21,7 +21,7 @@ struct CollisionParams {
     adhesion_range_factor: f32,
     bond_break_factor: f32,
     bonds_per_cell: u32,
-    _pad0: u32,
+    max_contacts_per_cell: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +37,19 @@ pub struct BondParams {
     pub break_factor: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct CollisionResult {
+    pub position_deltas: Vec<[f32; 3]>,
+    pub velocity_deltas: Vec<[f32; 3]>,
+    /// `contact_count[i]` = number of in-contact partners with idx > i.
+    /// Truncated at `max_contacts_per_cell`; overflow drops events but the
+    /// counter still reflects the true count for diagnostics.
+    pub contact_count: Vec<u32>,
+    /// Flat `contact_partners[i * max_contacts_per_cell + slot]` = partner
+    /// idx (only the first `contact_count[i]` slots are valid).
+    pub contact_partners: Vec<u32>,
+}
+
 pub struct CollisionGpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -48,6 +61,7 @@ pub struct CollisionGpu {
     collision_restitution: f32,
     adhesion: AdhesionParams,
     bonds: BondParams,
+    max_contacts_per_cell: u32,
     world_half_xy: [f32; 2],
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
@@ -59,15 +73,20 @@ pub struct CollisionGpu {
     bond_rest_buf: wgpu::Buffer,
     bond_stiffness_buf: wgpu::Buffer,
     bond_damping_buf: wgpu::Buffer,
+    contact_count_buf: wgpu::Buffer,
+    contact_partners_buf: wgpu::Buffer,
     deltas_buf: wgpu::Buffer,
     vel_deltas_buf: wgpu::Buffer,
     deltas_rb: wgpu::Buffer,
     vel_deltas_rb: wgpu::Buffer,
+    contact_count_rb: wgpu::Buffer,
+    contact_partners_rb: wgpu::Buffer,
     pos_packed: Vec<f32>,
     vel_packed: Vec<f32>,
 }
 
 impl CollisionGpu {
+    #[allow(clippy::too_many_arguments)]
     pub fn with_context(
         ctx: &GpuContext,
         capacity: usize,
@@ -76,6 +95,7 @@ impl CollisionGpu {
         collision_restitution: f32,
         adhesion: AdhesionParams,
         bonds: BondParams,
+        max_contacts_per_cell: u32,
         world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         Self::with_device_inner(
@@ -87,10 +107,12 @@ impl CollisionGpu {
             collision_restitution,
             adhesion,
             bonds,
+            max_contacts_per_cell,
             world_half_xy,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         capacity: usize,
         cell_size: f32,
@@ -98,6 +120,7 @@ impl CollisionGpu {
         collision_restitution: f32,
         adhesion: AdhesionParams,
         bonds: BondParams,
+        max_contacts_per_cell: u32,
         world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         let ctx = GpuContext::new()?;
@@ -110,10 +133,12 @@ impl CollisionGpu {
             collision_restitution,
             adhesion,
             bonds,
+            max_contacts_per_cell,
             world_half_xy,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_device_inner(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
@@ -123,6 +148,7 @@ impl CollisionGpu {
         collision_restitution: f32,
         adhesion: AdhesionParams,
         bonds: BondParams,
+        max_contacts_per_cell: u32,
         world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         assert!(capacity > 0);
@@ -130,11 +156,11 @@ impl CollisionGpu {
             label: Some("collision"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/collision.wgsl").into()),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..16)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
-                } else if i == 6 || i == 8 {
+                } else if i == 6 || i == 8 || i == 14 || i == 15 {
                     wgpu::BufferBindingType::Storage { read_only: false }
                 } else {
                     wgpu::BufferBindingType::Storage { read_only: true }
@@ -196,10 +222,17 @@ impl CollisionGpu {
         let bond_rest_buf = mk("collision-bond-rest", bonds_total * f, stor_dst);
         let bond_stiffness_buf = mk("collision-bond-stiffness", bonds_total * f, stor_dst);
         let bond_damping_buf = mk("collision-bond-damping", bonds_total * f, stor_dst);
+        let stor_dst_src = stor_dst | wgpu::BufferUsages::COPY_SRC;
+        let contacts_total = n * (max_contacts_per_cell.max(1) as u64);
+        let contact_count_buf = mk("collision-contact-count", n * f, stor_dst_src);
+        let contact_partners_buf =
+            mk("collision-contact-partners", contacts_total * f, stor_dst_src);
         let deltas_buf = mk("collision-deltas", n * 3 * f, stor_src);
         let vel_deltas_buf = mk("collision-vel-deltas", n * 3 * f, stor_src);
         let deltas_rb = mk("collision-deltas-rb", n * 3 * f, read);
         let vel_deltas_rb = mk("collision-vel-deltas-rb", n * 3 * f, read);
+        let contact_count_rb = mk("collision-contact-count-rb", n * f, read);
+        let contact_partners_rb = mk("collision-contact-partners-rb", contacts_total * f, read);
 
         Ok(Self {
             device,
@@ -212,6 +245,7 @@ impl CollisionGpu {
             collision_restitution,
             adhesion,
             bonds,
+            max_contacts_per_cell,
             world_half_xy,
             params_buf,
             positions_buf,
@@ -223,10 +257,14 @@ impl CollisionGpu {
             bond_rest_buf,
             bond_stiffness_buf,
             bond_damping_buf,
+            contact_count_buf,
+            contact_partners_buf,
             deltas_buf,
             vel_deltas_buf,
             deltas_rb,
             vel_deltas_rb,
+            contact_count_rb,
+            contact_partners_rb,
             pos_packed: Vec::new(),
             vel_packed: Vec::new(),
         })
@@ -245,7 +283,7 @@ impl CollisionGpu {
         bond_stiffness: &[f32],
         bond_damping: &[f32],
         cell_hash: &SpatialHashGpu,
-    ) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    ) -> CollisionResult {
         let n = positions.len();
         assert!(n <= self.capacity, "collision capacity overflow");
         assert_eq!(velocities.len(), n, "velocities length mismatch");
@@ -256,7 +294,12 @@ impl CollisionGpu {
         assert_eq!(bond_stiffness.len(), bonds_total, "bond_stiffness length mismatch");
         assert_eq!(bond_damping.len(), bonds_total, "bond_damping length mismatch");
         if n == 0 {
-            return (Vec::new(), Vec::new());
+            return CollisionResult {
+                position_deltas: Vec::new(),
+                velocity_deltas: Vec::new(),
+                contact_count: Vec::new(),
+                contact_partners: Vec::new(),
+            };
         }
         self.pos_packed.clear();
         self.pos_packed.reserve(n * 3);
@@ -280,7 +323,7 @@ impl CollisionGpu {
             adhesion_range_factor: self.adhesion.range_factor,
             bond_break_factor: self.bonds.break_factor,
             bonds_per_cell: self.bonds.bonds_per_cell,
-            _pad0: 0,
+            max_contacts_per_cell: self.max_contacts_per_cell,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -320,6 +363,14 @@ impl CollisionGpu {
             0,
             bytemuck::cast_slice(bond_damping),
         );
+        // Atomic counters and the partners array start clean each dispatch.
+        let zero_count = vec![0u8; (n * 4) as usize];
+        self.queue
+            .write_buffer(&self.contact_count_buf, 0, &zero_count);
+        let contacts_total = n * self.max_contacts_per_cell as usize;
+        let zero_partners = vec![0u8; contacts_total * 4];
+        self.queue
+            .write_buffer(&self.contact_partners_buf, 0, &zero_partners);
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("collision-bg"),
@@ -339,6 +390,8 @@ impl CollisionGpu {
                 wgpu::BindGroupEntry { binding: 11, resource: self.bond_rest_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: self.bond_stiffness_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: self.bond_damping_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: self.contact_count_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.contact_partners_buf.as_entire_binding() },
             ],
         });
 
@@ -355,17 +408,39 @@ impl CollisionGpu {
             pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
         }
         let bytes = (n as u64) * 3 * 4;
+        let count_bytes = (n as u64) * 4;
+        let partners_bytes = (n as u64) * (self.max_contacts_per_cell as u64) * 4;
         encoder.copy_buffer_to_buffer(&self.deltas_buf, 0, &self.deltas_rb, 0, bytes);
         encoder.copy_buffer_to_buffer(&self.vel_deltas_buf, 0, &self.vel_deltas_rb, 0, bytes);
+        encoder.copy_buffer_to_buffer(
+            &self.contact_count_buf,
+            0,
+            &self.contact_count_rb,
+            0,
+            count_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.contact_partners_buf,
+            0,
+            &self.contact_partners_rb,
+            0,
+            partners_bytes,
+        );
         self.queue.submit(Some(encoder.finish()));
 
         let pos_slice = self.deltas_rb.slice(0..bytes);
         let vel_slice = self.vel_deltas_rb.slice(0..bytes);
+        let count_slice = self.contact_count_rb.slice(0..count_bytes);
+        let partners_slice = self.contact_partners_rb.slice(0..partners_bytes);
         pos_slice.map_async(wgpu::MapMode::Read, |_| {});
         vel_slice.map_async(wgpu::MapMode::Read, |_| {});
+        count_slice.map_async(wgpu::MapMode::Read, |_| {});
+        partners_slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
         let pos_data = pos_slice.get_mapped_range();
         let vel_data = vel_slice.get_mapped_range();
+        let count_data = count_slice.get_mapped_range();
+        let partners_data = partners_slice.get_mapped_range();
         let pf: &[f32] = bytemuck::cast_slice(&pos_data);
         let vf: &[f32] = bytemuck::cast_slice(&vel_data);
         let pos_out: Vec<[f32; 3]> = (0..n)
@@ -374,11 +449,23 @@ impl CollisionGpu {
         let vel_out: Vec<[f32; 3]> = (0..n)
             .map(|i| [vf[i * 3], vf[i * 3 + 1], vf[i * 3 + 2]])
             .collect();
+        let contact_count: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&count_data).to_vec();
+        let contact_partners: Vec<u32> =
+            bytemuck::cast_slice::<u8, u32>(&partners_data).to_vec();
         drop(pos_data);
         drop(vel_data);
+        drop(count_data);
+        drop(partners_data);
         self.deltas_rb.unmap();
         self.vel_deltas_rb.unmap();
-        (pos_out, vel_out)
+        self.contact_count_rb.unmap();
+        self.contact_partners_rb.unmap();
+        CollisionResult {
+            position_deltas: pos_out,
+            velocity_deltas: vel_out,
+            contact_count,
+            contact_partners,
+        }
     }
 }
 
