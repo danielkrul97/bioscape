@@ -13,7 +13,7 @@ use super::super::resources::{
     SpikeMesh, WorldExtent,
 };
 #[cfg(feature = "gpu")]
-use super::super::resources_gpu::{GpuBrainState, GpuFullPipeline};
+use super::super::resources_gpu::GpuFullPipeline;
 
 pub(crate) fn cell_reproduces_on_threshold(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
@@ -24,7 +24,6 @@ pub(crate) fn cell_reproduces_on_threshold(
     mut bio_materials: ResMut<Assets<BioMaterial>>,
     mut slot_map: ResMut<CellSlotMap>,
     mut next_cell_id: ResMut<NextCellId>,
-    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
     mut fertile_scratch: Local<Vec<(Entity, [f32; 3])>>,
@@ -75,32 +74,9 @@ pub(crate) fn cell_reproduces_on_threshold(
     #[cfg(not(feature = "gpu"))]
     let use_gpu_cppn = false;
 
-    // Sprint 52: před crossover sync parent brains z GPU (post-Hebbian je
-    // canonical). Pokud GPU available; jinak no-op (CPU brain je canonical).
-    #[cfg(feature = "gpu")]
-    if let Some(gpu) = gpu_state.as_ref() {
-        for &(a, b) in &matings {
-            if let (Some(slot_a), Some(slot_b)) = (slot_map.slot_of(a), slot_map.slot_of(b)) {
-                let brain_a = gpu.cells.download_brain_at(slot_a);
-                let brain_b = gpu.cells.download_brain_at(slot_b);
-                if let Ok([(_, mut ca), (_, mut cb)]) = cells.get_many_mut([a, b]) {
-                    ca.0.genome.brain = brain_a;
-                    cb.0.genome.brain = brain_b;
-                }
-            }
-        }
-    } else if let Some(gpu) = gpu_full.as_ref() {
-        for &(a, b) in &matings {
-            if let (Some(slot_a), Some(slot_b)) = (slot_map.slot_of(a), slot_map.slot_of(b)) {
-                let brain_a = gpu.cells.download_brain_at(slot_a);
-                let brain_b = gpu.cells.download_brain_at(slot_b);
-                if let Ok([(_, mut ca), (_, mut cb)]) = cells.get_many_mut([a, b]) {
-                    ca.0.genome.brain = brain_a;
-                    cb.0.genome.brain = brain_b;
-                }
-            }
-        }
-    }
+    // Wave K: skip per-pair download_brain_at — make_mating_child_no_brain
+    // only touches Genome.cppn, and per-gen sync_brains_from_gpu refreshes
+    // the CPU shadow before diagnostics / serialization.
 
     let mut rng = rand::rng();
     to_spawn_scratch.clear();
@@ -158,18 +134,10 @@ pub(crate) fn cell_reproduces_on_threshold(
         }
         let slot = slot_map.allocate(entity);
         #[cfg(feature = "gpu")]
-        if let Some(gpu) = gpu_state.as_ref() {
-            gpu.cells.upload_brain_at(slot, &cell.genome.brain);
-            // V7-unification: seed from `cell.cell_id` so the GPU per-slot
-            // xoshiro stream matches the CPU `Cell.xoshiro_state` exactly.
-            gpu.cells.upload_xoshiro_seed_at(slot, cell.cell_id);
-        }
-        #[cfg(feature = "gpu")]
         if let Some(gpu) = gpu_full.as_ref() {
-            // Skip `upload_brain_at` — the GPU CPPN dispatch below writes
-            // brain weights directly into `cells.brain_weights_buf`.
-            // V7-unification: seed from `cell.cell_id` so the GPU per-slot
-            // xoshiro stream matches the CPU `Cell.xoshiro_state` exactly.
+            // GPU CPPN dispatch below writes brain weights directly to
+            // cells.brain_weights_buf. Seed xoshiro from cell_id so the
+            // GPU per-slot stream matches CPU `Cell.xoshiro_state`.
             gpu.cells.upload_xoshiro_seed_at(slot, cell.cell_id);
             gpu.cells.upload_turn_rate_at(slot, turn_rate);
             cppn_dispatch_scratch.push((slot, cppn_copy));
@@ -199,7 +167,6 @@ pub(crate) fn cell_dies_on_zero_energy(
     food_mesh: Res<FoodMesh>,
     food_material: Res<FoodMaterial>,
     mut slot_map: ResMut<CellSlotMap>,
-    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
     mut commands: Commands,
 ) {
@@ -235,21 +202,12 @@ pub(crate) fn cell_dies_on_zero_energy(
             // GPU swap_to drží sloty dense.
             if let Some((freed_slot, moved)) = slot_map.release(entity) {
                 #[cfg(feature = "gpu")]
-                if let Some(gpu) = gpu_state.as_ref() {
-                    if let Some(_moved_entity) = moved {
-                        // moved cell je ve slot_map.slot_of(moved_entity) = freed_slot
-                        // teď. Source je old_slot = current cell count (po release).
-                        gpu.cells.swap_to(freed_slot, slot_map.len());
-                    }
-                }
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = gpu_full.as_ref() {
                     if moved.is_some() {
                         gpu.cells.swap_to(freed_slot, slot_map.len());
                     }
                 }
-                let _ = freed_slot;
-                let _ = moved;
+                let _ = (freed_slot, moved);
             }
         }
     }

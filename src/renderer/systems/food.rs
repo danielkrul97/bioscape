@@ -16,7 +16,7 @@ use super::super::resources::{
     FoodMaterial, FoodMesh, WorldExtent, WorldMapResource,
 };
 #[cfg(feature = "gpu")]
-use super::super::resources_gpu::{GpuBrainState, GpuFullPipeline};
+use super::super::resources_gpu::GpuFullPipeline;
 use super::super::world_map::{food_multiplier, food_target};
 
 pub(crate) fn spawn_food(
@@ -177,7 +177,6 @@ pub(crate) fn cell_eats_food(
     world_map: Res<WorldMapResource>,
     slot_map: Res<CellSlotMap>,
     lookups: Res<CellEntityLookups>,
-    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
     mut diag: Diagnostics,
@@ -190,11 +189,10 @@ pub(crate) fn cell_eats_food(
 ) {
     let t_total = Instant::now();
 
-    // Sprint 52: pokud GPU available, sbíráme rewards Vec[N] a dispatchneme
-    // GPU Hebbian na konci místo per-cell CPU brain.hebbian_update. Plná
-    // gpu_full pipeline má vlastní Hebbian instanci uvnitř `GpuFullPipeline`.
+    // Sprint 52: GPU Hebbian dispatch consumes rewards Vec[N]. The
+    // GpuFullPipeline carries its own Hebbian instance.
     #[cfg(feature = "gpu")]
-    let use_gpu_hebbian = gpu_state.is_some() || gpu_full.is_some();
+    let use_gpu_hebbian = gpu_full.is_some();
     #[cfg(not(feature = "gpu"))]
     let use_gpu_hebbian = false;
 
@@ -376,9 +374,7 @@ pub(crate) fn cell_eats_food(
     // `compute_persistent`. The GPU hebbian_step pass (run per-tick from
     // `apply_eligibility_step`) has been decaying + accumulating
     // `cells.brain_traces`; this dispatch credits the recent motor
-    // pattern with `Δw = lr · reward · trace`. Legacy `compute_persistent`
-    // remains available for the GPU brain-only path (`gpu_state`) which
-    // doesn't carry traces.
+    // pattern with `Δw = lr · reward · trace`.
     #[cfg(feature = "gpu")]
     if let Some(mut gpu_full) = gpu_full {
         let n = slot_map.len();
@@ -388,12 +384,6 @@ pub(crate) fn cell_eats_food(
             pipeline
                 .hebbian
                 .dispatch_apply_reward_persistent(&pipeline.cells, n, LEARNING_RATE);
-        }
-    } else if let Some(gpu) = gpu_state {
-        let n = slot_map.len();
-        if n > 0 && rewards.iter().any(|&r| r > 0.0) {
-            gpu.cells.upload_rewards(&rewards);
-            gpu.hebbian.compute_persistent(&gpu.cells, n, LEARNING_RATE);
         }
     }
     let _ = rewards;

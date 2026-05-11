@@ -53,9 +53,9 @@ pub(crate) fn step_cells(
     });
 }
 
-/// Sprint 42: Brownův pohyb — gaussian perturbation na velocity.
-/// Sprint 52: pokud `GpuBrainState` Resource available, dispatch GPU brownian
-/// (xoshiro128++ per-cell). CPU fallback při absenci GPU.
+/// Brownian noise — gaussian velocity perturbation. Fused into
+/// `cells_brain_act_gpu_full` (motor → brownian → batch readback) so this
+/// system is a no-op when GpuFullPipeline is present (always after wave N).
 pub(crate) fn apply_brownian_motion(
     time: Res<Time>,
     extent: Res<WorldExtent>,
