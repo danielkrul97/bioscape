@@ -2500,14 +2500,13 @@ impl World {
         self.bonds_broken_gen += bonds_broken_this_tick;
     }
 
-    /// Wave H: GPU predation dispatch. Computes herd_counts + per-pair
-    /// energy/damage deltas in one shader pass and applies them to cells.
-    /// Pack-hunting CSV diagnostics (`bonded_attacks_gen` etc.) and
-    /// `predation_events_gen` are NOT computed on this path — the shader
-    /// doesn't emit per-event tuples. Extending `predate.wgsl` with an
-    /// atomic event buffer is follow-up work.
-    #[cfg(feature = "gpu")]
-    fn predate_gpu(&mut self) {
+    /// Predation dispatch — computes herd_counts + per-pair energy/damage
+    /// deltas in a single GPU pass and applies them to cells. Pack-hunting
+    /// CSV diagnostics (`bonded_attacks_gen` etc.) stay zero because the
+    /// shader doesn't emit per-event tuples; only the global
+    /// `predation_events_gen` counter is tracked via predate.wgsl's atomic
+    /// `event_count` binding.
+    fn predate(&mut self) {
         let n = self.cells.len();
         if n == 0 {
             return;
@@ -2583,176 +2582,6 @@ impl World {
         self.predation_events_gen += result.total_events as u64;
     }
 
-    fn predate(&mut self) {
-        #[cfg(feature = "gpu")]
-        if self.gpu_full.is_some() {
-            self.predate_gpu();
-            return;
-        }
-        // Sprint 43: cell_grid build (sdílený s brain_act ale tam refresh tickem
-        // později; rebuildujeme pro jistotu — pozice se mohly hnout v `step()`).
-        // Pass 1 (herd_counts): par_iter, write-only per i. Pass 2 (attack
-        // events): sekvenční, protože write na victim může kolidovat napříč
-        // attackers; grid lookup ale srazí cost na O(N·k).
-        let n = self.cells.len();
-        self.cell_grid.rebuild(
-            self.cells
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
-        );
-        self.energy_deltas_scratch.clear();
-        self.energy_deltas_scratch.resize(n, 0.0);
-        self.damage_deltas_scratch.clear();
-        self.damage_deltas_scratch.resize(n, 0.0);
-
-        let herd_r2 = HERD_RADIUS * HERD_RADIUS;
-        let cells = &self.cells;
-        let cell_grid = &self.cell_grid;
-        let pred_gain_mult = self.predation_gain_mult;
-        let pred_drain_mult = self.predation_drain_mult;
-        let herd_counts: Vec<u32> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let pos_i = cells[i].position;
-                let mut count = 0u32;
-                cell_grid.for_each_in_radius_toroidal(pos_i, HERD_RADIUS, WORLD_HALF, |id_j, pos_j, _| {
-                    if id_j == i {
-                        return;
-                    }
-                    let d = bioscape::min_image_delta(pos_i, pos_j, WORLD_HALF);
-                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if d2 < herd_r2 {
-                        count += 1;
-                    }
-                });
-                count
-            })
-            .collect();
-
-        // Sprint 57: paralelní attack candidate gathering. Pass 2a sbírá
-        // (i, j, gain) eventy bez sdílených writes; Pass 2b aggreguje sekvenčně
-        // do energy/damage scratch (řeší race na victim j shared mezi attackery).
-        // Spike attack cache built once per attacker — `spike_direction` etc.
-        // depend only on attacker pose + spikes, not on per-pair target.
-        let attack_events: Vec<(usize, usize, f32, f32)> = (0..n)
-            .into_par_iter()
-            .flat_map_iter(|i| {
-                let attack_signal = cells[i].last_outputs[6].max(0.0);
-                if attack_signal <= ATTACK_THRESHOLD {
-                    return Vec::new();
-                }
-                let pos_i = cells[i].position;
-                let radius_a = cells[i].phenotype.effective_radius();
-                let search_r =
-                    CELL_RADIUS * (radius_a + cells[i].phenotype.max_axis() * 2.0);
-                let spike_cache = cells[i].build_spike_attack_cache();
-                let mut local: Vec<(usize, usize, f32, f32)> = Vec::new();
-                cell_grid.for_each_in_radius_toroidal(
-                    pos_i,
-                    search_r,
-                    WORLD_HALF,
-                    |j, pos_j, radius_b| {
-                        if j == i {
-                            return;
-                        }
-                        if radius_a < SIZE_RATIO_THRESHOLD * radius_b {
-                            return;
-                        }
-                        let pair_r = CELL_RADIUS * (radius_a + radius_b);
-                        let pair_r2 = pair_r * pair_r;
-                        let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
-                        let d2 = d_vec[0] * d_vec[0]
-                            + d_vec[1] * d_vec[1]
-                            + d_vec[2] * d_vec[2];
-                        if d2 < pair_r2 {
-                            let mut gain = PREDATION_GAIN_PER_TICK;
-                            // Sprint 122: multi-spike per-spike cone test +
-                            // complexity multiplikátor (S123 zapne complexity).
-                            gain += cells[i].spike_bonus_against_cached(pos_j, &spike_cache);
-                            let dilution = 1.0 / (1.0 + DILUTION_K * herd_counts[j] as f32);
-                            // Sprint 69: bonded prey takes less damage + yields
-                            // less energy. Group-defense benefit činí bondování
-                            // evolučně positive (Sprint 67.1 ukázal opak bez něj).
-                            let defense = bioscape::bond_defense_factor(cells[j].n_bonds());
-                            gain *= dilution * defense * pred_gain_mult;
-                            local.push((i, j, gain, defense));
-                        }
-                    },
-                );
-                local
-            })
-            .collect();
-
-        // Pack-hunting metrics: per-victim attacker grouping + bonded vs solo
-        // per-attack gain. Done before energy mutation tak, aby `cells` shared
-        // borrow zůstal platný.
-        let mut by_victim: rustc_hash::FxHashMap<usize, Vec<usize>> = rustc_hash::FxHashMap::default();
-        let mut tick_bonded_n = 0u64;
-        let mut tick_solo_n = 0u64;
-        let mut tick_bonded_gain = 0.0_f64;
-        let mut tick_solo_gain = 0.0_f64;
-        for (i, j, gain, _) in &attack_events {
-            by_victim.entry(*j).or_default().push(*i);
-            if cells[*i].n_bonds() >= 1 {
-                tick_bonded_n += 1;
-                tick_bonded_gain += *gain as f64;
-            } else {
-                tick_solo_n += 1;
-                tick_solo_gain += *gain as f64;
-            }
-        }
-        let tick_victims = by_victim.len() as u64;
-        let mut tick_swarm = 0u64;
-        let mut tick_pack = 0u64;
-        for atks in by_victim.values() {
-            let mut uniq: Vec<usize> = atks.clone();
-            uniq.sort_unstable();
-            uniq.dedup();
-            if uniq.len() < 2 {
-                continue;
-            }
-            tick_swarm += 1;
-            let bonded_pair = (0..uniq.len()).any(|a| {
-                let id_a = cells[uniq[a]].cell_id;
-                uniq[a + 1..].iter().any(|&b| {
-                    cells[b]
-                        .bonds
-                        .iter()
-                        .any(|opt| opt.is_some_and(|bond| bond.other_cell_id == id_a))
-                })
-            });
-            if bonded_pair {
-                tick_pack += 1;
-            }
-        }
-        self.bonded_attacks_gen += tick_bonded_n;
-        self.solo_attacks_gen += tick_solo_n;
-        self.bonded_attack_gain_sum_gen += tick_bonded_gain;
-        self.solo_attack_gain_sum_gen += tick_solo_gain;
-        self.swarm_attacks_gen += tick_swarm;
-        self.pack_attacks_gen += tick_pack;
-        self.attack_victims_gen += tick_victims;
-
-        let events: u64 = attack_events.len() as u64;
-        for (i, j, gain, defense) in attack_events {
-            self.energy_deltas_scratch[i] += gain;
-            // Sprint 69: defense škáluje i drain + damage (consistent s gain).
-            let drain = PREDATION_DRAIN_PER_TICK * defense * pred_drain_mult;
-            self.energy_deltas_scratch[j] -= drain;
-            self.damage_deltas_scratch[j] += drain;
-        }
-        self.predation_events_gen += events;
-        for ((cell, energy_delta), dmg_delta) in self
-            .cells
-            .iter_mut()
-            .zip(self.energy_deltas_scratch.iter())
-            .zip(self.damage_deltas_scratch.iter())
-        {
-            cell.energy += energy_delta;
-            cell.damage_accum += dmg_delta;
-        }
-    }
 
     fn eat_food(&mut self) {
         // Sprint 43: food_grid lookup místo full sweep.
@@ -2950,12 +2779,11 @@ impl World {
         let _ = rewards;
     }
 
-    /// Wave J: GPU rejection sampling. Generates K = budget × MAX_SPAWN_ATTEMPTS
+    /// GPU rejection sampling — generates K = budget × MAX_SPAWN_ATTEMPTS
     /// candidates in parallel, CPU pushes the first `budget` valid ones into
     /// `self.foods`. Variable allocation stays CPU-side; GPU only does the
     /// rejection work (world_map richness + obstacle mask + cell exclusion).
-    #[cfg(feature = "gpu")]
-    fn spawn_food_gpu(&mut self, rng: &mut impl Rng, budget: usize) {
+    fn spawn_food_dispatch(&mut self, rng: &mut impl Rng, budget: usize) {
         if budget == 0 {
             return;
         }
@@ -3024,60 +2852,9 @@ impl World {
             return;
         }
         let to_spawn = (target - self.foods.len()).min(FOOD_SPAWN_RATE);
-        #[cfg(feature = "gpu")]
-        if self.gpu_full.is_some() {
-            self.spawn_food_gpu(rng, to_spawn);
-            return;
-        }
-        // Sprint 43: cell_grid pro exclusion check. Rebuild reuses bucket vec
-        // capacities; inner loop místo O(N) full sweep dělá O(k) per candidate.
-        // Bound search radius na EAT_RADIUS × MAX_BODY_LENGTH (max_axis nemůže
-        // přesáhnout MAX_BODY_LENGTH).
-        self.cell_grid.rebuild(
-            self.cells
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
-        );
-        let max_search_r = EAT_RADIUS * bioscape::MAX_BODY_LENGTH;
-        let obstacles = self.obstacles.as_ref();
-        'spawn: for _ in 0..to_spawn {
-            for _ in 0..MAX_SPAWN_ATTEMPTS {
-                let candidate = Food::random(rng, WORLD_HALF);
-                let richness = self
-                    .map
-                    .sample([candidate.position[0], candidate.position[1], 0.0]);
-                if reject_food_for_richness(rng, richness) {
-                    continue;
-                }
-                if let Some(field) = obstacles {
-                    if field.sample(candidate.position) {
-                        continue;
-                    }
-                }
-                let mut blocked = false;
-                self.cell_grid.for_each_in_radius_toroidal(
-                    candidate.position,
-                    max_search_r,
-                    WORLD_HALF,
-                    |id, cell_pos, _r| {
-                        if blocked {
-                            return;
-                        }
-                        let exclusion = EAT_RADIUS * self.cells[id].phenotype.max_axis();
-                        let d = bioscape::min_image_delta(candidate.position, cell_pos, WORLD_HALF);
-                        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < exclusion * exclusion {
-                            blocked = true;
-                        }
-                    },
-                );
-                if !blocked {
-                    self.foods.push(candidate);
-                    continue 'spawn;
-                }
-            }
-        }
+        self.spawn_food_dispatch(rng, to_spawn);
     }
+
 
     /// Sync `Genome.brain` for every cell from the persistent GPU buffer
     /// back to CPU. In `--gpu-full + GPU CPPN` mode child brains are produced
