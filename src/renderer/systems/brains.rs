@@ -23,11 +23,30 @@ use super::super::resources_gpu::{GpuBrainState, GpuFullPipeline};
 /// reward event (eat / predation / novelty) fires. Always-on, independent
 /// of maze toggle. Runs every tick so SIMD pressure matters — the
 /// per-cell `Brain::hebbian_step` body is a hot path.
+///
+/// Wave 7: when `GpuFullPipeline` is active, the equivalent shader
+/// (`hebbian_step.wgsl`) runs on-device against `cells.brain_traces`.
+/// Skip the CPU pass to avoid double-decay; CPU `genome.brain.trace_w*`
+/// stays stale until next-gen sync.
 pub(crate) fn apply_eligibility_step(
     time: Res<Time>,
     mut cells: Query<&mut CellEntity, Without<Dying>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<super::super::resources_gpu::GpuFullPipeline>>,
 ) {
     let dt = time.delta_secs();
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu) = gpu_full {
+        let n = cells.iter().count();
+        if n > 0 {
+            gpu.hebbian.dispatch_step_persistent(
+                &gpu.cells,
+                n,
+                dt,
+                bioscape::HEBBIAN_TRACE_DECAY_PER_SEC,
+            );
+        }
+        return;
+    }
     cells.par_iter_mut().for_each(|mut cell| {
         let last_inputs = cell.0.last_inputs;
         let last_hidden = cell.0.last_hidden;
@@ -54,10 +73,41 @@ pub(crate) fn apply_eligibility_step(
 /// 2 trade-off; Wave 3 brings GPU novelty hook.
 pub(crate) fn apply_episodic_novelty(
     extent: Res<super::super::resources::WorldExtent>,
-    mut cells: Query<&mut CellEntity, Without<Dying>>,
+    mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
+    #[cfg(feature = "gpu")] slot_map: Res<super::super::resources::CellSlotMap>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<super::super::resources_gpu::GpuFullPipeline>>,
+    #[cfg(feature = "gpu")] mut novelty_rewards_scratch: Local<Vec<f32>>,
 ) {
     let half = extent.as_array();
-    cells.par_iter_mut().for_each(|mut cell| {
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu) = gpu_full {
+        let n = slot_map.len();
+        if n == 0 {
+            return;
+        }
+        novelty_rewards_scratch.clear();
+        novelty_rewards_scratch.resize(n, 0.0);
+        let mut any = false;
+        for (entity, mut cell) in &mut cells {
+            let Some(slot) = slot_map.slot_of(entity) else {
+                continue;
+            };
+            let v = bioscape::Cell::novelty_voxel_index(cell.0.position, half);
+            if cell.0.check_novelty(v) {
+                novelty_rewards_scratch[slot] = bioscape::NOVELTY_REWARD_MAGNITUDE;
+                any = true;
+            }
+        }
+        if any {
+            let pipeline = &mut *gpu;
+            pipeline.cells.upload_rewards(&novelty_rewards_scratch);
+            pipeline
+                .hebbian
+                .dispatch_apply_reward_persistent(&pipeline.cells, n, bioscape::LEARNING_RATE);
+        }
+        return;
+    }
+    cells.par_iter_mut().for_each(|(_entity, mut cell)| {
         let v = bioscape::Cell::novelty_voxel_index(cell.0.position, half);
         if !cell.0.check_novelty(v) {
             return;

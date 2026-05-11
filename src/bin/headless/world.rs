@@ -750,7 +750,27 @@ impl World {
         timed!(brain_act, self.run_brain_act(dt));
         // Wave 3: per-tick eligibility-trace decay+accumulate — runs once
         // brain_act has populated this tick's last_inputs/last_hidden/last_outputs.
-        self.apply_eligibility_step(dt);
+        // Wave 7: GPU full pipeline runs the equivalent on-device, mutating
+        // `cells.brain_traces` in place. Skip CPU pass to avoid double-decay
+        // and to keep per-cell `genome.brain.trace_w*` matching the GPU
+        // until next-gen sync (`sync_brains_from_gpu`).
+        #[cfg(feature = "gpu")]
+        let skip_cpu_eligibility = self.gpu_full.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let skip_cpu_eligibility = false;
+        if !skip_cpu_eligibility {
+            self.apply_eligibility_step(dt);
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_full.as_ref() {
+            let n = self.cells.len();
+            gpu.hebbian.dispatch_step_persistent(
+                &gpu.cells,
+                n,
+                dt,
+                bioscape::HEBBIAN_TRACE_DECAY_PER_SEC,
+            );
+        }
         timed!(emit_pheromones, self.emit_pheromones(dt));
         timed!(apply_morph, self.apply_morph(dt));
         timed!(apply_brownian, self.apply_brownian(rng, dt));
@@ -1876,9 +1896,35 @@ impl World {
     /// (Wave 3 — was instantaneous pre·post in Wave 2). Encourages
     /// exploration; trace-based reward credits the action that placed the
     /// cell here even if it was several ticks back.
+    ///
+    /// Wave 7: in `--gpu-full` mode the CPU brain mutation is a no-op
+    /// (CPU brain is stale shadow), so we instead pack novelty rewards
+    /// into a per-cell vector and route them through the GPU trace-based
+    /// reward dispatch. CPU and GPU paths now both credit novelty against
+    /// the same eligibility trace.
     pub fn apply_episodic_novelty(&mut self) {
         use bioscape::{LEARNING_RATE, NOVELTY_REWARD_MAGNITUDE};
         let half = WORLD_HALF;
+        #[cfg(feature = "gpu")]
+        if self.gpu_full.is_some() {
+            // Decide novelty per cell first (read-only on cell state); then
+            // apply rewards via the GPU dispatch in one pass.
+            let mut rewards: Vec<f32> = vec![0.0; self.cells.len()];
+            for (i, cell) in self.cells.iter_mut().enumerate() {
+                let v = Cell::novelty_voxel_index(cell.position, half);
+                if cell.check_novelty(v) {
+                    rewards[i] = NOVELTY_REWARD_MAGNITUDE;
+                }
+            }
+            if rewards.iter().any(|&r| r != 0.0) {
+                let n = self.cells.len();
+                let gpu = self.gpu_full.as_ref().unwrap();
+                gpu.cells.upload_rewards(&rewards);
+                gpu.hebbian
+                    .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+            }
+            return;
+        }
         self.cells.par_iter_mut().for_each(|cell| {
             let v = Cell::novelty_voxel_index(cell.position, half);
             if !cell.check_novelty(v) {
@@ -2662,15 +2708,17 @@ impl World {
             }
         }
 
-        // Sprint 51: GPU Hebbian dispatch — mutuje brain weights na GPU
-        // in-place. CPU `cell.genome.brain` se NE-aktualizuje; sync se dělá
-        // až v `reproduce` fázi přes `download_brain_at`.
+        // Wave 7: trace-based reward apply replaces the legacy instantaneous
+        // `compute_persistent`. Mutates GPU brain_weights using the trace
+        // shadow that `dispatch_step_persistent` has been decaying+
+        // accumulating since the last reward event. CPU `cell.genome.brain`
+        // is NOT updated; sync happens at `reproduce` via `download_brain_at`.
         #[cfg(feature = "gpu")]
         if use_gpu_hebbian {
             let n = self.cells.len();
             let gpu = self.gpu_full.as_ref().unwrap();
             gpu.cells.upload_rewards(&rewards);
-            gpu.hebbian.compute_persistent(&gpu.cells, n, LEARNING_RATE);
+            gpu.hebbian.dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
         }
         let _ = rewards;
     }

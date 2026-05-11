@@ -372,6 +372,13 @@ pub(crate) fn cell_eats_food(
         commands.entity(*food_e).despawn();
     }
 
+    // Wave 7: trace-based reward apply replaces the legacy instantaneous
+    // `compute_persistent`. The GPU hebbian_step pass (run per-tick from
+    // `apply_eligibility_step`) has been decaying + accumulating
+    // `cells.brain_traces`; this dispatch credits the recent motor
+    // pattern with `Δw = lr · reward · trace`. Legacy `compute_persistent`
+    // remains available for the GPU brain-only path (`gpu_state`) which
+    // doesn't carry traces.
     #[cfg(feature = "gpu")]
     if let Some(mut gpu_full) = gpu_full {
         let n = slot_map.len();
@@ -380,7 +387,7 @@ pub(crate) fn cell_eats_food(
             pipeline.cells.upload_rewards(rewards);
             pipeline
                 .hebbian
-                .compute_persistent(&pipeline.cells, n, LEARNING_RATE);
+                .dispatch_apply_reward_persistent(&pipeline.cells, n, LEARNING_RATE);
         }
     } else if let Some(gpu) = gpu_state {
         let n = slot_map.len();

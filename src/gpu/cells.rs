@@ -37,6 +37,12 @@ pub struct CellsGpu {
     last_hidden_buf: wgpu::Buffer,
     last_outputs_buf: wgpu::Buffer,
     brain_weights_buf: wgpu::Buffer,
+    /// Wave 7: per-cell eligibility-trace shadow, parallel to
+    /// `brain_weights_buf`. Same `BRAIN_WEIGHTS_PER_CELL` stride; w1/w2
+    /// regions are decayed+accumulated each tick by `hebbian_step.wgsl`,
+    /// b1/b2 slots stay at zero (biases ride on activations at reward time).
+    /// Initialized to zero so first step starts clean.
+    brain_traces_buf: wgpu::Buffer,
     velocities_buf: wgpu::Buffer,
     xoshiro_state_buf: wgpu::Buffer,
     rewards_buf: wgpu::Buffer,
@@ -114,6 +120,20 @@ impl CellsGpu {
         let last_hidden_buf = mk("cells-last-hidden", n * (BRAIN_HIDDEN as u64) * f, stor_dst_src);
         let last_outputs_buf = mk("cells-last-outputs", n * (BRAIN_OUTPUTS as u64) * f, stor_dst_src);
         let brain_weights_buf = mk("cells-brain-weights", n * (BRAIN_WEIGHTS_PER_CELL as u64) * f, stor_dst_src);
+        // Wave 7: per-cell eligibility-trace shadow buffer, parallel to
+        // brain_weights. Same WEIGHTS_PER_CELL stride; only the w1 / w2
+        // sub-regions are actively updated by `hebbian_step.wgsl` (bias
+        // slots are written zero on init and never touched). Initial value
+        // is zero everywhere — `cells_buffer_init_zero` sets that on
+        // allocation by virtue of `mk`'s zeroed default.
+        let brain_traces_buf = mk("cells-brain-traces", n * (BRAIN_WEIGHTS_PER_CELL as u64) * f, stor_dst_src);
+        // Zero the trace buffer explicitly so the first hebbian_step starts
+        // from a clean state (initial decay·0 + pre·post = pre·post).
+        queue.write_buffer(
+            &brain_traces_buf,
+            0,
+            &vec![0u8; (n * (BRAIN_WEIGHTS_PER_CELL as u64) * f) as usize],
+        );
         let velocities_buf = mk("cells-velocities", n * 3 * f, stor_dst_src);
         let xoshiro_state_buf = mk("cells-xoshiro", n * 4 * 4, stor_dst_src);
         let rewards_buf = mk(
@@ -177,6 +197,7 @@ impl CellsGpu {
             last_hidden_buf,
             last_outputs_buf,
             brain_weights_buf,
+            brain_traces_buf,
             velocities_buf,
             xoshiro_state_buf,
             rewards_buf,
@@ -232,6 +253,8 @@ impl CellsGpu {
     pub fn last_hidden_buffer(&self) -> &wgpu::Buffer { &self.last_hidden_buf }
     pub fn last_outputs_buffer(&self) -> &wgpu::Buffer { &self.last_outputs_buf }
     pub fn brain_weights_buffer(&self) -> &wgpu::Buffer { &self.brain_weights_buf }
+    /// Wave 7: per-cell eligibility-trace buffer (parallel to brain weights).
+    pub fn brain_traces_buffer(&self) -> &wgpu::Buffer { &self.brain_traces_buf }
     pub fn velocities_buffer(&self) -> &wgpu::Buffer { &self.velocities_buf }
     pub fn xoshiro_state_buffer(&self) -> &wgpu::Buffer { &self.xoshiro_state_buf }
     pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
