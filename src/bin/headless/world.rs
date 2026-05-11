@@ -880,29 +880,11 @@ impl World {
         }
     }
 
-    fn apply_brownian(&mut self, _rng: &mut impl Rng, dt: f32) {
-        #[cfg(feature = "gpu")]
-        {
-            // Sprint 62: brownian je fused do `brain_act_gpu_full` pipeline
-            // (motor → brownian → batch readback). Tato fáze je v `--gpu-full`
-            // no-op aby se neaplikoval brownian dvakrát.
-            if self.gpu_full.is_some() {
-                let _ = dt;
-                return;
-            }
-        }
-        self.apply_brownian_cpu(dt);
-    }
-
-    fn apply_brownian_cpu(&mut self, dt: f32) {
-        // Per-cell xoshiro128++ stream — sjednoceno s GPU shaderem. Pop
-        // is small enough that sequential iteration outperforms a rayon
-        // par_iter_mut spawn overhead at typical N (≤1500 cells, ~10 µs
-        // per loop).
-        let sqrt_dt = dt.sqrt();
-        for cell in &mut self.cells {
-            cell.apply_brownian(sqrt_dt, WORLD_HALF[2]);
-        }
+    fn apply_brownian(&mut self, _rng: &mut impl Rng, _dt: f32) {
+        // Brownian noise is fused into `brain_act_gpu_full` (motor →
+        // brownian → batch readback). This phase is a no-op on the
+        // mandatory GPU path; kept as a tick-loop call site so per-phase
+        // bench_timings stays comparable across versions.
     }
 
     /// Sprint 51: GPU brownian s xoshiro128++ per-cell RNG. Upload velocities,
@@ -934,135 +916,60 @@ impl World {
     }
 
     fn update_smell(&mut self, dt: f32) {
-        // Sprint 60: deposit + diffuse na GPU bez readback. Sensor shader
-        // (SensorGatherGpu) čte field grid přes storage buffer binding
-        // (FieldGpu::current_grid_buffer) — žádná CPU SmellField sync.
-        #[cfg(feature = "gpu")]
-        if let Some(gpu) = self.gpu_full.as_mut() {
-            for food in &self.foods {
-                gpu.smell.add_source(
-                    [food.position[0], food.position[1], food.position[2]],
-                    SMELL_PER_FOOD * dt,
-                );
-            }
-            gpu.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
-            return;
-        }
+        // Deposit + diffuse on GPU without readback. Sensor shader reads
+        // FieldGpu.current_grid_buffer directly — no CPU SmellField sync.
+        let gpu = self.gpu_full.as_mut().expect("gpu_full mandatory");
         for food in &self.foods {
-            self.smell
-                .add_source([food.position[0], food.position[1], food.position[2]], SMELL_PER_FOOD * dt);
+            gpu.smell.add_source(
+                [food.position[0], food.position[1], food.position[2]],
+                SMELL_PER_FOOD * dt,
+            );
         }
-        match self.smell_mask.as_deref() {
-            Some(mask) => self.smell.step_masked(SMELL_DIFFUSION, SMELL_DECAY, dt, mask),
-            None => self.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt),
-        }
+        gpu.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
     }
 
     fn update_pheromone(&mut self, dt: f32) {
-        // Diffuse + decay BEFORE this tick's emissions are added (in
-        // emit_pheromones, called after brain_act). Cells thus read the
-        // gradient ze stavu pole na předchozí tick — prevents instant
-        // self-feedback (cell vidí svůj vlastní právě emitovaný puff).
-        // Sprint 126: per-channel decay/diffusion. ch0 GPU step (single
-        // FieldGpu instance), ch1/ch2 vždy CPU.
-        #[cfg(feature = "gpu")]
-        if let Some(gpu) = self.gpu_full.as_mut() {
-            gpu.pheromone.step(PHEROMONE_DIFFUSION_PER_CH[0], PHEROMONE_DECAY_PER_CH[0], dt);
-            gpu.pheromone_ch1.step(
-                PHEROMONE_DIFFUSION_PER_CH[1],
-                PHEROMONE_DECAY_PER_CH[1],
-                dt,
-            );
-            gpu.pheromone_ch2.step(
-                PHEROMONE_DIFFUSION_PER_CH[2],
-                PHEROMONE_DECAY_PER_CH[2],
-                dt,
-            );
-            return;
-        }
-        for ch in 0..N_PHEROMONE_CHANNELS {
-            match self.pheromone_masks[ch].as_deref() {
-                Some(mask) => self.pheromone_fields[ch].step_masked(
-                    PHEROMONE_DIFFUSION_PER_CH[ch],
-                    PHEROMONE_DECAY_PER_CH[ch],
-                    dt,
-                    mask,
-                ),
-                None => self.pheromone_fields[ch].step(
-                    PHEROMONE_DIFFUSION_PER_CH[ch],
-                    PHEROMONE_DECAY_PER_CH[ch],
-                    dt,
-                ),
-            }
-        }
+        // Diffuse + decay BEFORE this tick's emissions (added in
+        // emit_pheromones, called after brain_act) so cells read the
+        // previous-tick gradient — prevents instant self-feedback.
+        // All 3 channels step independently on GPU (Wave L); CPU mirror
+        // fields stay out-of-date until checkpoint readback.
+        let gpu = self.gpu_full.as_mut().expect("gpu_full mandatory");
+        gpu.pheromone.step(PHEROMONE_DIFFUSION_PER_CH[0], PHEROMONE_DECAY_PER_CH[0], dt);
+        gpu.pheromone_ch1.step(
+            PHEROMONE_DIFFUSION_PER_CH[1],
+            PHEROMONE_DECAY_PER_CH[1],
+            dt,
+        );
+        gpu.pheromone_ch2.step(
+            PHEROMONE_DIFFUSION_PER_CH[2],
+            PHEROMONE_DECAY_PER_CH[2],
+            dt,
+        );
     }
 
     fn update_vibration(&mut self, dt: f32) {
         // Deposit each cell's motion-driven emission, then diffuse + decay
-        // BEFORE this tick's brain_act samples the gradient. Brain therefore
-        // sees a propagated field that already reflects this tick's motion —
-        // same one-tick model would also work, but we want vibrations to
-        // feel immediate (cells reacting to "right now" stir).
-        #[cfg(feature = "gpu")]
-        if let Some(gpu) = self.gpu_full.as_mut() {
-            for cell in &self.cells {
-                let emit = bioscape::vibration_emit_for_cell(cell);
-                if emit > 0.0 {
-                    gpu.vibration.add_source(cell.position, emit * dt);
-                }
-            }
-            gpu.vibration.step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt);
-            return;
-        }
+        // BEFORE this tick's brain_act samples the gradient. Brain reads
+        // a propagated field that already reflects this tick's motion.
+        let gpu = self.gpu_full.as_mut().expect("gpu_full mandatory");
         for cell in &self.cells {
             let emit = bioscape::vibration_emit_for_cell(cell);
             if emit > 0.0 {
-                self.vibration.add_source(cell.position, emit * dt);
+                gpu.vibration.add_source(cell.position, emit * dt);
             }
         }
-        match self.vibration_mask.as_deref() {
-            Some(mask) => {
-                self.vibration
-                    .step_masked(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt, mask)
-            }
-            None => self.vibration.step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt),
-        }
+        gpu.vibration.step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt);
     }
 
     fn emit_pheromones(&mut self, dt: f32) {
-        // Sprint 126: per-channel emission. Brain output sloty:
+        // Per-channel emission. Brain output slot map:
         //   [2]  = ch0 (slow, mating-friendly)
         //   [10] = ch1 (medium decay)
         //   [11] = ch2 (fast decay, bursty / temporal patterning)
-        // Cost = sum všech positive emisí × PHEROMONE_COST_PER_RATE.
+        // Cost = sum of positive emissions × PHEROMONE_COST_PER_RATE.
         const EMIT_SLOTS: [usize; N_PHEROMONE_CHANNELS] = [2, 10, 11];
-
-        #[cfg(feature = "gpu")]
-        if let Some(gpu) = self.gpu_full.as_mut() {
-            for cell in &mut self.cells {
-                let pos = [cell.position[0], cell.position[1], cell.position[2]];
-                let mut total_emit = 0.0_f32;
-                let mut emits = [0.0_f32; N_PHEROMONE_CHANNELS];
-                for ch in 0..N_PHEROMONE_CHANNELS {
-                    let mod_strength = cell.last_outputs[EMIT_SLOTS[ch]].max(0.0);
-                    let brain_emit = PHEROMONE_BRAIN_MOD * mod_strength;
-                    emits[ch] = brain_emit;
-                    total_emit += brain_emit;
-                    let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
-                    match ch {
-                        0 => gpu.pheromone.add_source(pos, rate * dt),
-                        1 => gpu.pheromone_ch1.add_source(pos, rate * dt),
-                        _ => gpu.pheromone_ch2.add_source(pos, rate * dt),
-                    }
-                    let prev = cell.last_emit[ch];
-                    let delta = brain_emit - prev;
-                    cell.burst_accum[ch] += delta * delta;
-                }
-                cell.last_emit = emits;
-                cell.energy -= PHEROMONE_COST_PER_RATE * total_emit * dt;
-            }
-            return;
-        }
+        let gpu = self.gpu_full.as_mut().expect("gpu_full mandatory");
         for cell in &mut self.cells {
             let pos = [cell.position[0], cell.position[1], cell.position[2]];
             let mut total_emit = 0.0_f32;
@@ -1073,7 +980,11 @@ impl World {
                 emits[ch] = brain_emit;
                 total_emit += brain_emit;
                 let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
-                self.pheromone_fields[ch].add_source(pos, rate * dt);
+                match ch {
+                    0 => gpu.pheromone.add_source(pos, rate * dt),
+                    1 => gpu.pheromone_ch1.add_source(pos, rate * dt),
+                    _ => gpu.pheromone_ch2.add_source(pos, rate * dt),
+                }
                 let prev = cell.last_emit[ch];
                 let delta = brain_emit - prev;
                 cell.burst_accum[ch] += delta * delta;
