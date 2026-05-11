@@ -35,11 +35,11 @@ use world::*;
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     // Sprint 44: `--gpu` flag (filtered před positional parsingem). Bez
-    // `--features gpu` se flag tiše ignoruje.
-    // Sprint 51: `--gpu-full` flag — persistent brain weights + GPU Hebbian +
-    // GPU Brownian. Implies --gpu (brain forward na GPU).
-    let want_gpu_full = raw_args.iter().any(|a| a == "--gpu-full");
-    let want_gpu = want_gpu_full || raw_args.iter().any(|a| a == "--gpu");
+    // Wave N: GPU full pipeline is mandatory (no `--gpu-full` opt-in, no
+    // CPU fallback). The `--gpu-full` / `--gpu` flags are still accepted for
+    // backward compatibility with scripts but have no effect — both paths
+    // are always enabled.
+    let _ = raw_args.iter().any(|a| a == "--gpu-full" || a == "--gpu");
     // Sprint 48: `--save=PATH` / `--load=PATH` checkpoint flags. Form
     // `--key=value` aby se PATH ne-leakoval do positional indexingu.
     let save_path: Option<String> = raw_args
@@ -107,9 +107,9 @@ fn main() {
             None
         }
     });
-    if maze_difficulty.is_some() && want_gpu {
+    if maze_difficulty.is_some() {
         eprintln!(
-            "info: --maze + --gpu (Wave 7): full GPU parity — step wall collision, FieldGpu masked diffusion, sensor_gather LOS + whisker raycast, and hebbian eligibility traces (per-tick decay+accumulate + on-event trace-based reward apply) all run on-device."
+            "info: --maze (Wave 7): full GPU parity — step wall collision, FieldGpu masked diffusion, sensor_gather LOS + whisker raycast, and hebbian eligibility traces (per-tick decay+accumulate + on-event trace-based reward apply) all run on-device."
         );
     }
     // Wave 3 curriculum ramp: --maze-stages=easy:50,medium:100,hard
@@ -147,9 +147,9 @@ fn main() {
             out
         })
         .unwrap_or_default();
-    if !maze_stages.is_empty() && want_gpu {
+    if !maze_stages.is_empty() {
         eprintln!(
-            "info: --maze-stages + --gpu — same caveat as --maze + --gpu (see startup info)."
+            "info: --maze-stages — same caveat as --maze (see startup info)."
         );
     }
     let initial_maze_difficulty = if !maze_stages.is_empty() {
@@ -302,7 +302,7 @@ fn main() {
     }
 
     #[cfg(feature = "gpu")]
-    if want_gpu_full {
+    {
         let cap = initial_cells.max(max_population).max(64);
         // Sprint 59: FieldGpu sources capacity. Per-tick deposit count =
         // foods (smell) + cells (pheromone). food_target může bumpnout přes
@@ -487,25 +487,12 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("gpu-full: init failed ({e}); fallback to CPU");
+                // Wave N: no CPU fallback. GPU is the only compute path —
+                // if init fails the run can't proceed.
+                eprintln!("gpu-full: init failed: {e}");
+                std::process::exit(1);
             }
         }
-    }
-    #[cfg(feature = "gpu")]
-    if want_gpu && !want_gpu_full && world.gpu_full.is_none() {
-        match BrainGpu::new(initial_cells.max(64)) {
-            Ok(g) => {
-                eprintln!("gpu: BrainGpu initialized (capacity {})", initial_cells.max(64));
-                world.gpu = Some(g);
-            }
-            Err(e) => {
-                eprintln!("gpu: init failed ({e}); falling back to CPU");
-            }
-        }
-    }
-    #[cfg(not(feature = "gpu"))]
-    if want_gpu {
-        eprintln!("gpu: --gpu / --gpu-full requested but binary built without --features gpu");
     }
 
     let file = std::fs::File::create(&out_path).expect("can't create output file");
