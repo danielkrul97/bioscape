@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use super::super::components::{CellEntity, Dying, FoodEntity};
 use super::super::config::DIAG_BRAIN_ACT;
-use super::super::resources::{CellSlotMap, Clock, CoopFoodResource, WorldExtent};
+use super::super::resources::{CellSlotMap, Clock, CoopFoodResource, MazeWorld, WorldExtent};
 use super::super::resources_gpu::GpuFullPipeline;
 
 /// Full GPU pipeline brain_act: zrcadlí headless `brain_act_gpu_full`.
@@ -35,6 +35,7 @@ pub(crate) fn cells_brain_act_gpu_full(
     fixed_time: Res<Time<Fixed>>,
     clock: Res<Clock>,
     extent: Res<WorldExtent>,
+    maze: Res<MazeWorld>,
     mut diag: Diagnostics,
 ) {
     let t_total = Instant::now();
@@ -254,9 +255,19 @@ pub(crate) fn cells_brain_act_gpu_full(
         thermal_seasonal_phase: (clock.0.generation % CYCLE_GEN_PERIOD) as f32
             / CYCLE_GEN_PERIOD as f32,
         thermal_log2_q10: bioscape::THERMAL_Q10.log2(),
-        _pad_b0: 0,
-        _pad_b1: 0,
-        _pad_b2: 0,
+        // Wave 4: maze fields. Mask uploaded once when MazeWorld toggle
+        // flipped on (input.rs::toggle_maze_world).
+        maze_active: if maze.is_active() { 1 } else { 0 },
+        maze_res_x: maze
+            .field
+            .as_ref()
+            .map(|f| f.resolution[0] as u32)
+            .unwrap_or(0),
+        maze_res_y: maze
+            .field
+            .as_ref()
+            .map(|f| f.resolution[1] as u32)
+            .unwrap_or(0),
     };
 
     let mut encoder = pipeline

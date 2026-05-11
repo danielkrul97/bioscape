@@ -109,9 +109,8 @@ fn main() {
     });
     if maze_difficulty.is_some() && want_gpu {
         eprintln!(
-            "error: --maze and --gpu/--gpu-full are mutually exclusive in Wave 1 (GPU shader parity for walls/LOS/diffusion-mask is deferred to Wave 2). Re-run without --gpu."
+            "warning: --maze + --gpu in Wave 4 mode: step.wgsl wall collision + FieldGpu masked diffusion are GPU-aware, but sensor_gather LOS, whisker raycast, and hebbian eligibility traces still run the GPU code path without maze awareness — cells will see through walls, whisker brain inputs read 0, and reward credit-assignment skips eligibility traces. Wave 5 brings full GPU parity."
         );
-        std::process::exit(2);
     }
     // Wave 3 curriculum ramp: --maze-stages=easy:50,medium:100,hard
     // Each segment is "difficulty:gens_in_segment". The final segment may omit
@@ -150,9 +149,8 @@ fn main() {
         .unwrap_or_default();
     if !maze_stages.is_empty() && want_gpu {
         eprintln!(
-            "error: --maze-stages and --gpu/--gpu-full are mutually exclusive (Wave 4 brings GPU shader parity)."
+            "warning: --maze-stages + --gpu — same caveat as --maze + --gpu (Wave 4 partial GPU parity, see startup warning)."
         );
-        std::process::exit(2);
     }
     let initial_maze_difficulty = if !maze_stages.is_empty() {
         Some(maze_stages[0].0)
@@ -401,6 +399,29 @@ fn main() {
                     cap, field_sources_cap
                 );
                 world.gpu_full = Some(state);
+                // Wave 4: upload maze masks once if obstacles already present
+                // at init time. Curriculum rebuilds re-upload via tick path.
+                if let Some(field) = world.obstacles.as_ref() {
+                    let packed = field.packed_for_gpu();
+                    let smell_mask =
+                        field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]);
+                    let phero_mask = field.mask_for_grid([
+                        PHEROMONE_GRID_RES,
+                        PHEROMONE_GRID_RES,
+                        PHEROMONE_GRID_RES_Z,
+                    ]);
+                    let vib_mask = field.mask_for_grid([
+                        bioscape::VIBRATION_GRID_RES,
+                        bioscape::VIBRATION_GRID_RES,
+                        bioscape::VIBRATION_GRID_RES_Z,
+                    ]);
+                    if let Some(gpu) = world.gpu_full.as_mut() {
+                        gpu.step.upload_maze(&packed);
+                        gpu.smell.upload_obstacle_mask(&smell_mask);
+                        gpu.pheromone.upload_obstacle_mask(&phero_mask);
+                        gpu.vibration.upload_obstacle_mask(&vib_mask);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("gpu-full: init failed ({e}); fallback to CPU");

@@ -28,12 +28,24 @@ struct Params {
     world_half_x: f32,
     world_half_y: f32,
     world_half_z: f32,
+    // Wave 4: when non-zero, the diffuse stencil treats voxels with
+    // `mask[idx] != 0u` as Neumann zero-flux walls — neighbour reads of
+    // masked cells substitute the center value (no flux through wall) and
+    // masked cells themselves write 0. Mirror of CPU `SmellField::step_masked`.
+    mask_active: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> sources: array<vec4<f32>>;          // xyz + amount
 @group(0) @binding(2) var<storage, read_write> grid_in: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> grid_out: array<atomic<u32>>;
+// Wave 4: per-voxel obstacle mask (binding 4). Same layout as `grid_in`.
+// Read-only; populated by `FieldGpu::upload_obstacle_mask`. Zeroed when no
+// maze is active so even with `mask_active = 0` the binding is well-defined.
+@group(0) @binding(4) var<storage, read> obstacle_mask: array<u32>;
 
 @compute @workgroup_size(64)
 fn deposit(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -84,6 +96,12 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let plane = nx * ny;
     let idx = k * plane + j * nx + i;
+    let masked = params.mask_active != 0u;
+    // Wave 4: masked center = wall — write 0 and skip the stencil entirely.
+    if (masked && obstacle_mask[idx] != 0u) {
+        atomicStore(&grid_out[idx], bitcast<u32>(0.0));
+        return;
+    }
     let center = bitcast<f32>(atomicLoad(&grid_in[idx]));
 
     // Branchless toroidal wrap on xy.
@@ -99,12 +117,35 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k_back  = select(k - 1u, 0u,      k == 0u);
     let k_front = select(k + 1u, nz - 1u, k + 1u == nz);
 
-    let left  = bitcast<f32>(atomicLoad(&grid_in[k * plane + j * nx + i_left]));
-    let right = bitcast<f32>(atomicLoad(&grid_in[k * plane + j * nx + i_right]));
-    let up    = bitcast<f32>(atomicLoad(&grid_in[k * plane + j_up * nx + i]));
-    let down  = bitcast<f32>(atomicLoad(&grid_in[k * plane + j_down * nx + i]));
-    let back  = bitcast<f32>(atomicLoad(&grid_in[k_back * plane + j * nx + i]));
-    let front = bitcast<f32>(atomicLoad(&grid_in[k_front * plane + j * nx + i]));
+    // Wave 4: when masked, neighbours that are walls fall back to `center`
+    // (Neumann zero-flux through the wall). `read_neighbor` keeps the
+    // hot-path branchless when no maze is active.
+    let idx_left  = k * plane + j * nx + i_left;
+    let idx_right = k * plane + j * nx + i_right;
+    let idx_up    = k * plane + j_up * nx + i;
+    let idx_down  = k * plane + j_down * nx + i;
+    let idx_back  = k_back * plane + j * nx + i;
+    let idx_front = k_front * plane + j * nx + i;
+    let raw_left  = bitcast<f32>(atomicLoad(&grid_in[idx_left]));
+    let raw_right = bitcast<f32>(atomicLoad(&grid_in[idx_right]));
+    let raw_up    = bitcast<f32>(atomicLoad(&grid_in[idx_up]));
+    let raw_down  = bitcast<f32>(atomicLoad(&grid_in[idx_down]));
+    let raw_back  = bitcast<f32>(atomicLoad(&grid_in[idx_back]));
+    let raw_front = bitcast<f32>(atomicLoad(&grid_in[idx_front]));
+    var left  = raw_left;
+    var right = raw_right;
+    var up    = raw_up;
+    var down  = raw_down;
+    var back  = raw_back;
+    var front = raw_front;
+    if (masked) {
+        if (obstacle_mask[idx_left]  != 0u) { left  = center; }
+        if (obstacle_mask[idx_right] != 0u) { right = center; }
+        if (obstacle_mask[idx_up]    != 0u) { up    = center; }
+        if (obstacle_mask[idx_down]  != 0u) { down  = center; }
+        if (obstacle_mask[idx_back]  != 0u) { back  = center; }
+        if (obstacle_mask[idx_front] != 0u) { front = center; }
+    }
 
     let new_val = center + params.diffusion * (left + right + up + down + back + front - 6.0 * center);
     atomicStore(&grid_out[idx], bitcast<u32>(new_val * params.decay));

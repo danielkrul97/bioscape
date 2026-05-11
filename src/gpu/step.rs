@@ -5,6 +5,11 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
+/// Wave 4: pre-allocated maze-mask buffer capacity (in u32 voxels). Sized
+/// so the largest expected `ObstacleField` (Hard mode ~65×37 = 2405) fits
+/// with headroom; current limit 8192.
+pub const MAZE_MASK_CAPACITY: usize = 8192;
+
 // GPU step — kinematics, drag, thermal-modulated energy drains, and world
 // bounce, per cell. Mirror of `Cell::step_with_climate`.
 
@@ -52,9 +57,16 @@ pub struct StepParamsGpu {
     /// `pow(q10, x)` with `exp2(x * thermal_log2_q10)` (one log2 saved per cell
     /// per tick). Callers must keep this in sync with `thermal_q10`.
     pub thermal_log2_q10: f32,
-    pub _pad_b0: u32,
-    pub _pad_b1: u32,
-    pub _pad_b2: u32,
+    /// Wave 4 maze fields. `maze_active != 0` enables the in-shader
+    /// collision_push pass that mirrors `Cell::apply_obstacle_collision`
+    /// (xy-only push out of occupied voxels, zero outward velocity). Voxel
+    /// resolution comes from the same `world_half_x/y`; the mask itself is
+    /// uploaded to binding 12 (see `StepGpu::upload_maze`). When inactive
+    /// the binding still resolves but the shader skips the entire block —
+    /// non-maze runs stay byte-identical to pre-Wave-4 behavior.
+    pub maze_active: u32,
+    pub maze_res_x: u32,
+    pub maze_res_y: u32,
 }
 
 pub struct StepGpu {
@@ -76,6 +88,13 @@ pub struct StepGpu {
     energy_buf: wgpu::Buffer,
     body_dims_buf: wgpu::Buffer,
     aux_buf: wgpu::Buffer,
+    /// Wave 4 maze mask buffer (binding 12). One u32 per maze voxel,
+    /// row-major `vy * res_x + vx`, value 0 (passable) or non-zero
+    /// (occupied / wall). Pre-allocated with `MAZE_MASK_CAPACITY` u32s so
+    /// there's room for any difficulty without reallocating; oversized when
+    /// the maze is small or absent. Zeroed initial contents make the
+    /// no-maze path identical to pre-Wave-4 (no spurious collisions).
+    maze_mask_buf: wgpu::Buffer,
     pos_rb: wgpu::Buffer,
     vel_rb: wgpu::Buffer,
     heading_rb: wgpu::Buffer,
@@ -123,7 +142,10 @@ impl StepGpu {
             label: Some("step"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/step.wgsl").into()),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..12)
+        // Wave 4: 12 → 13 bindings (added maze_mask at binding 12, read-only
+        // storage). Bindings 10, 11, 12 are read-only; everything else
+        // unchanged.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -192,6 +214,14 @@ impl StepGpu {
         let energy_buf = mk("step-energy", n * f, stor_dst_src);
         let body_dims_buf = mk("step-body-dims", n * 3 * f, stor_dst);
         let aux_buf = mk("step-aux", n * 4 * f, stor_dst);
+        // Wave 4: maze mask buffer. MAZE_MASK_CAPACITY u32s holds the
+        // largest expected ObstacleField (Hard mode 65×37 = 2405 voxels at
+        // current settings); 8192 leaves 3.4× headroom for future grids.
+        let maze_mask_buf = mk(
+            "step-maze-mask",
+            MAZE_MASK_CAPACITY as u64 * std::mem::size_of::<u32>() as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
 
         let pos_rb = mk("step-pos-rb", n * 3 * f, read);
         let vel_rb = mk("step-vel-rb", n * 3 * f, read);
@@ -219,6 +249,7 @@ impl StepGpu {
                 wgpu::BindGroupEntry { binding: 9, resource: energy_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: body_dims_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: aux_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: maze_mask_buf.as_entire_binding() },
             ],
         });
 
@@ -240,6 +271,7 @@ impl StepGpu {
             energy_buf,
             body_dims_buf,
             aux_buf,
+            maze_mask_buf,
             pos_rb,
             vel_rb,
             heading_rb,
@@ -253,6 +285,26 @@ impl StepGpu {
             cached_cells_bg: None,
             cached_cells_epoch: 0,
         })
+    }
+
+    /// Wave 4: upload the maze occupancy mask to binding 12. `mask` is one
+    /// u32 per voxel (row-major `vy * res_x + vx`); 0 = passable, non-zero
+    /// = wall. Caller pads / truncates to fit `MAZE_MASK_CAPACITY`. Setting
+    /// `params.maze_active = 0` next dispatch makes the shader skip the
+    /// collision block regardless of buffer contents — pass an empty mask
+    /// with `maze_active = 0` to reset to non-maze behavior.
+    pub fn upload_maze(&self, mask: &[u32]) {
+        debug_assert!(
+            mask.len() <= MAZE_MASK_CAPACITY,
+            "maze mask {} exceeds capacity {}",
+            mask.len(),
+            MAZE_MASK_CAPACITY
+        );
+        if mask.is_empty() {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.maze_mask_buf, 0, bytemuck::cast_slice(mask));
     }
 
     /// Apply step pass. Inputs upload + dispatch + readback.
@@ -437,6 +489,7 @@ impl StepGpu {
                     wgpu::BindGroupEntry { binding: 9, resource: cells.energy_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 10, resource: cells.body_dims_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 11, resource: cells.aux_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: self.maze_mask_buf.as_entire_binding() },
                 ],
             }));
             self.cached_cells_epoch = cells_epoch;

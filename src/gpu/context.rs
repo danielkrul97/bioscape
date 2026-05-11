@@ -29,7 +29,11 @@ impl GpuContext {
                 label: Some("bioscape-shared"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 12,
+                    // Wave 4 bumped 12 → 14: step.wgsl gains a maze_mask
+                    // storage binding (binding 12); future maze-aware shaders
+                    // (sensor_gather LOS / whisker, hebbian traces) reuse the
+                    // headroom.
+                    max_storage_buffers_per_shader_stage: 14,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,

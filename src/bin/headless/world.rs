@@ -1283,9 +1283,19 @@ impl World {
             thermal_seasonal_phase: (self.clock.generation % CYCLE_GEN_PERIOD) as f32
                 / CYCLE_GEN_PERIOD as f32,
             thermal_log2_q10: bioscape::THERMAL_Q10.log2(),
-            _pad_b0: 0,
-            _pad_b1: 0,
-            _pad_b2: 0,
+            // Wave 4: maze fields. When obstacles present, mask was uploaded
+            // at allocation time (`World::sync_maze_to_gpu`); shader uses it.
+            maze_active: if self.obstacles.is_some() { 1 } else { 0 },
+            maze_res_x: self
+                .obstacles
+                .as_ref()
+                .map(|f| f.resolution[0] as u32)
+                .unwrap_or(0),
+            maze_res_y: self
+                .obstacles
+                .as_ref()
+                .map(|f| f.resolution[1] as u32)
+                .unwrap_or(0),
         };
         gpu.step.dispatch_with_cells(&gpu.cells, n, step_params);
 
@@ -1798,6 +1808,29 @@ impl World {
             VIBRATION_GRID_RES,
             VIBRATION_GRID_RES_Z,
         ]));
+        // Wave 4: re-upload mask + per-grid masks to gpu_full so the
+        // in-shader collision and masked diffusion see the new layout from
+        // this tick onward.
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_full.as_mut() {
+            let packed = field.packed_for_gpu();
+            let smell_mask =
+                field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]);
+            let phero_mask = field.mask_for_grid([
+                PHEROMONE_GRID_RES,
+                PHEROMONE_GRID_RES,
+                PHEROMONE_GRID_RES_Z,
+            ]);
+            let vib_mask = field.mask_for_grid([
+                VIBRATION_GRID_RES,
+                VIBRATION_GRID_RES,
+                VIBRATION_GRID_RES_Z,
+            ]);
+            gpu.step.upload_maze(&packed);
+            gpu.smell.upload_obstacle_mask(&smell_mask);
+            gpu.pheromone.upload_obstacle_mask(&phero_mask);
+            gpu.vibration.upload_obstacle_mask(&vib_mask);
+        }
         self.obstacles = Some(field);
     }
 

@@ -296,6 +296,14 @@ impl ObstacleField {
         &self.occupied
     }
 
+    /// Wave 4: pack the boolean occupancy array into a `Vec<u32>` (one u32
+    /// per voxel, value 0 or 1) for GPU upload. Direct one-bool-per-u32
+    /// avoids bit-twiddling on the shader side; storage cost is small (a
+    /// Hard-mode 65×37 maze packs to ~2.4 KB).
+    pub fn packed_for_gpu(&self) -> Vec<u32> {
+        self.occupied.iter().map(|&b| if b { 1 } else { 0 }).collect()
+    }
+
     /// Whisker raycast: shoots `WHISKER_COUNT` short rays from `pos` in the
     /// six body-frame cardinal directions (forward, back, right, left, up,
     /// down) and returns per-ray free-distance normalized to `[0, 1]`.

@@ -131,6 +131,7 @@ pub(super) fn toggle_maze_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<super::resources_gpu::GpuFullPipeline>>,
 ) {
     if !keys.just_pressed(KeyCode::KeyL) {
         return;
@@ -143,6 +144,15 @@ pub(super) fn toggle_maze_world(
         maze.vibration_mask = None;
         for entity in &walls {
             commands.entity(entity).despawn();
+        }
+        // Wave 4: clear GPU masks so the diffusion path falls back to
+        // homogeneous behavior. Step shader leaves the mask buffer alone
+        // (maze_active flag flips off via params next dispatch).
+        #[cfg(feature = "gpu")]
+        if let Some(mut gpu) = gpu_full {
+            gpu.smell.clear_obstacle_mask();
+            gpu.pheromone.clear_obstacle_mask();
+            gpu.vibration.clear_obstacle_mask();
         }
         return;
     }
@@ -190,6 +200,28 @@ pub(super) fn toggle_maze_world(
                 Transform::from_xyz(cx, cy, 0.0),
             ));
         }
+    }
+    // Wave 4: upload mask to GPU step shader + per-grid masks to FieldGpu
+    // so in-shader collision and masked diffusion both see walls.
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu) = gpu_full {
+        let packed = field.packed_for_gpu();
+        let smell_mask_for_gpu =
+            field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]);
+        let phero_mask_for_gpu = field.mask_for_grid([
+            PHEROMONE_GRID_RES,
+            PHEROMONE_GRID_RES,
+            PHEROMONE_GRID_RES_Z,
+        ]);
+        let vib_mask_for_gpu = field.mask_for_grid([
+            VIBRATION_GRID_RES,
+            VIBRATION_GRID_RES,
+            VIBRATION_GRID_RES_Z,
+        ]);
+        gpu.step.upload_maze(&packed);
+        gpu.smell.upload_obstacle_mask(&smell_mask_for_gpu);
+        gpu.pheromone.upload_obstacle_mask(&phero_mask_for_gpu);
+        gpu.vibration.upload_obstacle_mask(&vib_mask_for_gpu);
     }
     maze.field = Some(field);
     maze.smell_mask = smell_mask;
