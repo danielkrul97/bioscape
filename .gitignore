@@ -23,3 +23,7 @@ target
 /data/
 /.claude/
 /screenshots/
+
+# perf profiling output (cargo flamegraph / perf record)
+perf.data
+perf.data.old
