@@ -231,6 +231,7 @@ impl OrbitCamera {
 }
 
 #[derive(Resource)]
+#[allow(dead_code)]
 pub(super) struct SmellResource(pub(super) SmellField);
 
 /// Sprint 126: multi-channel pheromone fields. Pole `[SmellField; N_PHEROMONE_CHANNELS]`
@@ -284,6 +285,7 @@ impl MazeWorld {
 /// system cap. The two fields together replace the previous `coop_foods`
 /// param; net result is 15 params with maze access in scope.
 #[derive(SystemParam)]
+#[allow(dead_code)]
 pub(super) struct MazeAndCoop<'w> {
     pub(super) maze: Res<'w, MazeWorld>,
     pub(super) coop_foods: Res<'w, CoopFoodResource>,

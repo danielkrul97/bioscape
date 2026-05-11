@@ -7,23 +7,18 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    adhesion_velocity_delta, bond_velocity_delta,
     reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, MazeDifficulty,
-    ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
-    ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
+    ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
-    COLLISION_RESTITUTION, CONTACT_DECAY_TICKS, COOP_FOOD_MAX_CONCURRENT,
-    COOP_FOOD_SPAWN_RATE_PER_TICK, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD,
-    DILUTION_K, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
+    CONTACT_DECAY_TICKS, COOP_FOOD_MAX_CONCURRENT, COOP_FOOD_SPAWN_RATE_PER_TICK,
+    CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, EAT_RADIUS, FIXED_TIMESTEP_HZ, FOOD_SPAWN_RATE,
     GENERATIONS_PER_EPOCH, GRID_CELL_SIZE, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
-    HERD_RADIUS, LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MAX_BONDS_PER_CELL, MAX_SPAWN_ATTEMPTS,
-    N_PHEROMONE_CHANNELS,
-    PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE,
-    PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH,
-    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON,
-    PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
-    SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
+    LEARNING_RATE, MATING_COOLDOWN_TICKS, MATING_PHEROMONE_THRESHOLD, MAX_BONDS_PER_CELL,
+    MAX_SPAWN_ATTEMPTS, N_PHEROMONE_CHANNELS, PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD,
+    PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH,
+    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
+    REPRODUCE_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
     SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, VIBRATION_DECAY,
     VIBRATION_DIFFUSION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, VIBRATION_SAMPLE_EPSILON,
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP,
@@ -167,8 +162,6 @@ pub struct World {
     /// velocity podél separation normal je halved. Cell i sees pair (i, j),
     /// computes own delta; symmetric (Newton 3rd law) když j visits i.
     pub velocity_deltas_scratch: Vec<[f32; 3]>,
-    pub energy_deltas_scratch: Vec<f32>,
-    pub damage_deltas_scratch: Vec<f32>,
     pub eaten_scratch: Vec<bool>,
     /// Persistent cell_id → idx scratch. Built once at the start of each tick
     /// (`rebuild_id_to_idx`) and consumed by pool_bonded_hidden, brain_act,
@@ -479,8 +472,6 @@ impl World {
             food_grid: SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF),
             deltas_scratch: Vec::new(),
             velocity_deltas_scratch: Vec::new(),
-            energy_deltas_scratch: Vec::new(),
-            damage_deltas_scratch: Vec::new(),
             eaten_scratch: Vec::new(),
             id_to_idx_scratch: rustc_hash::FxHashMap::default(),
             contact_lists_scratch: Vec::new(),
@@ -619,8 +610,6 @@ impl World {
             food_grid: SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF),
             deltas_scratch: Vec::new(),
             velocity_deltas_scratch: Vec::new(),
-            energy_deltas_scratch: Vec::new(),
-            damage_deltas_scratch: Vec::new(),
             eaten_scratch: Vec::new(),
             id_to_idx_scratch: rustc_hash::FxHashMap::default(),
             contact_lists_scratch: Vec::new(),
@@ -1789,27 +1778,6 @@ impl World {
         self.obstacles = Some(field);
     }
 
-    /// Wave 3: per-tick eligibility-trace decay + accumulate. Runs after
-    /// brain_act so traces capture the (input, hidden, output) activations
-    /// from this tick before any reward event fires. No weight changes —
-    /// just trace bookkeeping. Always-on (independent of maze toggle):
-    /// decay constant `HEBBIAN_TRACE_DECAY_PER_SEC` works as a soft replay
-    /// window for sparse-reward credit assignment.
-    pub fn apply_eligibility_step(&mut self, dt: f32) {
-        use bioscape::HEBBIAN_TRACE_DECAY_PER_SEC;
-        self.cells.par_iter_mut().for_each(|cell| {
-            let last_inputs = cell.last_inputs;
-            let last_hidden = cell.last_hidden;
-            let last_outputs = cell.last_outputs;
-            cell.genome.brain.hebbian_step(
-                &last_inputs,
-                &last_hidden,
-                &last_outputs,
-                dt,
-                HEBBIAN_TRACE_DECAY_PER_SEC,
-            );
-        });
-    }
 
     /// Wave 2 episodic novelty pass. For each cell, bin its current position
     /// into a coarse novelty grid; if not in the cell's recent visit history,

@@ -155,7 +155,7 @@ pub(crate) fn resolve_cell_collisions(
     }
     let entity_to_idx = &*entity_to_idx_scratch;
     let id_to_idx = &*id_to_idx_scratch;
-    let grid_ref = &grid.0;
+    let _ = grid;
     // Phase 1 (parallel): per-cell delta + vel_delta + collected contacts.
     // Inner Vec<u64> per cell — drop persisted approach kvůli rayon
     // collect_into_vec: existing inner Vecs se znovu použijí jen pokud délka

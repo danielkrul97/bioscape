@@ -756,6 +756,35 @@ impl CellsGpu {
         self.queue.write_buffer(&self.rewards_buf, 0, bytemuck::cast_slice(rewards));
     }
 
+    /// Zero per-slot buffers that accumulate state across ticks: Hebbian
+    /// eligibility traces, last_inputs / last_hidden / last_outputs (the
+    /// BRAIN_RECURRENT feedback path reads `last_hidden` next tick), rewards,
+    /// and bonded inboxes. Used when the simulation is restarted in place
+    /// and the same slot is re-assigned to a fresh cell.
+    pub fn zero_persistent_state(&self) {
+        let n = self.capacity;
+        let f = std::mem::size_of::<f32>();
+        let traces_bytes = n * BRAIN_WEIGHTS_PER_CELL * f;
+        let inputs_bytes = n * BRAIN_INPUTS * f;
+        let hidden_bytes = n * BRAIN_HIDDEN * f;
+        let outputs_bytes = n * BRAIN_OUTPUTS * f;
+        let rewards_bytes = n * f;
+        let inbox_bytes = n * N_BOND_MSG_CHANNELS * f;
+        let max_bytes = traces_bytes
+            .max(inputs_bytes)
+            .max(hidden_bytes)
+            .max(outputs_bytes)
+            .max(rewards_bytes)
+            .max(inbox_bytes);
+        let zeros = vec![0u8; max_bytes];
+        self.queue.write_buffer(&self.brain_traces_buf, 0, &zeros[..traces_bytes]);
+        self.queue.write_buffer(&self.last_inputs_buf, 0, &zeros[..inputs_bytes]);
+        self.queue.write_buffer(&self.last_hidden_buf, 0, &zeros[..hidden_bytes]);
+        self.queue.write_buffer(&self.last_outputs_buf, 0, &zeros[..outputs_bytes]);
+        self.queue.write_buffer(&self.rewards_buf, 0, &zeros[..rewards_bytes]);
+        self.queue.write_buffer(&self.bonded_inbox_buf, 0, &zeros[..inbox_bytes]);
+    }
+
     /// GPU-side copy `slot[src] → slot[dst]` for `brain_weights`,
     /// `xoshiro_state`, and `turn_rate`. Used by the swap-remove pattern in
     /// `die_and_drop_carrion`: when the cell at `dst` dies, `src` is the

@@ -19,7 +19,8 @@ pub(crate) fn apply_eligibility_step(
     gpu_full: Option<ResMut<super::super::resources_gpu::GpuFullPipeline>>,
 ) {
     let dt = time.delta_secs();
-    if let Some(mut gpu) = gpu_full {
+    if let Some(gpu) = gpu_full {
+        let gpu = &*gpu;
         let n = cells.iter().count();
         if n > 0 {
             gpu.hebbian.dispatch_step_persistent(

@@ -253,7 +253,8 @@ pub fn run() {
             )
                 .chain()
                 .before(camera_orbit_input),
-        );
+        )
+        .add_systems(Update, restart_simulation);
     if let Some(cfg) = screencast_cfg {
         let _ = std::fs::create_dir_all(&cfg.dir);
         eprintln!(
