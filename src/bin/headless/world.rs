@@ -3201,21 +3201,13 @@ impl World {
         matings: &[(usize, usize)],
         rng: &mut impl Rng,
     ) -> Vec<Cell> {
-        // Sync parent brains z GPU (sprint 51 GPU Hebbian je canonical).
-        // In `--gpu-full + GPU CPPN` mode the parent brain isn't actually read
-        // by `make_mating_child_no_brain` (mating only touches `Genome.cppn`),
-        // but we keep the download for serialization parity — diagnostic
-        // metrics like `w1_frobenius_std` read `Genome.brain` and would be
-        // stale otherwise.
-        #[cfg(feature = "gpu")]
-        if let Some(gpu) = self.gpu_full.as_ref() {
-            for &(a, b) in matings {
-                let brain_a = gpu.cells.download_brain_at(a);
-                let brain_b = gpu.cells.download_brain_at(b);
-                self.cells[a].genome.brain = brain_a;
-                self.cells[b].genome.brain = brain_b;
-            }
-        }
+        // Wave K: skip the per-pair `download_brain_at` round-trip — mating
+        // only touches `Genome.cppn` (`make_mating_child_no_brain`), so the
+        // parent brain isn't actually read here. CPU `Cell.genome.brain`
+        // stays at the post-tick GPU value until the per-generation
+        // `sync_brains_from_gpu` batched download refreshes it for
+        // diagnostics / checkpoint serialization. Saves O(matings) ×
+        // `wgpu::Maintain::Wait` round-trips each tick.
         // Sprint 66: pre-allocate cell_ids for each child before splitting
         // self.cells (split_at_mut would conflict with self.next_cell_id access).
         let child_ids: Vec<u64> = (0..matings.len())
