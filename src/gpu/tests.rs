@@ -856,12 +856,16 @@ fn predate_gpu_matches_cpu() {
 }
 
 /// Sprint 50: collision GPU vs CPU `headless::resolve_collisions` parity.
-/// Pack cells velmi blízko sebe → forced overlaps. GPU vrací position deltas
-/// (depenetrace, Sprint 50) + velocity deltas (inelastic damping, Sprint 65)
-/// per cell; CPU brute-force počítá totéž. Tolerance 1e-3.
+/// Pack cells velmi blízko sebe → forced overlaps + adhesion-range pairs.
+/// GPU vrací position deltas (depenetrace, Sprint 50) + velocity deltas
+/// (inelastic damping Sprint 65 + differential adhesion Sprint 66) per cell;
+/// CPU brute-force počítá totéž. Tolerance 1e-3.
 #[test]
 fn collision_gpu_matches_cpu() {
-    use crate::{CELL_RADIUS, COLLISION_RESTITUTION};
+    use crate::{
+        ADHESION_CROSS_TYPE, ADHESION_RANGE_FACTOR, ADHESION_STRENGTH, ADHESION_TYPE_COUNT,
+        CELL_RADIUS, COLLISION_RESTITUTION,
+    };
     let mut rng = StdRng::seed_from_u64(53);
     let n = 100;
     let cell_size = 64.0_f32;
@@ -886,6 +890,14 @@ fn collision_gpu_matches_cpu() {
         .collect();
     let eff_radii: Vec<f32> = (0..n).map(|_| rng.random_range(0.7_f32..1.5)).collect();
     let max_axes: Vec<f32> = eff_radii.iter().map(|r| r * 1.2).collect();
+    let adhesion_types: Vec<u32> = (0..n)
+        .map(|_| rng.random_range(0..ADHESION_TYPE_COUNT) as u32)
+        .collect();
+    let adhesion = AdhesionParams {
+        strength: ADHESION_STRENGTH,
+        cross_type: ADHESION_CROSS_TYPE,
+        range_factor: ADHESION_RANGE_FACTOR,
+    };
 
     let ctx = match GpuContext::new() {
         Ok(c) => c,
@@ -899,15 +911,25 @@ fn collision_gpu_matches_cpu() {
         cell_size,
         CELL_RADIUS,
         COLLISION_RESTITUTION,
+        adhesion,
         [1000.0, 1000.0],
     )
     .expect("collision init");
-    let (gpu_deltas, gpu_vel_deltas) =
-        col.compute(&positions, &velocities, &eff_radii, &max_axes, &hash);
+    let (gpu_deltas, gpu_vel_deltas) = col.compute(
+        &positions,
+        &velocities,
+        &eff_radii,
+        &max_axes,
+        &adhesion_types,
+        &hash,
+    );
 
-    // CPU brute force — matches CPU resolve_collisions in-contact branch:
-    // position depenetration (Sprint 50) + inelastic velocity damping
-    // (Sprint 65: `damp = -v_rel_n × 0.5 × (1 - RESTITUTION) × n` if v_rel_n < 0).
+    // CPU brute force — matches CPU resolve_collisions:
+    // - in-contact: position depenetration (Sprint 50) + inelastic damping
+    //   (Sprint 65: damp = -v_rel_n × 0.5 × (1 - RESTITUTION) × n if v_rel_n < 0)
+    // - out-of-contact (pair_r < d < pair_r × ADHESION_RANGE_FACTOR):
+    //   linear-falloff adhesion velocity nudge (Sprint 66 differential
+    //   adhesion; positive same-type, negative cross-type).
     let damp_coeff = 0.5 * (1.0 - COLLISION_RESTITUTION);
     let mut cpu_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
     let mut cpu_vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
@@ -938,6 +960,23 @@ fn collision_gpu_matches_cpu() {
                     cpu_vel_deltas[i][0] += damp * nx;
                     cpu_vel_deltas[i][1] += damp * ny;
                     cpu_vel_deltas[i][2] += damp * nz;
+                }
+            } else if d2 > 0.0 {
+                let adhesion_range = pair_r * ADHESION_RANGE_FACTOR;
+                let adhesion_range2 = adhesion_range * adhesion_range;
+                if d2 < adhesion_range2 {
+                    let d = d2.sqrt();
+                    let falloff = (adhesion_range - d) / (adhesion_range - pair_r);
+                    let coeff = if adhesion_types[i] == adhesion_types[j] {
+                        ADHESION_STRENGTH
+                    } else {
+                        ADHESION_STRENGTH * ADHESION_CROSS_TYPE
+                    };
+                    let mag = -coeff * falloff;
+                    let inv_d = 1.0 / d;
+                    cpu_vel_deltas[i][0] += mag * dx * inv_d;
+                    cpu_vel_deltas[i][1] += mag * dy * inv_d;
+                    cpu_vel_deltas[i][2] += mag * dz * inv_d;
                 }
             }
         }

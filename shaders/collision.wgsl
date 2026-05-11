@@ -22,8 +22,12 @@ struct CollisionParams {
     collision_restitution: f32,
     world_half_x: f32,
     world_half_y: f32,
+    adhesion_strength: f32,
+    adhesion_cross_type: f32,
+    adhesion_range_factor: f32,
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: CollisionParams;
@@ -35,6 +39,7 @@ struct CollisionParams {
 @group(0) @binding(6) var<storage, read_write> deltas: array<f32>;
 @group(0) @binding(7) var<storage, read> velocities: array<f32>;
 @group(0) @binding(8) var<storage, read_write> vel_deltas: array<f32>;
+@group(0) @binding(9) var<storage, read> adhesion_types: array<u32>;
 
 fn min_image_xy(d: f32, half: f32) -> f32 {
     let w = 2.0 * half;
@@ -77,10 +82,15 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r_i = eff_radii[i];
     let crc = params.cell_radius_const;
     let crc_r_i = crc * r_i;
-    let search_r = crc * (r_i + max_axes[i] * 2.0);
+    // Sprint 66: search radius covers both collision contact range AND
+    // adhesion falloff range. ADHESION_RANGE_FACTOR typically expands
+    // the search ~3×, so adhesion neighbors must be reachable.
+    let collision_r = crc * (r_i + max_axes[i] * 2.0);
+    let search_r = collision_r * max(1.0, params.adhesion_range_factor);
     let cs = params.cell_size;
     let r_cells = i32(ceil(search_r / cs));
     let damp_coeff = 0.5 * (1.0 - params.collision_restitution);
+    let type_i = adhesion_types[i];
 
     var dx_acc: f32 = 0.0;
     var dy_acc: f32 = 0.0;
@@ -146,6 +156,26 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
                             vdx_acc = vdx_acc + damp * n.x;
                             vdy_acc = vdy_acc + damp * n.y;
                             vdz_acc = vdz_acc + damp * n.z;
+                        }
+                    } else if (d2 > 0.0) {
+                        // Sprint 66 differential adhesion: out-of-contact pairs
+                        // get a linear-falloff velocity nudge along ±n. Same-type
+                        // attracts (positive coefficient), cross-type repels
+                        // (negative coefficient via ADHESION_CROSS_TYPE).
+                        let adhesion_range = pair_r * params.adhesion_range_factor;
+                        let adhesion_range2 = adhesion_range * adhesion_range;
+                        if (d2 < adhesion_range2) {
+                            let dist = sqrt(d2);
+                            let falloff = (adhesion_range - dist) / (adhesion_range - pair_r);
+                            var coeff: f32 = params.adhesion_strength;
+                            if (adhesion_types[j] != type_i) {
+                                coeff = coeff * params.adhesion_cross_type;
+                            }
+                            let mag = -coeff * falloff;
+                            let inv_d = 1.0 / dist;
+                            vdx_acc = vdx_acc + mag * d.x * inv_d;
+                            vdy_acc = vdy_acc + mag * d.y * inv_d;
+                            vdz_acc = vdz_acc + mag * d.z * inv_d;
                         }
                     }
                 }
