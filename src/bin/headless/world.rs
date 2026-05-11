@@ -33,9 +33,9 @@ use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
 #[cfg(feature = "gpu")]
 use bioscape::{
     gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, CppnGpu, FieldGpu, GpuFullScratch, HebbianGpu, MotorGpu,
-        PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
-        StepGpu, StepParamsGpu,
+        BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, FieldGpu, GpuFullScratch,
+        HebbianGpu, MotorGpu, PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu,
+        SensorParamsGpu, SpatialHashGpu, StepGpu, StepParamsGpu,
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
     DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT, GRAVITY as PHYS_GRAVITY,
@@ -297,6 +297,12 @@ pub struct GpuFullState {
     pub brain: BrainGpu,
     pub hebbian: HebbianGpu,
     pub brownian: BrownianGpu,
+    /// Wave H: GPU collision broad-phase (position depenetration + velocity
+    /// damping + soft adhesion + spring-bond forces + contact events).
+    /// CPU side keeps Phase 2 (apply deltas), Phase 3 (bond pruning) and
+    /// Phase 4 (contact_progress / bond formation) — sparse / variable-
+    /// allocation work that does not fit the GPU pair loop.
+    pub collision: CollisionGpu,
     /// Sprint 59: GPU smell + pheromone field (3D 7-point Jacobi).
     /// Sprint 60: po wire SensorGatherGpu už NEČTE CPU SmellField shadow —
     /// sensor shader bere field grid storage buffer direct. Per-tick readback
@@ -2021,6 +2027,87 @@ impl World {
         }
     }
 
+    /// Wave H: GPU replacement for the CPU Phase 1 broad-phase pair loop.
+    /// Fills `deltas_scratch`, `velocity_deltas_scratch` and
+    /// `contact_lists_scratch` from a single GPU dispatch. Phase 2 / 3 / 4
+    /// of `resolve_collisions` consume these scratch buffers identically
+    /// regardless of which path produced them.
+    #[cfg(feature = "gpu")]
+    fn resolve_collisions_gpu_pass1(&mut self) {
+        let n = self.cells.len();
+        if n == 0 {
+            return;
+        }
+        let positions: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
+        let velocities: Vec<[f32; 3]> = self.cells.iter().map(|c| c.velocity).collect();
+        let eff_radii: Vec<f32> = self
+            .cells
+            .iter()
+            .map(|c| c.phenotype.effective_radius())
+            .collect();
+        let max_axes: Vec<f32> = self.cells.iter().map(|c| c.phenotype.max_axis()).collect();
+        let adhesion_types: Vec<u32> = self
+            .cells
+            .iter()
+            .map(|c| c.genome.adhesion_type as u32)
+            .collect();
+
+        let slots = MAX_BONDS_PER_CELL;
+        let total = n * slots;
+        let mut partner_idx = vec![-1_i32; total];
+        let mut rest = vec![0.0_f32; total];
+        let mut stiff = vec![0.0_f32; total];
+        let mut damp = vec![0.0_f32; total];
+        for i in 0..n {
+            for (s, slot) in self.cells[i].bonds.iter().enumerate() {
+                if let Some(b) = slot {
+                    if let Some(&j) = self.id_to_idx_scratch.get(&b.other_cell_id) {
+                        let idx = i * slots + s;
+                        partner_idx[idx] = j as i32;
+                        rest[idx] = b.rest_length;
+                        stiff[idx] = b.stiffness;
+                        damp[idx] = b.damping;
+                    }
+                }
+            }
+        }
+
+        // Refresh GPU spatial hash with current (post-step) positions. The
+        // hash from brain_act was keyed on pre-step positions; cells have
+        // moved since.
+        let result = {
+            let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
+            gpu.cell_hash.dispatch(&positions);
+            gpu.collision.compute(
+                &positions,
+                &velocities,
+                &eff_radii,
+                &max_axes,
+                &adhesion_types,
+                &partner_idx,
+                &rest,
+                &stiff,
+                &damp,
+                &gpu.cell_hash,
+            )
+        };
+
+        let max_contacts = bioscape::MAX_COLLISION_CONTACTS_PER_CELL as usize;
+        for i in 0..n {
+            self.deltas_scratch[i] = result.position_deltas[i];
+            self.velocity_deltas_scratch[i] = result.velocity_deltas[i];
+            let count = (result.contact_count[i] as usize).min(max_contacts);
+            let base = i * max_contacts;
+            let list = &mut self.contact_lists_scratch[i];
+            for s in 0..count {
+                let j = result.contact_partners[base + s] as usize;
+                if j < n {
+                    list.push(self.cells[j].cell_id);
+                }
+            }
+        }
+    }
+
     fn resolve_collisions(&mut self) {
         // Sprint 43: grid + rayon. Δ pro každé i je write-only do vlastního
         // slotu. Max search radius = CELL_RADIUS × (radius_i + max_neighbor_r);
@@ -2037,9 +2124,6 @@ impl World {
                 .enumerate()
                 .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
         );
-        // Sprint 66: cell_id → idx map pro O(1) bond lookup. Reuse persistent
-        // scratch built v `tick` start.
-        let id_to_idx = &self.id_to_idx_scratch;
         self.deltas_scratch.clear();
         self.deltas_scratch.resize(n, [0.0, 0.0, 0.0]);
         self.velocity_deltas_scratch.clear();
@@ -2053,13 +2137,29 @@ impl World {
             inner.clear();
         }
 
-        let cell_grid = &self.cell_grid;
-        let cells = &self.cells;
+        // Wave H: GPU collision shader covers the broad-phase pair loop
+        // (depenetration + velocity damping + adhesion + spring bond forces
+        // + contact event detection). When `gpu_full` is active we fill the
+        // scratch buffers from the GPU result and skip the CPU par_iter.
+        #[cfg(feature = "gpu")]
+        let used_gpu = if self.gpu_full.is_some() {
+            self.resolve_collisions_gpu_pass1();
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "gpu"))]
+        let used_gpu = false;
+
         // Sprint 66: search radius = max(collision, adhesion). Adhesion má
         // dosah pair_r × ADHESION_RANGE_FACTOR; pair_r = CELL_RADIUS × max_axis × 2.
         // Pro jistotu používáme effective_radius_i × CELL_RADIUS × 2 × FACTOR.
         // Per-i collected contact pairs: (other_cell_id, currently_in_contact).
         // Phase 2 sequentially merges do contact_progress.
+        if !used_gpu {
+        let id_to_idx = &self.id_to_idx_scratch;
+        let cell_grid = &self.cell_grid;
+        let cells = &self.cells;
         self.deltas_scratch
             .par_iter_mut()
             .zip(self.velocity_deltas_scratch.par_iter_mut())
@@ -2158,6 +2258,7 @@ impl World {
                     }
                 }
             });
+        }
 
         // Phase 2: sequential apply position/velocity deltas + contact tracker
         // update + bond pruning + bond formation. Vše drží borrow checker happy
@@ -2183,6 +2284,9 @@ impl World {
         //  2. cíl bondu zemřel (id chybí v map) → drop.
         //  3. distance > rest × BREAK_FACTOR → drop (overstretch).
         //  4. jinak inkrement age + accumulate per-cell bond count pro maintenance.
+        // Phase 3 / 4 bond lookups need this map (Phase 1 binds its own
+        // shorter-lived copy inside the CPU branch above).
+        let id_to_idx = &self.id_to_idx_scratch;
         let mut bonds_broken_this_tick: u64 = 0;
         // P1-#7: persistent positions snapshot scratch.
         self.positions_snapshot_scratch.clear();

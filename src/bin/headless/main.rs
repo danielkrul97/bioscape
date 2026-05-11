@@ -366,6 +366,26 @@ fn main() {
             let populate = PopulateInputsGpu::with_context(&ctx)?;
             let motor = MotorGpu::with_context(&ctx, cap)?;
             let step = StepGpu::with_context(&ctx, cap)?;
+            // Wave H: full-scope collision shader (depenetration + velocity
+            // damping + adhesion + spring bonds + contact events).
+            let collision = bioscape::gpu::CollisionGpu::with_context(
+                &ctx,
+                cap,
+                bioscape::GRID_CELL_SIZE,
+                bioscape::CELL_RADIUS,
+                bioscape::COLLISION_RESTITUTION,
+                bioscape::gpu::AdhesionParams {
+                    strength: bioscape::ADHESION_STRENGTH,
+                    cross_type: bioscape::ADHESION_CROSS_TYPE,
+                    range_factor: bioscape::ADHESION_RANGE_FACTOR,
+                },
+                bioscape::gpu::BondParams {
+                    bonds_per_cell: bioscape::MAX_BONDS_PER_CELL as u32,
+                    break_factor: bioscape::BOND_BREAK_FACTOR,
+                },
+                bioscape::MAX_COLLISION_CONTACTS_PER_CELL,
+                [WORLD_HALF[0], WORLD_HALF[1]],
+            )?;
             // GPU CPPN materialises child brain weights direct → cells.brain_weights_buf.
             // Capacity = cap (worst case: all cells reproduce in one tick after a
             // mass extinction; init upload is cap children too).
@@ -379,6 +399,7 @@ fn main() {
                 brain,
                 hebbian,
                 brownian,
+                collision,
                 smell,
                 pheromone,
                 vibration,

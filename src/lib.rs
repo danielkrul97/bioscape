@@ -138,6 +138,12 @@ pub const ADHESION_CROSS_TYPE: f32 = -0.3;
 /// Maximum spring bondů per cell. Sphere packing kissing 12, ale soft cells
 /// se realisticky drží ≤ 6 sousedů. Fixní array → no heap alloc.
 pub const MAX_BONDS_PER_CELL: usize = 6;
+/// Maximum per-cell in-contact partners the GPU collision shader records
+/// each tick. CPU side is unbounded (Vec<u64>) but the GPU buffer is fixed
+/// — overflow drops the extras (counter still tracks the true count). 32
+/// covers worst-case clusters comfortably without burning storage for
+/// near-empty rows.
+pub const MAX_COLLISION_CONTACTS_PER_CELL: u32 = 32;
 /// Tiků kontaktu (cells in collision range, mutual bond_signal active) než se
 /// vytvoří spring bond. Sprint 71 měl 30 (= 0.5 s při 60 Hz). Sprint 76:
 /// 30 → 10 (~0.17 s) — Sprint 75 smoke ukázal, že cells se speed 190 mají
