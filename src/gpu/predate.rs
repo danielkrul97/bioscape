@@ -35,6 +35,10 @@ pub struct PredateResult {
     pub herd_counts: Vec<u32>,
     pub energy_delta: Vec<f32>,
     pub damage_delta: Vec<f32>,
+    /// Wave H regression mitigation: per-tick total number of (attacker,
+    /// victim) attack hits. Mirrors CPU `attack_events.len()` so
+    /// `predation_events_gen` stays accurate on the GPU path.
+    pub total_events: u32,
 }
 
 pub struct PredateGpu {
@@ -59,9 +63,12 @@ pub struct PredateGpu {
     /// Per-cell pitch (rad) — multi-spike needs the full 3D forward
     /// direction (yaw + azim, pitch + elev).
     pitches_buf: wgpu::Buffer,
+    /// Single-element atomic counter for total attack hits this dispatch.
+    event_count_buf: wgpu::Buffer,
     herd_rb: wgpu::Buffer,
     energy_rb: wgpu::Buffer,
     damage_rb: wgpu::Buffer,
+    event_count_rb: wgpu::Buffer,
     pos_packed: Vec<f32>,
 }
 
@@ -85,12 +92,12 @@ impl PredateGpu {
             label: Some("predate"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/predate.wgsl").into()),
         });
-        // 13 bindings: 1 uniform + 12 storage. Bindings 1..=7 and 11..=12
+        // 14 bindings: 1 uniform + 13 storage. Bindings 1..=7 and 11..=12
         // are read-only (positions, eff_radii, headings, spikes_packed,
         // attack_signals, hash_offsets, hash_sorted, spike_counts, pitches);
-        // 8..=10 are read_write (herd_counts, energy_delta atomic,
-        // damage_delta atomic).
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13)
+        // 8..=10 and 13 are read_write (herd_counts, energy_delta atomic,
+        // damage_delta atomic, event_count atomic counter).
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -167,9 +174,11 @@ impl PredateGpu {
         let damage_delta_buf = mk("predate-damage-delta", n * f, stor_dst_src);
         let spike_counts_buf = mk("predate-spike-counts", n * f, stor_dst);
         let pitches_buf = mk("predate-pitches", n * f, stor_dst);
+        let event_count_buf = mk("predate-event-count", f, stor_dst_src);
         let herd_rb = mk("predate-herd-rb", n * f, read);
         let energy_rb = mk("predate-energy-rb", n * f, read);
         let damage_rb = mk("predate-damage-rb", n * f, read);
+        let event_count_rb = mk("predate-event-count-rb", f, read);
 
         Ok(Self {
             device,
@@ -189,9 +198,11 @@ impl PredateGpu {
             damage_delta_buf,
             spike_counts_buf,
             pitches_buf,
+            event_count_buf,
             herd_rb,
             energy_rb,
             damage_rb,
+            event_count_rb,
             pos_packed: Vec::new(),
         })
     }
@@ -223,6 +234,7 @@ impl PredateGpu {
                 herd_counts: Vec::new(),
                 energy_delta: Vec::new(),
                 damage_delta: Vec::new(),
+                total_events: 0,
             };
         }
         let mut params = params;
@@ -240,6 +252,10 @@ impl PredateGpu {
         self.queue.write_buffer(&self.herd_buf, 0, &zero_bytes);
         self.queue.write_buffer(&self.energy_delta_buf, 0, &zero_bytes);
         self.queue.write_buffer(&self.damage_delta_buf, 0, &zero_bytes);
+        // Event counter is a single u32 — separate zero write (don't reuse
+        // the per-cell `zero_bytes` since `n` can be 0+).
+        self.queue
+            .write_buffer(&self.event_count_buf, 0, &[0u8, 0, 0, 0]);
 
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -281,6 +297,7 @@ impl PredateGpu {
                 wgpu::BindGroupEntry { binding: 10, resource: self.damage_delta_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.spike_counts_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: self.pitches_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.event_count_buf.as_entire_binding() },
             ],
         });
 
@@ -310,24 +327,34 @@ impl PredateGpu {
         encoder.copy_buffer_to_buffer(&self.herd_buf, 0, &self.herd_rb, 0, bytes);
         encoder.copy_buffer_to_buffer(&self.energy_delta_buf, 0, &self.energy_rb, 0, bytes);
         encoder.copy_buffer_to_buffer(&self.damage_delta_buf, 0, &self.damage_rb, 0, bytes);
+        encoder.copy_buffer_to_buffer(&self.event_count_buf, 0, &self.event_count_rb, 0, 4);
         self.queue.submit(Some(encoder.finish()));
 
         let h = self.herd_rb.slice(0..bytes);
         let e = self.energy_rb.slice(0..bytes);
         let d = self.damage_rb.slice(0..bytes);
+        let ec = self.event_count_rb.slice(0..4);
         h.map_async(wgpu::MapMode::Read, |_| {});
         e.map_async(wgpu::MapMode::Read, |_| {});
         d.map_async(wgpu::MapMode::Read, |_| {});
+        ec.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
 
+        let event_count: u32 = {
+            let mapped = ec.get_mapped_range();
+            let arr: [u8; 4] = mapped[..4].try_into().expect("4-byte counter");
+            u32::from_ne_bytes(arr)
+        };
         let res = PredateResult {
             herd_counts: bytemuck::cast_slice::<u8, u32>(&h.get_mapped_range()).to_vec(),
             energy_delta: bytemuck::cast_slice::<u8, f32>(&e.get_mapped_range()).to_vec(),
             damage_delta: bytemuck::cast_slice::<u8, f32>(&d.get_mapped_range()).to_vec(),
+            total_events: event_count,
         };
         self.herd_rb.unmap();
         self.energy_rb.unmap();
         self.damage_rb.unmap();
+        self.event_count_rb.unmap();
         res
     }
 }

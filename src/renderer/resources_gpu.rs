@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bioscape::gpu::{
     BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, FieldGpu, HebbianGpu, MotorGpu,
-    PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
+    PopulateInputsGpu, PredateGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
 };
 
 /// Sprint 52: GPU compute state pro renderer. Drží persistent CellsGpu +
@@ -59,6 +59,8 @@ pub(super) struct GpuFullPipeline {
     pub(super) step: StepGpu,
     /// Wave H: GPU collision broad-phase. Mirrors headless GpuFullState.
     pub(super) collision: CollisionGpu,
+    /// Wave H: GPU predate (herd + atomic attack accumulation).
+    pub(super) predate: PredateGpu,
     /// GPU CPPN — materialises child brain weights direct → cells.brain_weights_buf
     /// at child slots, replacing per-child `upload_brain_at`. Dispatched once
     /// per `cell_reproduces_on_threshold` invocation.

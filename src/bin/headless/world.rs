@@ -2562,6 +2562,7 @@ impl World {
             cell.energy += result.energy_delta[i];
             cell.damage_accum += result.damage_delta[i];
         }
+        self.predation_events_gen += result.total_events as u64;
     }
 
     fn predate(&mut self) {

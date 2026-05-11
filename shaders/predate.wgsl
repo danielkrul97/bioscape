@@ -79,6 +79,9 @@ fn bucket_coords_of(pos: vec3<f32>) -> vec3<i32> {
 @group(0) @binding(10) var<storage, read_write> damage_delta: array<atomic<u32>>;
 @group(0) @binding(11) var<storage, read> spike_counts: array<u32>;
 @group(0) @binding(12) var<storage, read> pitches: array<f32>;
+// Single-element global counter incremented atomically per (i, j) attack hit.
+// Mirrors CPU `attack_events.len()` for `predation_events_gen` CSV column.
+@group(0) @binding(13) var<storage, read_write> event_count: array<atomic<u32>>;
 
 @compute @workgroup_size(64)
 fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -227,6 +230,7 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                     );
                     let d2 = dot(d, d);
                     if (d2 < pair_r2) {
+                        atomicAdd(&event_count[0], 1u);
                         var gain = params.predation_gain;
                         if (spike_active > 0u && d2 > 0.0) {
                             let inv_d = inverseSqrt(d2);

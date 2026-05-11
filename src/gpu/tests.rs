@@ -807,6 +807,7 @@ fn predate_gpu_matches_cpu() {
 
     let mut cpu_energy = vec![0.0_f32; n];
     let mut cpu_damage = vec![0.0_f32; n];
+    let mut cpu_events: u32 = 0;
     for i in 0..n {
         let attack = attack_signals[i].max(0.0);
         if attack <= ATTACK_THRESHOLD { continue; }
@@ -822,6 +823,7 @@ fn predate_gpu_matches_cpu() {
             let dz = positions[i][2] - positions[j][2];
             let d2 = dx * dx + dy * dy + dz * dz;
             if d2 < pair_r2 {
+                cpu_events += 1;
                 let mut gain = PREDATION_GAIN_PER_TICK;
                 if spike_counts[i] > 0 && d2 > 0.0 {
                     let inv_d = 1.0 / d2.sqrt();
@@ -853,6 +855,11 @@ fn predate_gpu_matches_cpu() {
             res.damage_delta[i]
         );
     }
+    assert_eq!(
+        cpu_events, res.total_events,
+        "total_events cpu={} gpu={}",
+        cpu_events, res.total_events
+    );
 }
 
 /// Sprint 50: collision GPU vs CPU `headless::resolve_collisions` parity.

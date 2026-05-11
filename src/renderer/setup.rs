@@ -327,6 +327,7 @@ pub(super) fn setup(
             let populate = PopulateInputsGpu::with_context(&ctx)?;
             let motor = MotorGpu::with_context(&ctx, cap)?;
             let step = StepGpu::with_context(&ctx, cap)?;
+            let predate = bioscape::gpu::PredateGpu::with_context(&ctx, cap)?;
             let collision = bioscape::gpu::CollisionGpu::with_context(
                 &ctx,
                 cap,
@@ -361,6 +362,7 @@ pub(super) fn setup(
                 motor,
                 step,
                 collision,
+                predate,
                 cppn,
                 scratch: bioscape::gpu::GpuFullScratch::default(),
             })
