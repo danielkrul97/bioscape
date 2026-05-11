@@ -366,6 +366,10 @@ fn main() {
             let populate = PopulateInputsGpu::with_context(&ctx)?;
             let motor = MotorGpu::with_context(&ctx, cap)?;
             let step = StepGpu::with_context(&ctx, cap)?;
+            // Wave H: GPU predation (herd + atomic attack accumulator).
+            // Pack-hunting CSV metrics (`bonded_attacks_gen` etc.) stay zero
+            // on the GPU path until predate.wgsl learns to emit events.
+            let predate = bioscape::gpu::PredateGpu::with_context(&ctx, cap)?;
             // Wave H: full-scope collision shader (depenetration + velocity
             // damping + adhesion + spring bonds + contact events).
             let collision = bioscape::gpu::CollisionGpu::with_context(
@@ -400,6 +404,7 @@ fn main() {
                 hebbian,
                 brownian,
                 collision,
+                predate,
                 smell,
                 pheromone,
                 vibration,

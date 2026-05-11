@@ -36,6 +36,7 @@ pub(crate) fn cell_predates_on_neighbor(
     grid: Res<CellGrid>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut diag: Diagnostics,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut energy_changes_scratch: Local<FxHashMap<Entity, f32>>,
     mut damage_changes_scratch: Local<FxHashMap<Entity, f32>>,
     mut snapshot_scratch: Local<Vec<(Entity, [f32; 3])>>,
@@ -44,6 +45,89 @@ pub(crate) fn cell_predates_on_neighbor(
     mut herd_counts_scratch: Local<FxHashMap<Entity, u32>>,
 ) {
     let t_total = Instant::now();
+
+    // Wave H: GPU predation path. Computes herd + per-pair attack with
+    // atomic energy/damage accumulation. Pack-hunting CSV diagnostics
+    // (bonded/solo/swarm/pack) are NOT computed here — the shader doesn't
+    // emit per-event tuples. CPU fallback still does the full metric set.
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu_res) = gpu_full {
+        let gpu = &mut *gpu_res;
+        let mut entities: Vec<Entity> = Vec::new();
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut eff_radii: Vec<f32> = Vec::new();
+        let mut headings: Vec<f32> = Vec::new();
+        let mut pitches: Vec<f32> = Vec::new();
+        let mut attack_signals: Vec<f32> = Vec::new();
+        let mut spike_counts: Vec<u32> = Vec::new();
+        let mut spikes_packed: Vec<[f32; 4]> = Vec::new();
+        for (e, c) in cells.iter() {
+            entities.push(e);
+            positions.push(c.0.position);
+            eff_radii.push(c.0.phenotype.effective_radius());
+            headings.push(c.0.heading);
+            pitches.push(c.0.pitch);
+            attack_signals.push(c.0.last_outputs[6].max(0.0));
+            let mut active = 0u32;
+            for s in 0..bioscape::SPIKE_SLOTS {
+                let spike = c.0.phenotype.spikes[s];
+                if spike.length > 0.0 {
+                    active += 1;
+                }
+                spikes_packed.push([
+                    spike.length,
+                    spike.azimuth_offset,
+                    spike.elevation_offset,
+                    spike.complexity,
+                ]);
+            }
+            spike_counts.push(active);
+        }
+        let n = entities.len();
+        if n == 0 {
+            diag.add_measurement(&DIAG_PREDATION, || {
+                t_total.elapsed().as_secs_f64() * 1000.0
+            });
+            return;
+        }
+        let params = bioscape::gpu::PredateParamsGpu {
+            num_cells: 0, // populated by compute()
+            cell_size: bioscape::GRID_CELL_SIZE,
+            cell_radius_const: CELL_RADIUS,
+            size_ratio_threshold: SIZE_RATIO_THRESHOLD,
+            herd_radius_sq: HERD_RADIUS * HERD_RADIUS,
+            attack_threshold: ATTACK_THRESHOLD,
+            predation_gain: PREDATION_GAIN_PER_TICK,
+            predation_drain: PREDATION_DRAIN_PER_TICK,
+            spike_dot_threshold: bioscape::SPIKE_DOT_THRESHOLD,
+            spike_bonus: bioscape::SPIKE_PREDATION_BONUS,
+            dilution_k: DILUTION_K,
+            world_half_x: WORLD_HALF[0],
+            world_half_y: WORLD_HALF[1],
+            ..bioscape::gpu::PredateParamsGpu::default()
+        };
+        gpu.cell_hash.dispatch(&positions);
+        let result = gpu.predate.compute(
+            &positions,
+            &eff_radii,
+            &headings,
+            &pitches,
+            &spikes_packed,
+            &spike_counts,
+            &attack_signals,
+            &gpu.cell_hash,
+            params,
+        );
+        for (i, entity) in entities.iter().enumerate() {
+            if let Ok((_, mut cell)) = cells.get_mut(*entity) {
+                cell.0.energy += result.energy_delta[i];
+                cell.0.damage_accum += result.damage_delta[i];
+            }
+        }
+        diag.add_measurement(&DIAG_PREDATION, || t_total.elapsed().as_secs_f64() * 1000.0);
+        return;
+    }
+
     // R-#5: persistent scratchy. Pre-fix: 6 fresh allocs per tick. Sprint 58
     // používal HashMap → FxHashMap (fixed seed); reuse navíc eliminuje alloc.
     energy_changes_scratch.clear();

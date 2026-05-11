@@ -34,8 +34,8 @@ use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
 use bioscape::{
     gpu::{
         BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, FieldGpu, GpuFullScratch,
-        HebbianGpu, MotorGpu, PopulateInputsGpu, PopulateInputsParams, SensorGatherGpu,
-        SensorParamsGpu, SpatialHashGpu, StepGpu, StepParamsGpu,
+        HebbianGpu, MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu,
+        PredateParamsGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu, StepGpu, StepParamsGpu,
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
     DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT, GRAVITY as PHYS_GRAVITY,
@@ -303,6 +303,11 @@ pub struct GpuFullState {
     /// Phase 4 (contact_progress / bond formation) — sparse / variable-
     /// allocation work that does not fit the GPU pair loop.
     pub collision: CollisionGpu,
+    /// Wave H: GPU predation (herd count + per-pair attack with atomic
+    /// energy/damage accumulation). Pack-hunting CSV diagnostics
+    /// (`bonded_attacks_gen` etc.) stay zero on this path — extending the
+    /// shader to emit per-event tuples is follow-up work.
+    pub predate: PredateGpu,
     /// Sprint 59: GPU smell + pheromone field (3D 7-point Jacobi).
     /// Sprint 60: po wire SensorGatherGpu už NEČTE CPU SmellField shadow —
     /// sensor shader bere field grid storage buffer direct. Per-tick readback
@@ -2477,7 +2482,94 @@ impl World {
         self.bonds_broken_gen += bonds_broken_this_tick;
     }
 
+    /// Wave H: GPU predation dispatch. Computes herd_counts + per-pair
+    /// energy/damage deltas in one shader pass and applies them to cells.
+    /// Pack-hunting CSV diagnostics (`bonded_attacks_gen` etc.) and
+    /// `predation_events_gen` are NOT computed on this path — the shader
+    /// doesn't emit per-event tuples. Extending `predate.wgsl` with an
+    /// atomic event buffer is follow-up work.
+    #[cfg(feature = "gpu")]
+    fn predate_gpu(&mut self) {
+        let n = self.cells.len();
+        if n == 0 {
+            return;
+        }
+        let positions: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
+        let eff_radii: Vec<f32> = self
+            .cells
+            .iter()
+            .map(|c| c.phenotype.effective_radius())
+            .collect();
+        let headings: Vec<f32> = self.cells.iter().map(|c| c.heading).collect();
+        let pitches: Vec<f32> = self.cells.iter().map(|c| c.pitch).collect();
+        let attack_signals: Vec<f32> = self
+            .cells
+            .iter()
+            .map(|c| c.last_outputs[6].max(0.0))
+            .collect();
+        let mut spike_counts: Vec<u32> = Vec::with_capacity(n);
+        let mut spikes_packed: Vec<[f32; 4]> = Vec::with_capacity(n * bioscape::SPIKE_SLOTS);
+        for cell in &self.cells {
+            let mut active = 0u32;
+            for s in 0..bioscape::SPIKE_SLOTS {
+                let spike = cell.phenotype.spikes[s];
+                if spike.length > 0.0 {
+                    active += 1;
+                }
+                spikes_packed.push([
+                    spike.length,
+                    spike.azimuth_offset,
+                    spike.elevation_offset,
+                    spike.complexity,
+                ]);
+            }
+            spike_counts.push(active);
+        }
+        let params = PredateParamsGpu {
+            num_cells: 0, // filled by compute()
+            cell_size: bioscape::GRID_CELL_SIZE,
+            cell_radius_const: bioscape::CELL_RADIUS,
+            size_ratio_threshold: bioscape::SIZE_RATIO_THRESHOLD,
+            herd_radius_sq: bioscape::HERD_RADIUS * bioscape::HERD_RADIUS,
+            attack_threshold: bioscape::ATTACK_THRESHOLD,
+            predation_gain: bioscape::PREDATION_GAIN_PER_TICK * self.predation_gain_mult,
+            predation_drain: bioscape::PREDATION_DRAIN_PER_TICK * self.predation_drain_mult,
+            spike_dot_threshold: bioscape::SPIKE_DOT_THRESHOLD,
+            spike_bonus: bioscape::SPIKE_PREDATION_BONUS,
+            dilution_k: bioscape::DILUTION_K,
+            world_half_x: WORLD_HALF[0],
+            world_half_y: WORLD_HALF[1],
+            ..PredateParamsGpu::default()
+        };
+        let result = {
+            let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
+            // Refresh GPU spatial hash with current (post-resolve_collisions)
+            // positions before the predate dispatch.
+            gpu.cell_hash.dispatch(&positions);
+            gpu.predate.compute(
+                &positions,
+                &eff_radii,
+                &headings,
+                &pitches,
+                &spikes_packed,
+                &spike_counts,
+                &attack_signals,
+                &gpu.cell_hash,
+                params,
+            )
+        };
+        for (i, cell) in self.cells.iter_mut().enumerate() {
+            cell.energy += result.energy_delta[i];
+            cell.damage_accum += result.damage_delta[i];
+        }
+    }
+
     fn predate(&mut self) {
+        #[cfg(feature = "gpu")]
+        if self.gpu_full.is_some() {
+            self.predate_gpu();
+            return;
+        }
         // Sprint 43: cell_grid build (sdílený s brain_act ale tam refresh tickem
         // později; rebuildujeme pro jistotu — pozice se mohly hnout v `step()`).
         // Pass 1 (herd_counts): par_iter, write-only per i. Pass 2 (attack
