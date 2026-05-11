@@ -19,9 +19,9 @@ struct CollisionParams {
     adhesion_strength: f32,
     adhesion_cross_type: f32,
     adhesion_range_factor: f32,
+    bond_break_factor: f32,
+    bonds_per_cell: u32,
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +29,12 @@ pub struct AdhesionParams {
     pub strength: f32,
     pub cross_type: f32,
     pub range_factor: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BondParams {
+    pub bonds_per_cell: u32,
+    pub break_factor: f32,
 }
 
 pub struct CollisionGpu {
@@ -41,6 +47,7 @@ pub struct CollisionGpu {
     cell_radius_const: f32,
     collision_restitution: f32,
     adhesion: AdhesionParams,
+    bonds: BondParams,
     world_half_xy: [f32; 2],
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
@@ -48,6 +55,10 @@ pub struct CollisionGpu {
     eff_radii_buf: wgpu::Buffer,
     max_axes_buf: wgpu::Buffer,
     adhesion_types_buf: wgpu::Buffer,
+    bond_partner_idx_buf: wgpu::Buffer,
+    bond_rest_buf: wgpu::Buffer,
+    bond_stiffness_buf: wgpu::Buffer,
+    bond_damping_buf: wgpu::Buffer,
     deltas_buf: wgpu::Buffer,
     vel_deltas_buf: wgpu::Buffer,
     deltas_rb: wgpu::Buffer,
@@ -64,6 +75,7 @@ impl CollisionGpu {
         cell_radius_const: f32,
         collision_restitution: f32,
         adhesion: AdhesionParams,
+        bonds: BondParams,
         world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         Self::with_device_inner(
@@ -74,6 +86,7 @@ impl CollisionGpu {
             cell_radius_const,
             collision_restitution,
             adhesion,
+            bonds,
             world_half_xy,
         )
     }
@@ -84,6 +97,7 @@ impl CollisionGpu {
         cell_radius_const: f32,
         collision_restitution: f32,
         adhesion: AdhesionParams,
+        bonds: BondParams,
         world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         let ctx = GpuContext::new()?;
@@ -95,6 +109,7 @@ impl CollisionGpu {
             cell_radius_const,
             collision_restitution,
             adhesion,
+            bonds,
             world_half_xy,
         )
     }
@@ -107,6 +122,7 @@ impl CollisionGpu {
         cell_radius_const: f32,
         collision_restitution: f32,
         adhesion: AdhesionParams,
+        bonds: BondParams,
         world_half_xy: [f32; 2],
     ) -> Result<Self, String> {
         assert!(capacity > 0);
@@ -114,7 +130,7 @@ impl CollisionGpu {
             label: Some("collision"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/collision.wgsl").into()),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..10)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -175,6 +191,11 @@ impl CollisionGpu {
         let eff_radii_buf = mk("collision-eff-radii", n * f, stor_dst);
         let max_axes_buf = mk("collision-max-axes", n * f, stor_dst);
         let adhesion_types_buf = mk("collision-adhesion-types", n * f, stor_dst);
+        let bonds_total = n * (bonds.bonds_per_cell.max(1) as u64);
+        let bond_partner_idx_buf = mk("collision-bond-partner-idx", bonds_total * f, stor_dst);
+        let bond_rest_buf = mk("collision-bond-rest", bonds_total * f, stor_dst);
+        let bond_stiffness_buf = mk("collision-bond-stiffness", bonds_total * f, stor_dst);
+        let bond_damping_buf = mk("collision-bond-damping", bonds_total * f, stor_dst);
         let deltas_buf = mk("collision-deltas", n * 3 * f, stor_src);
         let vel_deltas_buf = mk("collision-vel-deltas", n * 3 * f, stor_src);
         let deltas_rb = mk("collision-deltas-rb", n * 3 * f, read);
@@ -190,6 +211,7 @@ impl CollisionGpu {
             cell_radius_const,
             collision_restitution,
             adhesion,
+            bonds,
             world_half_xy,
             params_buf,
             positions_buf,
@@ -197,6 +219,10 @@ impl CollisionGpu {
             eff_radii_buf,
             max_axes_buf,
             adhesion_types_buf,
+            bond_partner_idx_buf,
+            bond_rest_buf,
+            bond_stiffness_buf,
+            bond_damping_buf,
             deltas_buf,
             vel_deltas_buf,
             deltas_rb,
@@ -206,6 +232,7 @@ impl CollisionGpu {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
         positions: &[[f32; 3]],
@@ -213,12 +240,21 @@ impl CollisionGpu {
         eff_radii: &[f32],
         max_axes: &[f32],
         adhesion_types: &[u32],
+        bond_partner_idx: &[i32],
+        bond_rest: &[f32],
+        bond_stiffness: &[f32],
+        bond_damping: &[f32],
         cell_hash: &SpatialHashGpu,
     ) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
         let n = positions.len();
         assert!(n <= self.capacity, "collision capacity overflow");
         assert_eq!(velocities.len(), n, "velocities length mismatch");
         assert_eq!(adhesion_types.len(), n, "adhesion_types length mismatch");
+        let bonds_total = n * self.bonds.bonds_per_cell as usize;
+        assert_eq!(bond_partner_idx.len(), bonds_total, "bond_partner_idx length mismatch");
+        assert_eq!(bond_rest.len(), bonds_total, "bond_rest length mismatch");
+        assert_eq!(bond_stiffness.len(), bonds_total, "bond_stiffness length mismatch");
+        assert_eq!(bond_damping.len(), bonds_total, "bond_damping length mismatch");
         if n == 0 {
             return (Vec::new(), Vec::new());
         }
@@ -242,9 +278,9 @@ impl CollisionGpu {
             adhesion_strength: self.adhesion.strength,
             adhesion_cross_type: self.adhesion.cross_type,
             adhesion_range_factor: self.adhesion.range_factor,
+            bond_break_factor: self.bonds.break_factor,
+            bonds_per_cell: self.bonds.bonds_per_cell,
             _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -267,6 +303,23 @@ impl CollisionGpu {
             0,
             bytemuck::cast_slice(adhesion_types),
         );
+        self.queue.write_buffer(
+            &self.bond_partner_idx_buf,
+            0,
+            bytemuck::cast_slice(bond_partner_idx),
+        );
+        self.queue
+            .write_buffer(&self.bond_rest_buf, 0, bytemuck::cast_slice(bond_rest));
+        self.queue.write_buffer(
+            &self.bond_stiffness_buf,
+            0,
+            bytemuck::cast_slice(bond_stiffness),
+        );
+        self.queue.write_buffer(
+            &self.bond_damping_buf,
+            0,
+            bytemuck::cast_slice(bond_damping),
+        );
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("collision-bg"),
@@ -282,6 +335,10 @@ impl CollisionGpu {
                 wgpu::BindGroupEntry { binding: 7, resource: self.velocities_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: self.vel_deltas_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: self.adhesion_types_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: self.bond_partner_idx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.bond_rest_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: self.bond_stiffness_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.bond_damping_buf.as_entire_binding() },
             ],
         });
 

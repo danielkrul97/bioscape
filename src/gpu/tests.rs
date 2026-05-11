@@ -856,15 +856,16 @@ fn predate_gpu_matches_cpu() {
 }
 
 /// Sprint 50: collision GPU vs CPU `headless::resolve_collisions` parity.
-/// Pack cells velmi blízko sebe → forced overlaps + adhesion-range pairs.
-/// GPU vrací position deltas (depenetrace, Sprint 50) + velocity deltas
-/// (inelastic damping Sprint 65 + differential adhesion Sprint 66) per cell;
-/// CPU brute-force počítá totéž. Tolerance 1e-3.
+/// Pack cells velmi blízko sebe → forced overlaps + adhesion-range pairs +
+/// random spring bonds. GPU vrací position deltas (depenetrace, Sprint 50)
+/// + velocity deltas (inelastic damping Sprint 65 + differential adhesion
+/// Sprint 66 + spring-bond Sprint 66/68) per cell; CPU brute-force počítá
+/// totéž. Tolerance 1e-3.
 #[test]
 fn collision_gpu_matches_cpu() {
     use crate::{
         ADHESION_CROSS_TYPE, ADHESION_RANGE_FACTOR, ADHESION_STRENGTH, ADHESION_TYPE_COUNT,
-        CELL_RADIUS, COLLISION_RESTITUTION,
+        BOND_BREAK_FACTOR, CELL_RADIUS, COLLISION_RESTITUTION, MAX_BONDS_PER_CELL,
     };
     let mut rng = StdRng::seed_from_u64(53);
     let n = 100;
@@ -898,6 +899,29 @@ fn collision_gpu_matches_cpu() {
         cross_type: ADHESION_CROSS_TYPE,
         range_factor: ADHESION_RANGE_FACTOR,
     };
+    let bond_params = BondParams {
+        bonds_per_cell: MAX_BONDS_PER_CELL as u32,
+        break_factor: BOND_BREAK_FACTOR,
+    };
+    let slots = MAX_BONDS_PER_CELL;
+    // Random sparse bonds: each slot is empty (idx=-1) with 70% probability,
+    // otherwise points at a random other cell. self-pointers are filtered.
+    let mut bond_partner_idx: Vec<i32> = vec![-1; n * slots];
+    let mut bond_rest: Vec<f32> = vec![0.0; n * slots];
+    let mut bond_stiffness: Vec<f32> = vec![0.0; n * slots];
+    let mut bond_damping: Vec<f32> = vec![0.0; n * slots];
+    for i in 0..n {
+        for s in 0..slots {
+            if rng.random::<f32>() < 0.7 { continue; }
+            let mut j = rng.random_range(0..n);
+            if j == i { j = (j + 1) % n; }
+            let idx = i * slots + s;
+            bond_partner_idx[idx] = j as i32;
+            bond_rest[idx] = rng.random_range(5.0_f32..30.0);
+            bond_stiffness[idx] = rng.random_range(0.5_f32..16.0);
+            bond_damping[idx] = rng.random_range(0.0_f32..2.0);
+        }
+    }
 
     let ctx = match GpuContext::new() {
         Ok(c) => c,
@@ -912,6 +936,7 @@ fn collision_gpu_matches_cpu() {
         CELL_RADIUS,
         COLLISION_RESTITUTION,
         adhesion,
+        bond_params,
         [1000.0, 1000.0],
     )
     .expect("collision init");
@@ -921,6 +946,10 @@ fn collision_gpu_matches_cpu() {
         &eff_radii,
         &max_axes,
         &adhesion_types,
+        &bond_partner_idx,
+        &bond_rest,
+        &bond_stiffness,
+        &bond_damping,
         &hash,
     );
 
@@ -979,6 +1008,39 @@ fn collision_gpu_matches_cpu() {
                     cpu_vel_deltas[i][2] += mag * dz * inv_d;
                 }
             }
+        }
+        // Bonds — spring + damping along (pos_i - pos_j) / dist.
+        for s in 0..slots {
+            let idx = i * slots + s;
+            let j_signed = bond_partner_idx[idx];
+            if j_signed < 0 { continue; }
+            let j = j_signed as usize;
+            let dx = positions[i][0] - positions[j][0];
+            let dy = positions[i][1] - positions[j][1];
+            let dz = positions[i][2] - positions[j][2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 <= 1e-20 { continue; }
+            let dist = d2.sqrt();
+            let rest = bond_rest[idx];
+            let break_len = rest * BOND_BREAK_FACTOR;
+            if dist > break_len { continue; }
+            let inv_d = 1.0 / dist;
+            let nx = dx * inv_d;
+            let ny = dy * inv_d;
+            let nz = dz * inv_d;
+            let stiffness = bond_stiffness[idx];
+            let damping = bond_damping[idx];
+            let extension = dist - rest;
+            let spring = -stiffness * extension;
+            let vrx = velocities[i][0] - velocities[j][0];
+            let vry = velocities[i][1] - velocities[j][1];
+            let vrz = velocities[i][2] - velocities[j][2];
+            let v_rel_n = vrx * nx + vry * ny + vrz * nz;
+            let damp = -damping * v_rel_n;
+            let mag = spring + damp;
+            cpu_vel_deltas[i][0] += mag * nx;
+            cpu_vel_deltas[i][1] += mag * ny;
+            cpu_vel_deltas[i][2] += mag * nz;
         }
     }
 

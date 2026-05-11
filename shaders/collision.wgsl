@@ -25,9 +25,9 @@ struct CollisionParams {
     adhesion_strength: f32,
     adhesion_cross_type: f32,
     adhesion_range_factor: f32,
+    bond_break_factor: f32,
+    bonds_per_cell: u32,
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: CollisionParams;
@@ -40,6 +40,10 @@ struct CollisionParams {
 @group(0) @binding(7) var<storage, read> velocities: array<f32>;
 @group(0) @binding(8) var<storage, read_write> vel_deltas: array<f32>;
 @group(0) @binding(9) var<storage, read> adhesion_types: array<u32>;
+@group(0) @binding(10) var<storage, read> bond_partner_idx: array<i32>;
+@group(0) @binding(11) var<storage, read> bond_rest: array<f32>;
+@group(0) @binding(12) var<storage, read> bond_stiffness: array<f32>;
+@group(0) @binding(13) var<storage, read> bond_damping: array<f32>;
 
 fn min_image_xy(d: f32, half: f32) -> f32 {
     let w = 2.0 * half;
@@ -181,6 +185,60 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
+    }
+
+    // Sprint 66 spring bonds: each cell carries up to `bonds_per_cell` slots
+    // pre-resolved by the caller to partner indices (-1 = empty). The bond
+    // force is Hookean spring × (dist − rest) plus per-bond linear damping
+    // along the spring axis. Overstretched bonds (dist > rest × break_factor)
+    // contribute zero force — the CPU side handles the actual break decision
+    // in a follow-up pass.
+    let bond_base = i * params.bonds_per_cell;
+    for (var slot = 0u; slot < params.bonds_per_cell; slot = slot + 1u) {
+        let bond_idx = bond_base + slot;
+        let j_signed = bond_partner_idx[bond_idx];
+        if (j_signed < 0) {
+            continue;
+        }
+        let j = u32(j_signed);
+        let pj = vec3<f32>(
+            positions[j * 3u + 0u],
+            positions[j * 3u + 1u],
+            positions[j * 3u + 2u],
+        );
+        let d = vec3<f32>(
+            min_image_xy(pos_i.x - pj.x, params.world_half_x),
+            min_image_xy(pos_i.y - pj.y, params.world_half_y),
+            pos_i.z - pj.z,
+        );
+        let d2 = dot(d, d);
+        if (d2 <= 1e-20) {
+            continue;
+        }
+        let dist = sqrt(d2);
+        let rest = bond_rest[bond_idx];
+        let break_len = rest * params.bond_break_factor;
+        if (dist > break_len) {
+            continue;
+        }
+        let inv_d = 1.0 / dist;
+        let n = d * inv_d;
+        let extension = dist - rest;
+        let stiffness = bond_stiffness[bond_idx];
+        let damping = bond_damping[bond_idx];
+        let spring = -stiffness * extension;
+        let vel_j = vec3<f32>(
+            velocities[j * 3u + 0u],
+            velocities[j * 3u + 1u],
+            velocities[j * 3u + 2u],
+        );
+        let v_rel = vel_i - vel_j;
+        let v_rel_n = dot(v_rel, n);
+        let damp = -damping * v_rel_n;
+        let mag = spring + damp;
+        vdx_acc = vdx_acc + mag * n.x;
+        vdy_acc = vdy_acc + mag * n.y;
+        vdz_acc = vdz_acc + mag * n.z;
     }
 
     deltas[i * 3u + 0u] = dx_acc;
