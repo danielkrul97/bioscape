@@ -110,6 +110,9 @@ pub fn base_cell() -> Cell {
         cell_state: 0.5,
         last_best_food_d2: f32::MAX,
         xoshiro_state: Xoshiro128PlusPlus::from_cell_id(0),
+        last_whisker_distances: [1.0; WHISKER_COUNT],
+        novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
+        novelty_head: 0,
         phenotype,
         genome,
     }

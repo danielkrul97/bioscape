@@ -807,6 +807,7 @@ fn populate_brain_inputs_writes_temperature_slot() {
         temperature_local: THERMAL_REF_TEMP, // exact REF → tanh(0) = 0
         vibration_grad: [0.0; 3],
         vibration_amp: 0.0,
+        whisker_distances: [1.0; WHISKER_COUNT],
     };
     let inputs = populate_brain_inputs(&mut cell, &sensors, 50.0);
     assert!((inputs[20] - 0.0).abs() < 1e-4, "REF should be 0, got {}", inputs[20]);
@@ -951,6 +952,9 @@ fn base_cell() -> Cell {
         cell_state: 0.5,
         last_best_food_d2: f32::MAX,
         xoshiro_state: crate::Xoshiro128PlusPlus::from_cell_id(0),
+        last_whisker_distances: [1.0; WHISKER_COUNT],
+        novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
+        novelty_head: 0,
         phenotype,
         genome,
     }

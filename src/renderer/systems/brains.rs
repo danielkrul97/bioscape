@@ -18,6 +18,56 @@ use super::super::resources::{
 #[cfg(feature = "gpu")]
 use super::super::resources_gpu::{GpuBrainState, GpuFullPipeline};
 
+/// Wave 2: episodic novelty reward pass. Runs after motion (positions
+/// reflect this tick's outcome). For each cell, bins position to a coarse
+/// novelty grid; if not in the cell's recent visit history, fires a small
+/// Hebbian reward against last-tick activations. Encourages exploration.
+/// Always-on regardless of maze toggle. GPU full pipeline reads brain
+/// weights persistent on GPU — we sync them back at the end of generation
+/// (`sync_brains_from_gpu`), so on `--gpu-full` the CPU novelty Hebbian
+/// patches the persistent CPU shadow only; weights re-sync next gen. Live
+/// effect lands during the next reproduce/CPPN regenerate. Acceptable Wave
+/// 2 trade-off; Wave 3 brings GPU novelty hook.
+pub(crate) fn apply_episodic_novelty(
+    extent: Res<super::super::resources::WorldExtent>,
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+) {
+    let half = extent.as_array();
+    cells.par_iter_mut().for_each(|mut cell| {
+        let v = bioscape::Cell::novelty_voxel_index(cell.0.position, half);
+        if !cell.0.check_novelty(v) {
+            return;
+        }
+        let last_inputs = cell.0.last_inputs;
+        let last_hidden = cell.0.last_hidden;
+        let last_outputs = cell.0.last_outputs;
+        cell.0.genome.brain.hebbian_update(
+            &last_inputs,
+            &last_hidden,
+            &last_outputs,
+            bioscape::NOVELTY_REWARD_MAGNITUDE,
+            bioscape::LEARNING_RATE,
+        );
+    });
+}
+
+/// Wave 2: per-cell whisker raycast pass. Fills `cell.last_whisker_distances`
+/// from `MazeWorld.field` so the sensor gather closure can read them
+/// without `MazeWorld` plumbed through (would push cells_brain_act over
+/// Bevy's 16-param system limit). Runs before `cells_brain_act`.
+pub(crate) fn update_whisker_distances(
+    maze: Res<super::super::resources::MazeWorld>,
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+) {
+    let Some(field) = maze.field.as_ref() else {
+        return;
+    };
+    cells.par_iter_mut().for_each(|mut cell| {
+        cell.0.last_whisker_distances =
+            field.whisker_distances(cell.0.position, cell.0.heading, cell.0.pitch);
+    });
+}
+
 /// Sprint 94: pre-brain pass. Compute `pooled_hidden` per cell = mean
 /// `last_hidden` over self + bonded partners (1-hop). Cluster cells získají
 /// shared recurrent state. Solo cells: pooled == self. Runs before
@@ -205,6 +255,7 @@ pub(crate) fn cells_brain_act(
             temperature_local,
             vibration_grad,
             vibration_amp,
+            whisker_distances: cell.0.last_whisker_distances,
         };
         cell.0.apply_shell_absorb(dt);
         // eat_food skip optim: cache d² k nejbližšímu food pro `cell_eats_food`

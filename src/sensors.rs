@@ -34,6 +34,12 @@ pub struct BrainSensors {
     /// Slot [32]. Combined with `vibration_grad` the brain can locate +
     /// gauge nearby movers.
     pub vibration_amp: f32,
+    /// Whisker raycast distances against the maze obstacle field, in body
+    /// frame: [+forward, -forward, +right, -right, +up, -down]. Slots
+    /// [33..39] in `populate_brain_inputs`. 1.0 = clear within
+    /// `WHISKER_RANGE`, 0.0 = wall at origin. When no obstacle field is
+    /// active, the helper returns all-ones (no walls).
+    pub whisker_distances: [f32; WHISKER_COUNT],
 }
 
 /// Sprint 40: jediný source of truth pro brain inputs layout. Pre-refactor byl
@@ -108,6 +114,14 @@ pub fn populate_brain_inputs(
     inputs[vib_base + 1] = (sensors.vibration_grad[1] * VIBRATION_NORMALIZATION_GAIN).tanh();
     inputs[vib_base + 2] = (sensors.vibration_grad[2] * VIBRATION_NORMALIZATION_GAIN).tanh();
     inputs[vib_base + 3] = (sensors.vibration_amp * VIBRATION_NORMALIZATION_GAIN).tanh();
+    // Wave 2 whiskers — [33..39] (= vib_base + 4 .. vib_base + 4 + WHISKER_COUNT).
+    // Already in [0, 1] from the raycast helper; no extra normalization. Mapped
+    // to [-1, 1] via 2x-1 so "clear" reads as +1 (preferred direction signal)
+    // and "wall touching" as -1 (avoid).
+    let wh_base = vib_base + 4;
+    for k in 0..WHISKER_COUNT {
+        inputs[wh_base + k] = sensors.whisker_distances[k] * 2.0 - 1.0;
+    }
     // Sprint 94: cluster-shared brain. Recurrent slots (21..52) čtou
     // `pooled_hidden` (mean self + bonded neighbors z předchozího ticku)
     // místo `last_hidden`. Solo cells: pool == self → behavior identical
@@ -173,6 +187,10 @@ pub fn sensor_slot_category(slot: usize) -> Option<usize> {
         // slots are categorized — that is how cells in a cluster share the
         // mechanosensory channel.
         29 | 30 | 31 | 32 => Some(SENSOR_CATEGORY_MECHANO),
+        // Wave 2 whiskers (33..39) → also Mechano (active touch is mechano-
+        // sensory). Pooled across bond network so a tissue can collectively
+        // map walls.
+        33 | 34 | 35 | 36 | 37 | 38 => Some(SENSOR_CATEGORY_MECHANO),
         // Energy (4), speed (5), heading (9,10,18) → proprio, no gain
         _ => None,
     }

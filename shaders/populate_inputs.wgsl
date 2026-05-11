@@ -158,6 +158,14 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     last_inputs[inputs_off + 31u] = tanh(vib_grad_z * params.vibration_norm_gain);
     last_inputs[inputs_off + 32u] = tanh(vib_amp    * params.vibration_norm_gain);
 
+    // Wave 2: whisker raycast slots 33..38 (WHISKER_COUNT = 6). GPU sensor
+    // gather doesn't yet compute per-cell raycasts (deferred to Wave 3), so
+    // these are zeroed each tick — neutral signal. CPU populate_brain_inputs
+    // writes the real raycast results when running on the CPU path.
+    for (var k: u32 = 33u; k <= 38u; k = k + 1u) {
+        last_inputs[inputs_off + k] = 0.0;
+    }
+
     // Sprint 30: damage_accum reset after consume.
     damage_accums[i] = 0.0;
 

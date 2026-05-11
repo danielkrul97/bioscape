@@ -193,6 +193,24 @@ pub fn run() {
                 .after(update_pheromone_field)
                 .before(pool_bonded_hidden_cells),
         )
+        // Wave 2: whisker raycast pre-pass. Reads `MazeWorld.field`, writes
+        // `cell.last_whisker_distances`. Must precede `cells_brain_act`
+        // (which reads from the cell). Registered separately for the same
+        // chain-size reason as `update_vibration_field`.
+        .add_systems(
+            FixedUpdate,
+            update_whisker_distances
+                .after(pool_bond_messages_cells)
+                .before(cells_brain_act),
+        )
+        // Wave 2: episodic novelty Hebbian reward — runs after motor /
+        // physics so the cell's voxel reflects this tick's motion. Modifies
+        // CPU brain weights; on `--gpu-full` the patches don't reach the
+        // persistent GPU buffer until next gen sync. Wave 3 brings GPU hook.
+        .add_systems(
+            FixedUpdate,
+            apply_episodic_novelty.after(step_cells),
+        )
         .add_systems(
             Update,
             (

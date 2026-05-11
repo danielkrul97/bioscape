@@ -296,6 +296,49 @@ impl ObstacleField {
         &self.occupied
     }
 
+    /// Whisker raycast: shoots `WHISKER_COUNT` short rays from `pos` in the
+    /// six body-frame cardinal directions (forward, back, right, left, up,
+    /// down) and returns per-ray free-distance normalized to `[0, 1]`.
+    /// `1.0` = no wall within `WHISKER_RANGE`; `0.0` = wall touching the
+    /// origin. Always xy-plane (z directions return 1.0 since walls span
+    /// full z). Pure read.
+    pub fn whisker_distances(
+        &self,
+        pos: [f32; 3],
+        heading: f32,
+        pitch: f32,
+    ) -> [f32; WHISKER_COUNT] {
+        let fwd = crate::forward_vector(heading, pitch);
+        let right = [-heading.sin(), heading.cos(), 0.0];
+        let dirs: [[f32; 3]; WHISKER_COUNT] = [
+            fwd,
+            [-fwd[0], -fwd[1], -fwd[2]],
+            right,
+            [-right[0], -right[1], -right[2]],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ];
+        let cs = self.voxel_size();
+        let step = cs[0].min(cs[1]) * 0.5;
+        let n_steps = (WHISKER_RANGE / step).ceil() as usize;
+        let mut out = [1.0_f32; WHISKER_COUNT];
+        for (k, dir) in dirs.iter().enumerate() {
+            // z-axis whiskers always clear (xy-only walls). Skip raycast.
+            if dir[0].abs() < 1e-6 && dir[1].abs() < 1e-6 {
+                continue;
+            }
+            for s in 1..=n_steps {
+                let t = s as f32 * step;
+                let p = [pos[0] + dir[0] * t, pos[1] + dir[1] * t, pos[2]];
+                if self.sample(p) {
+                    out[k] = (t / WHISKER_RANGE).clamp(0.0, 1.0);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     /// Sample this obstacle field at every voxel center of an external
     /// `[res_x, res_y, res_z]` grid (e.g. SmellField / pheromone field) and
     /// return a flat boolean mask in the same row-major layout the diffusion

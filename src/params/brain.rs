@@ -49,8 +49,14 @@ pub const N_BOND_MSG_CHANNELS: usize = 2;
 // amplitude. Field is `SmellField`-style 3D scalar with diffusion + decay;
 // emission is a byproduct of cell motion, not an explicit brain output. See
 // `params/vibration.rs` for constants and rationale.
+//
+// Wave 2 maze whiskers (slots [33..39]): 6 raycast distances normalized to
+// [0, 1] (1 = clear, 0 = wall touching). Shifts BRAIN_INPUTS_SENSORY 33→39
+// and BRAIN_INPUTS 78→84. CHECKPOINT_VERSION bumped — pre-V9 brain weights
+// don't match the new w1 matrix shape and re-init from CPPN at next reproduce.
 pub const BRAIN_INPUTS_SENSORY: usize =
-    27 + N_BOND_MSG_CHANNELS + crate::params::vibration::N_VIBRATION_INPUTS;
+    27 + N_BOND_MSG_CHANNELS + crate::params::vibration::N_VIBRATION_INPUTS
+        + crate::params::maze::WHISKER_COUNT;
 // Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
 // hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
 // w1 z 28×8=224 na 36×16=576 weights (2.6×).

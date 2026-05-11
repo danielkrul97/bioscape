@@ -33,3 +33,44 @@ pub const MAZE_GOAL_RADIUS: f32 = 40.0;
 /// preferentially, biasing food toward the maze terminus and giving
 /// reaching it real fitness payoff.
 pub const MAZE_GOAL_FOOD_BIAS: f32 = 5.0;
+
+/// Whisker proximity sensor — number of raycast directions in body frame.
+/// Six covers ±forward, ±right, ±up adequately for xy navigation; cheap
+/// enough to compute every tick (one short raycast each). Always-on brain
+/// input slot count regardless of maze toggle: when no obstacles exist the
+/// helper returns 1.0 (no wall within range) for every direction.
+pub const WHISKER_COUNT: usize = 6;
+
+/// Maximum whisker raycast range, in world units. Past this distance the
+/// returned signal saturates at 1.0 ("no wall in range"). Tuned to a few
+/// voxel widths at default world size (voxel size ≈ 60 units in Medium maze
+/// → 90 covers 1.5 voxels, plenty for "wall ahead" warning at navigation
+/// speed).
+pub const WHISKER_RANGE: f32 = 90.0;
+
+/// Eligibility-trace decay per second. Hebbian update changes from
+/// instantaneous `Δw = lr · reward · pre · post` (1-tick myopic) to trace-
+/// based: `e[i,j] *= decay; e[i,j] += pre · post; w[i,j] += lr · reward · e[i,j]`.
+/// At dt=1/60 s and `decay_per_sec=0.5`, per-tick decay ≈ 0.99 → effective
+/// reward window ~120 ticks (2 s). That spans a maze-corridor transit at
+/// typical speed, so cells reaching food can credit the choice they made
+/// at the previous corridor junction.
+pub const HEBBIAN_TRACE_DECAY_PER_SEC: f32 = 0.5;
+
+/// Per-cell episodic novelty: ring buffer of recently visited coarse-grid
+/// voxel indices. New voxel entry → novelty boost; revisit → no boost.
+/// Buffer length controls how far back "recent" reaches; 32 covers ~1/2
+/// generation at typical movement speed without dominating cell memory
+/// footprint.
+pub const NOVELTY_HISTORY_LEN: usize = 32;
+
+/// Coarse grid cell size for novelty bucketing, in world units. Larger =
+/// "I've been roughly here" granularity; smaller = each step counts as
+/// novel. 80 ≈ one maze-corridor cell.
+pub const NOVELTY_GRID_CELL_SIZE: f32 = 80.0;
+
+/// Novelty reward magnitude. Added to the Hebbian `reward` term whenever a
+/// cell visits a voxel not in its history buffer. Stays small relative to
+/// food/predation rewards (~1.0–10.0) so the cell isn't pulled away from
+/// goal-seeking by pure exploration. 0.05 ≈ 5 % of a food event.
+pub const NOVELTY_REWARD_MAGNITUDE: f32 = 0.05;

@@ -120,8 +120,34 @@ pub struct Cell {
     /// older saves overwrite on first `apply_brownian` re-seed.
     #[serde(default)]
     pub xoshiro_state: Xoshiro128PlusPlus,
+    /// Wave 2: whisker raycast results from the previous tick. Populated by
+    /// a pre-brain-act pass (`update_whiskers` in headless, separate system
+    /// in renderer); read by `populate_brain_inputs` into slots [33..39].
+    /// Stored on the cell to avoid plumbing `&ObstacleField` through every
+    /// sensor-gather call site (and to keep the sensor gather system param
+    /// count under Bevy's 16-cap). Defaults to all-ones (no walls) so when
+    /// the maze is off the brain reads neutral whisker signal.
+    #[serde(default = "default_whiskers")]
+    pub last_whisker_distances: [f32; WHISKER_COUNT],
+    /// Wave 2 episodic novelty: ring buffer of recently visited
+    /// `NOVELTY_GRID_CELL_SIZE`-bucketed voxel indices. New entries push out
+    /// the oldest. `novelty_head` is the next-write slot index. When the
+    /// cell enters a voxel not in the buffer, it earns a Hebbian reward
+    /// boost via `NOVELTY_REWARD_MAGNITUDE` and the index is recorded.
+    #[serde(default = "default_novelty_history")]
+    pub novelty_history: [u32; NOVELTY_HISTORY_LEN],
+    #[serde(default)]
+    pub novelty_head: u8,
     pub phenotype: Phenotype,
     pub genome: Genome,
+}
+
+fn default_whiskers() -> [f32; WHISKER_COUNT] {
+    [1.0; WHISKER_COUNT]
+}
+
+fn default_novelty_history() -> [u32; NOVELTY_HISTORY_LEN] {
+    [u32::MAX; NOVELTY_HISTORY_LEN]
 }
 
 fn f32_max_default() -> f32 {
@@ -234,6 +260,9 @@ impl Cell {
             // called with `c.cell_id`). CPU and GPU brownian streams stay in
             // lockstep as long as both initialize from the same cell_id.
             xoshiro_state: Xoshiro128PlusPlus::from_cell_id(cell_id),
+            last_whisker_distances: [1.0; WHISKER_COUNT],
+            novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
+            novelty_head: 0,
             phenotype,
             genome,
         }
@@ -714,6 +743,38 @@ impl Cell {
     pub fn apply_shell_absorb(&mut self, dt: f32) {
         let absorb = self.phenotype.shell_thickness * SHELL_ABSORB_PER_TICK * dt;
         self.damage_accum = (self.damage_accum - absorb).max(0.0);
+    }
+
+    /// Wave 2 episodic novelty: bin `pos` to a `NOVELTY_GRID_CELL_SIZE`-sized
+    /// voxel and return its packed index. Out-of-bounds positions clamp into
+    /// the grid (rare — cells stay inside world bounds).
+    pub fn novelty_voxel_index(pos: [f32; 3], world_half: [f32; 3]) -> u32 {
+        let nx = ((2.0 * world_half[0]) / NOVELTY_GRID_CELL_SIZE).ceil() as i32;
+        let ny = ((2.0 * world_half[1]) / NOVELTY_GRID_CELL_SIZE).ceil() as i32;
+        let xi = (((pos[0] + world_half[0]) / NOVELTY_GRID_CELL_SIZE).floor() as i32)
+            .clamp(0, nx - 1);
+        let yi = (((pos[1] + world_half[1]) / NOVELTY_GRID_CELL_SIZE).floor() as i32)
+            .clamp(0, ny - 1);
+        (yi as u32) * (nx as u32) + (xi as u32)
+    }
+
+    /// Wave 2: returns `true` and records the voxel if this cell hasn't been
+    /// in `voxel` recently (i.e. not in `novelty_history`); returns `false`
+    /// (no recording) if the voxel is already in the buffer. The ring
+    /// buffer evicts the oldest entry when a novel voxel is recorded.
+    pub fn check_novelty(&mut self, voxel: u32) -> bool {
+        if voxel == u32::MAX {
+            return false;
+        }
+        for &v in self.novelty_history.iter() {
+            if v == voxel {
+                return false;
+            }
+        }
+        let head = self.novelty_head as usize;
+        self.novelty_history[head] = voxel;
+        self.novelty_head = ((head + 1) % NOVELTY_HISTORY_LEN) as u8;
+        true
     }
 
     /// Brownian-motion gaussian noise on velocity. The `√dt` scaling is the

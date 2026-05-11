@@ -695,6 +695,10 @@ impl World {
         // recurrent state. Must run before brain_act (which reads pooled_hidden).
         self.pool_bonded_hidden();
         self.pool_bond_messages();
+        // Wave 2: whisker raycast against the maze. Stores per-cell results
+        // on `cell.last_whisker_distances` so the sensor gather closure can
+        // read them without an extra `&ObstacleField` capture.
+        self.update_whiskers();
         timed!(brain_act, self.run_brain_act(dt));
         timed!(emit_pheromones, self.emit_pheromones(dt));
         timed!(apply_morph, self.apply_morph(dt));
@@ -710,6 +714,11 @@ impl World {
         self.update_coop_food();
         timed!(reproduce, self.reproduce(rng));
         timed!(die_and_drop_carrion, self.die_and_drop_carrion(rng));
+        // Wave 2: episodic novelty reward — runs after position updates so
+        // the cell's voxel reflects this tick's motor outcome. Always-on
+        // (independent of maze toggle); for a homogeneous world this rewards
+        // any exploration. Helps cells break out of local minima.
+        self.apply_episodic_novelty();
         // Maze navigation tracker — no-op when obstacles is None, so the
         // homogeneous-world tick stays byte-identical with pre-maze runs.
         self.track_goal_metrics();
@@ -1393,6 +1402,7 @@ impl World {
                     temperature_local,
                     vibration_grad,
                     vibration_amp,
+                    whisker_distances: cell.last_whisker_distances,
                 };
                 cell.apply_shell_absorb(dt);
                 // eat_food skip optim: cache nejbližší food d² (viz CPU path).
@@ -1624,6 +1634,7 @@ impl World {
                     temperature_local,
                     vibration_grad,
                     vibration_amp,
+                    whisker_distances: cell.last_whisker_distances,
                 };
 
                 cell.apply_shell_absorb(dt);
@@ -1696,6 +1707,47 @@ impl World {
                 obstacles,
             );
         }
+    }
+
+    /// Wave 2 episodic novelty pass. For each cell, bin its current position
+    /// into a coarse novelty grid; if not in the cell's recent visit history,
+    /// fire a small Hebbian reward against last-tick (input, hidden, output)
+    /// activations. Encourages exploration without a separate brain output.
+    /// Runs after `step` so the cell's position reflects its motor output
+    /// from this tick (so credit attaches to the action that just placed it).
+    pub fn apply_episodic_novelty(&mut self) {
+        use bioscape::{LEARNING_RATE, NOVELTY_REWARD_MAGNITUDE};
+        let half = WORLD_HALF;
+        self.cells.par_iter_mut().for_each(|cell| {
+            let v = Cell::novelty_voxel_index(cell.position, half);
+            if !cell.check_novelty(v) {
+                return;
+            }
+            let last_inputs = cell.last_inputs;
+            let last_hidden = cell.last_hidden;
+            let last_outputs = cell.last_outputs;
+            cell.genome.brain.hebbian_update(
+                &last_inputs,
+                &last_hidden,
+                &last_outputs,
+                NOVELTY_REWARD_MAGNITUDE,
+                LEARNING_RATE,
+            );
+        });
+    }
+
+    /// Per-tick whisker raycast pass. Fills `cell.last_whisker_distances`
+    /// from `obstacles` so the sensor gather phase reads from the cell
+    /// without needing `&ObstacleField` plumbed through. No-op (leaves
+    /// defaults at 1.0 = "clear") when `obstacles` is `None`.
+    pub fn update_whiskers(&mut self) {
+        let Some(field) = self.obstacles.as_ref() else {
+            return;
+        };
+        self.cells.par_iter_mut().for_each(|cell| {
+            cell.last_whisker_distances =
+                field.whisker_distances(cell.position, cell.heading, cell.pitch);
+        });
     }
 
     /// Per-tick navigation metric tracker. No-op when `obstacles` is None.
