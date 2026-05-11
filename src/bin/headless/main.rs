@@ -333,6 +333,18 @@ fn main() {
                 WORLD_HALF,
                 field_sources_cap,
             )?;
+            let pheromone_ch1 = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                WORLD_HALF,
+                field_sources_cap,
+            )?;
+            let pheromone_ch2 = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                WORLD_HALF,
+                field_sources_cap,
+            )?;
             // V7: motion-driven vibration field on GPU. Source capacity is
             // `cap` (one deposit per cell per tick — far fewer sources than
             // smell which also takes food).
@@ -429,6 +441,8 @@ fn main() {
                 food_spawn,
                 smell,
                 pheromone,
+                pheromone_ch1,
+                pheromone_ch2,
                 vibration,
                 cell_hash,
                 food_hash,

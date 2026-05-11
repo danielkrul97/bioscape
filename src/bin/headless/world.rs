@@ -321,6 +321,12 @@ pub struct GpuFullState {
     /// checkpoint serialization (po `--gpu-full` jsou CPU shadows out-of-date).
     pub smell: FieldGpu,
     pub pheromone: FieldGpu,
+    /// Wave L: per-channel pheromone fields. ch0 = `pheromone` (above);
+    /// ch1 and ch2 here. All three step independently with the per-channel
+    /// `PHEROMONE_DIFFUSION_PER_CH` / `PHEROMONE_DECAY_PER_CH` constants
+    /// and feed sensor_gather binding 16 / 17 for brain-input gradients.
+    pub pheromone_ch1: FieldGpu,
+    pub pheromone_ch2: FieldGpu,
     /// V7: motion-driven mechanosensory field on GPU. Deposit + step inline
     /// each tick; sensor_gather shader binds the current grid buffer at
     /// binding 12. CPU `World.vibration` shadow is not synced on the
@@ -962,13 +968,16 @@ impl World {
         #[cfg(feature = "gpu")]
         if let Some(gpu) = self.gpu_full.as_mut() {
             gpu.pheromone.step(PHEROMONE_DIFFUSION_PER_CH[0], PHEROMONE_DECAY_PER_CH[0], dt);
-            for ch in 1..N_PHEROMONE_CHANNELS {
-                self.pheromone_fields[ch].step(
-                    PHEROMONE_DIFFUSION_PER_CH[ch],
-                    PHEROMONE_DECAY_PER_CH[ch],
-                    dt,
-                );
-            }
+            gpu.pheromone_ch1.step(
+                PHEROMONE_DIFFUSION_PER_CH[1],
+                PHEROMONE_DECAY_PER_CH[1],
+                dt,
+            );
+            gpu.pheromone_ch2.step(
+                PHEROMONE_DIFFUSION_PER_CH[2],
+                PHEROMONE_DECAY_PER_CH[2],
+                dt,
+            );
             return;
         }
         for ch in 0..N_PHEROMONE_CHANNELS {
@@ -1040,10 +1049,10 @@ impl World {
                     emits[ch] = brain_emit;
                     total_emit += brain_emit;
                     let rate = PHEROMONE_BASELINE_EMIT + brain_emit;
-                    if ch == 0 {
-                        gpu.pheromone.add_source(pos, rate * dt);
-                    } else {
-                        self.pheromone_fields[ch].add_source(pos, rate * dt);
+                    match ch {
+                        0 => gpu.pheromone.add_source(pos, rate * dt),
+                        1 => gpu.pheromone_ch1.add_source(pos, rate * dt),
+                        _ => gpu.pheromone_ch2.add_source(pos, rate * dt),
                     }
                     let prev = cell.last_emit[ch];
                     let delta = brain_emit - prev;
@@ -1253,6 +1262,8 @@ impl World {
             &gpu.food_hash,
             &gpu.smell,
             &gpu.pheromone,
+            &gpu.pheromone_ch1,
+            &gpu.pheromone_ch2,
             &gpu.vibration,
             sensor_params,
         );

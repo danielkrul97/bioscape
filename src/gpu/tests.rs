@@ -564,6 +564,11 @@ fn sensor_gather_gpu_matches_cpu() {
         &food_hash,
         &smell_gpu,
         &pheromone_gpu,
+        // Wave L: ch1/ch2 pheromone fields. Tests don't assert on these so
+        // reuse the existing ch0 instance — keeps the signature satisfied
+        // without allocating extra fields the test ignores.
+        &pheromone_gpu,
+        &pheromone_gpu,
         // V7: vibration shares the same FieldGpu type as smell/pheromone.
         // Tests don't assert on vibration values, so reuse smell as a stand-in
         // — vibration_grad/amp in returned rows will mirror smell, which is

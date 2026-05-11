@@ -71,6 +71,11 @@ struct SensorParams {
 // Allocated by SensorGatherGpu, uploaded each dispatch_no_readback.
 @group(0) @binding(14) var<storage, read> headings: array<f32>;
 @group(0) @binding(15) var<storage, read> pitches: array<f32>;
+// Wave L: per-channel pheromone grids (ch1, ch2). Same resolution +
+// world_half as `pheromone_grid` (ch0). Gradients fed to brain inputs
+// 21..26 via populate_inputs.wgsl.
+@group(0) @binding(16) var<storage, read> pheromone_grid_ch1: array<u32>;
+@group(0) @binding(17) var<storage, read> pheromone_grid_ch2: array<u32>;
 
 // Toroidal minimum-image displacement (used for both x and y).
 fn min_image_xy(d: f32, half: f32) -> f32 {
@@ -183,18 +188,20 @@ struct FieldConsts {
 struct FieldSample {
     smell: f32,
     pheromone: f32,
+    pheromone_ch1: f32,
+    pheromone_ch2: f32,
     vibration: f32,
 };
 
-// Single-position sample of all three grids. xy is toroidal (modulo wrap); z
+// Single-position sample of all five grids. xy is toroidal (modulo wrap); z
 // out of range yields a zero triple (matches CPU SmellField sample-on-bounds).
-// Vibration shares the same resolution + world_half as smell/pheromone (the
-// renderer/headless both allocate `VIBRATION_GRID_RES = SMELL_GRID_RES`), so a
-// single addressing pass serves all three reads.
+// All fields share the same resolution + world_half (renderer/headless both
+// allocate them on the same FieldGpu shape), so one addressing pass serves
+// every read.
 fn sample_all_at(pos: vec3<f32>, fc: FieldConsts) -> FieldSample {
     let zi = i32(floor((pos.z + params.field_world_half_z) * fc.inv_cell_z));
     if (zi < 0 || zi >= fc.nz) {
-        return FieldSample(0.0, 0.0, 0.0);
+        return FieldSample(0.0, 0.0, 0.0, 0.0, 0.0);
     }
     let xi_raw = i32(floor((pos.x + params.field_world_half_x) * fc.inv_cell_x));
     let yi_raw = i32(floor((pos.y + params.field_world_half_y) * fc.inv_cell_y));
@@ -204,6 +211,8 @@ fn sample_all_at(pos: vec3<f32>, fc: FieldConsts) -> FieldSample {
     return FieldSample(
         bitcast<f32>(smell_grid[idx]),
         bitcast<f32>(pheromone_grid[idx]),
+        bitcast<f32>(pheromone_grid_ch1[idx]),
+        bitcast<f32>(pheromone_grid_ch2[idx]),
         bitcast<f32>(vibration_grid[idx]),
     );
 }
@@ -360,6 +369,16 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
         (s_yp.pheromone - s_ym.pheromone) * inv_2eps,
         (s_zp.pheromone - s_zm.pheromone) * inv_2eps,
     );
+    let pheromone_grad_ch1 = vec3<f32>(
+        (s_xp.pheromone_ch1 - s_xm.pheromone_ch1) * inv_2eps,
+        (s_yp.pheromone_ch1 - s_ym.pheromone_ch1) * inv_2eps,
+        (s_zp.pheromone_ch1 - s_zm.pheromone_ch1) * inv_2eps,
+    );
+    let pheromone_grad_ch2 = vec3<f32>(
+        (s_xp.pheromone_ch2 - s_xm.pheromone_ch2) * inv_2eps,
+        (s_yp.pheromone_ch2 - s_ym.pheromone_ch2) * inv_2eps,
+        (s_zp.pheromone_ch2 - s_zm.pheromone_ch2) * inv_2eps,
+    );
     let vibration_grad = vec3<f32>(
         (s_xp.vibration - s_xm.vibration) * inv_2eps,
         (s_yp.vibration - s_ym.vibration) * inv_2eps,
@@ -392,7 +411,7 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
         // ±z directions always clear (xy-only walls); skip raycast.
     }
 
-    let off = i * 25u;
+    let off = i * 31u;
     output[off + 0u] = best_food_dx;
     output[off + 1u] = best_food_dy;
     output[off + 2u] = best_food_dz;
@@ -418,4 +437,12 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     output[off + 22u] = whisker3;
     output[off + 23u] = whisker4;
     output[off + 24u] = whisker5;
+    // Wave L: ch1/ch2 pheromone gradients. populate_inputs maps these to
+    // brain inputs 21..26.
+    output[off + 25u] = pheromone_grad_ch1.x;
+    output[off + 26u] = pheromone_grad_ch1.y;
+    output[off + 27u] = pheromone_grad_ch1.z;
+    output[off + 28u] = pheromone_grad_ch2.x;
+    output[off + 29u] = pheromone_grad_ch2.y;
+    output[off + 30u] = pheromone_grad_ch2.z;
 }

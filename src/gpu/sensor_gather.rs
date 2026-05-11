@@ -39,14 +39,17 @@ pub struct SensorRow {
     pub neighbors_in_vision: u32,
     pub smell_grad: [f32; 3],
     pub pheromone_grad: [f32; 3],
+    pub pheromone_grad_ch1: [f32; 3],
+    pub pheromone_grad_ch2: [f32; 3],
     pub vibration_grad: [f32; 3],
     pub vibration_amp: f32,
 }
 
 /// Output stride per cell in `sensor_gather.wgsl` — keep in lock-step with
-/// the shader's `let off = i * 25u;` block. V7 bumped 15 → 19 (+4 vibration);
-/// Wave 6 bumped 19 → 25 (+6 whisker raycast).
-pub const SENSOR_OUTPUT_STRIDE: usize = 25;
+/// the shader's `let off = i * 31u;` block. V7 bumped 15 → 19 (+4 vibration);
+/// Wave 6 bumped 19 → 25 (+6 whisker raycast); Wave L bumped 25 → 31
+/// (+6 for ch1/ch2 pheromone gradients).
+pub const SENSOR_OUTPUT_STRIDE: usize = 31;
 
 pub struct SensorGatherGpu {
     device: Arc<wgpu::Device>,
@@ -108,7 +111,9 @@ impl SensorGatherGpu {
         });
         // Wave 6: 14 → 16 bindings (bindings 14, 15 = headings, pitches
         // read-only for whisker raycast direction).
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..16)
+        // Wave L: 16 → 18 bindings (bindings 16, 17 = pheromone ch1/ch2
+        // grids read-only for multi-channel gradient sampling).
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..18)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -243,6 +248,7 @@ impl SensorGatherGpu {
     /// `PopulateInputsGpu` shader to consume. Saves a ~60 KB readback /
     /// device round-trip per tick.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_no_readback(
         &mut self,
         positions: &[[f32; 3]],
@@ -255,6 +261,8 @@ impl SensorGatherGpu {
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        pheromone_ch1: &FieldGpu,
+        pheromone_ch2: &FieldGpu,
         vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) {
@@ -276,6 +284,8 @@ impl SensorGatherGpu {
             food_hash,
             smell,
             pheromone,
+            pheromone_ch1,
+            pheromone_ch2,
             vibration,
             params,
         );
@@ -296,6 +306,8 @@ impl SensorGatherGpu {
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        pheromone_ch1: &FieldGpu,
+        pheromone_ch2: &FieldGpu,
         vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) {
@@ -352,6 +364,8 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 14, resource: self.headings_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: pheromone_ch1.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 17, resource: pheromone_ch2.current_grid_buffer().as_entire_binding() },
             ],
         });
 
@@ -380,6 +394,8 @@ impl SensorGatherGpu {
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        pheromone_ch1: &FieldGpu,
+        pheromone_ch2: &FieldGpu,
         vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) -> Vec<SensorRow> {
@@ -438,6 +454,8 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 14, resource: self.headings_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: pheromone_ch1.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 17, resource: pheromone_ch2.current_grid_buffer().as_entire_binding() },
             ],
         });
 
@@ -490,6 +508,8 @@ impl SensorGatherGpu {
                 neighbors_in_vision: count_bits,
                 smell_grad: [f[off + 8], f[off + 9], f[off + 10]],
                 pheromone_grad: [f[off + 11], f[off + 12], f[off + 13]],
+                pheromone_grad_ch1: [f[off + 25], f[off + 26], f[off + 27]],
+                pheromone_grad_ch2: [f[off + 28], f[off + 29], f[off + 30]],
                 vibration_grad: [f[off + 15], f[off + 16], f[off + 17]],
                 vibration_amp: f[off + 18],
             });

@@ -294,6 +294,8 @@ pub(crate) fn cells_brain_act_gpu_full(
         &pipeline.food_hash,
         &pipeline.smell,
         &pipeline.pheromone,
+        &pipeline.pheromone_ch1,
+        &pipeline.pheromone_ch2,
         &pipeline.vibration,
         sensor_params,
     );

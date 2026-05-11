@@ -32,7 +32,11 @@ impl GpuContext {
                     // Wave 6 bumped 14 → 16: sensor_gather adds heading +
                     // pitch bindings for whisker raycast (bindings 14, 15)
                     // alongside the existing 12 + maze_mask binding 13.
-                    max_storage_buffers_per_shader_stage: 16,
+                    // Wave L bumped 16 → 20: ch1/ch2 pheromone grids
+                    // (bindings 16, 17) for multi-channel sensor gather.
+                    // 20 is the wgpu default for desktop adapters and
+                    // covers contemporary discrete GPUs comfortably.
+                    max_storage_buffers_per_shader_stage: 20,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,

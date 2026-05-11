@@ -301,6 +301,18 @@ pub(super) fn setup(
                 world_half,
                 field_sources_cap,
             )?;
+            let pheromone_ch1 = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                world_half,
+                field_sources_cap,
+            )?;
+            let pheromone_ch2 = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                world_half,
+                field_sources_cap,
+            )?;
             let vibration = FieldGpu::with_context(
                 &ctx,
                 [
@@ -354,6 +366,8 @@ pub(super) fn setup(
                 brownian,
                 smell,
                 pheromone,
+                pheromone_ch1,
+                pheromone_ch2,
                 vibration,
                 cell_hash,
                 food_hash,

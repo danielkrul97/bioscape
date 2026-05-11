@@ -62,7 +62,7 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Sensor stride: V7 = 19 (4 vibration), Wave 6 = 25 (+6 whisker raycast).
-    let sensor_off = i * 25u;
+    let sensor_off = i * 31u;
     let inputs_off = i * params.brain_inputs;
     let hidden_off = i * params.brain_hidden;
 
@@ -137,12 +137,23 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     last_inputs[inputs_off + 13u] = tanh(neighbor_count / params.density_norm);
     last_inputs[inputs_off + 14u] = tanh(damage * params.damage_norm_gain);
 
-    // Reserved sensory slots: 20 (legacy gap) and 21–26 (ch1/ch2 pheromone
-    // gradient xyz, Sprint 126). GPU sensor gather is single-channel only,
-    // so these stay at 0 until multi-channel gather lands on GPU.
-    for (var k: u32 = 20u; k <= 26u; k = k + 1u) {
-        last_inputs[inputs_off + k] = 0.0;
-    }
+    // Slot 20 is a legacy reserved gap.
+    last_inputs[inputs_off + 20u] = 0.0;
+    // Wave L: ch1/ch2 pheromone gradients come from sensor_gather slots
+    // 25..30 (added alongside the existing ch0 grad at 11..13). Same
+    // tanh×PHEROMONE_NORMALIZATION_GAIN saturation as ch0.
+    last_inputs[inputs_off + 21u] =
+        tanh(sensor_output[sensor_off + 25u] * params.phero_norm_gain);
+    last_inputs[inputs_off + 22u] =
+        tanh(sensor_output[sensor_off + 26u] * params.phero_norm_gain);
+    last_inputs[inputs_off + 23u] =
+        tanh(sensor_output[sensor_off + 27u] * params.phero_norm_gain);
+    last_inputs[inputs_off + 24u] =
+        tanh(sensor_output[sensor_off + 28u] * params.phero_norm_gain);
+    last_inputs[inputs_off + 25u] =
+        tanh(sensor_output[sensor_off + 29u] * params.phero_norm_gain);
+    last_inputs[inputs_off + 26u] =
+        tanh(sensor_output[sensor_off + 30u] * params.phero_norm_gain);
     // Bond-mediated communication inbox: slots 27..29 (N_BOND_MSG_CHANNELS=2).
     // CPU pre-tick aggregates partner messages into bonded_inbox buffer.
     let inbox_off = i * 2u;

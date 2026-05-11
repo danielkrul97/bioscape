@@ -46,6 +46,11 @@ pub(super) struct GpuFullPipeline {
     pub(super) brownian: BrownianGpu,
     pub(super) smell: FieldGpu,
     pub(super) pheromone: FieldGpu,
+    /// Wave L: per-channel pheromone fields (ch1, ch2). ch0 = `pheromone`
+    /// above. sensor_gather binding 16/17 reads from these for brain
+    /// inputs 21..26.
+    pub(super) pheromone_ch1: FieldGpu,
+    pub(super) pheromone_ch2: FieldGpu,
     /// V7: motion-driven mechanosensory field. Deposit per cell mirrors
     /// `emit_pheromones` pattern but the emission formula is hard-coded
     /// (no brain output channel). Brain reads grad + amp via the chained
