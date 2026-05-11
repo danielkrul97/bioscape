@@ -288,6 +288,8 @@ pub(crate) fn cells_brain_act_gpu_full(
         eff_radii,
         vision_radii,
         food_positions,
+        headings,
+        pitches,
         &pipeline.cell_hash,
         &pipeline.food_hash,
         &pipeline.smell,

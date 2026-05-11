@@ -109,7 +109,7 @@ fn main() {
     });
     if maze_difficulty.is_some() && want_gpu {
         eprintln!(
-            "info: --maze + --gpu (Wave 5): step wall collision, FieldGpu masked diffusion, and sensor_gather LOS are GPU-aware. Whisker raycast still reads 0 in shader (CPU pre-pass populates last_whisker_distances but GPU populate_inputs zeroes the slot); hebbian eligibility traces run the CPU path against the persistent GPU brain weight buffer — patches reach GPU at next-gen sync. Wave 6 brings full parity."
+            "info: --maze + --gpu (Wave 6): step wall collision, FieldGpu masked diffusion, sensor_gather LOS, and whisker raycast are all GPU-aware. Hebbian eligibility traces still run the CPU path against the persistent GPU brain weight buffer — patches reach GPU at next-gen sync (Wave 7 brings GPU traces)."
         );
     }
     // Wave 3 curriculum ramp: --maze-stages=easy:50,medium:100,hard

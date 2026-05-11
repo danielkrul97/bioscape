@@ -987,8 +987,14 @@ fn sensor_gather_gpu_no_neighbors_when_alone() {
         field_world_half_z: field_world_half[2],
         ..SensorParamsGpu::default()
     };
+    // Wave 6: sensor.compute now also takes per-cell heading + pitch for
+    // the in-shader whisker raycast. Tests don't care about whiskers, so
+    // upload zeros and let `params.maze_active = 0` skip the raycast block.
+    let test_headings = vec![0.0_f32; positions.len()];
+    let test_pitches = vec![0.0_f32; positions.len()];
     let rows = sensor.compute(
         &positions, &eff_radii, &vision_radii, &food_positions,
+        &test_headings, &test_pitches,
         &cell_hash, &food_hash, &smell, &phero, &smell, params,
     );
     assert_eq!(rows[0].neighbors_in_vision, 0, "alone cell has no neighbors");
@@ -1040,8 +1046,14 @@ fn sensor_gather_gpu_food_in_vision_detected() {
         field_world_half_z: field_world_half[2],
         ..SensorParamsGpu::default()
     };
+    // Wave 6: sensor.compute now also takes per-cell heading + pitch for
+    // the in-shader whisker raycast. Tests don't care about whiskers, so
+    // upload zeros and let `params.maze_active = 0` skip the raycast block.
+    let test_headings = vec![0.0_f32; positions.len()];
+    let test_pitches = vec![0.0_f32; positions.len()];
     let rows = sensor.compute(
         &positions, &eff_radii, &vision_radii, &food_positions,
+        &test_headings, &test_pitches,
         &cell_hash, &food_hash, &smell, &phero, &smell, params,
     );
     assert!(rows[0].nearest_food.is_some(), "food within vision radius missed");

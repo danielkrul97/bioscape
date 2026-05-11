@@ -1210,6 +1210,8 @@ impl World {
             &eff_radii,
             &vision_radii,
             &food_positions,
+            &headings,
+            &pitches,
             &gpu.cell_hash,
             &gpu.food_hash,
             &gpu.smell,

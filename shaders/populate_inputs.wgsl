@@ -61,8 +61,8 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Sensor stride bumped to 19 in V7 (4 vibration slots appended).
-    let sensor_off = i * 19u;
+    // Sensor stride: V7 = 19 (4 vibration), Wave 6 = 25 (+6 whisker raycast).
+    let sensor_off = i * 25u;
     let inputs_off = i * params.brain_inputs;
     let hidden_off = i * params.brain_hidden;
 
@@ -158,13 +158,16 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     last_inputs[inputs_off + 31u] = tanh(vib_grad_z * params.vibration_norm_gain);
     last_inputs[inputs_off + 32u] = tanh(vib_amp    * params.vibration_norm_gain);
 
-    // Wave 2: whisker raycast slots 33..38 (WHISKER_COUNT = 6). GPU sensor
-    // gather doesn't yet compute per-cell raycasts (deferred to Wave 3), so
-    // these are zeroed each tick — neutral signal. CPU populate_brain_inputs
-    // writes the real raycast results when running on the CPU path.
-    for (var k: u32 = 33u; k <= 38u; k = k + 1u) {
-        last_inputs[inputs_off + k] = 0.0;
-    }
+    // Wave 6: whisker raycast slots 33..38. sensor_gather.wgsl writes
+    // normalized free-distances at sensor_off + 19..25; map [0, 1] →
+    // [-1, 1] so "clear" reads as +1 and "wall touching" as -1, matching
+    // CPU `populate_brain_inputs` whisker formatting.
+    last_inputs[inputs_off + 33u] = sensor_output[sensor_off + 19u] * 2.0 - 1.0;
+    last_inputs[inputs_off + 34u] = sensor_output[sensor_off + 20u] * 2.0 - 1.0;
+    last_inputs[inputs_off + 35u] = sensor_output[sensor_off + 21u] * 2.0 - 1.0;
+    last_inputs[inputs_off + 36u] = sensor_output[sensor_off + 22u] * 2.0 - 1.0;
+    last_inputs[inputs_off + 37u] = sensor_output[sensor_off + 23u] * 2.0 - 1.0;
+    last_inputs[inputs_off + 38u] = sensor_output[sensor_off + 24u] * 2.0 - 1.0;
 
     // Sprint 30: damage_accum reset after consume.
     damage_accums[i] = 0.0;

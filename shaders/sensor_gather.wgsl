@@ -65,10 +65,12 @@ struct SensorParams {
 // Wave 5: maze occupancy mask (binding 13). Same format as
 // step.wgsl::maze_mask — one u32 per voxel, row-major
 // `vy * maze_res_x + vx`, value 0 = passable. Read by `raycast_blocked`
-// for LOS filtering. Whisker raycast deferred — would need per-cell
-// heading + pitch as additional bindings, repacking to fit the storage
-// limit; postponed to Wave 6.
+// for LOS filtering and whisker raycast.
 @group(0) @binding(13) var<storage, read> maze_mask: array<u32>;
+// Wave 6: per-cell heading + pitch for whisker raycast direction.
+// Allocated by SensorGatherGpu, uploaded each dispatch_no_readback.
+@group(0) @binding(14) var<storage, read> headings: array<f32>;
+@group(0) @binding(15) var<storage, read> pitches: array<f32>;
 
 // Toroidal minimum-image displacement (used for both x and y).
 fn min_image_xy(d: f32, half: f32) -> f32 {
@@ -76,6 +78,40 @@ fn min_image_xy(d: f32, half: f32) -> f32 {
     if (d > half) { return d - w; }
     if (d < -half) { return d + w; }
     return d;
+}
+
+// Wave 6: single-direction whisker raycast in xy. Mirrors one ray of
+// `ObstacleField::whisker_distances`. `dir` is a unit vector in world
+// frame (caller derives from heading/pitch). Returns normalized
+// free-distance in [0, 1] — 1.0 = clear within WHISKER_RANGE, 0.0 =
+// wall touching origin. ±z directions short-circuit to 1.0 since walls
+// span full z height; caller skips those rays.
+fn whisker_distance(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
+    if (abs(dir.x) < 1e-6 && abs(dir.y) < 1e-6) {
+        return 1.0;
+    }
+    let cs_x = (2.0 * params.world_half_x) / f32(params.maze_res_x);
+    let cs_y = (2.0 * params.world_half_y) / f32(params.maze_res_y);
+    let step = min(cs_x, cs_y) * 0.5;
+    let whisker_range: f32 = 90.0; // mirrors lib::WHISKER_RANGE
+    let n_steps = u32(ceil(whisker_range / step));
+    let nx = i32(params.maze_res_x);
+    let ny = i32(params.maze_res_y);
+    for (var k: u32 = 1u; k <= n_steps; k = k + 1u) {
+        let t = f32(k) * step;
+        let px = origin.x + dir.x * t;
+        let py = origin.y + dir.y * t;
+        let xi = i32(floor((px + params.world_half_x) / cs_x));
+        let yi = i32(floor((py + params.world_half_y) / cs_y));
+        if (xi < 0 || xi >= nx || yi < 0 || yi >= ny) {
+            return clamp(t / whisker_range, 0.0, 1.0);
+        }
+        let idx = u32(yi) * params.maze_res_x + u32(xi);
+        if (maze_mask[idx] != 0u) {
+            return clamp(t / whisker_range, 0.0, 1.0);
+        }
+    }
+    return 1.0;
 }
 
 // Wave 5: xy raycast against the maze obstacle mask. Mirror of
@@ -331,7 +367,32 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let vibration_amp = s_center.vibration;
 
-    let off = i * 19u;
+    // Wave 6: 6-direction whisker raycast in body frame. Mirror of
+    // `ObstacleField::whisker_distances` — uniform-step samples from cell
+    // position along [+forward, -forward, +right, -right, +up, -down],
+    // returns normalized free-distance in [0, 1] (1 = clear, 0 = wall at
+    // origin). Always writes (zeros when maze inactive) so the populate
+    // shader can copy unconditionally.
+    var whisker0: f32 = 1.0;
+    var whisker1: f32 = 1.0;
+    var whisker2: f32 = 1.0;
+    var whisker3: f32 = 1.0;
+    var whisker4: f32 = 1.0;
+    var whisker5: f32 = 1.0;
+    if (params.maze_active != 0u) {
+        let heading = headings[i];
+        let pitch = pitches[i];
+        let cp = cos(pitch);
+        let fwd = vec3<f32>(cos(heading) * cp, sin(heading) * cp, sin(pitch));
+        let right = vec3<f32>(-sin(heading), cos(heading), 0.0);
+        whisker0 = whisker_distance(pos_i, fwd);
+        whisker1 = whisker_distance(pos_i, vec3<f32>(-fwd.x, -fwd.y, -fwd.z));
+        whisker2 = whisker_distance(pos_i, right);
+        whisker3 = whisker_distance(pos_i, vec3<f32>(-right.x, -right.y, -right.z));
+        // ±z directions always clear (xy-only walls); skip raycast.
+    }
+
+    let off = i * 25u;
     output[off + 0u] = best_food_dx;
     output[off + 1u] = best_food_dy;
     output[off + 2u] = best_food_dz;
@@ -351,4 +412,10 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     output[off + 16u] = vibration_grad.y;
     output[off + 17u] = vibration_grad.z;
     output[off + 18u] = vibration_amp;
+    output[off + 19u] = whisker0;
+    output[off + 20u] = whisker1;
+    output[off + 21u] = whisker2;
+    output[off + 22u] = whisker3;
+    output[off + 23u] = whisker4;
+    output[off + 24u] = whisker5;
 }

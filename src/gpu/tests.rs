@@ -549,11 +549,17 @@ fn sensor_gather_gpu_matches_cpu() {
         field_world_half_z: field_world_half[2],
         ..SensorParamsGpu::default()
     };
+    // Wave 6: sensor.compute now takes per-cell heading + pitch for whisker
+    // raycast. Tests don't care, pass zeros (params.maze_active = 0 skips it).
+    let test_headings = vec![0.0_f32; positions.len()];
+    let test_pitches = vec![0.0_f32; positions.len()];
     let rows = sensor.compute(
         &positions,
         &eff_radii,
         &vision_radii,
         &food_positions,
+        &test_headings,
+        &test_pitches,
         &cell_hash,
         &food_hash,
         &smell_gpu,

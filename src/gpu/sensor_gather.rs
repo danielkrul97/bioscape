@@ -44,9 +44,9 @@ pub struct SensorRow {
 }
 
 /// Output stride per cell in `sensor_gather.wgsl` — keep in lock-step with
-/// the shader's `let off = i * 19u;` block. Bumped from 15 to 19 in V7 to
-/// carry vibration gradient (3 floats) + amplitude (1 float).
-pub const SENSOR_OUTPUT_STRIDE: usize = 19;
+/// the shader's `let off = i * 25u;` block. V7 bumped 15 → 19 (+4 vibration);
+/// Wave 6 bumped 19 → 25 (+6 whisker raycast).
+pub const SENSOR_OUTPUT_STRIDE: usize = 25;
 
 pub struct SensorGatherGpu {
     device: Arc<wgpu::Device>,
@@ -63,6 +63,10 @@ pub struct SensorGatherGpu {
     /// Wave 5: per-voxel maze occupancy mask (binding 13). Same packing as
     /// `StepGpu::maze_mask_buf`. Pre-allocated at MAZE_MASK_CAPACITY u32s.
     maze_mask_buf: wgpu::Buffer,
+    /// Wave 6: per-cell heading + pitch for whisker raycast direction
+    /// derivation (bindings 14, 15). Uploaded each `dispatch_no_readback`.
+    headings_buf: wgpu::Buffer,
+    pitches_buf: wgpu::Buffer,
     output_buf: wgpu::Buffer,
     output_rb: wgpu::Buffer,
     pos_packed: Vec<f32>,
@@ -102,8 +106,9 @@ impl SensorGatherGpu {
                 include_str!("../../shaders/sensor_gather.wgsl").into(),
             ),
         });
-        // Wave 5: 13 → 14 bindings (binding 13 = maze_mask read-only).
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14)
+        // Wave 6: 14 → 16 bindings (bindings 14, 15 = headings, pitches
+        // read-only for whisker raycast direction).
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..16)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -171,6 +176,8 @@ impl SensorGatherGpu {
             MAZE_MASK_CAPACITY as u64 * std::mem::size_of::<u32>() as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
+        let headings_buf = mk("sensor-headings", nc * f, stor_dst);
+        let pitches_buf = mk("sensor-pitches", nc * f, stor_dst);
         // V7: 19 floats per cell (was 15). Layout — nearest_food (3) +
         // has_food (1) + nearest_cell delta (3) + radius (1) + smell_grad (3)
         // + phero_grad (3) + neighbors_count (1, bitcast<u32>) + vibration_grad (3)
@@ -192,6 +199,8 @@ impl SensorGatherGpu {
             vision_radii_buf,
             food_positions_buf,
             maze_mask_buf,
+            headings_buf,
+            pitches_buf,
             output_buf,
             output_rb,
             pos_packed: Vec::new(),
@@ -240,6 +249,8 @@ impl SensorGatherGpu {
         eff_radii: &[f32],
         vision_radii: &[f32],
         food_positions: &[[f32; 3]],
+        headings: &[f32],
+        pitches: &[f32],
         cell_hash: &SpatialHashGpu,
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
@@ -259,6 +270,8 @@ impl SensorGatherGpu {
             eff_radii,
             vision_radii,
             food_positions,
+            headings,
+            pitches,
             cell_hash,
             food_hash,
             smell,
@@ -277,6 +290,8 @@ impl SensorGatherGpu {
         eff_radii: &[f32],
         vision_radii: &[f32],
         food_positions: &[[f32; 3]],
+        headings: &[f32],
+        pitches: &[f32],
         cell_hash: &SpatialHashGpu,
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
@@ -314,6 +329,8 @@ impl SensorGatherGpu {
         self.queue.write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
         self.queue.write_buffer(&self.vision_radii_buf, 0, bytemuck::cast_slice(vision_radii));
         self.queue.write_buffer(&self.food_positions_buf, 0, bytemuck::cast_slice(&self.food_packed));
+        self.queue.write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
+        self.queue.write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sensor-bg"),
@@ -333,6 +350,8 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: self.headings_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
             ],
         });
 
@@ -355,6 +374,8 @@ impl SensorGatherGpu {
         eff_radii: &[f32],
         vision_radii: &[f32],
         food_positions: &[[f32; 3]],
+        headings: &[f32],
+        pitches: &[f32],
         cell_hash: &SpatialHashGpu,
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
@@ -393,6 +414,9 @@ impl SensorGatherGpu {
         self.queue.write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
         self.queue.write_buffer(&self.vision_radii_buf, 0, bytemuck::cast_slice(vision_radii));
         self.queue.write_buffer(&self.food_positions_buf, 0, bytemuck::cast_slice(&self.food_packed));
+        // Wave 6: per-cell heading + pitch for in-shader whisker raycast.
+        self.queue.write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
+        self.queue.write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sensor-bg"),
@@ -412,6 +436,8 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: self.headings_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
             ],
         });
 
