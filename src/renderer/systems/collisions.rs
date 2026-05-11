@@ -14,6 +14,8 @@ use std::time::Instant;
 use super::super::components::{CellEntity, Dying};
 use super::super::config::{DIAG_COLLISIONS, DIAG_PREDATION};
 use super::super::resources::{CellGrid, ContactProgress};
+#[cfg(feature = "gpu")]
+use super::super::resources_gpu::GpuFullPipeline;
 
 // Generous broad-phase upper bound on "other" effective_radius — captures
 // candidates even when neighbors are oversized. Narrow-phase uses pair sum.
@@ -155,6 +157,7 @@ pub(crate) fn resolve_cell_collisions(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut contact_progress: ResMut<ContactProgress>,
     mut diag: Diagnostics,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut snapshot_scratch: Local<Vec<SnapEntry>>,
     mut entity_to_idx_scratch: Local<FxHashMap<Entity, usize>>,
     mut id_to_idx_scratch: Local<FxHashMap<u64, usize>>,
@@ -192,6 +195,101 @@ pub(crate) fn resolve_cell_collisions(
     // results == n a indexy se zachovají. Reuse outer scratch je primary win;
     // inner Vec capacity přežije přes ticky.
     results_scratch.clear();
+    #[cfg(feature = "gpu")]
+    let used_gpu = gpu_full.is_some();
+    #[cfg(not(feature = "gpu"))]
+    let used_gpu = false;
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu_res) = gpu_full {
+        // Bevy `ResMut::deref_mut` doesn't allow split-field borrows, so the
+        // sibling-field `&gpu.cell_hash` arg passed to `gpu.collision.compute`
+        // would clash. Re-borrow through `&mut *res` to get a raw
+        // `&mut GpuFullPipeline` — the borrow checker handles split borrows
+        // through that.
+        let gpu = &mut *gpu_res;
+        let snapshot = snapshot_scratch.as_slice();
+        let n = snapshot.len();
+        if n > 0 {
+            let positions: Vec<[f32; 3]> = snapshot.iter().map(|s| s.position).collect();
+            let velocities: Vec<[f32; 3]> = snapshot.iter().map(|s| s.velocity).collect();
+            let eff_radii: Vec<f32> = snapshot.iter().map(|s| s.radius).collect();
+            // SnapEntry doesn't carry phenotype.max_axis(); approximate with
+            // the renderer's BROAD_PHASE_SIZE_BUDGET / 2 (the CPU broad-phase
+            // also uses `radius + BUDGET` rather than a per-cell max_axis).
+            let max_axes: Vec<f32> = snapshot
+                .iter()
+                .map(|_| BROAD_PHASE_SIZE_BUDGET * 0.5)
+                .collect();
+            let adhesion_types: Vec<u32> =
+                snapshot.iter().map(|s| s.adhesion_type as u32).collect();
+            let slots = MAX_BONDS_PER_CELL;
+            let total = n * slots;
+            let mut partner_idx = vec![-1_i32; total];
+            let mut rest = vec![0.0_f32; total];
+            let mut stiff = vec![0.0_f32; total];
+            let mut damp = vec![0.0_f32; total];
+            for (i, s) in snapshot.iter().enumerate() {
+                for (slot_idx, slot) in s.bonds.iter().enumerate() {
+                    if let Some(b) = slot {
+                        if let Some(&j) = id_to_idx_scratch.get(&b.other_cell_id) {
+                            let idx = i * slots + slot_idx;
+                            partner_idx[idx] = j as i32;
+                            rest[idx] = b.rest_length;
+                            stiff[idx] = b.stiffness;
+                            damp[idx] = b.damping;
+                        }
+                    }
+                }
+            }
+            gpu.cell_hash.dispatch(&positions);
+            let result = gpu.collision.compute(
+                &positions,
+                &velocities,
+                &eff_radii,
+                &max_axes,
+                &adhesion_types,
+                &partner_idx,
+                &rest,
+                &stiff,
+                &damp,
+                &gpu.cell_hash,
+            );
+            let max_contacts = bioscape::MAX_COLLISION_CONTACTS_PER_CELL as usize;
+            // Allocate one contact Vec per cell up-front so the canonicalized
+            // dedup pass below can drop a partner into either i's or j's list
+            // without coupling write order to iteration order.
+            let mut contact_vecs: Vec<Vec<u64>> = (0..n).map(|_| Vec::new()).collect();
+            for i in 0..n {
+                let count = (result.contact_count[i] as usize).min(max_contacts);
+                let base = i * max_contacts;
+                let cell_id_i = snapshot[i].cell_id;
+                for s in 0..count {
+                    let j = result.contact_partners[base + s] as usize;
+                    if j >= n {
+                        continue;
+                    }
+                    let cell_id_j = snapshot[j].cell_id;
+                    // CPU dedupe uses `cell_id_low < cell_id_high`; GPU uses
+                    // `idx_low < idx_high`. Re-canonicalize so the lower-id
+                    // cell always owns the partner reference.
+                    if cell_id_i < cell_id_j {
+                        contact_vecs[i].push(cell_id_j);
+                    } else if cell_id_j < cell_id_i {
+                        contact_vecs[j].push(cell_id_i);
+                    }
+                }
+            }
+            for (i, s) in snapshot.iter().enumerate() {
+                results_scratch.push((
+                    s.entity,
+                    result.position_deltas[i],
+                    result.velocity_deltas[i],
+                    std::mem::take(&mut contact_vecs[i]),
+                ));
+            }
+        }
+    }
+    if !used_gpu {
     {
         // Scoped `snapshot` borrow ends before Phase 2 mutates snapshot_scratch
         // (folds the post-Phase-2 `positions_scratch` rebuild into the existing
@@ -292,6 +390,7 @@ pub(crate) fn resolve_cell_collisions(
         })
         .collect_into_vec(&mut results_scratch);
     } // end snapshot scope; Phase 2 below mutates snapshot_scratch
+    } // end `if !used_gpu` (Wave H)
     let results = results_scratch.as_slice();
 
     // Phase 2 (sequential): apply deltas + bond age/prune + contact tracker

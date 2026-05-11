@@ -2096,13 +2096,25 @@ impl World {
         for i in 0..n {
             self.deltas_scratch[i] = result.position_deltas[i];
             self.velocity_deltas_scratch[i] = result.velocity_deltas[i];
+        }
+        // Contact events: GPU dedupes by idx (i < j), but CPU `contact_progress`
+        // keys on `(cell_id_min, cell_id_max)` — idx and cell_id orderings are
+        // independent. Re-canonicalize here so the lower-id cell's contact list
+        // always carries the higher-id partner.
+        for i in 0..n {
             let count = (result.contact_count[i] as usize).min(max_contacts);
             let base = i * max_contacts;
-            let list = &mut self.contact_lists_scratch[i];
+            let cell_id_i = self.cells[i].cell_id;
             for s in 0..count {
                 let j = result.contact_partners[base + s] as usize;
-                if j < n {
-                    list.push(self.cells[j].cell_id);
+                if j >= n {
+                    continue;
+                }
+                let cell_id_j = self.cells[j].cell_id;
+                if cell_id_i < cell_id_j {
+                    self.contact_lists_scratch[i].push(cell_id_j);
+                } else if cell_id_j < cell_id_i {
+                    self.contact_lists_scratch[j].push(cell_id_i);
                 }
             }
         }

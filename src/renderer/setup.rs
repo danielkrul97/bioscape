@@ -327,6 +327,24 @@ pub(super) fn setup(
             let populate = PopulateInputsGpu::with_context(&ctx)?;
             let motor = MotorGpu::with_context(&ctx, cap)?;
             let step = StepGpu::with_context(&ctx, cap)?;
+            let collision = bioscape::gpu::CollisionGpu::with_context(
+                &ctx,
+                cap,
+                bioscape::GRID_CELL_SIZE,
+                bioscape::CELL_RADIUS,
+                bioscape::COLLISION_RESTITUTION,
+                bioscape::gpu::AdhesionParams {
+                    strength: bioscape::ADHESION_STRENGTH,
+                    cross_type: bioscape::ADHESION_CROSS_TYPE,
+                    range_factor: bioscape::ADHESION_RANGE_FACTOR,
+                },
+                bioscape::gpu::BondParams {
+                    bonds_per_cell: bioscape::MAX_BONDS_PER_CELL as u32,
+                    break_factor: bioscape::BOND_BREAK_FACTOR,
+                },
+                bioscape::MAX_COLLISION_CONTACTS_PER_CELL,
+                [world_half[0], world_half[1]],
+            )?;
             let cppn = bioscape::gpu::CppnGpu::with_context(&ctx, cap);
             Ok(GpuFullPipeline {
                 cells,
@@ -342,6 +360,7 @@ pub(super) fn setup(
                 populate,
                 motor,
                 step,
+                collision,
                 cppn,
                 scratch: bioscape::gpu::GpuFullScratch::default(),
             })
