@@ -856,11 +856,12 @@ fn predate_gpu_matches_cpu() {
 }
 
 /// Sprint 50: collision GPU vs CPU `headless::resolve_collisions` parity.
-/// Pack cells velmi blízko sebe → forced overlaps. GPU vrací delta_position
+/// Pack cells velmi blízko sebe → forced overlaps. GPU vrací position deltas
+/// (depenetrace, Sprint 50) + velocity deltas (inelastic damping, Sprint 65)
 /// per cell; CPU brute-force počítá totéž. Tolerance 1e-3.
 #[test]
 fn collision_gpu_matches_cpu() {
-    use crate::CELL_RADIUS;
+    use crate::{CELL_RADIUS, COLLISION_RESTITUTION};
     let mut rng = StdRng::seed_from_u64(53);
     let n = 100;
     let cell_size = 64.0_f32;
@@ -874,6 +875,15 @@ fn collision_gpu_matches_cpu() {
             ]
         })
         .collect();
+    let velocities: Vec<[f32; 3]> = (0..n)
+        .map(|_| {
+            [
+                rng.random_range(-5.0_f32..5.0),
+                rng.random_range(-5.0_f32..5.0),
+                rng.random_range(-1.0_f32..1.0),
+            ]
+        })
+        .collect();
     let eff_radii: Vec<f32> = (0..n).map(|_| rng.random_range(0.7_f32..1.5)).collect();
     let max_axes: Vec<f32> = eff_radii.iter().map(|r| r * 1.2).collect();
 
@@ -883,12 +893,24 @@ fn collision_gpu_matches_cpu() {
     };
     let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
     let _ = hash.rebuild(&positions);
-    let mut col = CollisionGpu::with_context(&ctx, n, cell_size, CELL_RADIUS, [1000.0, 1000.0])
-        .expect("collision init");
-    let gpu_deltas = col.compute(&positions, &eff_radii, &max_axes, &hash);
+    let mut col = CollisionGpu::with_context(
+        &ctx,
+        n,
+        cell_size,
+        CELL_RADIUS,
+        COLLISION_RESTITUTION,
+        [1000.0, 1000.0],
+    )
+    .expect("collision init");
+    let (gpu_deltas, gpu_vel_deltas) =
+        col.compute(&positions, &velocities, &eff_radii, &max_axes, &hash);
 
-    // CPU brute force.
+    // CPU brute force — matches CPU resolve_collisions in-contact branch:
+    // position depenetration (Sprint 50) + inelastic velocity damping
+    // (Sprint 65: `damp = -v_rel_n × 0.5 × (1 - RESTITUTION) × n` if v_rel_n < 0).
+    let damp_coeff = 0.5 * (1.0 - COLLISION_RESTITUTION);
     let mut cpu_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let mut cpu_vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
     for i in 0..n {
         for j in 0..n {
             if i == j { continue; }
@@ -901,9 +923,22 @@ fn collision_gpu_matches_cpu() {
             if d2 < pair_r2 && d2 > 0.0 {
                 let d = d2.sqrt();
                 let overlap = pair_r - d;
-                cpu_deltas[i][0] += (dx / d) * overlap * 0.5;
-                cpu_deltas[i][1] += (dy / d) * overlap * 0.5;
-                cpu_deltas[i][2] += (dz / d) * overlap * 0.5;
+                let nx = dx / d;
+                let ny = dy / d;
+                let nz = dz / d;
+                cpu_deltas[i][0] += nx * overlap * 0.5;
+                cpu_deltas[i][1] += ny * overlap * 0.5;
+                cpu_deltas[i][2] += nz * overlap * 0.5;
+                let vrx = velocities[i][0] - velocities[j][0];
+                let vry = velocities[i][1] - velocities[j][1];
+                let vrz = velocities[i][2] - velocities[j][2];
+                let v_rel_n = vrx * nx + vry * ny + vrz * nz;
+                if v_rel_n < 0.0 {
+                    let damp = -v_rel_n * damp_coeff;
+                    cpu_vel_deltas[i][0] += damp * nx;
+                    cpu_vel_deltas[i][1] += damp * ny;
+                    cpu_vel_deltas[i][2] += damp * nz;
+                }
             }
         }
     }
@@ -911,8 +946,11 @@ fn collision_gpu_matches_cpu() {
     for i in 0..n {
         for k in 0..3 {
             let d = (cpu_deltas[i][k] - gpu_deltas[i][k]).abs();
-            assert!(d < 1e-3, "i={i} k={k} cpu={} gpu={} diff={}",
+            assert!(d < 1e-3, "pos i={i} k={k} cpu={} gpu={} diff={}",
                 cpu_deltas[i][k], gpu_deltas[i][k], d);
+            let dv = (cpu_vel_deltas[i][k] - gpu_vel_deltas[i][k]).abs();
+            assert!(dv < 1e-3, "vel i={i} k={k} cpu={} gpu={} diff={}",
+                cpu_vel_deltas[i][k], gpu_vel_deltas[i][k], dv);
         }
     }
 }

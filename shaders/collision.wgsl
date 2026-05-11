@@ -1,10 +1,12 @@
 // Per-cell collision resolution against spatial-hash neighbors. For each
 // pair (i, j) with d² < (CELL_RADIUS × (eff_r_i + eff_r_j))² and d² > 0,
-// `deltas[i]` accumulates (d/|d|) × overlap × 0.5. Output is write-only
-// per i — no atomics needed. The XY world is toroidal, so the search
-// neighborhood walks 3D ghost positions around `pos_i` to cover wrap, and
-// pair distances use the min-image convention. Search radius bound matches
-// the CPU helper: CELL_RADIUS × (eff_r_i + max_axis_i × 2).
+// `deltas[i]` accumulates (d/|d|) × overlap × 0.5 (position depenetration),
+// and `vel_deltas[i]` accumulates an inelastic damping impulse along the
+// contact normal when the pair is closing (v_rel · n < 0). Outputs are
+// write-only per i — no atomics needed. The XY world is toroidal, so the
+// search neighborhood walks 3D ghost positions around `pos_i` to cover
+// wrap, and pair distances use the min-image convention. Search radius
+// bound matches the CPU helper: CELL_RADIUS × (eff_r_i + max_axis_i × 2).
 
 const GRID_NX: i32 = 64;
 const GRID_NY: i32 = 32;
@@ -17,11 +19,11 @@ struct CollisionParams {
     num_cells: u32,
     cell_size: f32,
     cell_radius_const: f32,
-    _pad0: u32,
+    collision_restitution: f32,
     world_half_x: f32,
     world_half_y: f32,
+    _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: CollisionParams;
@@ -31,6 +33,8 @@ struct CollisionParams {
 @group(0) @binding(4) var<storage, read> hash_offsets: array<u32>;
 @group(0) @binding(5) var<storage, read> hash_sorted: array<u32>;
 @group(0) @binding(6) var<storage, read_write> deltas: array<f32>;
+@group(0) @binding(7) var<storage, read> velocities: array<f32>;
+@group(0) @binding(8) var<storage, read_write> vel_deltas: array<f32>;
 
 fn min_image_xy(d: f32, half: f32) -> f32 {
     let w = 2.0 * half;
@@ -65,16 +69,25 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
         positions[i * 3u + 1u],
         positions[i * 3u + 2u],
     );
+    let vel_i = vec3<f32>(
+        velocities[i * 3u + 0u],
+        velocities[i * 3u + 1u],
+        velocities[i * 3u + 2u],
+    );
     let r_i = eff_radii[i];
     let crc = params.cell_radius_const;
     let crc_r_i = crc * r_i;
     let search_r = crc * (r_i + max_axes[i] * 2.0);
     let cs = params.cell_size;
     let r_cells = i32(ceil(search_r / cs));
+    let damp_coeff = 0.5 * (1.0 - params.collision_restitution);
 
     var dx_acc: f32 = 0.0;
     var dy_acc: f32 = 0.0;
     var dz_acc: f32 = 0.0;
+    var vdx_acc: f32 = 0.0;
+    var vdy_acc: f32 = 0.0;
+    var vdz_acc: f32 = 0.0;
 
     // Resolve the center bucket once, walk neighbors via integer ±wrap on xy
     // (z clamped). Replaces the per-iteration `bucket_id_wrapped(ghost_pos)`
@@ -115,10 +128,25 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (d2 < pair_r2 && d2 > 0.0) {
                         // Algebraically: overlap*0.5/dist = pair_r*0.5/dist - 0.5.
                         // Replaces sqrt + divide with a single rsqrt + fma.
-                        let scale = pair_r * 0.5 * inverseSqrt(d2) - 0.5;
+                        let inv_d = inverseSqrt(d2);
+                        let scale = pair_r * 0.5 * inv_d - 0.5;
                         dx_acc = dx_acc + d.x * scale;
                         dy_acc = dy_acc + d.y * scale;
                         dz_acc = dz_acc + d.z * scale;
+                        let n = d * inv_d;
+                        let vel_j = vec3<f32>(
+                            velocities[j * 3u + 0u],
+                            velocities[j * 3u + 1u],
+                            velocities[j * 3u + 2u],
+                        );
+                        let v_rel = vel_i - vel_j;
+                        let v_rel_n = dot(v_rel, n);
+                        if (v_rel_n < 0.0) {
+                            let damp = -v_rel_n * damp_coeff;
+                            vdx_acc = vdx_acc + damp * n.x;
+                            vdy_acc = vdy_acc + damp * n.y;
+                            vdz_acc = vdz_acc + damp * n.z;
+                        }
                     }
                 }
             }
@@ -128,4 +156,7 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
     deltas[i * 3u + 0u] = dx_acc;
     deltas[i * 3u + 1u] = dy_acc;
     deltas[i * 3u + 2u] = dz_acc;
+    vel_deltas[i * 3u + 0u] = vdx_acc;
+    vel_deltas[i * 3u + 1u] = vdy_acc;
+    vel_deltas[i * 3u + 2u] = vdz_acc;
 }
