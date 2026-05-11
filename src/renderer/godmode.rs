@@ -12,7 +12,7 @@ use super::resources::{
     FoodMaterial, FoodMesh, NextCellId, PheromoneResource, SpikeMaterial, SpikeMesh, WorldExtent,
 };
 #[cfg(feature = "gpu")]
-use super::resources_gpu::{GpuBrainState, GpuFullPipeline};
+use super::resources_gpu::GpuFullPipeline;
 
 /// Click-vs-drag threshold in pixels. Below this, RMB release opens the menu;
 /// above it, the user is dragging the camera.
@@ -226,7 +226,6 @@ pub(super) fn god_mode_handle_action(
     mut god: ResMut<GodMode>,
     mut registries: SpawnRegistries,
     mut world_state: WorldState,
-    #[cfg(feature = "gpu")] gpu_state: Option<Res<GpuBrainState>>,
     #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
 ) {
@@ -328,13 +327,6 @@ pub(super) fn god_mode_handle_action(
                 ));
             }
             let slot = registries.slot_map.allocate(entity);
-            #[cfg(feature = "gpu")]
-            if let Some(gpu) = gpu_state.as_ref() {
-                gpu.cells.upload_brain_at(slot, &cell.genome.brain);
-                // V7-unification: seed from `cell_id` (matches CPU
-                // `Cell.xoshiro_state`), not a slot-hashed lineage id.
-                gpu.cells.upload_xoshiro_seed_at(slot, cell_id_for_seed);
-            }
             #[cfg(feature = "gpu")]
             if let Some(mut gpu) = gpu_full {
                 gpu.cells.upload_xoshiro_seed_at(slot, cell_id_for_seed);

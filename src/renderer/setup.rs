@@ -27,7 +27,7 @@ use super::resources::{
     WorldExtent, WorldMapResource,
 };
 #[cfg(feature = "gpu")]
-use super::resources_gpu::{GpuBrainState, GpuFieldState, GpuFullPipeline};
+use super::resources_gpu::GpuFullPipeline;
 use super::world_map::{food_target, world_map_image};
 
 pub(super) fn setup(
@@ -203,75 +203,15 @@ pub(super) fn setup(
         initial_cells.push(cell);
     }
 
-    // GPU compute init. Default = full pipeline (`GpuFullPipeline`, single-Wait
-    // readback). Init failure → CPU SIMD fallback (Resource None).
-    //
-    // Env var precedence:
-    //   `BIOSCAPE_GPU_FULL=0`  → opt-out, čistý CPU SIMD path
-    //   `BIOSCAPE_GPU_BRAIN=1` → legacy brain-only GPU (overrides GPU_FULL)
-    //   default                → GPU_FULL on
-    //
-    // Sprint 132 verdikt (CPU SIMD 5–10× faster) byl měřen na FRAGMENTED GPU
-    // path (`BIOSCAPE_GPU_BRAIN=1`) s per-system `Maintain::Wait` ~10 ms/tick.
-    // Single-Wait `download_full_batch_into` v gpu-full agreguje 9 readbacků
-    // do 1 polled barriera. Init fail je safety net pro adapters bez compute
-    // support.
+    // Wave N: GPU full pipeline is mandatory. Legacy `BIOSCAPE_GPU_BRAIN=1`
+    // brain-only path is gone (it never matched gpu-full feature parity).
+    // `BIOSCAPE_GPU_FULL=0` opt-out is also gone — init failure now panics
+    // because there is no CPU compute fallback to fall through to.
     #[cfg(feature = "gpu")]
-    let want_gpu_full =
-        !matches!(std::env::var("BIOSCAPE_GPU_FULL").as_deref(), Ok("0"));
-    #[cfg(feature = "gpu")]
-    let want_gpu_brain = std::env::var("BIOSCAPE_GPU_BRAIN").as_deref() == Ok("1");
-    #[cfg(feature = "gpu")]
-    if want_gpu_brain {
-        let cap = MAX_POPULATION + 64;
-        let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
-        let field_sources_cap = (initial_food_target + cap) * 2;
-        let world_half = extent.as_array();
-        let init = || -> Result<(GpuBrainState, GpuFieldState), String> {
-            let ctx = GpuContext::new()?;
-            let cells = CellsGpu::with_context(&ctx, cap);
-            cells.upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
-            // V7-unification: seed from `cell_id` (stable, unique per cell)
-            // so CPU `Cell.xoshiro_state` and GPU per-slot state expand from
-            // the same input and produce identical brownian streams.
-            cells.upload_xoshiro_seeds(initial_cells.iter().map(|c| c.cell_id));
-            let brain = BrainGpu::with_context(&ctx, cap)?;
-            let hebbian = HebbianGpu::with_context(&ctx, cap)?;
-            let brownian = BrownianGpu::with_context(&ctx, cap)?;
-            let smell = FieldGpu::with_context(
-                &ctx,
-                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
-                world_half,
-                field_sources_cap,
-            )?;
-            let pheromone = FieldGpu::with_context(
-                &ctx,
-                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-                world_half,
-                field_sources_cap,
-            )?;
-            Ok((
-                GpuBrainState { cells, brain, hebbian, brownian },
-                GpuFieldState { smell, pheromone },
-            ))
-        };
-        match init() {
-            Ok((brain_state, field_state)) => {
-                info!(
-                    "renderer-gpu: persistent brain weights + Hebbian + Field (opt-in via BIOSCAPE_GPU_BRAIN=1, cap {} cells, {} field sources)",
-                    cap, field_sources_cap
-                );
-                commands.insert_resource(brain_state);
-                commands.insert_resource(field_state);
-            }
-            Err(e) => {
-                warn!("renderer-gpu: init failed ({}); CPU compute path active", e);
-            }
-        }
-    } else if want_gpu_full {
-        // Full GPU pipeline (mirror headless `--gpu-full`): single-Wait readback,
-        // sensor + populate + brain + motor + step + brownian na GPU. Default
-        // path. Disable přes `BIOSCAPE_GPU_FULL=0` (forced CPU SIMD).
+    {
+        // Full GPU pipeline (mirror headless --gpu-full): single-Wait
+        // readback, sensor + populate + brain + motor + step + brownian
+        // + collision + predate + food_spawn on GPU.
         let cap = MAX_POPULATION + 64;
         let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
         let field_sources_cap = (initial_food_target + cap) * 2;
@@ -384,17 +324,15 @@ pub(super) fn setup(
         match init_full() {
             Ok(pipeline) => {
                 info!(
-                    "renderer-gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (default; disable s BIOSCAPE_GPU_FULL=0; cap {} cells, {} field sources)",
+                    "renderer-gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step + Collision + Predate + FoodSpawn (cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
                 commands.insert_resource(pipeline);
             }
             Err(e) => {
-                warn!("renderer-gpu-full: init failed ({}); CPU compute path active", e);
+                panic!("renderer-gpu-full: init failed ({e}); GPU is mandatory");
             }
         }
-    } else {
-        info!("renderer: CPU compute path (BIOSCAPE_GPU_FULL=0; SIMD brain + field, no GPU sync stall)");
     }
     commands.insert_resource(slot_map);
     let _ = initial_cells;

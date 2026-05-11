@@ -31,7 +31,6 @@ use input::*;
 use material::*;
 use resources::*;
 #[cfg(feature = "gpu")]
-use resources_gpu::*;
 use screencast::*;
 use setup::*;
 use stats::*;
@@ -155,9 +154,7 @@ pub fn run() {
                     pool_bonded_hidden_cells,
                     pool_bond_messages_cells,
                     #[cfg(feature = "gpu")]
-                    cells_brain_act_gpu_full
-                        .run_if(resource_exists::<GpuFullPipeline>),
-                    cells_brain_act,
+                    cells_brain_act_gpu_full,
                     emit_pheromones,
                     apply_cell_morph,
                     apply_brownian_motion,
