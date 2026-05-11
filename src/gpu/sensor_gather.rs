@@ -24,7 +24,12 @@ pub struct SensorParamsGpu {
     pub field_world_half_x: f32,
     pub field_world_half_y: f32,
     pub field_world_half_z: f32,
-    pub _pad0: u32,
+    /// Wave 5: maze fields (LOS raycast). `maze_active != 0` enables LOS
+    /// filtering of food/cell candidates against the obstacle mask at
+    /// binding 13.
+    pub maze_active: u32,
+    pub maze_res_x: u32,
+    pub maze_res_y: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -55,6 +60,9 @@ pub struct SensorGatherGpu {
     eff_radii_buf: wgpu::Buffer,
     vision_radii_buf: wgpu::Buffer,
     food_positions_buf: wgpu::Buffer,
+    /// Wave 5: per-voxel maze occupancy mask (binding 13). Same packing as
+    /// `StepGpu::maze_mask_buf`. Pre-allocated at MAZE_MASK_CAPACITY u32s.
+    maze_mask_buf: wgpu::Buffer,
     output_buf: wgpu::Buffer,
     output_rb: wgpu::Buffer,
     pos_packed: Vec<f32>,
@@ -94,7 +102,8 @@ impl SensorGatherGpu {
                 include_str!("../../shaders/sensor_gather.wgsl").into(),
             ),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13)
+        // Wave 5: 13 → 14 bindings (binding 13 = maze_mask read-only).
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -155,6 +164,13 @@ impl SensorGatherGpu {
         let eff_radii_buf = mk("sensor-eff", nc * f, stor_dst);
         let vision_radii_buf = mk("sensor-vision", nc * f, stor_dst);
         let food_positions_buf = mk("sensor-food-pos", nf * 3 * f, stor_dst);
+        // Wave 5: maze mask buffer. Same MAZE_MASK_CAPACITY as StepGpu so
+        // the same packed mask payload feeds both shaders.
+        let maze_mask_buf = mk(
+            "sensor-maze-mask",
+            MAZE_MASK_CAPACITY as u64 * std::mem::size_of::<u32>() as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         // V7: 19 floats per cell (was 15). Layout — nearest_food (3) +
         // has_food (1) + nearest_cell delta (3) + radius (1) + smell_grad (3)
         // + phero_grad (3) + neighbors_count (1, bitcast<u32>) + vibration_grad (3)
@@ -175,6 +191,7 @@ impl SensorGatherGpu {
             eff_radii_buf,
             vision_radii_buf,
             food_positions_buf,
+            maze_mask_buf,
             output_buf,
             output_rb,
             pos_packed: Vec::new(),
@@ -193,6 +210,23 @@ impl SensorGatherGpu {
     }
     pub fn vision_radii_buffer(&self) -> &wgpu::Buffer {
         &self.vision_radii_buf
+    }
+
+    /// Wave 5: upload the maze mask. Same packing as `StepGpu::upload_maze`.
+    /// `params.maze_active = 0` next dispatch makes the shader skip the LOS
+    /// check; the mask buffer contents are then irrelevant.
+    pub fn upload_maze(&self, mask: &[u32]) {
+        debug_assert!(
+            mask.len() <= MAZE_MASK_CAPACITY,
+            "sensor maze mask {} exceeds capacity {}",
+            mask.len(),
+            MAZE_MASK_CAPACITY
+        );
+        if mask.is_empty() {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.maze_mask_buf, 0, bytemuck::cast_slice(mask));
     }
 
     /// Variant of `compute()` that skips the `Vec<SensorRow>` readback —
@@ -298,6 +332,7 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
             ],
         });
 
@@ -376,6 +411,7 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
             ],
         });
 

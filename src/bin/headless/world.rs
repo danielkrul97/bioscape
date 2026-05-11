@@ -1192,7 +1192,18 @@ impl World {
             field_world_half_x: WORLD_HALF[0],
             field_world_half_y: WORLD_HALF[1],
             field_world_half_z: WORLD_HALF[2],
-            _pad0: 0,
+            // Wave 5: maze fields enable LOS raycast in the shader.
+            maze_active: if self.obstacles.is_some() { 1 } else { 0 },
+            maze_res_x: self
+                .obstacles
+                .as_ref()
+                .map(|f| f.resolution[0] as u32)
+                .unwrap_or(0),
+            maze_res_y: self
+                .obstacles
+                .as_ref()
+                .map(|f| f.resolution[1] as u32)
+                .unwrap_or(0),
         };
         gpu.sensor.dispatch_no_readback(
             &positions,
@@ -1827,6 +1838,7 @@ impl World {
                 VIBRATION_GRID_RES_Z,
             ]);
             gpu.step.upload_maze(&packed);
+            gpu.sensor.upload_maze(&packed);
             gpu.smell.upload_obstacle_mask(&smell_mask);
             gpu.pheromone.upload_obstacle_mask(&phero_mask);
             gpu.vibration.upload_obstacle_mask(&vib_mask);

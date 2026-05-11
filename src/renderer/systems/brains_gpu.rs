@@ -204,7 +204,10 @@ pub(crate) fn cells_brain_act_gpu_full(
         field_world_half_x: world_half[0],
         field_world_half_y: world_half[1],
         field_world_half_z: world_half[2],
-        _pad0: 0,
+        // Wave 5: maze fields enable in-shader LOS raycast.
+        maze_active: if maze.is_active() { 1 } else { 0 },
+        maze_res_x: maze.field.as_ref().map(|f| f.resolution[0] as u32).unwrap_or(0),
+        maze_res_y: maze.field.as_ref().map(|f| f.resolution[1] as u32).unwrap_or(0),
     };
     let populate_params = PopulateInputsParams {
         num_cells: n as u32,

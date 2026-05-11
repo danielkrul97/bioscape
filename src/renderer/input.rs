@@ -219,6 +219,7 @@ pub(super) fn toggle_maze_world(
             VIBRATION_GRID_RES_Z,
         ]);
         gpu.step.upload_maze(&packed);
+        gpu.sensor.upload_maze(&packed);
         gpu.smell.upload_obstacle_mask(&smell_mask_for_gpu);
         gpu.pheromone.upload_obstacle_mask(&phero_mask_for_gpu);
         gpu.vibration.upload_obstacle_mask(&vib_mask_for_gpu);

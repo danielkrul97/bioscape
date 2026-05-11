@@ -109,7 +109,7 @@ fn main() {
     });
     if maze_difficulty.is_some() && want_gpu {
         eprintln!(
-            "warning: --maze + --gpu in Wave 4 mode: step.wgsl wall collision + FieldGpu masked diffusion are GPU-aware, but sensor_gather LOS, whisker raycast, and hebbian eligibility traces still run the GPU code path without maze awareness — cells will see through walls, whisker brain inputs read 0, and reward credit-assignment skips eligibility traces. Wave 5 brings full GPU parity."
+            "info: --maze + --gpu (Wave 5): step wall collision, FieldGpu masked diffusion, and sensor_gather LOS are GPU-aware. Whisker raycast still reads 0 in shader (CPU pre-pass populates last_whisker_distances but GPU populate_inputs zeroes the slot); hebbian eligibility traces run the CPU path against the persistent GPU brain weight buffer — patches reach GPU at next-gen sync. Wave 6 brings full parity."
         );
     }
     // Wave 3 curriculum ramp: --maze-stages=easy:50,medium:100,hard
@@ -149,7 +149,7 @@ fn main() {
         .unwrap_or_default();
     if !maze_stages.is_empty() && want_gpu {
         eprintln!(
-            "warning: --maze-stages + --gpu — same caveat as --maze + --gpu (Wave 4 partial GPU parity, see startup warning)."
+            "info: --maze-stages + --gpu — same caveat as --maze + --gpu (see startup info)."
         );
     }
     let initial_maze_difficulty = if !maze_stages.is_empty() {
@@ -417,6 +417,7 @@ fn main() {
                     ]);
                     if let Some(gpu) = world.gpu_full.as_mut() {
                         gpu.step.upload_maze(&packed);
+                        gpu.sensor.upload_maze(&packed);
                         gpu.smell.upload_obstacle_mask(&smell_mask);
                         gpu.pheromone.upload_obstacle_mask(&phero_mask);
                         gpu.vibration.upload_obstacle_mask(&vib_mask);

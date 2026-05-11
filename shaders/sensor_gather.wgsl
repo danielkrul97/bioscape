@@ -41,7 +41,12 @@ struct SensorParams {
     field_world_half_x: f32,
     field_world_half_y: f32,
     field_world_half_z: f32,
-    _pad0: u32,
+    // Wave 5 maze fields. `maze_active != 0` enables LOS raycast that
+    // filters food/cell candidates blocked by walls. Whisker raycast
+    // deferred (needs heading + pitch bindings, see binding 13 comment).
+    maze_active: u32,
+    maze_res_x: u32,
+    maze_res_y: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SensorParams;
@@ -57,6 +62,13 @@ struct SensorParams {
 @group(0) @binding(10) var<storage, read> pheromone_grid: array<u32>;
 @group(0) @binding(11) var<storage, read_write> output: array<f32>;
 @group(0) @binding(12) var<storage, read> vibration_grid: array<u32>;
+// Wave 5: maze occupancy mask (binding 13). Same format as
+// step.wgsl::maze_mask — one u32 per voxel, row-major
+// `vy * maze_res_x + vx`, value 0 = passable. Read by `raycast_blocked`
+// for LOS filtering. Whisker raycast deferred — would need per-cell
+// heading + pitch as additional bindings, repacking to fit the storage
+// limit; postponed to Wave 6.
+@group(0) @binding(13) var<storage, read> maze_mask: array<u32>;
 
 // Toroidal minimum-image displacement (used for both x and y).
 fn min_image_xy(d: f32, half: f32) -> f32 {
@@ -64,6 +76,44 @@ fn min_image_xy(d: f32, half: f32) -> f32 {
     if (d > half) { return d - w; }
     if (d < -half) { return d + w; }
     return d;
+}
+
+// Wave 5: xy raycast against the maze obstacle mask. Mirror of
+// `ObstacleField::raycast_blocked` — uniform-step sampling at half-voxel
+// pitch. Returns true if any voxel between `origin` and `target` is
+// occupied. Caller MUST check `params.maze_active != 0u` first; this
+// helper assumes it.
+fn raycast_blocked(origin: vec3<f32>, tgt: vec3<f32>) -> bool {
+    let dx = tgt.x - origin.x;
+    let dy = tgt.y - origin.y;
+    let dist = sqrt(dx * dx + dy * dy);
+    if (dist < 1e-3) {
+        return false;
+    }
+    let nx = i32(params.maze_res_x);
+    let ny = i32(params.maze_res_y);
+    let cs_x = (2.0 * params.world_half_x) / f32(params.maze_res_x);
+    let cs_y = (2.0 * params.world_half_y) / f32(params.maze_res_y);
+    let step = min(cs_x, cs_y) * 0.5;
+    let n_steps = u32(ceil(dist / step));
+    if (n_steps <= 1u) {
+        return false;
+    }
+    for (var k: u32 = 1u; k < n_steps; k = k + 1u) {
+        let t = f32(k) * step / dist;
+        let px = origin.x + dx * t;
+        let py = origin.y + dy * t;
+        let xi = i32(floor((px + params.world_half_x) / cs_x));
+        let yi = i32(floor((py + params.world_half_y) / cs_y));
+        if (xi < 0 || xi >= nx || yi < 0 || yi >= ny) {
+            return true; // outside bounds = solid in maze mode
+        }
+        let idx = u32(yi) * params.maze_res_x + u32(xi);
+        if (maze_mask[idx] != 0u) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Bucket coordinates for a position. xy is wrapped to [-half, half) before
@@ -192,6 +242,13 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let dzf = pj.z - pos_i.z;
                     let d2 = dxf * dxf + dyf * dyf + dzf * dzf;
                     if (d2 <= vr2) {
+                        // Wave 5: LOS check — skip neighbors hidden by walls.
+                        // Mirror of CPU `bioscape::los_clear`. Only fires
+                        // when the maze is active to keep the no-maze path
+                        // identical.
+                        if (params.maze_active != 0u && raycast_blocked(pos_i, pj)) {
+                            continue;
+                        }
                         neighbors_count = neighbors_count + 1u;
                         if (d2 < best_cell_d2) {
                             best_cell_d2 = d2;
@@ -219,6 +276,10 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let dzf = pf.z - pos_i.z;
                         let d2 = dxf * dxf + dyf * dyf + dzf * dzf;
                         if (d2 <= vr2 && d2 < best_food_d2) {
+                            // Wave 5: LOS check — skip food blocked by walls.
+                            if (params.maze_active != 0u && raycast_blocked(pos_i, pf)) {
+                                continue;
+                            }
                             best_food_d2 = d2;
                             best_food_dx = dxf;
                             best_food_dy = dyf;
