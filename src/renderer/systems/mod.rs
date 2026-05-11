@@ -1,5 +1,4 @@
 pub(super) mod brains;
-#[cfg(feature = "gpu")]
 pub(super) mod brains_gpu;
 pub(super) mod collisions;
 pub(super) mod fields;
@@ -11,7 +10,6 @@ pub(super) mod spikes;
 pub(super) mod transforms;
 
 pub(super) use brains::*;
-#[cfg(feature = "gpu")]
 pub(super) use brains_gpu::*;
 pub(super) use collisions::*;
 pub(super) use fields::*;

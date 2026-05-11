@@ -7,7 +7,6 @@ use super::super::components::{CellEntity, Dying, FoodEntity};
 use super::super::config::DIAG_BROWNIAN;
 use super::super::resources::{Clock, EventCalendarResource, MazeWorld, WorldExtent, WorldMapResource};
 use super::super::world_map::hazard_drain;
-#[cfg(feature = "gpu")]
 use super::super::resources_gpu::GpuFullPipeline;
 
 pub(crate) fn step_cells(
@@ -17,11 +16,10 @@ pub(crate) fn step_cells(
     events: Res<EventCalendarResource>,
     maze: Res<MazeWorld>,
     mut cells: Query<&mut CellEntity>,
-    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
+    gpu_full: Option<Res<GpuFullPipeline>>,
 ) {
     // Full GPU pipeline: kinematics + drag + energy + bounce už proběhly v
     // `cells_brain_act_gpu_full` (StepGpu shader); tento systém je no-op.
-    #[cfg(feature = "gpu")]
     if gpu_full.is_some() {
         return;
     }
@@ -61,11 +59,10 @@ pub(crate) fn apply_brownian_motion(
     extent: Res<WorldExtent>,
     mut cells: Query<&mut CellEntity, Without<Dying>>,
     mut diag: Diagnostics,
-    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
+    gpu_full: Option<Res<GpuFullPipeline>>,
 ) {
     // Full GPU pipeline: brownian dispatchnut v `cells_brain_act_gpu_full`
     // (xoshiro128++ shader) — tento systém je no-op.
-    #[cfg(feature = "gpu")]
     if gpu_full.is_some() {
         return;
     }

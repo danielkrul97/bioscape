@@ -12,7 +12,6 @@ use super::super::resources::{
     AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh, NextCellId, SpikeMaterial,
     SpikeMesh, WorldExtent,
 };
-#[cfg(feature = "gpu")]
 use super::super::resources_gpu::GpuFullPipeline;
 
 pub(crate) fn cell_reproduces_on_threshold(
@@ -24,11 +23,11 @@ pub(crate) fn cell_reproduces_on_threshold(
     mut bio_materials: ResMut<Assets<BioMaterial>>,
     mut slot_map: ResMut<CellSlotMap>,
     mut next_cell_id: ResMut<NextCellId>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
     mut fertile_scratch: Local<Vec<(Entity, [f32; 3])>>,
     mut to_spawn_scratch: Local<Vec<Cell>>,
-    #[cfg(feature = "gpu")] mut cppn_dispatch_scratch: Local<Vec<(usize, bioscape::Cppn)>>,
+    mut cppn_dispatch_scratch: Local<Vec<(usize, bioscape::Cppn)>>,
 ) {
     // `slot_map` tracks every live (non-Dying) cell — equivalent to walking the
     // `Query<_, Without<Dying>>` but in O(1).
@@ -69,10 +68,7 @@ pub(crate) fn cell_reproduces_on_threshold(
     // In `--gpu-full` we materialise child brain weights via GPU CPPN
     // dispatch after spawn; the chained `crossover().mutate()` already
     // skips `Brain::from_cppn` via `make_mating_child_no_brain`.
-    #[cfg(feature = "gpu")]
     let use_gpu_cppn = gpu_full.is_some();
-    #[cfg(not(feature = "gpu"))]
-    let use_gpu_cppn = false;
 
     // Wave K: skip per-pair download_brain_at — make_mating_child_no_brain
     // only touches Genome.cppn, and per-gen sync_brains_from_gpu refreshes
@@ -99,7 +95,6 @@ pub(crate) fn cell_reproduces_on_threshold(
         to_spawn_scratch.push(child);
     }
 
-    #[cfg(feature = "gpu")]
     cppn_dispatch_scratch.clear();
     let mesh = cell_mesh.0.clone();
     for cell in to_spawn_scratch.drain(..) {
@@ -110,7 +105,6 @@ pub(crate) fn cell_reproduces_on_threshold(
         );
         // `Cppn` is `Copy`; clone the value before `spawn()` consumes `cell`
         // so we can dispatch the GPU CPPN materialisation after the loop.
-        #[cfg(feature = "gpu")]
         let cppn_copy = cell.genome.cppn;
         let turn_rate = cell.genome.turn_rate;
         let entity = commands
@@ -133,7 +127,6 @@ pub(crate) fn cell_reproduces_on_threshold(
             ));
         }
         let slot = slot_map.allocate(entity);
-        #[cfg(feature = "gpu")]
         if let Some(gpu) = gpu_full.as_ref() {
             // GPU CPPN dispatch below writes brain weights directly to
             // cells.brain_weights_buf. Seed xoshiro from cell_id so the
@@ -146,7 +139,6 @@ pub(crate) fn cell_reproduces_on_threshold(
     }
 
     // Single GPU CPPN dispatch covers every child spawned this frame.
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu) = gpu_full {
         if !cppn_dispatch_scratch.is_empty() {
             // Build `&Cppn` references into the owned scratch Vec; the dispatch
@@ -167,7 +159,7 @@ pub(crate) fn cell_dies_on_zero_energy(
     food_mesh: Res<FoodMesh>,
     food_material: Res<FoodMaterial>,
     mut slot_map: ResMut<CellSlotMap>,
-    #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
+    gpu_full: Option<Res<GpuFullPipeline>>,
     mut commands: Commands,
 ) {
     let mut rng = rand::rng();
@@ -201,7 +193,6 @@ pub(crate) fn cell_dies_on_zero_energy(
             // pro fade animaci (Without<Dying> ji vyloučí ze sim systems).
             // GPU swap_to drží sloty dense.
             if let Some((freed_slot, moved)) = slot_map.release(entity) {
-                #[cfg(feature = "gpu")]
                 if let Some(gpu) = gpu_full.as_ref() {
                     if moved.is_some() {
                         gpu.cells.swap_to(freed_slot, slot_map.len());

@@ -69,13 +69,13 @@ rustc-hash = "2"
 # slije do jedné instrukce). 8 lanes × ~10 chunks per row pokrývá padded
 # BRAIN_INPUTS=80 a padded BRAIN_HIDDEN=56.
 wide = "1"
-wgpu = { version = "23", optional = true }
-bytemuck = { version = "1", features = ["derive"], optional = true }
-pollster = { version = "0.4", optional = true }
+# Wave N: GPU compute is mandatory — wgpu / bytemuck / pollster no longer
+# gated by the `gpu` feature flag (removed).
+wgpu = "23"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
 
 [features]
-default = ["gpu"]
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 # Speeds up incremental rebuilds during development.
 # Run with: cargo run --features dev
 dev = ["bevy/dynamic_linking"]

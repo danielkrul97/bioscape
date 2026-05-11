@@ -10,7 +10,6 @@ use std::time::Instant;
 use super::super::components::{CellEntity, Dying, FoodEntity};
 use super::super::config::{DIAG_FOOD_COUNT, DIAG_PHEROMONE, DIAG_SMELL, DIAG_VIBRATION};
 use super::super::resources::{MazeWorld, PheromoneResource, SmellResource, VibrationResource};
-#[cfg(feature = "gpu")]
 use super::super::resources_gpu::GpuFullPipeline;
 
 pub(crate) fn update_smell_field(
@@ -18,7 +17,7 @@ pub(crate) fn update_smell_field(
     foods: Query<&FoodEntity>,
     smell: ResMut<SmellResource>,
     _maze: Res<MazeWorld>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut diag: Diagnostics,
 ) {
     let t = Instant::now();
@@ -29,7 +28,6 @@ pub(crate) fn update_smell_field(
     // `gpu_full.smell.current_grid_buffer()` direct, no CPU readback.
     // SmellResource CPU shadow stays stale; checkpoint readback (not
     // yet wired) is the only consumer.
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu_full) = gpu_full {
         for food in &foods {
             gpu_full.smell.add_source(
@@ -47,7 +45,7 @@ pub(crate) fn update_pheromone_field(
     time: Res<Time>,
     pheromone: ResMut<PheromoneResource>,
     _maze: Res<MazeWorld>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut diag: Diagnostics,
 ) {
     // Diffuse + decay BEFORE this tick's emissions (in emit_pheromones, which
@@ -58,7 +56,6 @@ pub(crate) fn update_pheromone_field(
 
     // Wave L: all 3 channels live on GPU; sensor_gather reads gradients
     // direct via storage bindings, no CPU readback.
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu_full) = gpu_full {
         gpu_full
             .pheromone
@@ -78,7 +75,7 @@ pub(crate) fn update_vibration_field(
     time: Res<Time>,
     mut vibration: ResMut<VibrationResource>,
     maze: Res<MazeWorld>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     cells: Query<&CellEntity, Without<Dying>>,
     mut diag: Diagnostics,
 ) {
@@ -94,7 +91,6 @@ pub(crate) fn update_vibration_field(
     // and any future CSV/diagnostic reader see real values; cost is one
     // ~256 KB readback per tick which is acceptable against the perf
     // headroom gained by skipping the per-tick *sensor* readback.
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu_full) = gpu_full {
         for cell in &cells {
             let emit = bioscape::vibration_emit_for_cell(&cell.0);
@@ -120,7 +116,7 @@ pub(crate) fn update_vibration_field(
 pub(crate) fn emit_pheromones(
     time: Res<Time>,
     pheromone: ResMut<PheromoneResource>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut cells: Query<&mut CellEntity, Without<Dying>>,
 ) {
     let dt = time.delta_secs();
@@ -132,7 +128,6 @@ pub(crate) fn emit_pheromones(
     // Cost = sum of all positive emissions × PHEROMONE_COST_PER_RATE.
     const EMIT_SLOTS: [usize; N_PHEROMONE_CHANNELS] = [2, 10, 11];
 
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu_full) = gpu_full {
         for mut cell in &mut cells {
             let pos = [cell.0.position[0], cell.0.position[1], cell.0.position[2]];

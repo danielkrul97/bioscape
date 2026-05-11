@@ -15,7 +15,6 @@ use super::super::resources::{
     CellEntityLookups, CellGrid, CellSlotMap, Clock, CoopFoodResource, FoodDensityFactor, FoodGrid,
     FoodMaterial, FoodMesh, WorldExtent, WorldMapResource,
 };
-#[cfg(feature = "gpu")]
 use super::super::resources_gpu::GpuFullPipeline;
 use super::super::world_map::{food_multiplier, food_target};
 
@@ -177,7 +176,7 @@ pub(crate) fn cell_eats_food(
     world_map: Res<WorldMapResource>,
     slot_map: Res<CellSlotMap>,
     lookups: Res<CellEntityLookups>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
     mut diag: Diagnostics,
     mut snapshot_scratch: Local<Vec<(Entity, [f32; 3], f32, [f32; 3], f32, f32, f32, f32, bool)>>,
@@ -191,10 +190,7 @@ pub(crate) fn cell_eats_food(
 
     // Sprint 52: GPU Hebbian dispatch consumes rewards Vec[N]. The
     // GpuFullPipeline carries its own Hebbian instance.
-    #[cfg(feature = "gpu")]
     let use_gpu_hebbian = gpu_full.is_some();
-    #[cfg(not(feature = "gpu"))]
-    let use_gpu_hebbian = false;
 
     rewards_scratch.clear();
     if use_gpu_hebbian {
@@ -375,7 +371,6 @@ pub(crate) fn cell_eats_food(
     // `apply_eligibility_step`) has been decaying + accumulating
     // `cells.brain_traces`; this dispatch credits the recent motor
     // pattern with `Δw = lr · reward · trace`.
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu_full) = gpu_full {
         let n = slot_map.len();
         if n > 0 && rewards.iter().any(|&r| r > 0.0) {

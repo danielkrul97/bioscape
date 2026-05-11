@@ -14,7 +14,6 @@ use bioscape::{
     N_PHEROMONE_CHANNELS,
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z, TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_SEED,
 };
-#[cfg(feature = "gpu")]
 use bioscape::gpu::{
         BrainGpu, BrownianGpu, CellsGpu, CppnGpu, FieldGpu, GpuContext, GpuFullScratch,
         HebbianGpu, MotorGpu, PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
@@ -301,7 +300,6 @@ fn main() {
         world.food_factor_mult = v;
     }
 
-    #[cfg(feature = "gpu")]
     {
         let cap = initial_cells.max(max_population).max(64);
         // Sprint 59: FieldGpu sources capacity. Per-tick deposit count =
@@ -551,7 +549,6 @@ fn main() {
             };
             // GPU CPPN keeps child brains GPU-resident; sync to CPU before the
             // stats pass reads `Genome.brain` for diagnostic metrics.
-            #[cfg(feature = "gpu")]
             world.sync_brains_from_gpu();
             // V7: the vibration field lives on the GPU in --gpu-full mode
             // (sensor gather reads it inline). Pull it back to the CPU shadow

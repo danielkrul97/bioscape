@@ -11,7 +11,6 @@ use super::resources::{
     AdhesionMaterials, CellMesh, CellSlotMap, Clock, CoopFoodResource, EventCalendarResource,
     FoodMaterial, FoodMesh, NextCellId, PheromoneResource, SpikeMaterial, SpikeMesh, WorldExtent,
 };
-#[cfg(feature = "gpu")]
 use super::resources_gpu::GpuFullPipeline;
 
 /// Click-vs-drag threshold in pixels. Below this, RMB release opens the menu;
@@ -226,7 +225,7 @@ pub(super) fn god_mode_handle_action(
     mut god: ResMut<GodMode>,
     mut registries: SpawnRegistries,
     mut world_state: WorldState,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
 ) {
     let GodModeState::MenuOpen { world_pos } = god.state else {
@@ -305,7 +304,6 @@ pub(super) fn god_mode_handle_action(
             );
             let cell_id_for_seed = cell.cell_id;
             let turn_rate = cell.genome.turn_rate;
-            #[cfg(feature = "gpu")]
             let cppn_copy = cell.genome.cppn;
             let entity = commands
                 .spawn((
@@ -327,7 +325,6 @@ pub(super) fn god_mode_handle_action(
                 ));
             }
             let slot = registries.slot_map.allocate(entity);
-            #[cfg(feature = "gpu")]
             if let Some(mut gpu) = gpu_full {
                 gpu.cells.upload_xoshiro_seed_at(slot, cell_id_for_seed);
                 gpu.cells.upload_turn_rate_at(slot, turn_rate);
@@ -336,8 +333,6 @@ pub(super) fn god_mode_handle_action(
                     .cppn
                     .dispatch(&[(slot, &cppn_copy)], &pipeline.cells);
             }
-            #[cfg(not(feature = "gpu"))]
-            let _ = (cell_id_for_seed, turn_rate);
             let _ = slot;
         }
         GodAction::CoopFood => {

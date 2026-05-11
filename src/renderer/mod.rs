@@ -15,7 +15,6 @@ mod godmode;
 mod input;
 mod material;
 mod resources;
-#[cfg(feature = "gpu")]
 mod resources_gpu;
 mod screencast;
 mod setup;
@@ -30,7 +29,6 @@ use godmode::*;
 use input::*;
 use material::*;
 use resources::*;
-#[cfg(feature = "gpu")]
 use screencast::*;
 use setup::*;
 use stats::*;
@@ -153,7 +151,6 @@ pub fn run() {
                     update_pheromone_field,
                     pool_bonded_hidden_cells,
                     pool_bond_messages_cells,
-                    #[cfg(feature = "gpu")]
                     cells_brain_act_gpu_full,
                     emit_pheromones,
                     apply_cell_morph,
@@ -198,7 +195,7 @@ pub fn run() {
             FixedUpdate,
             update_whisker_distances
                 .after(pool_bond_messages_cells)
-                .before(cells_brain_act),
+                .before(cells_brain_act_gpu_full),
         )
         // Wave 2: episodic novelty Hebbian reward — runs after motor /
         // physics so the cell's voxel reflects this tick's motion. Modifies
@@ -214,7 +211,7 @@ pub fn run() {
         .add_systems(
             FixedUpdate,
             apply_eligibility_step
-                .after(cells_brain_act)
+                .after(cells_brain_act_gpu_full)
                 .before(step_cells),
         )
         .add_systems(

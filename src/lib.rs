@@ -6,7 +6,6 @@
 use core::f32::consts::TAU;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "gpu")]
 pub mod gpu;
 
 pub mod params;

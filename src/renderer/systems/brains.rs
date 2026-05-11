@@ -16,10 +16,9 @@ use super::super::components::{CellEntity, Dying};
 pub(crate) fn apply_eligibility_step(
     time: Res<Time>,
     mut cells: Query<&mut CellEntity, Without<Dying>>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<super::super::resources_gpu::GpuFullPipeline>>,
+    gpu_full: Option<ResMut<super::super::resources_gpu::GpuFullPipeline>>,
 ) {
     let dt = time.delta_secs();
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu) = gpu_full {
         let n = cells.iter().count();
         if n > 0 {
@@ -59,12 +58,11 @@ pub(crate) fn apply_eligibility_step(
 pub(crate) fn apply_episodic_novelty(
     extent: Res<super::super::resources::WorldExtent>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
-    #[cfg(feature = "gpu")] slot_map: Res<super::super::resources::CellSlotMap>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<super::super::resources_gpu::GpuFullPipeline>>,
-    #[cfg(feature = "gpu")] mut novelty_rewards_scratch: Local<Vec<f32>>,
+    slot_map: Res<super::super::resources::CellSlotMap>,
+    gpu_full: Option<ResMut<super::super::resources_gpu::GpuFullPipeline>>,
+    mut novelty_rewards_scratch: Local<Vec<f32>>,
 ) {
     let half = extent.as_array();
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu) = gpu_full {
         let n = slot_map.len();
         if n == 0 {

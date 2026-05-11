@@ -30,7 +30,6 @@ use bioscape::{
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
 };
 use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
-#[cfg(feature = "gpu")]
 use bioscape::{
     gpu::{
         BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, FieldGpu, FoodSpawnGpu,
@@ -278,21 +277,18 @@ pub struct World {
     pub goal_first_reach_tick: rustc_hash::FxHashMap<u64, u64>,
     // Sprint 44: pokud `Some`, brain_act offloaduje forward pass na GPU.
     // Sensor gather + populate_brain_inputs + apply_brain_motor zůstává CPU.
-    #[cfg(feature = "gpu")]
     pub gpu: Option<BrainGpu>,
     // Sprint 51: full-GPU brain pipeline. Když Some, drží brain weights
     // persistent na GPU mezi ticky (eliminuje 30 MB/tick upload Sprintu 44),
     // GPU Hebbian replace CPU brain.hebbian_update, GPU Brownian replace
     // CPU apply_brownian. Sensor/motor/step/collision/predate zůstávají CPU
     // rayon (Sprint 50 standalone shadery jsou ready, integrace je Sprint 52+).
-    #[cfg(feature = "gpu")]
     pub gpu_full: Option<GpuFullState>,
 }
 
 // `GpuFullScratch` přesunut do `bioscape::gpu::scratch` (lib) — sdílen mezi
 // headless `--gpu-full` pathem a renderer `BIOSCAPE_GPU_FULL=1` pathem.
 
-#[cfg(feature = "gpu")]
 pub struct GpuFullState {
     pub cells: CellsGpu,
     pub brain: BrainGpu,
@@ -527,9 +523,7 @@ impl World {
             goal_zone_ticks_gen: 0,
             goal_unique_reachers_gen: rustc_hash::FxHashSet::default(),
             goal_first_reach_tick: rustc_hash::FxHashMap::default(),
-            #[cfg(feature = "gpu")]
             gpu: None,
-            #[cfg(feature = "gpu")]
             gpu_full: None,
         }
     }
@@ -677,9 +671,7 @@ impl World {
             goal_zone_ticks_gen: 0,
             goal_unique_reachers_gen: rustc_hash::FxHashSet::default(),
             goal_first_reach_tick: rustc_hash::FxHashMap::default(),
-            #[cfg(feature = "gpu")]
             gpu: None,
-            #[cfg(feature = "gpu")]
             gpu_full: None,
         })
     }
@@ -777,14 +769,9 @@ impl World {
         // `cells.brain_traces` in place. Skip CPU pass to avoid double-decay
         // and to keep per-cell `genome.brain.trace_w*` matching the GPU
         // until next-gen sync (`sync_brains_from_gpu`).
-        #[cfg(feature = "gpu")]
-        let skip_cpu_eligibility = self.gpu_full.is_some();
-        #[cfg(not(feature = "gpu"))]
-        let skip_cpu_eligibility = false;
-        if !skip_cpu_eligibility {
-            self.apply_eligibility_step(dt);
-        }
-        #[cfg(feature = "gpu")]
+        // GPU pipeline runs the equivalent on-device; skip CPU Hebbian
+        // to avoid double-decay (CPU `genome.brain.trace_w*` stays stale
+        // until next-gen `sync_brains_from_gpu`).
         if let Some(gpu) = self.gpu_full.as_ref() {
             let n = self.cells.len();
             gpu.hebbian.dispatch_step_persistent(
@@ -892,7 +879,6 @@ impl World {
     /// deterministic across GPU runs (xoshiro state seedovaný z cell.lineage_id).
     /// Sprint 62: nyní fused do brain_act_gpu_full pipeline; tato standalone
     /// metoda je dead code preserved pro Sprint 63+ test path.
-    #[cfg(feature = "gpu")]
     #[allow(dead_code)]
     fn apply_brownian_gpu(&mut self, dt: f32) {
         let n = self.cells.len();
@@ -996,7 +982,6 @@ impl World {
 
     /// Sprint 44 + 51: dispatch GPU full / GPU brain / CPU.
     fn run_brain_act(&mut self, dt: f32) {
-        #[cfg(feature = "gpu")]
         {
             if self.gpu_full.is_some() {
                 self.brain_act_gpu_full(dt);
@@ -1029,7 +1014,6 @@ impl World {
     ///   10. CPU writeback all 5 buffers + apply_brain_motor je SKIPPED (motor
     ///       byl GPU-side).
     /// Round-trip status: 1× `device.poll(Wait)` per tick (vs Sprint 61 2×).
-    #[cfg(feature = "gpu")]
     fn brain_act_gpu_full(&mut self, dt: f32) {
         let n = self.cells.len();
         if n == 0 {
@@ -1316,7 +1300,6 @@ impl World {
             });
     }
 
-    #[cfg(feature = "gpu")]
     fn brain_act_gpu(&mut self, dt: f32) {
         let n = self.cells.len();
         if n == 0 {
@@ -1707,7 +1690,6 @@ impl World {
         // Tato fáze je v `--gpu-full` no-op; kinematics + drag + energy +
         // bounce už proběhly přes StepGpu shader, position/velocity/age/
         // cooldown/energy jsou writebackd v batch readback Phase 10-11.
-        #[cfg(feature = "gpu")]
         {
             if self.gpu_full.is_some() {
                 let _ = dt;
@@ -1783,7 +1765,6 @@ impl World {
         // Wave 4: re-upload mask + per-grid masks to gpu_full so the
         // in-shader collision and masked diffusion see the new layout from
         // this tick onward.
-        #[cfg(feature = "gpu")]
         if let Some(gpu) = self.gpu_full.as_mut() {
             let packed = field.packed_for_gpu();
             let smell_mask =
@@ -1845,7 +1826,6 @@ impl World {
     pub fn apply_episodic_novelty(&mut self) {
         use bioscape::{LEARNING_RATE, NOVELTY_REWARD_MAGNITUDE};
         let half = WORLD_HALF;
-        #[cfg(feature = "gpu")]
         if self.gpu_full.is_some() {
             // Decide novelty per cell first (read-only on cell state); then
             // apply rewards via the GPU dispatch in one pass.
@@ -1966,7 +1946,6 @@ impl World {
     /// `contact_lists_scratch` from a single GPU dispatch. Phase 2 / 3 / 4
     /// of `resolve_collisions` consume these scratch buffers identically
     /// regardless of which path produced them.
-    #[cfg(feature = "gpu")]
     fn resolve_collisions_gpu_pass1(&mut self) {
         let n = self.cells.len();
         if n == 0 {
@@ -2396,16 +2375,9 @@ impl World {
         // scratch (built v `tick` start, cells layout v eat_food beze změny).
         let id_to_idx = &self.id_to_idx_scratch;
 
-        #[cfg(feature = "gpu")]
-        let use_gpu_hebbian = self.gpu_full.is_some();
-        #[cfg(not(feature = "gpu"))]
-        let use_gpu_hebbian = false;
-
-        let mut rewards: Vec<f32> = if use_gpu_hebbian {
-            vec![0.0; self.cells.len()]
-        } else {
-            Vec::new()
-        };
+        // GPU Hebbian is the only path post wave N.
+        let mut rewards: Vec<f32> = vec![0.0; self.cells.len()];
+        let use_gpu_hebbian = true;
 
         // Pass 1 (parallel): per-cell candidate selection. Žádná mutace.
         // First match v grid traversal wins (zachovává pre-Sprint-57 sémantiku).
@@ -2563,7 +2535,6 @@ impl World {
         // shadow that `dispatch_step_persistent` has been decaying+
         // accumulating since the last reward event. CPU `cell.genome.brain`
         // is NOT updated; sync happens at `reproduce` via `download_brain_at`.
-        #[cfg(feature = "gpu")]
         if use_gpu_hebbian {
             let n = self.cells.len();
             let gpu = self.gpu_full.as_ref().unwrap();
@@ -2656,7 +2627,6 @@ impl World {
     /// `Brain::zeros()` placeholder until something explicitly downloads.
     /// Call this once per generation before serialisation / diagnostics
     /// (`w1_frobenius_std` etc.) — single `Wait` barrier, ~few ms total.
-    #[cfg(feature = "gpu")]
     pub fn sync_brains_from_gpu(&mut self) {
         if let Some(gpu) = self.gpu_full.as_ref() {
             let n = self.cells.len();
@@ -2675,15 +2645,12 @@ impl World {
     /// `main` right before `write_stats`; per-tick CPU shadow stays
     /// out-of-date in `--gpu-full` mode (sensor gather reads the GPU
     /// buffer direct, no readback needed mid-tick).
-    #[cfg(feature = "gpu")]
     pub fn sync_vibration_from_gpu(&mut self) {
         if let Some(gpu) = self.gpu_full.as_mut() {
             let grid = gpu.vibration.download();
             self.vibration.replace_grid_from(&grid);
         }
     }
-    #[cfg(not(feature = "gpu"))]
-    pub fn sync_vibration_from_gpu(&mut self) {}
 
     fn reproduce(&mut self, rng: &mut impl Rng) {
         let current_pop = self.cells.len();
@@ -2706,7 +2673,6 @@ impl World {
         // (saves ~16 KB × n_children write_buffer per reproduce phase).
         // xoshiro seed + turn_rate uploads stay — they're independent of
         // the brain materialisation path.
-        #[cfg(feature = "gpu")]
         if n_births > 0 && self.gpu_full.is_some() {
             // Borrow split: build `pairs` from `self.cells` (immutable),
             // then take `&mut self.gpu_full` for dispatch. Rust's disjoint
@@ -2791,10 +2757,9 @@ impl World {
         // In `--gpu-full` skip CPU `Brain::from_cppn` — child brain weights
         // land on the device through the per-reproduce-phase
         // `CppnGpu::dispatch` after `cells.extend(children)`.
-        #[cfg(feature = "gpu")]
-        let use_gpu_cppn = self.gpu_full.is_some();
-        #[cfg(not(feature = "gpu"))]
-        let use_gpu_cppn = false;
+        // GPU CPPN produces child brain weights direct on device; skip
+        // per-child CPU `Brain::from_cppn` cost.
+        let use_gpu_cppn = true;
         let mut children = Vec::with_capacity(matings.len());
         for (i, &(a, b)) in matings.iter().enumerate() {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
@@ -2847,20 +2812,13 @@ impl World {
         // Phase 2: remove dead cells. --gpu-full uses swap_remove pattern so
         // GPU brain_weights + xoshiro_state lze udržet in sync přes O(deaths)
         // GPU memcpy operations (žádný full re-upload).
-        #[cfg(feature = "gpu")]
-        let gpu_full_active = self.gpu_full.is_some();
-        #[cfg(not(feature = "gpu"))]
-        let gpu_full_active = false;
-
-        if gpu_full_active {
+        {
             let before = self.cells.len();
-            #[cfg(feature = "gpu")]
             let gpu = self.gpu_full.as_ref().unwrap();
             let mut i = 0;
             while i < self.cells.len() {
                 if self.cells[i].energy <= 0.0 {
                     let last = self.cells.len() - 1;
-                    #[cfg(feature = "gpu")]
                     if i != last {
                         gpu.cells.swap_to(i, last);
                     }
@@ -2870,10 +2828,6 @@ impl World {
                     i += 1;
                 }
             }
-            self.deaths_gen += (before - self.cells.len()) as u64;
-        } else {
-            let before = self.cells.len();
-            self.cells.retain(|c| c.energy > 0.0);
             self.deaths_gen += (before - self.cells.len()) as u64;
         }
         self.foods.extend(new_foods);

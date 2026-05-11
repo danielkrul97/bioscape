@@ -11,7 +11,6 @@ use bioscape::{
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z,
     WORLD_MAP_SEED, reject_food_for_richness,
 };
-#[cfg(feature = "gpu")]
 use bioscape::gpu::{
     BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
     PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
@@ -26,7 +25,6 @@ use super::resources::{
     OrbitCamera, PheromoneResource, SmellResource, SpikeMaterial, SpikeMesh, VibrationResource,
     WorldExtent, WorldMapResource,
 };
-#[cfg(feature = "gpu")]
 use super::resources_gpu::GpuFullPipeline;
 use super::world_map::{food_target, world_map_image};
 
@@ -207,7 +205,6 @@ pub(super) fn setup(
     // brain-only path is gone (it never matched gpu-full feature parity).
     // `BIOSCAPE_GPU_FULL=0` opt-out is also gone — init failure now panics
     // because there is no CPU compute fallback to fall through to.
-    #[cfg(feature = "gpu")]
     {
         // Full GPU pipeline (mirror headless --gpu-full): single-Wait
         // readback, sensor + populate + brain + motor + step + brownian

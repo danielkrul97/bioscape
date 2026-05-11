@@ -6,13 +6,12 @@ use bioscape::{
     CONTACT_DECAY_TICKS, DILUTION_K, FIXED_TIMESTEP_HZ, HERD_RADIUS, MAX_BONDS_PER_CELL,
     PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, SIZE_RATIO_THRESHOLD, WORLD_HALF,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Instant;
 
 use super::super::components::{CellEntity, Dying};
 use super::super::config::{DIAG_COLLISIONS, DIAG_PREDATION};
-use super::super::resources::ContactProgress;
-#[cfg(feature = "gpu")]
+use super::super::resources::{CellGrid, ContactProgress};
 use super::super::resources_gpu::GpuFullPipeline;
 
 // Generous broad-phase upper bound on "other" effective_radius — captures
@@ -33,7 +32,7 @@ pub(crate) struct SnapEntry {
 pub(crate) fn cell_predates_on_neighbor(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut diag: Diagnostics,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
 ) {
     let t_total = Instant::now();
 
@@ -41,7 +40,6 @@ pub(crate) fn cell_predates_on_neighbor(
     // atomic energy/damage accumulation. Pack-hunting CSV diagnostics
     // (bonded/solo/swarm/pack) are NOT computed here — the shader doesn't
     // emit per-event tuples. CPU fallback still does the full metric set.
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu_res) = gpu_full {
         let gpu = &mut *gpu_res;
         let mut entities: Vec<Entity> = Vec::new();
@@ -126,7 +124,7 @@ pub(crate) fn resolve_cell_collisions(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut contact_progress: ResMut<ContactProgress>,
     mut diag: Diagnostics,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut snapshot_scratch: Local<Vec<SnapEntry>>,
     mut entity_to_idx_scratch: Local<FxHashMap<Entity, usize>>,
     mut id_to_idx_scratch: Local<FxHashMap<u64, usize>>,
@@ -164,7 +162,6 @@ pub(crate) fn resolve_cell_collisions(
     // results == n a indexy se zachovají. Reuse outer scratch je primary win;
     // inner Vec capacity přežije přes ticky.
     results_scratch.clear();
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu_res) = gpu_full {
         // Bevy `ResMut::deref_mut` doesn't allow split-field borrows, so the
         // sibling-field `&gpu.cell_hash` arg passed to `gpu.collision.compute`

@@ -131,7 +131,7 @@ pub(super) fn toggle_maze_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<super::resources_gpu::GpuFullPipeline>>,
+    gpu_full: Option<ResMut<super::resources_gpu::GpuFullPipeline>>,
 ) {
     if !keys.just_pressed(KeyCode::KeyL) {
         return;
@@ -148,7 +148,6 @@ pub(super) fn toggle_maze_world(
         // Wave 4: clear GPU masks so the diffusion path falls back to
         // homogeneous behavior. Step shader leaves the mask buffer alone
         // (maze_active flag flips off via params next dispatch).
-        #[cfg(feature = "gpu")]
         if let Some(mut gpu) = gpu_full {
             gpu.smell.clear_obstacle_mask();
             gpu.pheromone.clear_obstacle_mask();
@@ -203,7 +202,6 @@ pub(super) fn toggle_maze_world(
     }
     // Wave 4: upload mask to GPU step shader + per-grid masks to FieldGpu
     // so in-shader collision and masked diffusion both see walls.
-    #[cfg(feature = "gpu")]
     if let Some(mut gpu) = gpu_full {
         let packed = field.packed_for_gpu();
         let smell_mask_for_gpu =
