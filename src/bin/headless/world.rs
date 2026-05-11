@@ -33,9 +33,10 @@ use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
 #[cfg(feature = "gpu")]
 use bioscape::{
     gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, FieldGpu, GpuFullScratch,
-        HebbianGpu, MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu,
-        PredateParamsGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu, StepGpu, StepParamsGpu,
+        BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, FieldGpu, FoodSpawnGpu,
+        FoodSpawnParamsGpu, GpuFullScratch, HebbianGpu, MotorGpu, PopulateInputsGpu,
+        PopulateInputsParams, PredateGpu, PredateParamsGpu, SensorGatherGpu, SensorParamsGpu,
+        SpatialHashGpu, StepGpu, StepParamsGpu,
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
     DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT, GRAVITY as PHYS_GRAVITY,
@@ -308,6 +309,11 @@ pub struct GpuFullState {
     /// (`bonded_attacks_gen` etc.) stay zero on this path — extending the
     /// shader to emit per-event tuples is follow-up work.
     pub predate: PredateGpu,
+    /// Wave J: GPU food spawn rejection sampling. K-attempts per dispatch;
+    /// CPU consumes valid candidates up to the per-tick budget. CPU still
+    /// owns `World::foods: Vec<Food>` (variable allocation = control
+    /// plane); GPU just does the rejection work.
+    pub food_spawn: FoodSpawnGpu,
     /// Sprint 59: GPU smell + pheromone field (3D 7-point Jacobi).
     /// Sprint 60: po wire SensorGatherGpu už NEČTE CPU SmellField shadow —
     /// sensor shader bere field grid storage buffer direct. Per-tick readback
@@ -1872,6 +1878,7 @@ impl World {
             ]);
             gpu.step.upload_maze(&packed);
             gpu.sensor.upload_maze(&packed);
+            gpu.food_spawn.upload_obstacle(&packed);
             gpu.smell.upload_obstacle_mask(&smell_mask);
             gpu.pheromone.upload_obstacle_mask(&phero_mask);
             gpu.vibration.upload_obstacle_mask(&vib_mask);
@@ -2932,9 +2939,83 @@ impl World {
         let _ = rewards;
     }
 
+    /// Wave J: GPU rejection sampling. Generates K = budget × MAX_SPAWN_ATTEMPTS
+    /// candidates in parallel, CPU pushes the first `budget` valid ones into
+    /// `self.foods`. Variable allocation stays CPU-side; GPU only does the
+    /// rejection work (world_map richness + obstacle mask + cell exclusion).
+    #[cfg(feature = "gpu")]
+    fn spawn_food_gpu(&mut self, rng: &mut impl Rng, budget: usize) {
+        if budget == 0 {
+            return;
+        }
+        let k = budget * bioscape::MAX_SPAWN_ATTEMPTS;
+        let positions: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
+        let max_axes: Vec<f32> = self.cells.iter().map(|c| c.phenotype.max_axis()).collect();
+        let seeds: Vec<[u32; 4]> = (0..k)
+            .map(|_| {
+                [
+                    rng.random::<u32>(),
+                    rng.random::<u32>(),
+                    rng.random::<u32>(),
+                    rng.random::<u32>(),
+                ]
+            })
+            .collect();
+        let obstacle_active = self.obstacles.is_some();
+        let (obs_nx, obs_ny, obs_nz) = self
+            .obstacles
+            .as_ref()
+            .map(|o| (o.resolution[0] as u32, o.resolution[1] as u32, o.resolution[2] as u32))
+            .unwrap_or((1, 1, 1));
+        let params = FoodSpawnParamsGpu {
+            num_attempts: 0, // populated by compute()
+            rejection_strength: bioscape::FOOD_REJECTION_STRENGTH,
+            eat_radius: bioscape::EAT_RADIUS,
+            cell_size: bioscape::GRID_CELL_SIZE,
+            world_half_x: WORLD_HALF[0],
+            world_half_y: WORLD_HALF[1],
+            world_half_z: WORLD_HALF[2],
+            num_cells: 0, // populated by compute()
+            world_map_nx: self.map.resolution[0] as u32,
+            world_map_ny: self.map.resolution[1] as u32,
+            world_map_nz: self.map.resolution[2] as u32,
+            obstacle_active: if obstacle_active { 1 } else { 0 },
+            obstacle_nx: obs_nx,
+            obstacle_ny: obs_ny,
+            obstacle_nz: obs_nz,
+            _pad0: 0,
+        };
+        let result = {
+            let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
+            gpu.cell_hash.dispatch(&positions);
+            gpu.food_spawn.seed_attempts(&seeds);
+            gpu.food_spawn.compute(k, &positions, &max_axes, &gpu.cell_hash, params)
+        };
+        let mut pushed = 0usize;
+        for i in 0..k {
+            if pushed >= budget {
+                break;
+            }
+            if result.valid_mask[i] != 0 {
+                self.foods.push(Food {
+                    position: result.candidate_positions[i],
+                    age_ticks: 0,
+                    kind: bioscape::FoodKind::Plant,
+                });
+                pushed += 1;
+            }
+        }
+    }
+
     fn spawn_food(&mut self, rng: &mut impl Rng) {
         let target = food_target(self.density_factor * self.food_factor_mult);
         if self.foods.len() >= target {
+            return;
+        }
+        let to_spawn = (target - self.foods.len()).min(FOOD_SPAWN_RATE);
+        #[cfg(feature = "gpu")]
+        if self.gpu_full.is_some() {
+            self.spawn_food_gpu(rng, to_spawn);
             return;
         }
         // Sprint 43: cell_grid pro exclusion check. Rebuild reuses bucket vec
@@ -2947,7 +3028,6 @@ impl World {
                 .enumerate()
                 .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
         );
-        let to_spawn = (target - self.foods.len()).min(FOOD_SPAWN_RATE);
         let max_search_r = EAT_RADIUS * bioscape::MAX_BODY_LENGTH;
         let obstacles = self.obstacles.as_ref();
         'spawn: for _ in 0..to_spawn {
