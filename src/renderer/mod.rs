@@ -11,6 +11,7 @@ mod components;
 mod config;
 mod diagnostics;
 mod gizmos;
+mod godmode;
 mod input;
 mod material;
 mod resources;
@@ -25,6 +26,7 @@ mod world_map;
 use camera::*;
 use components::*;
 use gizmos::*;
+use godmode::*;
 use input::*;
 use material::*;
 use resources::*;
@@ -111,7 +113,8 @@ pub fn run() {
         );
     }
 
-    app.init_resource::<TickCounter>()
+    app.init_resource::<gizmos::ShowVibration>()
+        .init_resource::<TickCounter>()
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`.
         // Sprint 88: white → ocean blue. Match s DistanceFog color tak aby
         // fog-fadeout splynul s pozadím (no harsh edges).
@@ -133,6 +136,8 @@ pub fn run() {
         .init_resource::<NextCellId>()
         .init_resource::<ContactProgress>()
         .init_resource::<CoopFoodResource>()
+        .init_resource::<GodMode>()
+        .init_resource::<MazeWorld>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
         .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay, rebuild_cell_grid).chain())
@@ -178,10 +183,21 @@ pub fn run() {
             )
                 .chain(),
         )
+        // `update_vibration_field` sits between `update_pheromone_field` and
+        // `pool_bonded_hidden_cells` — registered separately because folding
+        // it into the Phase 1 chain pushes the tuple past Bevy's `chain` impl
+        // size cap. The two explicit ordering constraints pin it in place.
+        .add_systems(
+            FixedUpdate,
+            update_vibration_field
+                .after(update_pheromone_field)
+                .before(pool_bonded_hidden_cells),
+        )
         .add_systems(
             Update,
             (
                 speed_input,
+                god_mode_button_hover,
                 camera_orbit_input,
                 camera_zoom_input,
                 camera_pan_input,
@@ -190,6 +206,10 @@ pub fn run() {
                 sync_spikes,
                 draw_bond_gizmos,
                 draw_cell_state_gizmos,
+                draw_vibration_gizmos,
+                draw_hazard_pulse_gizmos,
+                toggle_vibration_overlay,
+                toggle_maze_world,
                 log_clock_events,
                 toggle_stats_overlay,
                 toggle_world_map_overlay,
@@ -197,6 +217,21 @@ pub fn run() {
                 report_frame_diagnostics,
                 screencast_capture,
             ),
+        )
+        // God-mode pipeline runs before camera input so RMB orbit suppression
+        // takes effect on the same tick as the press. Order inside the chain:
+        // handle button hits first, then run the RMB state machine, then close
+        // on outside-clicks. Separate `add_systems` call avoids nested-tuple
+        // trait resolution issues with `.chain()`.
+        .add_systems(
+            Update,
+            (
+                god_mode_handle_action,
+                god_mode_input,
+                close_menu_on_outside_click,
+            )
+                .chain()
+                .before(camera_orbit_input),
         );
     if let Some(cfg) = screencast_cfg {
         let _ = std::fs::create_dir_all(&cfg.dir);

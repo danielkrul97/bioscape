@@ -989,7 +989,7 @@ fn sensor_gather_gpu_no_neighbors_when_alone() {
     };
     let rows = sensor.compute(
         &positions, &eff_radii, &vision_radii, &food_positions,
-        &cell_hash, &food_hash, &smell, &phero, params,
+        &cell_hash, &food_hash, &smell, &phero, &smell, params,
     );
     assert_eq!(rows[0].neighbors_in_vision, 0, "alone cell has no neighbors");
     assert!(rows[0].nearest_cell.is_none());
@@ -1042,7 +1042,7 @@ fn sensor_gather_gpu_food_in_vision_detected() {
     };
     let rows = sensor.compute(
         &positions, &eff_radii, &vision_radii, &food_positions,
-        &cell_hash, &food_hash, &smell, &phero, params,
+        &cell_hash, &food_hash, &smell, &phero, &smell, params,
     );
     assert!(rows[0].nearest_food.is_some(), "food within vision radius missed");
 }

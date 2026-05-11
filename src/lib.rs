@@ -33,6 +33,9 @@ pub use chemistry::*;
 pub mod world_map;
 pub use world_map::*;
 
+pub mod obstacles;
+pub use obstacles::*;
+
 pub mod spatial;
 pub use spatial::*;
 
@@ -47,6 +50,9 @@ pub use physics_utils::*;
 
 pub mod sensors;
 pub use sensors::*;
+
+pub mod xoshiro;
+pub use xoshiro::*;
 
 /// Sprint 121: jeden spike v multi-spike struktuře. `length` ∈ [MIN, MAX]
 /// (= dnešní spike_length), `azimuth_offset`/`elevation_offset` určují směr

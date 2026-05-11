@@ -14,6 +14,8 @@ pub(super) const DIAG_EAT_FOOD: DiagnosticPath = DiagnosticPath::const_new("sim/
 pub(super) const DIAG_SMELL: DiagnosticPath = DiagnosticPath::const_new("sim/smell_field_ms");
 pub(super) const DIAG_PHEROMONE: DiagnosticPath =
     DiagnosticPath::const_new("sim/pheromone_field_ms");
+pub(super) const DIAG_VIBRATION: DiagnosticPath =
+    DiagnosticPath::const_new("sim/vibration_field_ms");
 pub(super) const DIAG_GRID_REBUILD: DiagnosticPath =
     DiagnosticPath::const_new("sim/grid_rebuild_ms");
 pub(super) const DIAG_SYNC_TRANSFORMS: DiagnosticPath =

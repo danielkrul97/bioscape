@@ -46,6 +46,11 @@ pub(super) struct GpuFullPipeline {
     pub(super) brownian: BrownianGpu,
     pub(super) smell: FieldGpu,
     pub(super) pheromone: FieldGpu,
+    /// V7: motion-driven mechanosensory field. Deposit per cell mirrors
+    /// `emit_pheromones` pattern but the emission formula is hard-coded
+    /// (no brain output channel). Brain reads grad + amp via the chained
+    /// `sensor_gather → populate_inputs` pipeline.
+    pub(super) vibration: FieldGpu,
     pub(super) cell_hash: SpatialHashGpu,
     pub(super) food_hash: SpatialHashGpu,
     pub(super) sensor: SensorGatherGpu,

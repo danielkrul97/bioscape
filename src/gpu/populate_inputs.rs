@@ -24,8 +24,8 @@ pub struct PopulateInputsParams {
     pub damage_norm_gain: f32,
     pub density_norm: f32,
     pub reproduce_threshold: f32,
+    pub vibration_norm_gain: f32,
     pub _pad0: u32,
-    pub _pad1: u32,
 }
 
 pub struct PopulateInputsGpu {

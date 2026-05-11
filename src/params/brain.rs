@@ -45,7 +45,12 @@ pub const INITIAL_ENERGY: f32 = 100.0;
 /// bonded peers' last_outputs[12..14]) → inputs slots [27..29]. Selekce může
 /// využít k inter-cell signalizaci nad rámec broadcast pheromone fields.
 pub const N_BOND_MSG_CHANNELS: usize = 2;
-pub const BRAIN_INPUTS_SENSORY: usize = 27 + N_BOND_MSG_CHANNELS;
+// Vibration / mechanosensory inputs (slots [29..33]): grad_x, grad_y, grad_z,
+// amplitude. Field is `SmellField`-style 3D scalar with diffusion + decay;
+// emission is a byproduct of cell motion, not an explicit brain output. See
+// `params/vibration.rs` for constants and rationale.
+pub const BRAIN_INPUTS_SENSORY: usize =
+    27 + N_BOND_MSG_CHANNELS + crate::params::vibration::N_VIBRATION_INPUTS;
 // Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
 // hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
 // w1 z 28×8=224 na 36×16=576 weights (2.6×).

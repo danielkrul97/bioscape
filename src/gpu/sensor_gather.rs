@@ -34,7 +34,14 @@ pub struct SensorRow {
     pub neighbors_in_vision: u32,
     pub smell_grad: [f32; 3],
     pub pheromone_grad: [f32; 3],
+    pub vibration_grad: [f32; 3],
+    pub vibration_amp: f32,
 }
+
+/// Output stride per cell in `sensor_gather.wgsl` — keep in lock-step with
+/// the shader's `let off = i * 19u;` block. Bumped from 15 to 19 in V7 to
+/// carry vibration gradient (3 floats) + amplitude (1 float).
+pub const SENSOR_OUTPUT_STRIDE: usize = 19;
 
 pub struct SensorGatherGpu {
     device: Arc<wgpu::Device>,
@@ -87,7 +94,7 @@ impl SensorGatherGpu {
                 include_str!("../../shaders/sensor_gather.wgsl").into(),
             ),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..12)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -148,11 +155,13 @@ impl SensorGatherGpu {
         let eff_radii_buf = mk("sensor-eff", nc * f, stor_dst);
         let vision_radii_buf = mk("sensor-vision", nc * f, stor_dst);
         let food_positions_buf = mk("sensor-food-pos", nf * 3 * f, stor_dst);
-        // 15 floats per cell: nearest_food (3) + nearest_cell delta (3) +
-        // size (1) + neighbors_count (1) + smell_grad (3) + phero_grad (3) +
-        // padding to land on a vec4 boundary.
-        let output_buf = mk("sensor-output", nc * 15 * f, stor_src);
-        let output_rb = mk("sensor-output-rb", nc * 15 * f, read);
+        // V7: 19 floats per cell (was 15). Layout — nearest_food (3) +
+        // has_food (1) + nearest_cell delta (3) + radius (1) + smell_grad (3)
+        // + phero_grad (3) + neighbors_count (1, bitcast<u32>) + vibration_grad (3)
+        // + vibration_amp (1). Keep in sync with shader's `let off = i * 19u`.
+        let stride_bytes = (SENSOR_OUTPUT_STRIDE as u64) * f;
+        let output_buf = mk("sensor-output", nc * stride_bytes, stor_src);
+        let output_rb = mk("sensor-output-rb", nc * stride_bytes, read);
 
         Ok(Self {
             device,
@@ -201,6 +210,7 @@ impl SensorGatherGpu {
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) {
         if positions.is_empty() {
@@ -219,6 +229,7 @@ impl SensorGatherGpu {
             food_hash,
             smell,
             pheromone,
+            vibration,
             params,
         );
         self.queue.submit(Some(encoder.finish()));
@@ -236,6 +247,7 @@ impl SensorGatherGpu {
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) {
         let n = positions.len();
@@ -285,6 +297,7 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 9, resource: smell.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
             ],
         });
 
@@ -311,6 +324,7 @@ impl SensorGatherGpu {
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) -> Vec<SensorRow> {
         let n = positions.len();
@@ -361,6 +375,7 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 9, resource: smell.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
             ],
         });
 
@@ -376,7 +391,7 @@ impl SensorGatherGpu {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
         }
-        let bytes = (n as u64) * 15 * 4;
+        let bytes = (n as u64) * (SENSOR_OUTPUT_STRIDE as u64) * 4;
         encoder.copy_buffer_to_buffer(&self.output_buf, 0, &self.output_rb, 0, bytes);
         self.queue.submit(Some(encoder.finish()));
 
@@ -387,7 +402,7 @@ impl SensorGatherGpu {
         let f: &[f32] = bytemuck::cast_slice(&data);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let off = i * 15;
+            let off = i * SENSOR_OUTPUT_STRIDE;
             let has_food = f[off + 3] > 0.5;
             // `SensorRow` carries a signed min-image delta (toroidal-aware,
             // matches `BrainSensors.nearest_food/cell`). Reconstructing an
@@ -413,6 +428,8 @@ impl SensorGatherGpu {
                 neighbors_in_vision: count_bits,
                 smell_grad: [f[off + 8], f[off + 9], f[off + 10]],
                 pheromone_grad: [f[off + 11], f[off + 12], f[off + 13]],
+                vibration_grad: [f[off + 15], f[off + 16], f[off + 17]],
+                vibration_amp: f[off + 18],
             });
         }
         drop(data);

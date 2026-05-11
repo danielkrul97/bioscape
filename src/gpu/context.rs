@@ -56,9 +56,12 @@ const W1_OFFSET: usize = 0;
 pub const B1_OFFSET: usize = BRAIN_HIDDEN * BRAIN_INPUTS;
 pub const W2_OFFSET: usize = B1_OFFSET + BRAIN_HIDDEN;
 pub const B2_OFFSET: usize = W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN;
+// V7 (vibration): BRAIN_INPUTS 74→78 (4 mechanosensory slots). Offsets
+// shift accordingly; keep the WGSL shader constants in `brain_forward.wgsl`
+// and `hebbian.wgsl` in lock-step with these values.
 const _: () = assert!(W1_OFFSET == 0);
-const _: () = assert!(B1_OFFSET == 3330);
-const _: () = assert!(W2_OFFSET == 3375);
-const _: () = assert!(B2_OFFSET == 4005);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4019);
+const _: () = assert!(B1_OFFSET == 3510);
+const _: () = assert!(W2_OFFSET == 3555);
+const _: () = assert!(B2_OFFSET == 4185);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4199);
 

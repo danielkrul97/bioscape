@@ -216,8 +216,8 @@ pub(crate) fn cells_brain_act_gpu_full(
         damage_norm_gain: DAMAGE_NORMALIZATION_GAIN,
         density_norm: DENSITY_NORM_COUNT,
         reproduce_threshold: REPRODUCE_THRESHOLD,
+        vibration_norm_gain: bioscape::VIBRATION_NORMALIZATION_GAIN,
         _pad0: 0,
-        _pad1: 0,
     };
     let has_z = world_half[2] > 0.0;
     let step_params = StepParamsGpu {
@@ -278,6 +278,7 @@ pub(crate) fn cells_brain_act_gpu_full(
         &pipeline.food_hash,
         &pipeline.smell,
         &pipeline.pheromone,
+        &pipeline.vibration,
         sensor_params,
     );
     pipeline

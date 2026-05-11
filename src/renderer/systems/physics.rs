@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use super::super::components::{CellEntity, Dying, FoodEntity};
 use super::super::config::DIAG_BROWNIAN;
-use super::super::resources::{Clock, EventCalendarResource, WorldExtent, WorldMapResource};
+use super::super::resources::{Clock, EventCalendarResource, MazeWorld, WorldExtent, WorldMapResource};
 use super::super::world_map::hazard_drain;
 #[cfg(feature = "gpu")]
 use super::super::resources_gpu::GpuFullPipeline;
@@ -15,6 +15,7 @@ pub(crate) fn step_cells(
     extent: Res<WorldExtent>,
     clock: Res<Clock>,
     events: Res<EventCalendarResource>,
+    maze: Res<MazeWorld>,
     mut cells: Query<&mut CellEntity>,
     #[cfg(feature = "gpu")] gpu_full: Option<Res<GpuFullPipeline>>,
 ) {
@@ -33,6 +34,7 @@ pub(crate) fn step_cells(
     // `step_with_thermal` reuse it (saves two sin / modulo pairs per cell).
     let event_slice = events.0.events.as_slice();
     let thermal_ctx = bioscape::ThermalCtx::for_tick(tick, gen);
+    let obstacles = maze.field.as_ref();
     cells.par_iter_mut().for_each(|mut cell| {
         let climate_offset = bioscape::climate_shock_offset(
             event_slice,
@@ -40,8 +42,14 @@ pub(crate) fn step_cells(
             [cell.0.position[0], cell.0.position[1]],
             half,
         );
-        cell.0
-            .step_with_thermal(dt, half, &thermal_ctx, &PHYSICS_CONFIG, climate_offset);
+        cell.0.step_with_thermal_maze(
+            dt,
+            half,
+            &thermal_ctx,
+            &PHYSICS_CONFIG,
+            climate_offset,
+            obstacles,
+        );
     });
 }
 
@@ -61,18 +69,15 @@ pub(crate) fn apply_brownian_motion(
     if gpu_full.is_some() {
         return;
     }
-    // Sprint 129: vždy CPU rayon path. GPU brownian (xoshiro128++ per-cell)
-    // měla compute < 30 µs, ale upload+download s `Maintain::Wait` přidávalo
-    // ~0.8 ms / tick = 96 % phase costu. CPU `apply_brownian` (Box-Muller
-    // gaussian) přes par_iter_mut běží subdolarní; thread-local `rand::rng()`
-    // dá jiný RNG stream než xoshiro, drift je acceptable (consistent
-    // s S113 stochastic-reorder konvencí).
+    // Per-cell xoshiro128++ stream now lives on `Cell.xoshiro_state` (seeded
+    // from `cell_id` at spawn / reproduce). Identical algorithm to the GPU
+    // shader, so CPU and GPU paths produce the same brownian samples — the
+    // dominant source of CPU/GPU trajectory drift before this change.
     let t_total = Instant::now();
     let sqrt_dt = time.delta_secs().sqrt();
     let half_z = extent.as_array()[2];
     cells.par_iter_mut().for_each(|mut cell| {
-        let mut rng = rand::rng();
-        cell.0.apply_brownian(&mut rng, sqrt_dt, half_z);
+        cell.0.apply_brownian(sqrt_dt, half_z);
     });
     diag.add_measurement(&DIAG_BROWNIAN, || t_total.elapsed().as_secs_f64() * 1000.0);
 }

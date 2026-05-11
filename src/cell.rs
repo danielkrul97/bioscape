@@ -111,6 +111,15 @@ pub struct Cell {
     /// path) disables the skip when the CPU sensor stage didn't run.
     #[serde(default = "f32_max_default")]
     pub last_best_food_d2: f32,
+    /// Per-cell xoshiro128++ stream for Brownian motion. The state is
+    /// derived from `cell_id` at spawn / reproduce so CPU and GPU paths
+    /// share the same RNG sequence — that's the single biggest lever for
+    /// CPU/GPU trajectory parity (per-tick velocity perturbation was the
+    /// fastest source of divergence). `serde(default)` keeps older
+    /// checkpoints loadable; the default state is a sentinel non-zero that
+    /// older saves overwrite on first `apply_brownian` re-seed.
+    #[serde(default)]
+    pub xoshiro_state: Xoshiro128PlusPlus,
     pub phenotype: Phenotype,
     pub genome: Genome,
 }
@@ -221,6 +230,10 @@ impl Cell {
             // their original order.
             cell_state: 0.5 + rng.random_range(-CELL_STATE_INIT_KICK..CELL_STATE_INIT_KICK),
             last_best_food_d2: f32::MAX,
+            // Seed mirrors the GPU upload path (`CellsGpu::upload_xoshiro_seeds`
+            // called with `c.cell_id`). CPU and GPU brownian streams stay in
+            // lockstep as long as both initialize from the same cell_id.
+            xoshiro_state: Xoshiro128PlusPlus::from_cell_id(cell_id),
             phenotype,
             genome,
         }
@@ -286,6 +299,37 @@ impl Cell {
         self.apply_angular_drag(dt, physics);
         self.apply_energy_costs(dt, world_half, ctx, physics, climate_offset);
         self.apply_world_bounce(world_half);
+        self.update_cell_state(dt);
+    }
+
+    /// Maze-aware variant of `step_with_thermal`. When `obstacles` is None,
+    /// reduces to `step_with_thermal` exactly. When Some, the XY world
+    /// boundary becomes hard walls (no toroidal wrap) and a post-bounce
+    /// obstacle collision pass pushes the cell out of any wall it overlaps.
+    pub fn step_with_thermal_maze(
+        &mut self,
+        dt: f32,
+        world_half: [f32; 3],
+        ctx: &ThermalCtx,
+        physics: &PhysicsConfig,
+        climate_offset: f32,
+        obstacles: Option<&ObstacleField>,
+    ) {
+        self.age = self.age.saturating_add(1);
+        if self.reproduce_cooldown_ticks > 0 {
+            self.reproduce_cooldown_ticks -= 1;
+        }
+        self.integrate_kinematics(dt, world_half);
+        self.apply_anisotropic_drag(dt, physics);
+        self.apply_angular_drag(dt, physics);
+        self.apply_energy_costs(dt, world_half, ctx, physics, climate_offset);
+        match obstacles {
+            Some(field) => {
+                self.apply_world_bounce_bounded(world_half);
+                self.apply_obstacle_collision(field);
+            }
+            None => self.apply_world_bounce(world_half),
+        }
         self.update_cell_state(dt);
     }
 
@@ -424,6 +468,66 @@ impl Cell {
             self.velocity[2] = -self.velocity[2];
             self.position[2] = self.position[2].clamp(-world_half[2], world_half[2]);
         }
+    }
+
+    /// Maze-mode XY boundary: hard walls (clamp + zero outward velocity),
+    /// no toroidal wrap. Z behaves as in `apply_world_bounce`. Used by the
+    /// world tick when an `ObstacleField` is active so cells cannot wrap
+    /// around the maze edge.
+    pub fn apply_world_bounce_bounded(&mut self, world_half: [f32; 3]) {
+        if self.position[0] > world_half[0] {
+            self.position[0] = world_half[0];
+            if self.velocity[0] > 0.0 {
+                self.velocity[0] = 0.0;
+            }
+        } else if self.position[0] < -world_half[0] {
+            self.position[0] = -world_half[0];
+            if self.velocity[0] < 0.0 {
+                self.velocity[0] = 0.0;
+            }
+        }
+        if self.position[1] > world_half[1] {
+            self.position[1] = world_half[1];
+            if self.velocity[1] > 0.0 {
+                self.velocity[1] = 0.0;
+            }
+        } else if self.position[1] < -world_half[1] {
+            self.position[1] = -world_half[1];
+            if self.velocity[1] < 0.0 {
+                self.velocity[1] = 0.0;
+            }
+        }
+        if world_half[2] > 0.0 && self.position[2].abs() > world_half[2] {
+            self.velocity[2] = -self.velocity[2];
+            self.position[2] = self.position[2].clamp(-world_half[2], world_half[2]);
+        }
+    }
+
+    /// Resolve overlap with maze obstacles. Pushes the cell back along the
+    /// shortest separating axis, kills outward-facing velocity components,
+    /// and accrues a small `damage_accum` so the brain perceives the bump
+    /// next tick (slot 14). Returns true if a collision was resolved.
+    pub fn apply_obstacle_collision(&mut self, field: &ObstacleField) -> bool {
+        let radius = self.phenotype.effective_radius().max(crate::CELL_RADIUS * 0.5);
+        let push = field.collision_push(self.position, radius);
+        if push[0].abs() < 1e-4 && push[1].abs() < 1e-4 {
+            return false;
+        }
+        self.position[0] += push[0];
+        self.position[1] += push[1];
+        let pmag2 = push[0] * push[0] + push[1] * push[1];
+        if pmag2 > 1e-8 {
+            let inv = 1.0 / pmag2.sqrt();
+            let nx = push[0] * inv;
+            let ny = push[1] * inv;
+            let v_dot_n = self.velocity[0] * nx + self.velocity[1] * ny;
+            if v_dot_n < 0.0 {
+                self.velocity[0] -= v_dot_n * nx;
+                self.velocity[1] -= v_dot_n * ny;
+            }
+        }
+        self.damage_accum += MAZE_WALL_BUMP_DAMAGE;
+        true
     }
 
     /// Apply runtime morph from brain outputs to the phenotype and charge
@@ -614,14 +718,23 @@ impl Cell {
 
     /// Brownian-motion gaussian noise on velocity. The `√dt` scaling is the
     /// correct stochastic integration (Wiener process), not linear in dt.
-    /// The z-axis is perturbed only when the z-volume is active. Caller
-    /// passes a pre-computed `sqrt_dt` so the sqrt isn't repeated per cell.
-    pub fn apply_brownian(&mut self, rng: &mut impl Rng, sqrt_dt: f32, world_half_z: f32) {
+    /// The z-axis is perturbed only when the z-volume is active.
+    ///
+    /// Uses the per-cell `xoshiro_state` so the RNG stream is deterministic
+    /// per cell *and identical across CPU and GPU compute paths* (the GPU
+    /// shader in `brownian.wgsl` runs the same xoshiro128++ + Box-Muller on
+    /// each per-cell state). Consumes two gaussian pairs per call to mirror
+    /// the shader: pair 1 → x, y; pair 2 → z (second component discarded
+    /// in 2D mode so the stream state stays in lockstep regardless of
+    /// `world_half_z`).
+    pub fn apply_brownian(&mut self, sqrt_dt: f32, world_half_z: f32) {
         let scale = THERMAL_NOISE * sqrt_dt;
-        self.velocity[0] += gaussian(rng) * scale;
-        self.velocity[1] += gaussian(rng) * scale;
+        let (gx, gy) = self.xoshiro_state.next_gaussian_pair();
+        self.velocity[0] += gx * scale;
+        self.velocity[1] += gy * scale;
         if world_half_z > 0.0 {
-            self.velocity[2] += gaussian(rng) * scale;
+            let (gz, _drop) = self.xoshiro_state.next_gaussian_pair();
+            self.velocity[2] += gz * scale;
         }
     }
 }

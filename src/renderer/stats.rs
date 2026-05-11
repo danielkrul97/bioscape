@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use rustc_hash::FxHashSet;
 
 use super::components::{CellEntity, Dying, EpochEnded, FoodEntity, GenerationEnded, StatsText};
-use super::resources::{Clock, FoodDensityFactor};
+use super::resources::{Clock, FoodDensityFactor, VibrationResource};
 
 pub(super) fn log_clock_events(
     mut generation_ended: MessageReader<GenerationEnded>,
@@ -22,6 +22,7 @@ pub(super) fn update_stats_overlay(
     time: Res<Time<Virtual>>,
     density: Res<FoodDensityFactor>,
     diagnostics: Res<DiagnosticsStore>,
+    vibration: Res<VibrationResource>,
     cells: Query<&CellEntity, Without<Dying>>,
     foods: Query<(), With<FoodEntity>>,
     text: Single<&mut Text, With<StatsText>>,
@@ -50,6 +51,9 @@ pub(super) fn update_stats_overlay(
     let mut spk_sum = 0.0_f64;
     let mut spk_max = 0.0_f64;
     let mut e_sum = 0.0_f64;
+    let mut vib_emit_sum = 0.0_f64;
+    let mut vib_amp_sum = 0.0_f64;
+    let mut vib_grad_sum = 0.0_f64;
     // R-#15: per-frame Update system. Persistent Local set zachová capacity.
     lineages_scratch.clear();
     let lineages = &mut *lineages_scratch;
@@ -79,6 +83,15 @@ pub(super) fn update_stats_overlay(
             spk_max = spk;
         }
         e_sum += e;
+        // V7: motion-driven emission + locally-sampled field — gives a quick
+        // "how loud is the medium" readout to compare against gizmo intensity.
+        let pos = c.0.position;
+        vib_emit_sum += bioscape::vibration_emit_for_cell(&c.0) as f64;
+        vib_amp_sum += vibration.0.sample(pos) as f64;
+        let g = vibration
+            .0
+            .gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
+        vib_grad_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
         lineages.insert(c.0.lineage_id);
         let age = current_gen.saturating_sub(c.0.lineage_birth_gen);
         if age > oldest_age {
@@ -110,10 +123,16 @@ pub(super) fn update_stats_overlay(
                 e_sum / n,
             )
         };
+    let (vib_emit_avg, vib_amp_avg, vib_grad_avg) = if count == 0 {
+        (0.0, 0.0, 0.0)
+    } else {
+        let n = count as f64;
+        (vib_emit_sum / n, vib_amp_sum / n, vib_grad_sum / n)
+    };
 
     let mut text = text.into_inner();
     text.0 = format!(
-        "tick     {}\ngen      {}\nepoch    {}\nspeed    {}\ncells    {}\nfood     {}\ndensity  {:.2}\nfps      {:.0}\nspd_avg  {:.1}\nspd_dev  {:.2}\nvis_avg  {:.1}\nvis_dev  {:.2}\ntrn_avg  {:.2}\nlen_avg  {:.2}\nwid_avg  {:.2}\nasp_avg  {:.2}\nasp_dev  {:.2}\nspk_avg  {:.2}\nspk_max  {:.2}\ne_avg    {:.1}\nlineages {}\noldest   {}",
+        "tick     {}\ngen      {}\nepoch    {}\nspeed    {}\ncells    {}\nfood     {}\ndensity  {:.2}\nfps      {:.0}\nspd_avg  {:.1}\nspd_dev  {:.2}\nvis_avg  {:.1}\nvis_dev  {:.2}\ntrn_avg  {:.2}\nlen_avg  {:.2}\nwid_avg  {:.2}\nasp_avg  {:.2}\nasp_dev  {:.2}\nspk_avg  {:.2}\nspk_max  {:.2}\ne_avg    {:.1}\nlineages {}\noldest   {}\nvib_emit {:.3}\nvib_amp  {:.4}\nvib_grad {:.5}",
         clock.0.tick,
         clock.0.generation,
         clock.0.epoch,
@@ -136,5 +155,8 @@ pub(super) fn update_stats_overlay(
         e_avg,
         lineage_count,
         oldest_age,
+        vib_emit_avg,
+        vib_amp_avg,
+        vib_grad_avg,
     );
 }

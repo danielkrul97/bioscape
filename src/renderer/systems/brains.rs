@@ -1,7 +1,8 @@
 use bevy::diagnostic::Diagnostics;
 use bevy::prelude::*;
 use bioscape::{
-    BRAIN_INPUTS, N_PHEROMONE_CHANNELS, PHEROMONE_SAMPLE_EPSILON, SMELL_SAMPLE_EPSILON, WORLD_HALF,
+    BRAIN_INPUTS, N_PHEROMONE_CHANNELS, PHEROMONE_SAMPLE_EPSILON, SMELL_SAMPLE_EPSILON,
+    VIBRATION_SAMPLE_EPSILON, WORLD_HALF,
 };
 use rustc_hash::FxHashMap;
 use std::time::Instant;
@@ -12,6 +13,7 @@ use super::super::config::DIAG_BRAIN_GPU_RT;
 use super::super::config::{DIAG_BRAIN_ACT, DIAG_CELL_COUNT};
 use super::super::resources::{
     CellGrid, CellSlotMap, Clock, CoopFoodResource, FoodGrid, PheromoneResource, SmellResource,
+    VibrationResource,
 };
 #[cfg(feature = "gpu")]
 use super::super::resources_gpu::{GpuBrainState, GpuFullPipeline};
@@ -77,6 +79,7 @@ pub(crate) fn cells_brain_act(
     food_grid: Res<FoodGrid>,
     smell: Res<SmellResource>,
     pheromone: Res<PheromoneResource>,
+    vibration: Res<VibrationResource>,
     coop_foods: Res<CoopFoodResource>,
     slot_map: Res<CellSlotMap>,
     clock: Res<Clock>,
@@ -86,8 +89,10 @@ pub(crate) fn cells_brain_act(
     mut diag: Diagnostics,
     mut coop_positions_scratch: Local<Vec<[f32; 3]>>,
     mut id_to_inputs_scratch: Local<FxHashMap<u64, [f32; BRAIN_INPUTS]>>,
-    #[cfg(feature = "gpu")] mut inputs_by_slot_scratch: Local<Vec<[f32; BRAIN_INPUTS]>>,
-    #[cfg(feature = "gpu")] mut hidden_n_by_slot_scratch: Local<Vec<u32>>,
+    // V7: pack the two GPU-only scratches into one Local so the SystemParam
+    // tuple stays within Bevy's 16-element impl cap after the `vibration`
+    // Res was added.
+    #[cfg(feature = "gpu")] mut gpu_brain_scratch: Local<(Vec<[f32; BRAIN_INPUTS]>, Vec<u32>)>,
 ) {
     // Full GPU pipeline: separate `cells_brain_act_gpu_full` system handles
     // all of brain_act + motor + step + brownian on GPU; this CPU/GPU-brain-only
@@ -120,6 +125,7 @@ pub(crate) fn cells_brain_act(
     let cell_grid_ref = &cell_grid.0;
     let smell_ref = &smell.0;
     let pheromone_ref = &pheromone.fields;
+    let vibration_ref = &vibration.0;
     cells.par_iter_mut().for_each(|(entity, mut cell)| {
         let pos = cell.0.position;
         let vision_r = cell.0.genome.vision_radius;
@@ -188,6 +194,8 @@ pub(crate) fn cells_brain_act(
                 pheromone_ref[ch].gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
         }
         let temperature_local = bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
+        let vibration_grad = vibration_ref.gradient_at(pos_xyz, VIBRATION_SAMPLE_EPSILON);
+        let vibration_amp = vibration_ref.sample(pos_xyz);
         let sensors = bioscape::BrainSensors {
             nearest_food,
             nearest_cell,
@@ -195,6 +203,8 @@ pub(crate) fn cells_brain_act(
             smell_grad,
             pheromone_grads,
             temperature_local,
+            vibration_grad,
+            vibration_amp,
         };
         cell.0.apply_shell_absorb(dt);
         // eat_food skip optim: cache d² k nejbližšímu food pro `cell_eats_food`
@@ -224,12 +234,13 @@ pub(crate) fn cells_brain_act(
         // place inputs at slot index. Slots jsou dense 0..n.
         // Persistent Local scratch — pre-fix `vec![[0.0; INPUTS]; n]` (~640 KB
         // pro n=2000) per tick.
+        let (inputs_by_slot_scratch, hidden_n_by_slot_scratch) = &mut *gpu_brain_scratch;
         inputs_by_slot_scratch.clear();
         inputs_by_slot_scratch.resize(n, [0.0; BRAIN_INPUTS]);
         hidden_n_by_slot_scratch.clear();
         hidden_n_by_slot_scratch.resize(n, 0);
-        let inputs_by_slot = &mut *inputs_by_slot_scratch;
-        let hidden_n_by_slot = &mut *hidden_n_by_slot_scratch;
+        let inputs_by_slot = inputs_by_slot_scratch;
+        let hidden_n_by_slot = hidden_n_by_slot_scratch;
         for (entity, cell) in cells.iter() {
             let Some(slot) = slot_map.slot_of(entity) else {
                 continue;

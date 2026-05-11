@@ -17,14 +17,14 @@
 // contribute nothing. `hidden_n` only gates which tanh path the activation
 // takes — see `tanh_fast` below.
 
-const BRAIN_INPUTS: u32 = 72u;
+const BRAIN_INPUTS: u32 = 78u;       // 27 sensory + 2 bond inbox + 4 vibration + 45 recurrent
 const BRAIN_HIDDEN: u32 = 45u;
-const BRAIN_OUTPUTS: u32 = 12u;
+const BRAIN_OUTPUTS: u32 = 14u;      // 12 motor/morph + 2 bond message
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3240u;        // BRAIN_HIDDEN * BRAIN_INPUTS
-const W2_OFFSET: u32 = 3285u;        // B1_OFFSET + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 3825u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
-const WEIGHTS_PER_CELL: u32 = 3837u; // B2_OFFSET + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 3510u;        // BRAIN_HIDDEN * BRAIN_INPUTS
+const W2_OFFSET: u32 = 3555u;        // B1_OFFSET + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 4185u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
+const WEIGHTS_PER_CELL: u32 = 4199u; // B2_OFFSET + BRAIN_OUTPUTS
 
 struct Params {
     num_cells: u32,
@@ -72,15 +72,26 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
         in_local[i] = inputs[i_off + i];
     }
 
+    // V8: Kahan compensated summation in the dot-product. Bounds error to
+    // O(ε) per dot regardless of float-add order, which (combined with the
+    // unified brownian RNG stream) keeps CPU `Brain::forward_with_state`
+    // and this shader within a tight ULP envelope per tick. The bias is
+    // applied AFTER the compensated sum so it does not pollute the running
+    // compensation term.
     let w1_base = w_off + W1_OFFSET;
     let b1_base = w_off + B1_OFFSET;
     var hid: array<f32, BRAIN_HIDDEN>;
     for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
         let row_base = w1_base + h * BRAIN_INPUTS;
-        var sum: f32 = weights[b1_base + h];
+        var sum: f32 = 0.0;
+        var c: f32 = 0.0;
         for (var i: u32 = 0u; i < BRAIN_INPUTS; i = i + 1u) {
-            sum = sum + weights[row_base + i] * in_local[i];
+            let y = weights[row_base + i] * in_local[i] - c;
+            let t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
+        sum = sum + weights[b1_base + h];
         var act: f32;
         if (h < chunk_end) {
             act = tanh_fast(sum);
@@ -97,10 +108,15 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let b2_base = w_off + B2_OFFSET;
     for (var o: u32 = 0u; o < BRAIN_OUTPUTS; o = o + 1u) {
         let row_base = w2_base + o * BRAIN_HIDDEN;
-        var sum: f32 = weights[b2_base + o];
+        var sum: f32 = 0.0;
+        var c: f32 = 0.0;
         for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
-            sum = sum + weights[row_base + h] * hid[h];
+            let y = weights[row_base + h] * hid[h] - c;
+            let t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
         }
+        sum = sum + weights[b2_base + o];
         outputs[o_off + o] = tanh(sum);
     }
 }

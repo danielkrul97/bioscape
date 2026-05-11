@@ -4,7 +4,7 @@
 // mean of the three body axes), not full volume — smoke-tuned for inertia
 // scaling without quadratic cost shock on untrained brains.
 
-const BRAIN_OUTPUTS: u32 = 12u;
+const BRAIN_OUTPUTS: u32 = 14u; // 12 motor/morph + 2 bond message (V7)
 
 struct Params {
     num_cells: u32,

@@ -142,9 +142,9 @@ pub struct Genome {
     #[serde(default)]
     pub carnivore_score: f32,
     /// Per-category sensor gain in `[MIN_SENSOR_GAIN, MAX_SENSOR_GAIN]`.
-    /// Index 0 = Vision, 1 = Chemistry, 2 = Defensive. Scales input strength
-    /// and adds `sum × SENSOR_GAIN_COST` per-tick drain, creating room for
-    /// role differentiation when cluster cells pool sensors.
+    /// Index 0 = Vision, 1 = Chemistry, 2 = Defensive, 3 = Mechano. Scales
+    /// input strength and adds `sum × SENSOR_GAIN_COST` per-tick drain,
+    /// creating room for role differentiation when cluster cells pool sensors.
     #[serde(default = "default_sensor_gains")]
     pub sensor_gains: [f32; N_SENSOR_CATEGORIES],
     pub brain: Brain,
@@ -227,6 +227,7 @@ impl Genome {
             // 0.5, which can take many generations.
             carnivore_score: rng.random_range(0.0..0.5),
             sensor_gains: [
+                rng.random_range(0.7..1.3),
                 rng.random_range(0.7..1.3),
                 rng.random_range(0.7..1.3),
                 rng.random_range(0.7..1.3),

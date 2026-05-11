@@ -6,6 +6,36 @@ use super::activation::tanh_fast_simd;
 use super::cppn::Cppn;
 use crate::*;
 
+/// One Kahan compensated add of `addend` into 8-lane SIMD accumulator
+/// `acc` with 8-lane compensation `comp`. Mirrors the scalar GPU-shader
+/// loop step in `shaders/brain_forward.wgsl` so error budgets line up
+/// across compute paths.
+#[inline(always)]
+fn kahan_step_simd(addend: f32x8, acc: &mut f32x8, comp: &mut f32x8) {
+    let y = addend - *comp;
+    let t = *acc + y;
+    *comp = (t - *acc) - y;
+    *acc = t;
+}
+
+/// Horizontally combine an 8-lane Kahan accumulator into a scalar using
+/// the same compensated-summation pattern. Per-lane partial sums merge in
+/// fixed order (lane 0 → lane 7) so different runs produce identical
+/// last-bit results given identical lane contents.
+#[inline(always)]
+fn kahan_reduce_lanes(acc: f32x8) -> f32 {
+    let arr = acc.to_array();
+    let mut sum = 0.0_f32;
+    let mut comp = 0.0_f32;
+    for &x in &arr {
+        let y = x - comp;
+        let t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+    sum
+}
+
 impl Brain {
     /// All-zero brain. Used as a placeholder when the caller knows the
     /// brain will be materialised by the very next operation (e.g.,
@@ -340,11 +370,17 @@ impl Brain {
     /// Forward pass that also returns hidden activations (needed for Hebbian
     /// updates).
     ///
-    /// Matvec is SIMDified with `wide::f32x8`: full 8-lane chunks load
-    /// directly from weight rows, the trailing partial chunk uses a
-    /// zero-padded scratch lane. With `target-cpu=native` the inner mul_add
-    /// lowers to a single FMA. tanh activation is also vectorized via
-    /// `tanh_fast` over the active hidden range.
+    /// Matvec uses **Kahan compensated summation** in 8-lane SIMD parallel
+    /// across the dot-product, then a sequential Kahan horizontal reduce.
+    /// The compensation term bounds the per-dot-product error to O(ε)
+    /// regardless of summation order — that is what shrinks the CPU/GPU
+    /// brain-forward drift after the V8 RNG unification closed Brownian as
+    /// a divergence source. Trade-off: no FMA in the inner product (Kahan
+    /// requires separate mul + add to keep the compensation term valid),
+    /// but the dependency chain stays SIMD-pipelined.
+    ///
+    /// tanh activation is still vectorized via `tanh_fast` over the active
+    /// hidden range.
     // L1_TAIL/L2_TAIL branches are statically dead when BRAIN_INPUTS /
     // BRAIN_HIDDEN are multiples of 8, but kept defensive in case the
     // dimensions change. Clippy lints flag the dead branch as unreachable.
@@ -373,21 +409,26 @@ impl Brain {
             input_lanes[L1_FULL] = f32x8::new(tail);
         }
 
-        // L1 matvec — load weight chunks directly (no per-row scratch).
+        // L1 matvec with Kahan compensated summation in each SIMD lane.
         let mut pre_hidden = [0.0_f32; BRAIN_HIDDEN];
         for i in 0..h_n {
             let row = &self.w1[i];
             let mut acc = f32x8::ZERO;
+            let mut comp = f32x8::ZERO;
             for k in 0..L1_FULL {
                 let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
-                acc = w.mul_add(input_lanes[k], acc);
+                kahan_step_simd(w * input_lanes[k], &mut acc, &mut comp);
             }
             if L1_TAIL > 0 {
                 let mut tail = [0.0_f32; 8];
                 tail[..L1_TAIL].copy_from_slice(&row[L1_FULL * 8..]);
-                acc = f32x8::new(tail).mul_add(input_lanes[L1_FULL], acc);
+                kahan_step_simd(
+                    f32x8::new(tail) * input_lanes[L1_FULL],
+                    &mut acc,
+                    &mut comp,
+                );
             }
-            pre_hidden[i] = self.b1[i] + acc.reduce_add();
+            pre_hidden[i] = self.b1[i] + kahan_reduce_lanes(acc);
         }
 
         // Vectorized tanh in chunks of 8 over active hiddens; scalar tail.
@@ -414,20 +455,26 @@ impl Brain {
             hidden_lanes[L2_FULL] = f32x8::new(tail);
         }
 
-        // L2 matvec; BRAIN_OUTPUTS is small, scalar tanh per output is fine.
+        // L2 matvec with Kahan compensated summation; BRAIN_OUTPUTS is small
+        // so we still do scalar tanh per output at the end.
         let mut out = [0.0_f32; BRAIN_OUTPUTS];
         for ((o, row), &bias) in out.iter_mut().zip(self.w2.iter()).zip(self.b2.iter()) {
             let mut acc = f32x8::ZERO;
+            let mut comp = f32x8::ZERO;
             for k in 0..L2_FULL {
                 let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
-                acc = w.mul_add(hidden_lanes[k], acc);
+                kahan_step_simd(w * hidden_lanes[k], &mut acc, &mut comp);
             }
             if L2_TAIL > 0 {
                 let mut tail = [0.0_f32; 8];
                 tail[..L2_TAIL].copy_from_slice(&row[L2_FULL * 8..]);
-                acc = f32x8::new(tail).mul_add(hidden_lanes[L2_FULL], acc);
+                kahan_step_simd(
+                    f32x8::new(tail) * hidden_lanes[L2_FULL],
+                    &mut acc,
+                    &mut comp,
+                );
             }
-            *o = (bias + acc.reduce_add()).tanh();
+            *o = (bias + kahan_reduce_lanes(acc)).tanh();
         }
         (hidden, out)
     }

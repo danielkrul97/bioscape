@@ -204,6 +204,9 @@ pub fn make_mating_child_no_brain(
             + rng.random_range(-CELL_STATE_INHERIT_NOISE..CELL_STATE_INHERIT_NOISE))
             .clamp(0.0, 1.0),
         last_best_food_d2: f32::MAX,
+        // Seed mirrors GPU `upload_xoshiro_seed_at(slot, cell.cell_id)` so
+        // the child's CPU and GPU brownian streams agree from tick 0.
+        xoshiro_state: Xoshiro128PlusPlus::from_cell_id(cell_id),
         phenotype: child_phenotype,
         genome: child_genome,
     }

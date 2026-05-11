@@ -3,13 +3,13 @@ use bevy::prelude::*;
 use bioscape::{
     N_PHEROMONE_CHANNELS, PHEROMONE_BASELINE_EMIT, PHEROMONE_BRAIN_MOD, PHEROMONE_COST_PER_RATE,
     PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH, SMELL_DECAY, SMELL_DIFFUSION,
-    SMELL_PER_FOOD,
+    SMELL_PER_FOOD, VIBRATION_DECAY, VIBRATION_DIFFUSION,
 };
 use std::time::Instant;
 
 use super::super::components::{CellEntity, Dying, FoodEntity};
-use super::super::config::{DIAG_FOOD_COUNT, DIAG_PHEROMONE, DIAG_SMELL};
-use super::super::resources::{PheromoneResource, SmellResource};
+use super::super::config::{DIAG_FOOD_COUNT, DIAG_PHEROMONE, DIAG_SMELL, DIAG_VIBRATION};
+use super::super::resources::{MazeWorld, PheromoneResource, SmellResource, VibrationResource};
 #[cfg(feature = "gpu")]
 use super::super::resources_gpu::{GpuFieldState, GpuFullPipeline};
 
@@ -17,6 +17,7 @@ pub(crate) fn update_smell_field(
     time: Res<Time>,
     foods: Query<&FoodEntity>,
     mut smell: ResMut<SmellResource>,
+    maze: Res<MazeWorld>,
     #[cfg(feature = "gpu")] gpu_field: Option<ResMut<GpuFieldState>>,
     #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut diag: Diagnostics,
@@ -64,13 +65,17 @@ pub(crate) fn update_smell_field(
             .0
             .add_source([food.0.position[0], food.0.position[1], food.0.position[2]], SMELL_PER_FOOD * dt);
     }
-    smell.0.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
+    match maze.smell_mask.as_deref() {
+        Some(mask) => smell.0.step_masked(SMELL_DIFFUSION, SMELL_DECAY, dt, mask),
+        None => smell.0.step(SMELL_DIFFUSION, SMELL_DECAY, dt),
+    }
     diag.add_measurement(&DIAG_SMELL, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
 pub(crate) fn update_pheromone_field(
     time: Res<Time>,
     mut pheromone: ResMut<PheromoneResource>,
+    maze: Res<MazeWorld>,
     #[cfg(feature = "gpu")] gpu_field: Option<ResMut<GpuFieldState>>,
     #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut diag: Diagnostics,
@@ -115,9 +120,79 @@ pub(crate) fn update_pheromone_field(
     }
 
     for ch in 0..N_PHEROMONE_CHANNELS {
-        pheromone.fields[ch].step(PHEROMONE_DIFFUSION_PER_CH[ch], PHEROMONE_DECAY_PER_CH[ch], dt);
+        match maze.pheromone_masks[ch].as_deref() {
+            Some(mask) => pheromone.fields[ch].step_masked(
+                PHEROMONE_DIFFUSION_PER_CH[ch],
+                PHEROMONE_DECAY_PER_CH[ch],
+                dt,
+                mask,
+            ),
+            None => pheromone.fields[ch].step(
+                PHEROMONE_DIFFUSION_PER_CH[ch],
+                PHEROMONE_DECAY_PER_CH[ch],
+                dt,
+            ),
+        }
     }
     diag.add_measurement(&DIAG_PHEROMONE, || t.elapsed().as_secs_f64() * 1000.0);
+}
+
+pub(crate) fn update_vibration_field(
+    time: Res<Time>,
+    mut vibration: ResMut<VibrationResource>,
+    maze: Res<MazeWorld>,
+    #[cfg(feature = "gpu")] gpu_full: Option<ResMut<GpuFullPipeline>>,
+    cells: Query<&CellEntity, Without<Dying>>,
+    mut diag: Diagnostics,
+) {
+    // Deposit per cell, then diffuse + decay. Runs after `update_pheromone_field`
+    // and before `cells_brain_act` so brains read a freshly stepped field.
+    let t = Instant::now();
+    let dt = time.delta_secs();
+
+    // Full GPU pipeline: deposit + diffuse on the GPU FieldGpu so the sensor
+    // gather shader can read the buffer directly via storage binding — no
+    // CPU readback for the sensor stage. We do download the grid into the
+    // CPU shadow at the end of the tick so the gizmo overlay (`V` toggle)
+    // and any future CSV/diagnostic reader see real values; cost is one
+    // ~256 KB readback per tick which is acceptable against the perf
+    // headroom gained by skipping the per-tick *sensor* readback.
+    #[cfg(feature = "gpu")]
+    if let Some(mut gpu_full) = gpu_full {
+        for cell in &cells {
+            let emit = bioscape::vibration_emit_for_cell(&cell.0);
+            if emit > 0.0 {
+                gpu_full.vibration.add_source(
+                    [cell.0.position[0], cell.0.position[1], cell.0.position[2]],
+                    emit * dt,
+                );
+            }
+        }
+        gpu_full
+            .vibration
+            .step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt);
+        let grid = gpu_full.vibration.download();
+        vibration.0.replace_grid_from(&grid);
+        diag.add_measurement(&DIAG_VIBRATION, || t.elapsed().as_secs_f64() * 1000.0);
+        return;
+    }
+
+    for cell in &cells {
+        let emit = bioscape::vibration_emit_for_cell(&cell.0);
+        if emit > 0.0 {
+            vibration.0.add_source(
+                [cell.0.position[0], cell.0.position[1], cell.0.position[2]],
+                emit * dt,
+            );
+        }
+    }
+    match maze.vibration_mask.as_deref() {
+        Some(mask) => vibration
+            .0
+            .step_masked(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt, mask),
+        None => vibration.0.step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt),
+    }
+    diag.add_measurement(&DIAG_VIBRATION, || t.elapsed().as_secs_f64() * 1000.0);
 }
 
 pub(crate) fn emit_pheromones(

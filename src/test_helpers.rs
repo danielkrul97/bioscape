@@ -109,6 +109,7 @@ pub fn base_cell() -> Cell {
         bonds: [None; MAX_BONDS_PER_CELL],
         cell_state: 0.5,
         last_best_food_d2: f32::MAX,
+        xoshiro_state: Xoshiro128PlusPlus::from_cell_id(0),
         phenotype,
         genome,
     }

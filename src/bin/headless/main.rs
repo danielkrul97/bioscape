@@ -7,7 +7,7 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    EventCalendar,
+    EventCalendar, MazeDifficulty,
     ShockScheduleConfig, CYCLE_AMPLITUDE, GRID_CELL_SIZE,
     INITIAL_CELLS,
     MATING_RADIUS, MAX_POPULATION,
@@ -86,6 +86,32 @@ fn main() {
             }
             break;
         }
+    }
+    // Maze toggle: `--maze` (default medium) or `--maze=easy|medium|hard`.
+    // GPU paths don't yet honour walls/LOS/masks, so combining `--maze` with
+    // `--gpu`/`--gpu-full` is rejected up-front to avoid misleading runs.
+    let maze_difficulty: Option<MazeDifficulty> = raw_args.iter().find_map(|a| {
+        if a == "--maze" {
+            Some(MazeDifficulty::Medium)
+        } else if let Some(val) = a.strip_prefix("--maze=") {
+            match MazeDifficulty::parse(val) {
+                Some(d) => Some(d),
+                None => {
+                    eprintln!(
+                        "warning: unknown --maze value '{val}', using medium. Valid: easy|medium|hard"
+                    );
+                    Some(MazeDifficulty::Medium)
+                }
+            }
+        } else {
+            None
+        }
+    });
+    if maze_difficulty.is_some() && want_gpu {
+        eprintln!(
+            "error: --maze and --gpu/--gpu-full are mutually exclusive in Wave 1 (GPU shader parity for walls/LOS/diffusion-mask is deferred to Wave 2). Re-run without --gpu."
+        );
+        std::process::exit(2);
     }
     let args: Vec<String> = raw_args
         .iter()
@@ -167,26 +193,40 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("checkpoint: load failed ({e}); starting fresh");
-                World::new(
+                World::new_with_maze(
                     &mut rng,
                     map_seed,
                     mating_radius,
                     initial_cells,
                     max_population,
                     events.clone(),
+                    maze_difficulty,
                 )
             }
         }
     } else {
-        World::new(
+        World::new_with_maze(
             &mut rng,
             map_seed,
             mating_radius,
             initial_cells,
             max_population,
             events,
+            maze_difficulty,
         )
     };
+    if let Some(d) = maze_difficulty {
+        if let Some(field) = world.obstacles.as_ref() {
+            eprintln!(
+                "maze: {} ({}×{} voxels, goal at [{:.0}, {:.0}])",
+                d.label(),
+                field.resolution[0],
+                field.resolution[1],
+                field.goal_position[0],
+                field.goal_position[1],
+            );
+        }
+    }
     // Sprint 87 Hamilton sweep: aplikuj CLI overrides AFTER World::new (i po
     // checkpoint load) — nikdy se neserializují, vždy z aktuálního CLI.
     if let Some(sf) = share_frac_override {
@@ -214,9 +254,11 @@ fn main() {
             let ctx = GpuContext::new()?;
             let cells_gpu = CellsGpu::with_context(&ctx, cap);
             cells_gpu.upload_brains(world.cells.iter().map(|c| &c.genome.brain));
-            cells_gpu.upload_xoshiro_seeds(world.cells.iter().enumerate().map(|(slot, c)| {
-                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
-            }));
+            // V7-unification: seed from `cell_id` so the GPU per-slot stream
+            // matches the CPU `Cell.xoshiro_state` (also derived from cell_id
+            // at spawn). Tests now expect CPU and GPU brownian outputs to be
+            // byte-identical for any cell with a given cell_id.
+            cells_gpu.upload_xoshiro_seeds(world.cells.iter().map(|c| c.cell_id));
             let brain = BrainGpu::with_context(&ctx, cap)?;
             let hebbian = HebbianGpu::with_context(&ctx, cap)?;
             let brownian = BrownianGpu::with_context(&ctx, cap)?;
@@ -232,6 +274,19 @@ fn main() {
                 [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
                 WORLD_HALF,
                 field_sources_cap,
+            )?;
+            // V7: motion-driven vibration field on GPU. Source capacity is
+            // `cap` (one deposit per cell per tick — far fewer sources than
+            // smell which also takes food).
+            let vibration = FieldGpu::with_context(
+                &ctx,
+                [
+                    bioscape::VIBRATION_GRID_RES,
+                    bioscape::VIBRATION_GRID_RES,
+                    bioscape::VIBRATION_GRID_RES_Z,
+                ],
+                WORLD_HALF,
+                cap,
             )?;
             // Sprint 60: spatial hashes pro sensor broad-phase. Sdílí
             // GRID_CELL_SIZE konstantu s CPU SpatialGrid; xy world bounds
@@ -268,6 +323,7 @@ fn main() {
                 brownian,
                 smell,
                 pheromone,
+                vibration,
                 cell_hash,
                 food_hash,
                 sensor,
@@ -312,7 +368,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac,vib_emit_avg,vib_amp_avg,vib_grad_mag_avg,gain_mech_avg,gain_mech_dev,maze_active,maze_in_goal_frac,maze_unique_reach_frac,maze_first_reach_total"
     )
     .unwrap();
     write_stats(&mut log, &world, 0.0).unwrap();
@@ -366,6 +422,10 @@ fn main() {
             // stats pass reads `Genome.brain` for diagnostic metrics.
             #[cfg(feature = "gpu")]
             world.sync_brains_from_gpu();
+            // V7: the vibration field lives on the GPU in --gpu-full mode
+            // (sensor gather reads it inline). Pull it back to the CPU shadow
+            // so the per-gen CSV write samples real values, not zeros.
+            world.sync_vibration_from_gpu();
             write_stats(&mut log, &world, tps).unwrap();
             // Sprint 126: reset burst_accum aby každá generace měřila vlastní
             // tick-to-tick variance. Bez resetu by hodnoty monotonně rostly.
@@ -425,6 +485,8 @@ fn main() {
             world.coop_food_failed_gen = 0;
             world.coop_food_arrivals_sum_gen = 0;
             world.coop_food_events_gen = 0;
+            world.goal_zone_ticks_gen = 0;
+            world.goal_unique_reachers_gen.clear();
         }
         if world.cells.is_empty() {
             eprintln!("extinction at gen {}", world.clock.generation);

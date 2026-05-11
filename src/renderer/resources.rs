@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bioscape::{
-    EventCalendar, FoodKind, SimClock, SmellField, SpatialGrid, WorldMap, INITIAL_CELLS,
+    EventCalendar, FoodKind, ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap,
+    INITIAL_CELLS, N_PHEROMONE_CHANNELS,
 };
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
@@ -239,6 +240,12 @@ pub(super) struct PheromoneResource {
     pub(super) fields: [SmellField; bioscape::N_PHEROMONE_CHANNELS],
 }
 
+/// Motion-driven mechanosensory field. Reuses `SmellField` (3D scalar with
+/// diffusion + decay); deposit per cell happens in `update_vibration_field`.
+/// CPU-only — no GPU shader counterpart.
+#[derive(Resource)]
+pub(super) struct VibrationResource(pub(super) SmellField);
+
 /// Sprint 128: cooperative food packets. Vec uloženo přímo v Resource (žádná
 /// per-node Entity — coop food má jen pozici a stav, žádné rendering aspekty
 /// v této verzi).
@@ -247,6 +254,29 @@ pub(super) struct CoopFoodResource(pub(super) Vec<bioscape::CoopFood>);
 
 #[derive(Resource)]
 pub(super) struct WorldMapResource(pub(super) WorldMap);
+
+/// Maze world toggle. When `field` is `Some`, the renderer routes wall
+/// collision (`step_cells`), masked diffusion (smell/pheromone/vibration
+/// fields) and vision LOS (`cells_brain_act`) through the maze-aware code
+/// paths, and a set of `MazeWallEntity` boxes is rendered for the occupied
+/// voxels. Pressing `KeyL` flips this — toggling fully allocates or
+/// deallocates the obstacle field + per-grid masks. Diffusion masks are
+/// precomputed once at allocation; the mask resolutions match
+/// `SmellField` / pheromone / vibration grid sizes so per-tick lookup is a
+/// flat indexing op.
+#[derive(Resource, Default)]
+pub(super) struct MazeWorld {
+    pub(super) field: Option<ObstacleField>,
+    pub(super) smell_mask: Option<Vec<bool>>,
+    pub(super) pheromone_masks: [Option<Vec<bool>>; N_PHEROMONE_CHANNELS],
+    pub(super) vibration_mask: Option<Vec<bool>>,
+}
+
+impl MazeWorld {
+    pub(super) fn is_active(&self) -> bool {
+        self.field.is_some()
+    }
+}
 
 #[derive(Resource, Clone)]
 pub(super) struct ScreencastConfig {

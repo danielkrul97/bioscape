@@ -30,6 +30,12 @@ pub(super) struct StatsText;
 #[derive(Component)]
 pub(super) struct WorldMapOverlay;
 
+/// Marker for one wall-voxel mesh in the maze. The toggle handler scans for
+/// every entity carrying this and despawns it when the maze is turned off,
+/// then respawns the set when re-enabled.
+#[derive(Component)]
+pub(super) struct MazeWallEntity;
+
 #[derive(Message, Debug, Clone, Copy)]
 pub(super) struct GenerationEnded {
     pub(super) generation: u64,

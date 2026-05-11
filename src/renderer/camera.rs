@@ -2,6 +2,7 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 
 use super::config::*;
+use super::godmode::GodMode;
 use super::resources::OrbitCamera;
 
 /// Sprint 36: mouse drag rotuje kamerou kolem `target` (orbit) NEBO pannuje
@@ -11,12 +12,17 @@ pub(super) fn camera_orbit_input(
     buttons: Res<ButtonInput<MouseButton>>,
     mut motion: MessageReader<MouseMotion>,
     mut orbit: ResMut<OrbitCamera>,
+    god: Res<GodMode>,
 ) {
     // Sprint 73 chore: right button orbit alias. Blender/CAD-style users
     // očekávají rotaci na pravém tlačítku; left button zůstává jako
     // primary (Bevy default), right je pohodlná alternativa.
-    let orbit_active =
-        buttons.pressed(MouseButton::Left) || buttons.pressed(MouseButton::Right);
+    // God-mode click detect / open menu suppresses RMB-as-orbit so a click
+    // doesn't steal camera rotation. LMB orbit stays active so users can
+    // still rotate via the primary button.
+    let suppress_rmb = god.orbit_suppressed();
+    let orbit_active = buttons.pressed(MouseButton::Left)
+        || (!suppress_rmb && buttons.pressed(MouseButton::Right));
     let pan_active = buttons.pressed(MouseButton::Middle);
     if !orbit_active && !pan_active {
         // Drop accumulated motion when not actively dragging — jinak by

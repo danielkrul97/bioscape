@@ -1,6 +1,13 @@
 use bevy::prelude::*;
+use bioscape::{
+    MazeDifficulty, ObstacleField, N_PHEROMONE_CHANNELS, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z,
+    SMELL_GRID_RES, SMELL_GRID_RES_Z, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, WORLD_HALF,
+    WORLD_MAP_SEED,
+};
 
-use super::components::{StatsRoot, WorldMapOverlay};
+use super::components::{MazeWallEntity, StatsRoot, WorldMapOverlay};
+use super::gizmos::ShowVibration;
+use super::resources::MazeWorld;
 
 pub(super) fn speed_input(
     keys: Res<ButtonInput<KeyCode>>,
@@ -81,6 +88,17 @@ pub(super) fn toggle_stats_overlay(
     };
 }
 
+pub(super) fn toggle_vibration_overlay(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut show: ResMut<ShowVibration>,
+) {
+    if !keys.just_pressed(KeyCode::KeyV) {
+        return;
+    }
+    show.0 = !show.0;
+    info!("vibration overlay: {}", if show.0 { "on" } else { "off" });
+}
+
 pub(super) fn toggle_world_map_overlay(
     keys: Res<ButtonInput<KeyCode>>,
     mut overlays: Query<&mut Visibility, With<WorldMapOverlay>>,
@@ -94,4 +112,87 @@ pub(super) fn toggle_world_map_overlay(
             _ => Visibility::Hidden,
         };
     }
+}
+
+/// `KeyL` toggle for the maze world. Off → On allocates an `ObstacleField`
+/// (medium difficulty by default), precomputes the per-grid Neumann masks,
+/// and spawns one wall-voxel mesh per occupied voxel. On → Off deallocates
+/// everything and despawns every `MazeWallEntity`. The seed mirrors the
+/// renderer's `WORLD_MAP_SEED` so each session generates the same maze
+/// across toggles within that session. Note: when the GPU full pipeline is
+/// active (default), wall collision / LOS / mask diffusion are CPU-only
+/// code paths that the GPU systems bypass — the visual walls render but
+/// cells will pass through them. Restart with `BIOSCAPE_GPU_FULL=0` to use
+/// maze physics. Wave 2 brings GPU shader parity.
+pub(super) fn toggle_maze_world(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut maze: ResMut<MazeWorld>,
+    walls: Query<Entity, With<MazeWallEntity>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyL) {
+        return;
+    }
+    if maze.is_active() {
+        info!("maze: off");
+        maze.field = None;
+        maze.smell_mask = None;
+        maze.pheromone_masks = std::array::from_fn(|_| None);
+        maze.vibration_mask = None;
+        for entity in &walls {
+            commands.entity(entity).despawn();
+        }
+        return;
+    }
+    let field = ObstacleField::new_maze(WORLD_HALF, WORLD_MAP_SEED, MazeDifficulty::Medium);
+    info!(
+        "maze: on (medium, {}×{} voxels, goal at [{:.0}, {:.0}])",
+        field.resolution[0], field.resolution[1], field.goal_position[0], field.goal_position[1]
+    );
+    let smell_mask =
+        Some(field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]));
+    let pheromone_masks: [Option<Vec<bool>>; N_PHEROMONE_CHANNELS] = std::array::from_fn(|_| {
+        Some(field.mask_for_grid([
+            PHEROMONE_GRID_RES,
+            PHEROMONE_GRID_RES,
+            PHEROMONE_GRID_RES_Z,
+        ]))
+    });
+    let vibration_mask = Some(field.mask_for_grid([
+        VIBRATION_GRID_RES,
+        VIBRATION_GRID_RES,
+        VIBRATION_GRID_RES_Z,
+    ]));
+    let cs = field.voxel_size();
+    let half_z = WORLD_HALF[2];
+    let wall_mesh = meshes.add(Cuboid::new(cs[0], cs[1], 2.0 * half_z).mesh());
+    let wall_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.20, 0.18, 0.16),
+        perceptual_roughness: 0.85,
+        metallic: 0.05,
+        ..default()
+    });
+    let res_x = field.resolution[0];
+    let res_y = field.resolution[1];
+    for vy in 0..res_y {
+        for vx in 0..res_x {
+            if !field.occupied()[vy * res_x + vx] {
+                continue;
+            }
+            let cx = -WORLD_HALF[0] + (vx as f32 + 0.5) * cs[0];
+            let cy = -WORLD_HALF[1] + (vy as f32 + 0.5) * cs[1];
+            commands.spawn((
+                MazeWallEntity,
+                Mesh3d(wall_mesh.clone()),
+                MeshMaterial3d(wall_material.clone()),
+                Transform::from_xyz(cx, cy, 0.0),
+            ));
+        }
+    }
+    maze.field = Some(field);
+    maze.smell_mask = smell_mask;
+    maze.pheromone_masks = pheromone_masks;
+    maze.vibration_mask = vibration_mask;
 }

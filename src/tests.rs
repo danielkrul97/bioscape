@@ -540,7 +540,10 @@ fn sensor_slot_category_covers_known_indices() {
 fn apply_sensor_gains_scales_only_categorized_slots() {
     // Sprint 97: gains aplikuje na sensory slots, proprio nedotčeno.
     let mut inputs = [1.0_f32; BRAIN_INPUTS];
-    let gains = [2.0, 0.5, 0.0];
+    // gains[0] vision, [1] chemistry, [2] defensive, [3] mechano. Mechano set
+    // to 3.0 so slot 29 (vibration_grad_x) ends up at 3.0 — verifies the new
+    // category got wired through.
+    let gains = [2.0, 0.5, 0.0, 3.0];
     apply_sensor_gains(&mut inputs, &gains);
     // Vision slot 0 = 2× gain
     assert!((inputs[0] - 2.0).abs() < 1e-6);
@@ -548,6 +551,8 @@ fn apply_sensor_gains_scales_only_categorized_slots() {
     assert!((inputs[7] - 0.5).abs() < 1e-6);
     // Defensive slot 14 = 0× gain
     assert!((inputs[14] - 0.0).abs() < 1e-6);
+    // Mechano slot 29 = 3× gain
+    assert!((inputs[29] - 3.0).abs() < 1e-6);
     // Proprio slot 4 → unchanged.
     assert!((inputs[4] - 1.0).abs() < 1e-6);
     // Recurrent slot mimo BRAIN_INPUTS_SENSORY → unchanged.
@@ -800,6 +805,8 @@ fn populate_brain_inputs_writes_temperature_slot() {
         smell_grad: [0.0; 3],
         pheromone_grads: [[0.0; 3]; N_PHEROMONE_CHANNELS],
         temperature_local: THERMAL_REF_TEMP, // exact REF → tanh(0) = 0
+        vibration_grad: [0.0; 3],
+        vibration_amp: 0.0,
     };
     let inputs = populate_brain_inputs(&mut cell, &sensors, 50.0);
     assert!((inputs[20] - 0.0).abs() < 1e-4, "REF should be 0, got {}", inputs[20]);
@@ -943,6 +950,7 @@ fn base_cell() -> Cell {
         bonds: [None; MAX_BONDS_PER_CELL],
         cell_state: 0.5,
         last_best_food_d2: f32::MAX,
+        xoshiro_state: crate::Xoshiro128PlusPlus::from_cell_id(0),
         phenotype,
         genome,
     }
@@ -2077,12 +2085,11 @@ fn motor_scales_inversely_with_mass() {
 
 #[test]
 fn brownian_perturbs_zero_velocity() {
-    let mut rng = rand::rng();
     let mut cell = base_cell();
     // 100 brownian steps; statisticky téměř jistě některá komponenta != 0.
     let sqrt_dt = (1.0_f32 / FIXED_TIMESTEP_HZ).sqrt();
     for _ in 0..100 {
-        cell.apply_brownian(&mut rng, sqrt_dt, 0.0);
+        cell.apply_brownian(sqrt_dt, 0.0);
     }
     // 2D případ (world_half_z = 0) — z se nesmí měnit.
     assert_eq!(cell.velocity[2], 0.0);
@@ -2093,14 +2100,32 @@ fn brownian_perturbs_zero_velocity() {
 
 #[test]
 fn brownian_z_only_in_3d_world() {
-    let mut rng = rand::rng();
     let mut cell = base_cell();
     // 3D mode: world_half_z > 0 → z se má hýbat.
     let sqrt_dt = (1.0_f32 / FIXED_TIMESTEP_HZ).sqrt();
     for _ in 0..100 {
-        cell.apply_brownian(&mut rng, sqrt_dt, 2.0);
+        cell.apply_brownian(sqrt_dt, 2.0);
     }
     assert!(cell.velocity[2] != 0.0, "expected nonzero z velocity in 3D");
+}
+
+#[test]
+fn brownian_deterministic_across_paths_for_same_cell_id() {
+    // Two cells spawned with the same `cell_id` must produce identical
+    // velocity perturbations — this is the contract that CPU and GPU
+    // brownian streams now share (both seed xoshiro from `cell_id`).
+    let mut a = base_cell();
+    let mut b = base_cell();
+    a.cell_id = 42;
+    b.cell_id = 42;
+    a.xoshiro_state = crate::Xoshiro128PlusPlus::from_cell_id(a.cell_id);
+    b.xoshiro_state = crate::Xoshiro128PlusPlus::from_cell_id(b.cell_id);
+    let sqrt_dt = 0.1_f32;
+    for _ in 0..50 {
+        a.apply_brownian(sqrt_dt, 2.0);
+        b.apply_brownian(sqrt_dt, 2.0);
+    }
+    assert_eq!(a.velocity, b.velocity);
 }
 
 #[test]

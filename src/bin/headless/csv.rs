@@ -32,9 +32,10 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         } else {
             0.0
         };
+        let maze_active: u8 = if world.obstacles.is_some() { 1 } else { 0 };
         return writeln!(
             w,
-            // 82 columns total. Layout:
+            // 86 columns total (82 base + 4 maze). Layout:
             //   gen, cells, 11×0(cell metrics), food, density,
             //   17×0(lineages..mean_y), 0(energy_avg), births, deaths, fertile_ticks,
             //   0(atk_emit), predation, 6×0(recurrent..noise),
@@ -42,8 +43,9 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   shock_active, shock_hazard_max, 0.000(climate), shock_food_factor,
             //   0(lineage_count), 0.000, 0.000, 3×0(spike),
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
-            //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000",
+            //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
+            //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{}",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -60,6 +62,8 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             world.coop_food_solved_gen,
             world.coop_food_failed_gen,
             coop_arrivals_avg,
+            maze_active,
+            world.goal_first_reach_tick.len() as u64,
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -157,6 +161,25 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let (gain_vis_m, gain_vis_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_VISION);
     let (gain_chem_m, gain_chem_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_CHEMISTRY);
     let (gain_def_m, gain_def_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_DEFENSIVE);
+    let (gain_mech_m, gain_mech_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_MECHANO);
+    // Vibration field stats — per-cell aggregates so the row reports what
+    // the brain actually saw this tick (sample + gradient at each cell's
+    // position), plus the population's mean emission rate.
+    let mut vib_emit_sum = 0.0_f64;
+    let mut vib_amp_sum = 0.0_f64;
+    let mut vib_grad_mag_sum = 0.0_f64;
+    for c in &world.cells {
+        let pos = c.position;
+        vib_emit_sum += bioscape::vibration_emit_for_cell(c) as f64;
+        vib_amp_sum += world.vibration.sample(pos) as f64;
+        let g = world
+            .vibration
+            .gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
+        vib_grad_mag_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
+    }
+    let vib_emit_m = if cell_count > 0 { vib_emit_sum / cell_count as f64 } else { 0.0 };
+    let vib_amp_m = if cell_count > 0 { vib_amp_sum / cell_count as f64 } else { 0.0 };
+    let vib_grad_mag_m = if cell_count > 0 { vib_grad_mag_sum / cell_count as f64 } else { 0.0 };
     // Sprint 107: speciation distance diagnostic. Sample N pairs random,
     // průměr compatibility_distance na CPPN. Indicator of population-wide
     // genetic divergence (vyšší = víc speciation).
@@ -467,9 +490,27 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     } else {
         0.0
     };
+    // Maze navigation metrics — all zero when `world.obstacles` is None,
+    // i.e. no `--maze` flag. `maze_in_goal_frac` is the per-tick fraction of
+    // the population inside the goal zone, averaged over the generation;
+    // `maze_unique_reach_frac` is distinct cells that touched the goal this
+    // gen / current pop; `maze_first_reach_total` is the cumulative count of
+    // cell_ids that have ever first-touched the goal across all generations.
+    let maze_active: u8 = if world.obstacles.is_some() { 1 } else { 0 };
+    let maze_in_goal_frac = if maze_active == 1 && n > 0 {
+        world.goal_zone_ticks_gen as f64 / (TICKS_PER_GENERATION as f64 * nf)
+    } else {
+        0.0
+    };
+    let maze_unique_reach_frac = if maze_active == 1 && n > 0 {
+        world.goal_unique_reachers_gen.len() as f64 / nf
+    } else {
+        0.0
+    };
+    let maze_first_reach_total = world.goal_first_reach_tick.len() as u64;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{}",
         world.clock.generation,
         n,
         spd_m,
@@ -571,6 +612,19 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         bonded_attack_eff,
         swarm_attack_frac,
         pack_attack_frac,
+        // Vibration / mechanosensory diagnostics. Emit is the population's
+        // mean motion-driven amplitude per tick; amp + grad_mag are sampled
+        // at each cell's position so they reflect what the brain actually
+        // read this tick.
+        vib_emit_m,
+        vib_amp_m,
+        vib_grad_mag_m,
+        gain_mech_m,
+        gain_mech_d,
+        maze_active,
+        maze_in_goal_frac,
+        maze_unique_reach_frac,
+        maze_first_reach_total,
     )
 }
 

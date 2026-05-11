@@ -136,7 +136,6 @@ pub(crate) fn cell_reproduces_on_threshold(
         // so we can dispatch the GPU CPPN materialisation after the loop.
         #[cfg(feature = "gpu")]
         let cppn_copy = cell.genome.cppn;
-        let lineage_id = cell.lineage_id;
         let turn_rate = cell.genome.turn_rate;
         let entity = commands
             .spawn((
@@ -161,19 +160,17 @@ pub(crate) fn cell_reproduces_on_threshold(
         #[cfg(feature = "gpu")]
         if let Some(gpu) = gpu_state.as_ref() {
             gpu.cells.upload_brain_at(slot, &cell.genome.brain);
-            gpu.cells.upload_xoshiro_seed_at(
-                slot,
-                lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
-            );
+            // V7-unification: seed from `cell.cell_id` so the GPU per-slot
+            // xoshiro stream matches the CPU `Cell.xoshiro_state` exactly.
+            gpu.cells.upload_xoshiro_seed_at(slot, cell.cell_id);
         }
         #[cfg(feature = "gpu")]
         if let Some(gpu) = gpu_full.as_ref() {
             // Skip `upload_brain_at` — the GPU CPPN dispatch below writes
             // brain weights directly into `cells.brain_weights_buf`.
-            gpu.cells.upload_xoshiro_seed_at(
-                slot,
-                lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
-            );
+            // V7-unification: seed from `cell.cell_id` so the GPU per-slot
+            // xoshiro stream matches the CPU `Cell.xoshiro_state` exactly.
+            gpu.cells.upload_xoshiro_seed_at(slot, cell.cell_id);
             gpu.cells.upload_turn_rate_at(slot, turn_rate);
             cppn_dispatch_scratch.push((slot, cppn_copy));
         }

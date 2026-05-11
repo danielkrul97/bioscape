@@ -8,7 +8,8 @@
 
 use bioscape::{
     adhesion_velocity_delta, bond_velocity_delta,
-    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
+    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, MazeDifficulty,
+    ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap, ADHESION_RANGE_FACTOR,
     ATTACK_THRESHOLD, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
@@ -23,9 +24,10 @@ use bioscape::{
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON,
     PHYSICS_CONFIG, PREDATION_DRAIN_PER_TICK, PREDATION_GAIN_PER_TICK, REPRODUCE_THRESHOLD,
     SIZE_RATIO_THRESHOLD, SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, WORLD_HALF,
-    WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
-    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, VIBRATION_DECAY,
+    VIBRATION_DIFFUSION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, VIBRATION_SAMPLE_EPSILON,
+    WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP,
+    WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
 };
 use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
 #[cfg(feature = "gpu")]
@@ -60,7 +62,14 @@ const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
 /// V6: Cell.last_best_food_d2 added. `serde(default)` zajistí backward-compat
 /// při deserializaci V5 dat (default = f32::MAX → eat_food skip vždy v 1. ticku
 /// po loadu, neutral, brain_act nastaví v 1. ticku).
-const CHECKPOINT_VERSION: u32 = 6;
+/// V7: vibration sensing — new `vibration` SmellField, BRAIN_INPUTS_SENSORY
+/// 29→33, BRAIN_INPUTS 74→78, `Genome.sensor_gains` 3→4 (Mechano added). V6
+/// savefiles incompatible (brain weight matrices resize).
+/// V8: per-cell `xoshiro_state` added to `Cell` for unified CPU/GPU brownian
+/// RNG stream. V7 saves would deserialize via `serde(default)` to identical
+/// sentinel state across cells — that would make every cell move in noise
+/// lockstep, so we force-fail the version mismatch instead.
+const CHECKPOINT_VERSION: u32 = 8;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -81,6 +90,11 @@ pub struct Checkpoint {
     /// V4 checkpointy s `pheromone: SmellField` (ch0 only) už nelze
     /// deserializovat — version bump.
     pub pheromone_fields: Vec<SmellField>,
+    /// V7: motion-driven mechanosensory field. Same 3D scalar SmellField
+    /// type, different decay/diffusion constants. Persisted because the
+    /// field carries state across the generation boundary (it does not
+    /// reset).
+    pub vibration: SmellField,
     pub map: WorldMap,
     pub births_gen: u64,
     pub deaths_gen: u64,
@@ -96,6 +110,7 @@ pub struct Checkpoint {
 pub struct PhaseTimings {
     pub update_smell: f64,
     pub update_pheromone: f64,
+    pub update_vibration: f64,
     pub brain_act: f64,
     pub emit_pheromones: f64,
     pub apply_morph: f64,
@@ -134,6 +149,12 @@ pub struct World {
     /// ch2 fast (5.0, bursty). GPU path používá pouze ch0 ve `gpu.pheromone`,
     /// ch1/ch2 vždy CPU step.
     pub pheromone_fields: [SmellField; N_PHEROMONE_CHANNELS],
+    /// V7: motion-driven mechanosensory field. Each cell deposits an
+    /// amplitude proportional to its kinetic + rotational activity (see
+    /// `bioscape::vibration_emit_for_cell`); the field then diffuses + decays
+    /// every tick. Brain reads gradient + amplitude as inputs [29..32]. CPU
+    /// only — no GPU shader counterpart in this cut.
+    pub vibration: SmellField,
     pub map: WorldMap,
     // Sprint 43: spatial hashes pro broad-phase. Rebuild před fází, která
     // neighbors používá — `cell_grid` před brain_act/resolve_collisions/predate,
@@ -221,6 +242,30 @@ pub struct World {
     pub predation_drain_mult: f32,
     pub food_factor_mult: f32,
     pub bench_timings: PhaseTimings,
+    /// Static voxel maze. `Some` when started with `--maze[=easy|medium|hard]`.
+    /// When set, the world bounds become hard XY walls (no toroidal wrap),
+    /// cells push out of occupied voxels, smell/pheromone/vibration diffuse
+    /// with Neumann boundaries on walls, vision raycast checks LOS, and
+    /// per-gen navigation metrics (goal-zone visits, time-to-goal) are
+    /// recorded.
+    pub obstacles: Option<ObstacleField>,
+    /// Per-grid Neumann masks derived from `obstacles` at allocation time.
+    /// All `None` when `obstacles` is `None` — fast path stays byte-identical
+    /// to pre-maze behavior.
+    pub smell_mask: Option<Vec<bool>>,
+    pub pheromone_masks: [Option<Vec<bool>>; N_PHEROMONE_CHANNELS],
+    pub vibration_mask: Option<Vec<bool>>,
+    /// Per-gen sum of (cells in goal zone) accumulated each tick. Divide by
+    /// (`TICKS_PER_GENERATION × cells.len()`) for mean fraction-time-at-goal.
+    pub goal_zone_ticks_gen: u64,
+    /// `cell_id`s of cells that touched the goal zone in the current
+    /// generation. Cleared at gen end. `len() / cells.len()` = unique
+    /// reachers fraction this gen.
+    pub goal_unique_reachers_gen: rustc_hash::FxHashSet<u64>,
+    /// `cell_id` → tick of first goal entry. Lifelong record (never reset),
+    /// used for the time-to-goal histogram. New entries appear only when a
+    /// cell first touches the goal.
+    pub goal_first_reach_tick: rustc_hash::FxHashMap<u64, u64>,
     // Sprint 44: pokud `Some`, brain_act offloaduje forward pass na GPU.
     // Sensor gather + populate_brain_inputs + apply_brain_motor zůstává CPU.
     #[cfg(feature = "gpu")]
@@ -250,6 +295,11 @@ pub struct GpuFullState {
     /// checkpoint serialization (po `--gpu-full` jsou CPU shadows out-of-date).
     pub smell: FieldGpu,
     pub pheromone: FieldGpu,
+    /// V7: motion-driven mechanosensory field on GPU. Deposit + step inline
+    /// each tick; sensor_gather shader binds the current grid buffer at
+    /// binding 12. CPU `World.vibration` shadow is not synced on the
+    /// `--gpu-full` path (kept only for checkpoint round-trip).
+    pub vibration: FieldGpu,
     /// Sprint 60: GPU spatial hashes pro sensor broad-phase. Per-tick
     /// `dispatch()` (no readback) + sensor shader čte `offsets_buffer()` /
     /// `sorted_buffer()` přes binding group.
@@ -275,6 +325,7 @@ pub struct GpuFullState {
 }
 
 impl World {
+    #[allow(dead_code)]
     pub fn new(
         rng: &mut impl Rng,
         map_seed: u64,
@@ -282,6 +333,26 @@ impl World {
         initial_cells: usize,
         max_population: usize,
         events: EventCalendar,
+    ) -> Self {
+        Self::new_with_maze(
+            rng,
+            map_seed,
+            mating_radius,
+            initial_cells,
+            max_population,
+            events,
+            None,
+        )
+    }
+
+    pub fn new_with_maze(
+        rng: &mut impl Rng,
+        map_seed: u64,
+        mating_radius: f32,
+        initial_cells: usize,
+        max_population: usize,
+        events: EventCalendar,
+        maze_difficulty: Option<MazeDifficulty>,
     ) -> Self {
         // Sprint 53: WorldMap a SmellField/Pheromone jsou plně 3D volumetric.
         // Food richness sampling používá z=0 (canonical surface depth) aby
@@ -293,8 +364,47 @@ impl World {
             WORLD_HALF,
             map_seed,
         );
-        let cells = (0..initial_cells)
-            .map(|i| Cell::random(rng, WORLD_HALF, i as u64, 0, i as u64))
+        // Maze obstacles seeded from `map_seed` so the same `--seed N`
+        // reproduces the same maze across runs.
+        let obstacles =
+            maze_difficulty.map(|d| ObstacleField::new_maze(WORLD_HALF, map_seed, d));
+        let smell_mask = obstacles
+            .as_ref()
+            .map(|o| o.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]));
+        let pheromone_masks: [Option<Vec<bool>>; N_PHEROMONE_CHANNELS] =
+            std::array::from_fn(|_| {
+                obstacles.as_ref().map(|o| {
+                    o.mask_for_grid([
+                        PHEROMONE_GRID_RES,
+                        PHEROMONE_GRID_RES,
+                        PHEROMONE_GRID_RES_Z,
+                    ])
+                })
+            });
+        let vibration_mask = obstacles.as_ref().map(|o| {
+            o.mask_for_grid([
+                VIBRATION_GRID_RES,
+                VIBRATION_GRID_RES,
+                VIBRATION_GRID_RES_Z,
+            ])
+        });
+        // Initial cells: in maze mode reject spawn positions inside walls
+        // (rejection sampling against the obstacle field). Non-maze path
+        // unchanged.
+        let cells: Vec<Cell> = (0..initial_cells)
+            .map(|i| {
+                if let Some(field) = obstacles.as_ref() {
+                    for _ in 0..MAX_SPAWN_ATTEMPTS {
+                        let c = Cell::random(rng, WORLD_HALF, i as u64, 0, i as u64);
+                        if !field.sample(c.position) {
+                            return c;
+                        }
+                    }
+                    Cell::random(rng, WORLD_HALF, i as u64, 0, i as u64)
+                } else {
+                    Cell::random(rng, WORLD_HALF, i as u64, 0, i as u64)
+                }
+            })
             .collect();
         let target = food_target(1.0);
         let foods = (0..target)
@@ -302,9 +412,15 @@ impl World {
                 for _ in 0..MAX_SPAWN_ATTEMPTS {
                     let candidate = Food::random(rng, WORLD_HALF);
                     let richness = map.sample([candidate.position[0], candidate.position[1], 0.0]);
-                    if !reject_food_for_richness(rng, richness) {
-                        return candidate;
+                    if reject_food_for_richness(rng, richness) {
+                        continue;
                     }
+                    if let Some(field) = obstacles.as_ref() {
+                        if field.sample(candidate.position) {
+                            continue;
+                        }
+                    }
+                    return candidate;
                 }
                 Food::random(rng, WORLD_HALF)
             })
@@ -326,6 +442,10 @@ impl World {
                     WORLD_HALF,
                 )
             }),
+            vibration: SmellField::new(
+                [VIBRATION_GRID_RES, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z],
+                WORLD_HALF,
+            ),
             map,
             cell_grid: SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF),
             food_grid: SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF),
@@ -366,6 +486,13 @@ impl World {
             predation_drain_mult: 1.0,
             food_factor_mult: 1.0,
             bench_timings: PhaseTimings::default(),
+            obstacles,
+            smell_mask,
+            pheromone_masks,
+            vibration_mask,
+            goal_zone_ticks_gen: 0,
+            goal_unique_reachers_gen: rustc_hash::FxHashSet::default(),
+            goal_first_reach_tick: rustc_hash::FxHashMap::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -385,6 +512,7 @@ impl World {
             density_factor: self.density_factor,
             smell: self.smell.clone(),
             pheromone_fields: self.pheromone_fields.iter().cloned().collect(),
+            vibration: self.vibration.clone(),
             map: self.map.clone(),
             births_gen: self.births_gen,
             deaths_gen: self.deaths_gen,
@@ -457,6 +585,7 @@ impl World {
             density_factor: chk.density_factor,
             smell: chk.smell,
             pheromone_fields,
+            vibration: chk.vibration,
             map: chk.map,
             cell_grid: SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF),
             food_grid: SpatialGrid::new(GRID_CELL_SIZE, WORLD_HALF),
@@ -500,6 +629,18 @@ impl World {
             predation_drain_mult: 1.0,
             food_factor_mult: 1.0,
             bench_timings: PhaseTimings::default(),
+            // Maze state is not serialized into the checkpoint — `--maze` on
+            // resume reapplies it from CLI. A checkpoint saved with `--maze`
+            // but loaded without it will run the homogeneous world; the
+            // converse is also fine. Cells in either direction may need a
+            // few ticks to drift out of newly-walled-up positions.
+            obstacles: None,
+            smell_mask: None,
+            pheromone_masks: std::array::from_fn(|_| None),
+            vibration_mask: None,
+            goal_zone_ticks_gen: 0,
+            goal_unique_reachers_gen: rustc_hash::FxHashSet::default(),
+            goal_first_reach_tick: rustc_hash::FxHashMap::default(),
             #[cfg(feature = "gpu")]
             gpu: None,
             #[cfg(feature = "gpu")]
@@ -544,6 +685,7 @@ impl World {
 
         timed!(update_smell, self.update_smell(dt));
         timed!(update_pheromone, self.update_pheromone(dt));
+        timed!(update_vibration, self.update_vibration(dt));
         // Persistent cell_id → idx — built once per tick, consumed v pool_bonded_hidden,
         // brain_act, resolve_collisions, eat_food. Cell layout je stable
         // od tady přes eat_food; reproduce/die_and_drop_carrion na konci ticku
@@ -568,6 +710,9 @@ impl World {
         self.update_coop_food();
         timed!(reproduce, self.reproduce(rng));
         timed!(die_and_drop_carrion, self.die_and_drop_carrion(rng));
+        // Maze navigation tracker — no-op when obstacles is None, so the
+        // homogeneous-world tick stays byte-identical with pre-maze runs.
+        self.track_goal_metrics();
 
         transitions.generation_ended
     }
@@ -632,7 +777,7 @@ impl World {
         }
     }
 
-    fn apply_brownian(&mut self, rng: &mut impl Rng, dt: f32) {
+    fn apply_brownian(&mut self, _rng: &mut impl Rng, dt: f32) {
         #[cfg(feature = "gpu")]
         {
             // Sprint 62: brownian je fused do `brain_act_gpu_full` pipeline
@@ -643,14 +788,17 @@ impl World {
                 return;
             }
         }
-        let _ = rng; // touch to satisfy unused warning under gpu cfg path
-        let _ = self.apply_brownian_cpu(rng, dt);
+        self.apply_brownian_cpu(dt);
     }
 
-    fn apply_brownian_cpu(&mut self, rng: &mut impl Rng, dt: f32) {
+    fn apply_brownian_cpu(&mut self, dt: f32) {
+        // Per-cell xoshiro128++ stream — sjednoceno s GPU shaderem. Pop
+        // is small enough that sequential iteration outperforms a rayon
+        // par_iter_mut spawn overhead at typical N (≤1500 cells, ~10 µs
+        // per loop).
         let sqrt_dt = dt.sqrt();
         for cell in &mut self.cells {
-            cell.apply_brownian(rng, sqrt_dt, WORLD_HALF[2]);
+            cell.apply_brownian(sqrt_dt, WORLD_HALF[2]);
         }
     }
 
@@ -701,7 +849,10 @@ impl World {
             self.smell
                 .add_source([food.position[0], food.position[1], food.position[2]], SMELL_PER_FOOD * dt);
         }
-        self.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt);
+        match self.smell_mask.as_deref() {
+            Some(mask) => self.smell.step_masked(SMELL_DIFFUSION, SMELL_DECAY, dt, mask),
+            None => self.smell.step(SMELL_DIFFUSION, SMELL_DECAY, dt),
+        }
     }
 
     fn update_pheromone(&mut self, dt: f32) {
@@ -724,11 +875,51 @@ impl World {
             return;
         }
         for ch in 0..N_PHEROMONE_CHANNELS {
-            self.pheromone_fields[ch].step(
-                PHEROMONE_DIFFUSION_PER_CH[ch],
-                PHEROMONE_DECAY_PER_CH[ch],
-                dt,
-            );
+            match self.pheromone_masks[ch].as_deref() {
+                Some(mask) => self.pheromone_fields[ch].step_masked(
+                    PHEROMONE_DIFFUSION_PER_CH[ch],
+                    PHEROMONE_DECAY_PER_CH[ch],
+                    dt,
+                    mask,
+                ),
+                None => self.pheromone_fields[ch].step(
+                    PHEROMONE_DIFFUSION_PER_CH[ch],
+                    PHEROMONE_DECAY_PER_CH[ch],
+                    dt,
+                ),
+            }
+        }
+    }
+
+    fn update_vibration(&mut self, dt: f32) {
+        // Deposit each cell's motion-driven emission, then diffuse + decay
+        // BEFORE this tick's brain_act samples the gradient. Brain therefore
+        // sees a propagated field that already reflects this tick's motion —
+        // same one-tick model would also work, but we want vibrations to
+        // feel immediate (cells reacting to "right now" stir).
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.gpu_full.as_mut() {
+            for cell in &self.cells {
+                let emit = bioscape::vibration_emit_for_cell(cell);
+                if emit > 0.0 {
+                    gpu.vibration.add_source(cell.position, emit * dt);
+                }
+            }
+            gpu.vibration.step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt);
+            return;
+        }
+        for cell in &self.cells {
+            let emit = bioscape::vibration_emit_for_cell(cell);
+            if emit > 0.0 {
+                self.vibration.add_source(cell.position, emit * dt);
+            }
+        }
+        match self.vibration_mask.as_deref() {
+            Some(mask) => {
+                self.vibration
+                    .step_masked(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt, mask)
+            }
+            None => self.vibration.step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt),
         }
     }
 
@@ -952,6 +1143,7 @@ impl World {
             &gpu.food_hash,
             &gpu.smell,
             &gpu.pheromone,
+            &gpu.vibration,
             sensor_params,
         );
 
@@ -968,8 +1160,8 @@ impl World {
             damage_norm_gain: DAMAGE_NORMALIZATION_GAIN,
             density_norm: DENSITY_NORM_COUNT,
             reproduce_threshold: REPRODUCE_THRESHOLD,
+            vibration_norm_gain: bioscape::VIBRATION_NORMALIZATION_GAIN,
             _pad0: 0,
-            _pad1: 0,
         };
         gpu.populate
             .dispatch(&gpu.cells, &gpu.sensor, populate_params);
@@ -1105,6 +1297,7 @@ impl World {
         let food_grid = &self.food_grid;
         let smell = &self.smell;
         let pheromone_fields = &self.pheromone_fields;
+        let vibration = &self.vibration;
         let coop_foods = &self.coop_foods;
         let tick = self.clock.tick;
         let gen = self.clock.generation;
@@ -1188,6 +1381,9 @@ impl World {
                 }
                 let temperature_local =
                     bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
+                let vibration_grad =
+                    vibration.gradient_at(pos_xyz, VIBRATION_SAMPLE_EPSILON);
+                let vibration_amp = vibration.sample(pos_xyz);
                 let sensors = bioscape::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
@@ -1195,6 +1391,8 @@ impl World {
                     smell_grad,
                     pheromone_grads,
                     temperature_local,
+                    vibration_grad,
+                    vibration_amp,
                 };
                 cell.apply_shell_absorb(dt);
                 // eat_food skip optim: cache nejbližší food d² (viz CPU path).
@@ -1321,9 +1519,11 @@ impl World {
         let food_grid = &self.food_grid;
         let smell = &self.smell;
         let pheromone_fields = &self.pheromone_fields;
+        let vibration = &self.vibration;
         let coop_foods = &self.coop_foods;
         let tick = self.clock.tick;
         let gen = self.clock.generation;
+        let obstacles = self.obstacles.as_ref();
 
         // Sprint 97: dvojfáze pro cluster sensor pooling. Phase 1: gather + apply
         // own gains. Phase 2: pool max-magnitude přes bond network + brain forward.
@@ -1354,6 +1554,9 @@ impl World {
                     if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
                         return;
                     }
+                    if !bioscape::los_clear(obstacles, pos, fp) {
+                        return;
+                    }
                     best_food_d2 = d2;
                     best_food = Some(d);
                 });
@@ -1366,6 +1569,9 @@ impl World {
                         continue;
                     }
                     if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                        continue;
+                    }
+                    if !bioscape::los_clear(obstacles, pos, coop.position) {
                         continue;
                     }
                     best_food_d2 = d2;
@@ -1387,6 +1593,9 @@ impl World {
                     if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
                         return;
                     }
+                    if !bioscape::los_clear(obstacles, pos, op) {
+                        return;
+                    }
                     neighbors_in_vision += 1;
                     if d2 < best_cell_d2 {
                         best_cell_d2 = d2;
@@ -1403,6 +1612,9 @@ impl World {
                 }
                 let temperature_local =
                     bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
+                let vibration_grad =
+                    vibration.gradient_at(pos_xyz, VIBRATION_SAMPLE_EPSILON);
+                let vibration_amp = vibration.sample(pos_xyz);
                 let sensors = bioscape::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
@@ -1410,6 +1622,8 @@ impl World {
                     smell_grad,
                     pheromone_grads,
                     temperature_local,
+                    vibration_grad,
+                    vibration_amp,
                 };
 
                 cell.apply_shell_absorb(dt);
@@ -1464,6 +1678,8 @@ impl World {
         let tick = self.clock.tick;
         let gen = self.clock.generation;
         let events = &self.events.events;
+        let ctx = bioscape::ThermalCtx::for_tick(tick, gen);
+        let obstacles = self.obstacles.as_ref();
         for cell in &mut self.cells {
             let climate_offset = bioscape::climate_shock_offset(
                 events,
@@ -1471,8 +1687,38 @@ impl World {
                 [cell.position[0], cell.position[1]],
                 WORLD_HALF,
             );
-            cell.step_with_climate(dt, WORLD_HALF, tick, gen, &PHYSICS_CONFIG, climate_offset);
+            cell.step_with_thermal_maze(
+                dt,
+                WORLD_HALF,
+                &ctx,
+                &PHYSICS_CONFIG,
+                climate_offset,
+                obstacles,
+            );
         }
+    }
+
+    /// Per-tick navigation metric tracker. No-op when `obstacles` is None.
+    /// Counts cells currently in the goal zone (per-tick), records first-
+    /// reach tick per `cell_id` (lifelong), and tracks unique reachers in
+    /// the current generation (cleared at gen end by `csv::write_stats`).
+    pub fn track_goal_metrics(&mut self) {
+        let Some(field) = self.obstacles.as_ref() else {
+            return;
+        };
+        let mut now_count: u64 = 0;
+        let tick = self.clock.tick;
+        for cell in &self.cells {
+            if !field.at_goal(cell.position) {
+                continue;
+            }
+            now_count += 1;
+            self.goal_unique_reachers_gen.insert(cell.cell_id);
+            self.goal_first_reach_tick
+                .entry(cell.cell_id)
+                .or_insert(tick);
+        }
+        self.goal_zone_ticks_gen += now_count;
     }
 
     /// Sprint 112: per-cell climate offset helper, sdílený mezi tick hot path
@@ -2235,6 +2481,7 @@ impl World {
         );
         let to_spawn = (target - self.foods.len()).min(FOOD_SPAWN_RATE);
         let max_search_r = EAT_RADIUS * bioscape::MAX_BODY_LENGTH;
+        let obstacles = self.obstacles.as_ref();
         'spawn: for _ in 0..to_spawn {
             for _ in 0..MAX_SPAWN_ATTEMPTS {
                 let candidate = Food::random(rng, WORLD_HALF);
@@ -2243,6 +2490,11 @@ impl World {
                     .sample([candidate.position[0], candidate.position[1], 0.0]);
                 if reject_food_for_richness(rng, richness) {
                     continue;
+                }
+                if let Some(field) = obstacles {
+                    if field.sample(candidate.position) {
+                        continue;
+                    }
                 }
                 let mut blocked = false;
                 self.cell_grid.for_each_in_radius_toroidal(
@@ -2288,6 +2540,21 @@ impl World {
         }
     }
 
+    /// V7: pull the GPU vibration field back into the CPU shadow so the
+    /// per-gen CSV writer can sample it at cell positions. Called from
+    /// `main` right before `write_stats`; per-tick CPU shadow stays
+    /// out-of-date in `--gpu-full` mode (sensor gather reads the GPU
+    /// buffer direct, no readback needed mid-tick).
+    #[cfg(feature = "gpu")]
+    pub fn sync_vibration_from_gpu(&mut self) {
+        if let Some(gpu) = self.gpu_full.as_mut() {
+            let grid = gpu.vibration.download();
+            self.vibration.replace_grid_from(&grid);
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    pub fn sync_vibration_from_gpu(&mut self) {}
+
     fn reproduce(&mut self, rng: &mut impl Rng) {
         let current_pop = self.cells.len();
         if current_pop >= self.max_population {
@@ -2327,10 +2594,9 @@ impl World {
             for off in 0..n_births {
                 let slot = child_start + off;
                 let child = &self.cells[slot];
-                gpu.cells.upload_xoshiro_seed_at(
-                    slot,
-                    child.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15),
-                );
+                // V7-unification: seed from `cell_id` to keep CPU + GPU
+                // xoshiro streams in lockstep across reproduce events.
+                gpu.cells.upload_xoshiro_seed_at(slot, child.cell_id);
                 gpu.cells.upload_turn_rate_at(slot, child.genome.turn_rate);
             }
         }

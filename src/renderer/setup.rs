@@ -7,8 +7,9 @@ use bevy::render::view::Hdr;
 use bioscape::{
     Cell, Food, SmellField, WorldMap, CELL_RADIUS, CYCLE_AMPLITUDE,
     INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z,
-    SMELL_GRID_RES, SMELL_GRID_RES_Z, SPIKE_SLOTS, WORLD_HALF, WORLD_MAP_BASE_RES,
-    WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, reject_food_for_richness,
+    SMELL_GRID_RES, SMELL_GRID_RES_Z, SPIKE_SLOTS, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z,
+    WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z,
+    WORLD_MAP_SEED, reject_food_for_richness,
 };
 #[cfg(feature = "gpu")]
 use bioscape::gpu::{
@@ -22,8 +23,8 @@ use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
     AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh,
-    OrbitCamera, PheromoneResource, SmellResource, SpikeMaterial, SpikeMesh, WorldExtent,
-    WorldMapResource,
+    OrbitCamera, PheromoneResource, SmellResource, SpikeMaterial, SpikeMesh, VibrationResource,
+    WorldExtent, WorldMapResource,
 };
 #[cfg(feature = "gpu")]
 use super::resources_gpu::{GpuBrainState, GpuFieldState, GpuFullPipeline};
@@ -230,9 +231,10 @@ pub(super) fn setup(
             let ctx = GpuContext::new()?;
             let cells = CellsGpu::with_context(&ctx, cap);
             cells.upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
-            cells.upload_xoshiro_seeds(initial_cells.iter().enumerate().map(|(slot, c)| {
-                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
-            }));
+            // V7-unification: seed from `cell_id` (stable, unique per cell)
+            // so CPU `Cell.xoshiro_state` and GPU per-slot state expand from
+            // the same input and produce identical brownian streams.
+            cells.upload_xoshiro_seeds(initial_cells.iter().map(|c| c.cell_id));
             let brain = BrainGpu::with_context(&ctx, cap)?;
             let hebbian = HebbianGpu::with_context(&ctx, cap)?;
             let brownian = BrownianGpu::with_context(&ctx, cap)?;
@@ -278,9 +280,10 @@ pub(super) fn setup(
             let ctx = GpuContext::new()?;
             let cells = CellsGpu::with_context(&ctx, cap);
             cells.upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
-            cells.upload_xoshiro_seeds(initial_cells.iter().enumerate().map(|(slot, c)| {
-                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
-            }));
+            // V7-unification: seed from `cell_id` (stable, unique per cell)
+            // so CPU `Cell.xoshiro_state` and GPU per-slot state expand from
+            // the same input and produce identical brownian streams.
+            cells.upload_xoshiro_seeds(initial_cells.iter().map(|c| c.cell_id));
             let turn_rates: Vec<f32> = initial_cells.iter().map(|c| c.genome.turn_rate).collect();
             cells.upload_turn_rates(&turn_rates);
             let brain = BrainGpu::with_context(&ctx, cap)?;
@@ -297,6 +300,16 @@ pub(super) fn setup(
                 [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
                 world_half,
                 field_sources_cap,
+            )?;
+            let vibration = FieldGpu::with_context(
+                &ctx,
+                [
+                    bioscape::VIBRATION_GRID_RES,
+                    bioscape::VIBRATION_GRID_RES,
+                    bioscape::VIBRATION_GRID_RES_Z,
+                ],
+                world_half,
+                cap,
             )?;
             let cell_hash = SpatialHashGpu::with_context(
                 &ctx,
@@ -322,6 +335,7 @@ pub(super) fn setup(
                 brownian,
                 smell,
                 pheromone,
+                vibration,
                 cell_hash,
                 food_hash,
                 sensor,
@@ -386,6 +400,10 @@ pub(super) fn setup(
             )
         }),
     });
+    commands.insert_resource(VibrationResource(SmellField::new(
+        [VIBRATION_GRID_RES, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z],
+        half,
+    )));
     commands.insert_resource(WorldMapResource(world_map));
 }
 

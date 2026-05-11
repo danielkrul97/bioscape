@@ -961,6 +961,8 @@ fn populate_brain_inputs_resets_damage_accum() {
         smell_grad: [0.0; 3],
         pheromone_grads: [[0.0; 3]; N_PHEROMONE_CHANNELS],
         temperature_local: THERMAL_REF_TEMP,
+        vibration_grad: [0.0; 3],
+        vibration_amp: 0.0,
     };
     let _ = populate_brain_inputs(&mut cell, &sensors, 50.0);
     assert_eq!(cell.damage_accum, 0.0);
@@ -976,6 +978,8 @@ fn populate_brain_inputs_writes_food_and_cell_deltas() {
         smell_grad: [0.0; 3],
         pheromone_grads: [[0.0; 3]; N_PHEROMONE_CHANNELS],
         temperature_local: THERMAL_REF_TEMP,
+        vibration_grad: [0.0; 3],
+        vibration_amp: 0.0,
     };
     let inputs = populate_brain_inputs(&mut cell, &sensors, 100.0);
     assert!((inputs[0] - 0.1).abs() < 1e-4);
@@ -998,6 +1002,8 @@ fn populate_brain_inputs_writes_multichannel_pheromone_gradients() {
         smell_grad: [0.0; 3],
         pheromone_grads: grads,
         temperature_local: THERMAL_REF_TEMP,
+        vibration_grad: [0.0; 3],
+        vibration_amp: 0.0,
     };
     let inputs = populate_brain_inputs(&mut cell, &sensors, 50.0);
     assert!(inputs[21].abs() > 0.0);

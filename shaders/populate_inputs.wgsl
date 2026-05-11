@@ -12,11 +12,15 @@
 // Sprint 126: BRAIN_INPUTS_SENSORY 21→27 (slots 21–26 = ch1/ch2 pheromone
 // gradient xyz; GPU path writes 0 — multi-channel sensor gather is CPU-only).
 // BRAIN_INPUTS 71→77, BRAIN_OUTPUTS 10→12.
+// V7: vibration sensing — slots 29..32 (grad_x, grad_y, grad_z, amp). GPU
+// sensor gather has no vibration field readback, so these stay 0 — the GPU
+// brain path is effectively deaf to the mechanosensory channel.
+// BRAIN_INPUTS_SENSORY 29→33, BRAIN_INPUTS 74→78, BRAIN_OUTPUTS unchanged.
 
 struct Params {
     num_cells: u32,
-    brain_inputs: u32,           // Sprint 126: 77
-    brain_inputs_sensory: u32,   // Sprint 126: 27
+    brain_inputs: u32,           // V7: 78
+    brain_inputs_sensory: u32,   // V7: 33
     brain_hidden: u32,           // 50
     brain_recurrent: u32,        // 50 (== brain_hidden)
     smell_norm_gain: f32,
@@ -24,8 +28,8 @@ struct Params {
     damage_norm_gain: f32,
     density_norm: f32,
     reproduce_threshold: f32,
+    vibration_norm_gain: f32,    // V7: tanh gain on slots 29..32
     _pad0: u32,
-    _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -57,7 +61,8 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let sensor_off = i * 15u;
+    // Sensor stride bumped to 19 in V7 (4 vibration slots appended).
+    let sensor_off = i * 19u;
     let inputs_off = i * params.brain_inputs;
     let hidden_off = i * params.brain_hidden;
 
@@ -77,6 +82,11 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     let phero_y = sensor_output[sensor_off + 12u];
     let phero_z = sensor_output[sensor_off + 13u];
     let neighbor_count = f32(bitcast<u32>(sensor_output[sensor_off + 14u]));
+    // V7: vibration grad + amp, written by sensor_gather.wgsl at offsets 15..19.
+    let vib_grad_x = sensor_output[sensor_off + 15u];
+    let vib_grad_y = sensor_output[sensor_off + 16u];
+    let vib_grad_z = sensor_output[sensor_off + 17u];
+    let vib_amp    = sensor_output[sensor_off + 18u];
 
     // Cell metadata.
     let vx = velocities[i * 3u];
@@ -138,6 +148,15 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     let inbox_off = i * 2u;
     last_inputs[inputs_off + 27u] = bonded_inbox[inbox_off];
     last_inputs[inputs_off + 28u] = bonded_inbox[inbox_off + 1u];
+
+    // V7: vibration slots 29..32 (grad_xyz + amp). GPU sensor_gather samples
+    // the vibration FieldGpu directly, mirroring smell/pheromone semantics
+    // (tanh-normalize through the per-channel gain so saturation behaviour
+    // matches `lib::populate_brain_inputs`).
+    last_inputs[inputs_off + 29u] = tanh(vib_grad_x * params.vibration_norm_gain);
+    last_inputs[inputs_off + 30u] = tanh(vib_grad_y * params.vibration_norm_gain);
+    last_inputs[inputs_off + 31u] = tanh(vib_grad_z * params.vibration_norm_gain);
+    last_inputs[inputs_off + 32u] = tanh(vib_amp    * params.vibration_norm_gain);
 
     // Sprint 30: damage_accum reset after consume.
     damage_accums[i] = 0.0;
