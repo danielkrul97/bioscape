@@ -1,3 +1,4 @@
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bioscape::{
     EventCalendar, FoodKind, ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap,
@@ -276,6 +277,16 @@ impl MazeWorld {
     pub(super) fn is_active(&self) -> bool {
         self.field.is_some()
     }
+}
+
+/// Wave 3: bundle `MazeWorld` + `CoopFoodResource` into one `SystemParam`
+/// so `cells_brain_act` can carry both without crossing Bevy's 16-param
+/// system cap. The two fields together replace the previous `coop_foods`
+/// param; net result is 15 params with maze access in scope.
+#[derive(SystemParam)]
+pub(super) struct MazeAndCoop<'w> {
+    pub(super) maze: Res<'w, MazeWorld>,
+    pub(super) coop_foods: Res<'w, CoopFoodResource>,
 }
 
 #[derive(Resource, Clone)]

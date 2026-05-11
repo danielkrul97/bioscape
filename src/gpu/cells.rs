@@ -688,6 +688,8 @@ impl CellsGpu {
                 b1: [0.0; BRAIN_HIDDEN],
                 w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
                 b2: [0.0; BRAIN_OUTPUTS],
+                trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+                trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             };
             for h in 0..BRAIN_HIDDEN {
                 for in_i in 0..BRAIN_INPUTS {
@@ -928,6 +930,8 @@ impl CellsGpu {
             b1: [0.0; BRAIN_HIDDEN],
             w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             b2: [0.0; BRAIN_OUTPUTS],
+            trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         };
         for h in 0..BRAIN_HIDDEN {
             for in_i in 0..BRAIN_INPUTS {

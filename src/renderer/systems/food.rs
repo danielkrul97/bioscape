@@ -317,11 +317,12 @@ pub(crate) fn cell_eats_food(
                         }
                     }
                 } else {
-                    let last_inputs = cell.0.last_inputs;
                     let last_hidden = cell.0.last_hidden;
                     let last_outputs = cell.0.last_outputs;
-                    cell.0.genome.brain.hebbian_update(
-                        &last_inputs,
+                    // Wave 3: trace-based reward — credits motor outputs from
+                    // up to ~120 ticks back (1/HEBBIAN_TRACE_DECAY_PER_SEC at
+                    // 60 Hz), not just this tick's pre·post.
+                    cell.0.genome.brain.hebbian_apply_reward(
                         &last_hidden,
                         &last_outputs,
                         1.0,

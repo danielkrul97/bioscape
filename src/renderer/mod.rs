@@ -206,10 +206,19 @@ pub fn run() {
         // Wave 2: episodic novelty Hebbian reward — runs after motor /
         // physics so the cell's voxel reflects this tick's motion. Modifies
         // CPU brain weights; on `--gpu-full` the patches don't reach the
-        // persistent GPU buffer until next gen sync. Wave 3 brings GPU hook.
+        // persistent GPU buffer until next gen sync. Wave 4 brings GPU hook.
         .add_systems(
             FixedUpdate,
             apply_episodic_novelty.after(step_cells),
+        )
+        // Wave 3: per-tick eligibility-trace decay+accumulate. Runs after
+        // brain_act so traces capture this tick's activations before any
+        // event reward (eat/predation/novelty) fires.
+        .add_systems(
+            FixedUpdate,
+            apply_eligibility_step
+                .after(cells_brain_act)
+                .before(step_cells),
         )
         .add_systems(
             Update,

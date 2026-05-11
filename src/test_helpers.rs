@@ -14,6 +14,8 @@ pub fn dummy_brain() -> Brain {
         b1: [0.0; BRAIN_HIDDEN],
         w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         b2: [0.0; BRAIN_OUTPUTS],
+        trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+        trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
     }
 }
 

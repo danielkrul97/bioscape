@@ -255,6 +255,15 @@ pub struct World {
     pub smell_mask: Option<Vec<bool>>,
     pub pheromone_masks: [Option<Vec<bool>>; N_PHEROMONE_CHANNELS],
     pub vibration_mask: Option<Vec<bool>>,
+    /// Wave 3 curriculum: ramp schedule. Each entry `(MazeDifficulty,
+    /// end_gen)` means "use this difficulty up through `end_gen` (exclusive
+    /// upper bound)". The last entry's `end_gen` is `u64::MAX` (run forever
+    /// at the final difficulty). Empty when `--maze-stages` not passed —
+    /// the world stays on the single difficulty given by `--maze`.
+    pub maze_curriculum: Vec<(MazeDifficulty, u64)>,
+    /// Wave 3: monotonic seed offset bumped each curriculum rebuild so
+    /// successive maze topologies for the same `map_seed` differ.
+    pub maze_seed_step: u64,
     /// Per-gen sum of (cells in goal zone) accumulated each tick. Divide by
     /// (`TICKS_PER_GENERATION × cells.len()`) for mean fraction-time-at-goal.
     pub goal_zone_ticks_gen: u64,
@@ -490,6 +499,8 @@ impl World {
             smell_mask,
             pheromone_masks,
             vibration_mask,
+            maze_curriculum: Vec::new(),
+            maze_seed_step: 0,
             goal_zone_ticks_gen: 0,
             goal_unique_reachers_gen: rustc_hash::FxHashSet::default(),
             goal_first_reach_tick: rustc_hash::FxHashMap::default(),
@@ -638,6 +649,8 @@ impl World {
             smell_mask: None,
             pheromone_masks: std::array::from_fn(|_| None),
             vibration_mask: None,
+            maze_curriculum: Vec::new(),
+            maze_seed_step: 0,
             goal_zone_ticks_gen: 0,
             goal_unique_reachers_gen: rustc_hash::FxHashSet::default(),
             goal_first_reach_tick: rustc_hash::FxHashMap::default(),
@@ -662,6 +675,41 @@ impl World {
     pub fn tick(&mut self, rng: &mut impl Rng) -> Option<u64> {
         let dt = 1.0 / FIXED_TIMESTEP_HZ;
         let transitions = self.clock.advance();
+        // Wave 3 curriculum: check ramp on generation roll-over. Rebuild
+        // obstacles + masks when the active stage's difficulty differs from
+        // what's currently allocated (and seed walks via maze_seed_step so
+        // each stage gets a fresh maze layout).
+        if transitions.generation_ended.is_some() && !self.maze_curriculum.is_empty() {
+            let target = self.difficulty_for_generation(self.clock.generation);
+            let current = self.obstacles.as_ref().map(|o| o.difficulty);
+            if target != current {
+                match target {
+                    Some(diff) => {
+                        let base_seed = self
+                            .obstacles
+                            .as_ref()
+                            .map(|o| o.seed)
+                            .unwrap_or(0);
+                        self.rebuild_maze(diff, base_seed);
+                        eprintln!(
+                            "curriculum: gen {} → maze {}",
+                            self.clock.generation,
+                            diff.label()
+                        );
+                    }
+                    None => {
+                        self.obstacles = None;
+                        self.smell_mask = None;
+                        self.pheromone_masks = std::array::from_fn(|_| None);
+                        self.vibration_mask = None;
+                        eprintln!(
+                            "curriculum: gen {} → maze off",
+                            self.clock.generation
+                        );
+                    }
+                }
+            }
+        }
         if transitions.generation_ended.is_some() {
             let phase =
                 (self.clock.generation as f32 / CYCLE_GEN_PERIOD as f32) * std::f32::consts::TAU;
@@ -700,6 +748,9 @@ impl World {
         // read them without an extra `&ObstacleField` capture.
         self.update_whiskers();
         timed!(brain_act, self.run_brain_act(dt));
+        // Wave 3: per-tick eligibility-trace decay+accumulate — runs once
+        // brain_act has populated this tick's last_inputs/last_hidden/last_outputs.
+        self.apply_eligibility_step(dt);
         timed!(emit_pheromones, self.emit_pheromones(dt));
         timed!(apply_morph, self.apply_morph(dt));
         timed!(apply_brownian, self.apply_brownian(rng, dt));
@@ -1709,12 +1760,75 @@ impl World {
         }
     }
 
+    /// Wave 3 curriculum: returns the maze difficulty active at `gen` per
+    /// `maze_curriculum`, or `None` if curriculum is empty / `gen` is past
+    /// the last stage. The current `obstacles.difficulty` is what's already
+    /// running; comparing against this value tells us whether to rebuild.
+    pub fn difficulty_for_generation(&self, gen: u64) -> Option<MazeDifficulty> {
+        for &(diff, end_gen) in &self.maze_curriculum {
+            if gen < end_gen {
+                return Some(diff);
+            }
+        }
+        None
+    }
+
+    /// Wave 3: rebuild `obstacles` + masks at a new difficulty (called from
+    /// the per-gen ramp check or whenever the curriculum advances). Cells
+    /// keep their positions; the next collision tick pushes any caught in a
+    /// freshly-spawned wall back out. Goal-tracking state (`goal_first_reach_tick`,
+    /// `goal_unique_reachers_gen`) is preserved across rebuilds — comparing
+    /// time-to-goal across difficulty stages is part of the curriculum signal.
+    pub fn rebuild_maze(&mut self, difficulty: MazeDifficulty, base_seed: u64) {
+        self.maze_seed_step = self.maze_seed_step.wrapping_add(1);
+        let seed = base_seed.wrapping_add(self.maze_seed_step);
+        let field = ObstacleField::new_maze(WORLD_HALF, seed, difficulty);
+        self.smell_mask = Some(
+            field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]),
+        );
+        self.pheromone_masks = std::array::from_fn(|_| {
+            Some(field.mask_for_grid([
+                PHEROMONE_GRID_RES,
+                PHEROMONE_GRID_RES,
+                PHEROMONE_GRID_RES_Z,
+            ]))
+        });
+        self.vibration_mask = Some(field.mask_for_grid([
+            VIBRATION_GRID_RES,
+            VIBRATION_GRID_RES,
+            VIBRATION_GRID_RES_Z,
+        ]));
+        self.obstacles = Some(field);
+    }
+
+    /// Wave 3: per-tick eligibility-trace decay + accumulate. Runs after
+    /// brain_act so traces capture the (input, hidden, output) activations
+    /// from this tick before any reward event fires. No weight changes —
+    /// just trace bookkeeping. Always-on (independent of maze toggle):
+    /// decay constant `HEBBIAN_TRACE_DECAY_PER_SEC` works as a soft replay
+    /// window for sparse-reward credit assignment.
+    pub fn apply_eligibility_step(&mut self, dt: f32) {
+        use bioscape::HEBBIAN_TRACE_DECAY_PER_SEC;
+        self.cells.par_iter_mut().for_each(|cell| {
+            let last_inputs = cell.last_inputs;
+            let last_hidden = cell.last_hidden;
+            let last_outputs = cell.last_outputs;
+            cell.genome.brain.hebbian_step(
+                &last_inputs,
+                &last_hidden,
+                &last_outputs,
+                dt,
+                HEBBIAN_TRACE_DECAY_PER_SEC,
+            );
+        });
+    }
+
     /// Wave 2 episodic novelty pass. For each cell, bin its current position
     /// into a coarse novelty grid; if not in the cell's recent visit history,
-    /// fire a small Hebbian reward against last-tick (input, hidden, output)
-    /// activations. Encourages exploration without a separate brain output.
-    /// Runs after `step` so the cell's position reflects its motor output
-    /// from this tick (so credit attaches to the action that just placed it).
+    /// fire a small Hebbian reward against the accumulated eligibility trace
+    /// (Wave 3 — was instantaneous pre·post in Wave 2). Encourages
+    /// exploration; trace-based reward credits the action that placed the
+    /// cell here even if it was several ticks back.
     pub fn apply_episodic_novelty(&mut self) {
         use bioscape::{LEARNING_RATE, NOVELTY_REWARD_MAGNITUDE};
         let half = WORLD_HALF;
@@ -1723,11 +1837,9 @@ impl World {
             if !cell.check_novelty(v) {
                 return;
             }
-            let last_inputs = cell.last_inputs;
             let last_hidden = cell.last_hidden;
             let last_outputs = cell.last_outputs;
-            cell.genome.brain.hebbian_update(
-                &last_inputs,
+            cell.genome.brain.hebbian_apply_reward(
                 &last_hidden,
                 &last_outputs,
                 NOVELTY_REWARD_MAGNITUDE,
@@ -2483,11 +2595,11 @@ impl World {
         if !use_gpu_hebbian {
             for &cell_idx in &ate_cell_indices {
                 let cell = &mut self.cells[cell_idx];
-                let last_inputs = cell.last_inputs;
                 let last_hidden = cell.last_hidden;
                 let last_outputs = cell.last_outputs;
-                cell.genome.brain.hebbian_update(
-                    &last_inputs,
+                // Wave 3: trace-based reward — credits motor outputs from up
+                // to ~120 ticks back, not just this tick's pre·post.
+                cell.genome.brain.hebbian_apply_reward(
                     &last_hidden,
                     &last_outputs,
                     1.0,

@@ -113,6 +113,52 @@ fn main() {
         );
         std::process::exit(2);
     }
+    // Wave 3 curriculum ramp: --maze-stages=easy:50,medium:100,hard
+    // Each segment is "difficulty:gens_in_segment". The final segment may omit
+    // its length (interpreted as "rest of run"). Implies --maze automatically
+    // (the first stage's difficulty seeds the initial obstacle field).
+    let maze_stages: Vec<(MazeDifficulty, u64)> = raw_args
+        .iter()
+        .find_map(|a| a.strip_prefix("--maze-stages="))
+        .map(|spec| {
+            let mut out: Vec<(MazeDifficulty, u64)> = Vec::new();
+            let mut cum: u64 = 0;
+            let parts: Vec<&str> = spec.split(',').collect();
+            let last_idx = parts.len().saturating_sub(1);
+            for (i, p) in parts.iter().enumerate() {
+                let mut it = p.splitn(2, ':');
+                let diff_str = it.next().unwrap_or("");
+                let gens_str = it.next();
+                let diff = match MazeDifficulty::parse(diff_str) {
+                    Some(d) => d,
+                    None => {
+                        eprintln!("warning: unknown stage difficulty '{diff_str}', skipping");
+                        continue;
+                    }
+                };
+                let end_gen = if i == last_idx && gens_str.is_none() {
+                    u64::MAX
+                } else {
+                    let n = gens_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(50);
+                    cum = cum.saturating_add(n);
+                    cum
+                };
+                out.push((diff, end_gen));
+            }
+            out
+        })
+        .unwrap_or_default();
+    if !maze_stages.is_empty() && want_gpu {
+        eprintln!(
+            "error: --maze-stages and --gpu/--gpu-full are mutually exclusive (Wave 4 brings GPU shader parity)."
+        );
+        std::process::exit(2);
+    }
+    let initial_maze_difficulty = if !maze_stages.is_empty() {
+        Some(maze_stages[0].0)
+    } else {
+        maze_difficulty
+    };
     let args: Vec<String> = raw_args
         .iter()
         .enumerate()
@@ -200,7 +246,7 @@ fn main() {
                     initial_cells,
                     max_population,
                     events.clone(),
-                    maze_difficulty,
+                    initial_maze_difficulty,
                 )
             }
         }
@@ -212,10 +258,24 @@ fn main() {
             initial_cells,
             max_population,
             events,
-            maze_difficulty,
+            initial_maze_difficulty,
         )
     };
-    if let Some(d) = maze_difficulty {
+    if !maze_stages.is_empty() {
+        world.maze_curriculum = maze_stages.clone();
+        let stages_str: Vec<String> = maze_stages
+            .iter()
+            .map(|(d, end)| {
+                if *end == u64::MAX {
+                    format!("{}:rest", d.label())
+                } else {
+                    format!("{}→gen{}", d.label(), end)
+                }
+            })
+            .collect();
+        eprintln!("maze curriculum: {}", stages_str.join(", "));
+    }
+    if let Some(d) = initial_maze_difficulty {
         if let Some(field) = world.obstacles.as_ref() {
             eprintln!(
                 "maze: {} ({}×{} voxels, goal at [{:.0}, {:.0}])",

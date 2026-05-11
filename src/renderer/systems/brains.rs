@@ -12,11 +12,35 @@ use super::super::components::{CellEntity, Dying};
 use super::super::config::DIAG_BRAIN_GPU_RT;
 use super::super::config::{DIAG_BRAIN_ACT, DIAG_CELL_COUNT};
 use super::super::resources::{
-    CellGrid, CellSlotMap, Clock, CoopFoodResource, FoodGrid, PheromoneResource, SmellResource,
+    CellGrid, CellSlotMap, Clock, FoodGrid, MazeAndCoop, PheromoneResource, SmellResource,
     VibrationResource,
 };
 #[cfg(feature = "gpu")]
 use super::super::resources_gpu::{GpuBrainState, GpuFullPipeline};
+
+/// Wave 3: per-tick eligibility-trace decay+accumulate. Runs after the
+/// brain forward pass so traces capture this tick's activations before any
+/// reward event (eat / predation / novelty) fires. Always-on, independent
+/// of maze toggle. Runs every tick so SIMD pressure matters — the
+/// per-cell `Brain::hebbian_step` body is a hot path.
+pub(crate) fn apply_eligibility_step(
+    time: Res<Time>,
+    mut cells: Query<&mut CellEntity, Without<Dying>>,
+) {
+    let dt = time.delta_secs();
+    cells.par_iter_mut().for_each(|mut cell| {
+        let last_inputs = cell.0.last_inputs;
+        let last_hidden = cell.0.last_hidden;
+        let last_outputs = cell.0.last_outputs;
+        cell.0.genome.brain.hebbian_step(
+            &last_inputs,
+            &last_hidden,
+            &last_outputs,
+            dt,
+            bioscape::HEBBIAN_TRACE_DECAY_PER_SEC,
+        );
+    });
+}
 
 /// Wave 2: episodic novelty reward pass. Runs after motion (positions
 /// reflect this tick's outcome). For each cell, bins position to a coarse
@@ -38,11 +62,10 @@ pub(crate) fn apply_episodic_novelty(
         if !cell.0.check_novelty(v) {
             return;
         }
-        let last_inputs = cell.0.last_inputs;
         let last_hidden = cell.0.last_hidden;
         let last_outputs = cell.0.last_outputs;
-        cell.0.genome.brain.hebbian_update(
-            &last_inputs,
+        // Wave 3: trace-based reward.
+        cell.0.genome.brain.hebbian_apply_reward(
             &last_hidden,
             &last_outputs,
             bioscape::NOVELTY_REWARD_MAGNITUDE,
@@ -130,7 +153,7 @@ pub(crate) fn cells_brain_act(
     smell: Res<SmellResource>,
     pheromone: Res<PheromoneResource>,
     vibration: Res<VibrationResource>,
-    coop_foods: Res<CoopFoodResource>,
+    maze_coop: MazeAndCoop,
     slot_map: Res<CellSlotMap>,
     clock: Res<Clock>,
     #[cfg(feature = "gpu")] gpu_state: Option<ResMut<GpuBrainState>>,
@@ -169,13 +192,14 @@ pub(crate) fn cells_brain_act(
     // sequential pass — last_inputs se stejně přepisují na konci brain_act,
     // takže scratch use je behavior-neutral.
     coop_positions_scratch.clear();
-    coop_positions_scratch.extend(coop_foods.0.iter().map(|c| c.position));
+    coop_positions_scratch.extend(maze_coop.coop_foods.0.iter().map(|c| c.position));
     let coop_positions_ref = coop_positions_scratch.as_slice();
     let food_grid_ref = &food_grid.0;
     let cell_grid_ref = &cell_grid.0;
     let smell_ref = &smell.0;
     let pheromone_ref = &pheromone.fields;
     let vibration_ref = &vibration.0;
+    let obstacles_ref = maze_coop.maze.field.as_ref();
     cells.par_iter_mut().for_each(|(entity, mut cell)| {
         let pos = cell.0.position;
         let vision_r = cell.0.genome.vision_radius;
@@ -195,6 +219,9 @@ pub(crate) fn cells_brain_act(
             if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
                 return;
             }
+            if !bioscape::los_clear(obstacles_ref, pos, fp) {
+                return;
+            }
             best_food_d2 = d2;
             nearest_food = Some(d);
         });
@@ -205,6 +232,9 @@ pub(crate) fn cells_brain_act(
                 continue;
             }
             if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                continue;
+            }
+            if !bioscape::los_clear(obstacles_ref, pos, *cp) {
                 continue;
             }
             best_food_d2 = d2;
@@ -227,6 +257,9 @@ pub(crate) fn cells_brain_act(
                     return;
                 }
                 if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                    return;
+                }
+                if !bioscape::los_clear(obstacles_ref, pos, other_pos) {
                     return;
                 }
                 neighbors_in_vision += 1;

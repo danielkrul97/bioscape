@@ -35,6 +35,8 @@ fn dummy_brain() -> Brain {
         b1: [0.0; BRAIN_HIDDEN],
         w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         b2: [0.0; BRAIN_OUTPUTS],
+        trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+        trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
     }
 }
 
@@ -125,6 +127,8 @@ fn mutation_with_zero_sigma_is_identity() {
             b1: [0.3; BRAIN_HIDDEN],
             w2: [[1.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             b2: [0.5; BRAIN_OUTPUTS],
+            trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         },
         cppn: default_cppn(),
     };
@@ -1313,6 +1317,8 @@ fn brain_forward_zero_weights_outputs_tanh_of_output_biases() {
         b1: [0.7; BRAIN_HIDDEN],
         w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         b2,
+        trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+        trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
     };
     let outputs = brain.forward(&[0.0; BRAIN_INPUTS]);
     assert_eq!(outputs.len(), BRAIN_OUTPUTS);

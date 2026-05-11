@@ -48,6 +48,8 @@ impl Brain {
             b1: [0.0; BRAIN_HIDDEN],
             w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             b2: [0.0; BRAIN_OUTPUTS],
+            trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         }
     }
 
@@ -186,6 +188,8 @@ impl Brain {
             b1,
             w2,
             b2,
+            trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         }
     }
 }
@@ -205,6 +209,26 @@ pub struct Brain {
     #[serde(with = "serde_arrays_w2")]
     pub w2: [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
     pub b2: [f32; BRAIN_OUTPUTS],
+    /// Wave 3 eligibility trace shadow buffers — same shape as `w1`/`w2`.
+    /// Each tick, `hebbian_step` decays and accumulates `pre × post` into
+    /// these slots. When a reward event fires (eat / predation / novelty),
+    /// `hebbian_apply_reward` does `w += lr · reward · trace` instead of
+    /// the classic instantaneous `w += lr · reward · pre · post`. Effective
+    /// reward window scales with `1 / decay_per_sec` — sparse-reward maze
+    /// goal-reaching can credit motor outputs from many ticks earlier.
+    /// Defaults to all-zeros for old checkpoints so they keep loading.
+    #[serde(default = "default_trace_w1", with = "serde_arrays_w1")]
+    pub trace_w1: [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN],
+    #[serde(default = "default_trace_w2", with = "serde_arrays_w2")]
+    pub trace_w2: [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+}
+
+fn default_trace_w1() -> [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN] {
+    [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN]
+}
+
+fn default_trace_w2() -> [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS] {
+    [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS]
 }
 
 fn default_hidden_n() -> u32 {
@@ -360,7 +384,15 @@ impl Brain {
         // wants a high baseline). Just enough to avoid a cold start near 0.
         b2[10] += INNATE_PHEROMONE_AUX_BIAS;
         b2[11] += INNATE_PHEROMONE_AUX_BIAS;
-        Self { hidden_n, w1, b1, w2, b2 }
+        Self {
+            hidden_n,
+            w1,
+            b1,
+            w2,
+            b2,
+            trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+        }
     }
 
     pub fn forward(&self, inputs: &[f32; BRAIN_INPUTS]) -> [f32; BRAIN_OUTPUTS] {
@@ -549,6 +581,68 @@ impl Brain {
         }
         for (b, &o) in self.b2.iter_mut().zip(last_outputs.iter()) {
             *b += lr * o;
+        }
+    }
+
+    /// Wave 3: per-tick eligibility-trace decay + accumulate. Runs every
+    /// tick after the brain forward pass; no weight changes happen here —
+    /// just trace bookkeeping. `decay = (1 − decay_per_sec · dt)`. Applied
+    /// `trace = decay · trace + pre · post`. When a reward event later
+    /// fires `hebbian_apply_reward`, the cell can credit motor outputs from
+    /// many ticks earlier (effective window ~ 1 / decay_per_sec). Iterates
+    /// only the active hidden range to leave dead-zone weights at 0.
+    pub fn hebbian_step(
+        &mut self,
+        last_inputs: &[f32; BRAIN_INPUTS],
+        last_hidden: &[f32; BRAIN_HIDDEN],
+        last_outputs: &[f32; BRAIN_OUTPUTS],
+        dt: f32,
+        decay_per_sec: f32,
+    ) {
+        let decay = (1.0 - decay_per_sec * dt).max(0.0);
+        let h_n = self.hidden_n as usize;
+        let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
+        for i in 0..h_n {
+            let post = last_hidden[i];
+            for j in 0..active_inputs {
+                self.trace_w1[i][j] = decay * self.trace_w1[i][j] + post * last_inputs[j];
+            }
+        }
+        for (o, row) in self.trace_w2.iter_mut().enumerate() {
+            let post = last_outputs[o];
+            for j in 0..h_n {
+                row[j] = decay * row[j] + post * last_hidden[j];
+            }
+        }
+    }
+
+    /// Wave 3: apply a reward event against the accumulated eligibility
+    /// trace. `Δw[i,j] = lr · reward · trace[i,j]`. Fires on eat / predation
+    /// / novelty events. Does not reset traces — they keep decaying tick by
+    /// tick, so a long reward streak reinforces the same recent motor
+    /// pattern multiple times. Bias terms ride on `last_hidden` /
+    /// `last_outputs` since traces only cover weights, not biases.
+    pub fn hebbian_apply_reward(
+        &mut self,
+        last_hidden: &[f32; BRAIN_HIDDEN],
+        last_outputs: &[f32; BRAIN_OUTPUTS],
+        reward: f32,
+        learning_rate: f32,
+    ) {
+        let lr = learning_rate * reward;
+        let h_n = self.hidden_n as usize;
+        let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
+        for i in 0..h_n {
+            for j in 0..active_inputs {
+                self.w1[i][j] += lr * self.trace_w1[i][j];
+            }
+            self.b1[i] += lr * last_hidden[i];
+        }
+        for (o, row) in self.w2.iter_mut().enumerate() {
+            for j in 0..h_n {
+                row[j] += lr * self.trace_w2[o][j];
+            }
+            self.b2[o] += lr * last_outputs[o];
         }
     }
 
