@@ -27,3 +27,6 @@ target
 # perf profiling output (cargo flamegraph / perf record)
 perf.data
 perf.data.old
+
+# Headless run outputs (run_seed*.csv, events_seed*.csv) — regenerable artifacts
+*.csv
