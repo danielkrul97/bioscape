@@ -30,8 +30,8 @@ use bioscape::{
         BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, EatFoodGpu, EatFoodParamsGpu,
         FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, HebbianGpu,
         MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
-        ExcitabilityGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu, StepGpu,
-        StepParamsGpu, SynapticScaleGpu,
+        ExcitabilityGpu, IzhikevichGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
+        StepGpu, StepParamsGpu, SynapticScaleGpu,
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BOND_FORMED_REWARD_MAGNITUDE, BRAIN_INPUTS_SENSORY,
     BRAIN_OUTPUTS, CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN,
@@ -354,6 +354,10 @@ pub struct GpuFullState {
     /// materialise child brain weights directly into `cells.brain_weights_buf`,
     /// skipping per-child CPU `Brain::from_cppn`.
     pub cppn: CppnGpu,
+    /// Sprint 147: per-tick Izhikevich forward (overlay on top of the
+    /// shared `BrainGpu` output — Perceptron cells are filtered out inside
+    /// the shader). Runs immediately after `BrainGpu::forward_persistent`.
+    pub izhikevich: IzhikevichGpu,
     /// Sprint 138: homeostatic synaptic scaling. Dispatched every
     /// `SCALING_PERIOD_TICKS` against `cells.brain_weights_buf` so runaway
     /// Hebbian growth doesn't saturate tanh and lock the brain into a
@@ -645,6 +649,7 @@ impl World {
         let cppn = CppnGpu::with_context(&ctx, cap);
         let synaptic_scale = SynapticScaleGpu::with_context(&ctx)?;
         let excitability = ExcitabilityGpu::with_context(&ctx, cap)?;
+        let izhikevich = IzhikevichGpu::with_context(&ctx)?;
         // GPU eat_food candidate selection. `food_capacity` matches the
         // worst-case live food count = `food_target(1 + CYCLE_AMPLITUDE)`
         // padded by max_population (carrion drops), already computed as
@@ -666,6 +671,15 @@ impl World {
             .collect();
         cells_gpu.upload_learning_rates(&learning_rates);
         cells_gpu.upload_trace_decays(&trace_decays);
+        // Sprint 147: initial neuron-model assignment. Default population
+        // is all-Perceptron, but a loaded checkpoint may carry Izhikevich
+        // lineages.
+        let neuron_models: Vec<u32> = self
+            .cells
+            .iter()
+            .map(|c| c.genome.neuron_model.as_u32())
+            .collect();
+        cells_gpu.upload_neuron_models(&neuron_models);
 
         self.gpu_full = Some(GpuFullState {
             cells: cells_gpu,
@@ -688,6 +702,7 @@ impl World {
             motor,
             step,
             cppn,
+            izhikevich,
             synaptic_scale,
             excitability,
             scratch: GpuFullScratch::default(),
@@ -1392,6 +1407,12 @@ impl World {
         // Phase 6: GPU brain forward_persistent. Čte `last_inputs_buf` direct,
         // píše last_hidden + last_outputs storage buffers.
         gpu.brain.forward_persistent(&gpu.cells, n, &gpu.scratch.hidden_ns);
+        // Sprint 147: Izhikevich forward runs AFTER perceptron — cells whose
+        // `neuron_models[i] == Izhikevich` overwrite the perceptron's
+        // last_hidden / last_outputs with spike-rate outputs. Perceptron
+        // cells are early-exited inside the shader (zero overhead per
+        // skipped cell beyond a single buffer read).
+        gpu.izhikevich.dispatch(&gpu.cells, n);
 
         // Phase 7: GPU motor.dispatch_with_cells. Čte last_outputs + heading/
         // pitch/turn_rate/eff_radius/max_speed, mutuje velocity/angular_vel/
@@ -3044,6 +3065,10 @@ impl World {
                     child.genome.learning_rate,
                     child.genome.trace_decay_per_sec,
                 );
+                // Sprint 147: child's NeuronModel — slot recycled from a
+                // Perceptron parent might need flipping to Izhikevich.
+                gpu.cells
+                    .upload_neuron_model_at(slot, child.genome.neuron_model.as_u32());
                 // Slot may be a recycled one (post-swap_to from a death this
                 // tick or earlier); zero per-slot Hebbian state so the child
                 // doesn't inherit previous-occupant traces or recurrent input.

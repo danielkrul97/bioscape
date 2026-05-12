@@ -63,6 +63,11 @@ pub struct CellsGpu {
     membrane_buf: wgpu::Buffer,
     /// Sprint 145: matching recovery variable `u`. Default 0.0.
     recovery_buf: wgpu::Buffer,
+    /// Sprint 147: per-cell `NeuronModel` discriminator (u32: 0 = Perceptron,
+    /// 1 = Izhikevich). The Izhikevich forward shader early-exits for cells
+    /// whose entry isn't `Izhikevich`. Initialised to all-zeros so a fresh
+    /// capacity defaults to Perceptron (matches pre-S147 behavior).
+    neuron_models_buf: wgpu::Buffer,
     /// Cell metadata fed to the `populate_brain_inputs` shader.
     /// `energy`, `heading`, `pitch`, `damage_accum` are uploaded per tick;
     /// `max_speed` and `eff_radius` only change on reproduce / morph but the
@@ -199,6 +204,18 @@ impl CellsGpu {
         // Zero-init recovery — write_buffer with zero slice is cheap.
         let zero_recovery = vec![0.0_f32; capacity * BRAIN_HIDDEN];
         queue.write_buffer(&recovery_buf, 0, bytemuck::cast_slice(&zero_recovery));
+        // Sprint 147: neuron_models default all-zero = Perceptron.
+        let neuron_models_buf = mk(
+            "cells-neuron-models",
+            (capacity as u64) * (std::mem::size_of::<u32>() as u64),
+            stor_dst_src,
+        );
+        let zero_models = vec![0_u32; capacity];
+        queue.write_buffer(
+            &neuron_models_buf,
+            0,
+            bytemuck::cast_slice(&zero_models),
+        );
         // populate_inputs metadata.
         let energy_buf = mk("cells-energy", n * f, stor_dst_src);
         let heading_buf = mk("cells-heading", n * f, stor_dst_src);
@@ -263,6 +280,7 @@ impl CellsGpu {
             trace_decays_buf,
             membrane_buf,
             recovery_buf,
+            neuron_models_buf,
             energy_buf,
             heading_buf,
             pitch_buf,
@@ -324,6 +342,7 @@ impl CellsGpu {
     pub fn trace_decays_buffer(&self) -> &wgpu::Buffer { &self.trace_decays_buf }
     pub fn membrane_buffer(&self) -> &wgpu::Buffer { &self.membrane_buf }
     pub fn recovery_buffer(&self) -> &wgpu::Buffer { &self.recovery_buf }
+    pub fn neuron_models_buffer(&self) -> &wgpu::Buffer { &self.neuron_models_buf }
     /// `populate_inputs` metadata buffer accessors.
     pub fn energy_buffer(&self) -> &wgpu::Buffer { &self.energy_buf }
     pub fn heading_buffer(&self) -> &wgpu::Buffer { &self.heading_buf }
@@ -853,6 +872,23 @@ impl CellsGpu {
             &self.trace_decays_buf,
             slot as u64 * f,
             bytemuck::bytes_of(&trace_decay),
+        );
+    }
+
+    /// Sprint 147: full-population upload of per-cell neuron model
+    /// discriminators. Called at `init_gpu_full` and per reproduce phase.
+    pub fn upload_neuron_models(&self, models: &[u32]) {
+        self.queue
+            .write_buffer(&self.neuron_models_buf, 0, bytemuck::cast_slice(models));
+    }
+
+    pub fn upload_neuron_model_at(&self, slot: usize, model: u32) {
+        assert!(slot < self.capacity);
+        let stride = std::mem::size_of::<u32>() as u64;
+        self.queue.write_buffer(
+            &self.neuron_models_buf,
+            slot as u64 * stride,
+            bytemuck::bytes_of(&model),
         );
     }
 
