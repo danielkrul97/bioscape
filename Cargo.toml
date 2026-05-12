@@ -74,6 +74,7 @@ wide = "1"
 wgpu = "23"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
+clap = { version = "4", features = ["derive"] }
 
 [features]
 # Speeds up incremental rebuilds during development.
@@ -81,8 +82,6 @@ pollster = "0.4"
 dev = ["bevy/dynamic_linking"]
 
 [dev-dependencies]
-indicatif = "0.18"
-textplots = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

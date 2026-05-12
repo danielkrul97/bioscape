@@ -14,9 +14,9 @@ use bioscape::{
     N_PHEROMONE_CHANNELS,
     TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_SEED,
 };
+use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::env;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
@@ -27,121 +27,163 @@ mod world;
 use csv::*;
 use world::*;
 
-fn main() {
-    let raw_args: Vec<String> = env::args().collect();
-    // Sprint 44: `--gpu` flag (filtered před positional parsingem). Bez
-    // Wave N: GPU full pipeline is mandatory (no `--gpu-full` opt-in, no
-    // CPU fallback). The `--gpu-full` / `--gpu` flags are still accepted for
-    // backward compatibility with scripts but have no effect — both paths
-    // are always enabled.
-    let _ = raw_args.iter().any(|a| a == "--gpu-full" || a == "--gpu");
-    // Sprint 48: `--save=PATH` / `--load=PATH` checkpoint flags. Form
-    // `--key=value` aby se PATH ne-leakoval do positional indexingu.
-    let save_path: Option<String> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--save=").map(|s| s.to_string()));
-    let load_path: Option<String> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--load=").map(|s| s.to_string()));
-    // Sprint 87 Hamilton sweep: `--share-frac=X` runtime override pro
-    // BOND_FOOD_SHARE_FRAC, `--kin` zapne kin filter (food share jen na
-    // partnery se stejným lineage_id).
-    let share_frac_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--share-frac=").and_then(|s| s.parse().ok()));
-    let kin_filter = raw_args.iter().any(|a| a == "--kin");
-    let pred_gain_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--pred-gain=").and_then(|s| s.parse().ok()));
-    let pred_drain_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--pred-drain=").and_then(|s| s.parse().ok()));
-    let food_mult_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--food=").and_then(|s| s.parse().ok()));
-    // Sprint 109: `--shocks-mean-gens N` (space-separated) nebo
-    // `--shocks-mean-gens=N` (= form). Default 0 = no-op (empty kalendář).
-    // `consumed_value_idx` drží pozici následujícího raw arg pokud je flag
-    // space-separated; ten se musí vyfiltrovat z positional setu.
-    let mut shocks_mean_gens: u32 = 0;
-    let mut consumed_value_idx: Option<usize> = None;
-    for (i, a) in raw_args.iter().enumerate() {
-        if let Some(rest) = a.strip_prefix("--shocks-mean-gens") {
-            if let Some(eq_val) = rest.strip_prefix('=') {
-                if let Ok(v) = eq_val.parse::<u32>() {
-                    shocks_mean_gens = v;
-                }
-            } else if rest.is_empty() {
-                if let Some(next) = raw_args.get(i + 1) {
-                    if let Ok(v) = next.parse::<u32>() {
-                        shocks_mean_gens = v;
-                        consumed_value_idx = Some(i + 1);
-                    }
-                }
-            }
-            break;
+#[derive(Parser, Debug)]
+#[command(
+    name = "headless",
+    about = "Bioscape headless simulator — deterministic, GPU compute mandatory.",
+)]
+struct Cli {
+    /// RNG seed (deterministic; same seed → identical run).
+    #[arg(default_value_t = 0)]
+    seed: u64,
+
+    /// Number of generations to simulate.
+    #[arg(default_value_t = 500)]
+    max_gens: u64,
+
+    /// Output CSV path. Default: `run_seed{seed}.csv`.
+    out_path: Option<String>,
+
+    /// Map noise seed.
+    map_seed: Option<u64>,
+
+    /// Mating radius in world units.
+    mating_radius: Option<f32>,
+
+    /// Initial cell count.
+    initial_cells: Option<usize>,
+
+    /// Population cap.
+    max_population: Option<usize>,
+
+    /// Rayon thread count (default: std::thread::available_parallelism()).
+    threads: Option<usize>,
+
+    /// Save checkpoint to PATH at end of run.
+    #[arg(long, value_name = "PATH")]
+    save: Option<String>,
+
+    /// Load checkpoint from PATH instead of starting fresh.
+    #[arg(long, value_name = "PATH")]
+    load: Option<String>,
+
+    /// BOND_FOOD_SHARE_FRAC runtime override (Hamilton sweep).
+    #[arg(long, value_name = "FRAC")]
+    share_frac: Option<f32>,
+
+    /// Kin filter: bond food sharing restricted to same lineage_id.
+    #[arg(long)]
+    kin: bool,
+
+    /// Predation gain multiplier.
+    #[arg(long, value_name = "X")]
+    pred_gain: Option<f32>,
+
+    /// Predation drain multiplier.
+    #[arg(long, value_name = "X")]
+    pred_drain: Option<f32>,
+
+    /// Food spawn multiplier.
+    #[arg(long, value_name = "X")]
+    food: Option<f32>,
+
+    /// Mean generations between environmental shocks. 0 = empty calendar (default).
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    shocks_mean_gens: u32,
+
+    /// Maze difficulty (easy|medium|hard). Bare `--maze` defaults to medium.
+    #[arg(
+        long,
+        value_name = "DIFFICULTY",
+        num_args = 0..=1,
+        default_missing_value = "medium",
+    )]
+    maze: Option<String>,
+
+    /// Curriculum: `difficulty:gens,difficulty:gens,…` (final segment may omit
+    /// length = rest of run). Implies `--maze` from the first stage.
+    #[arg(long, value_name = "SPEC")]
+    maze_stages: Option<String>,
+}
+
+fn parse_maze_lenient(s: &str) -> MazeDifficulty {
+    match MazeDifficulty::parse(s) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "warning: unknown --maze value '{s}', using medium. Valid: easy|medium|hard"
+            );
+            MazeDifficulty::Medium
         }
     }
-    // Maze toggle: `--maze` (default medium) or `--maze=easy|medium|hard`.
-    // GPU paths don't yet honour walls/LOS/masks, so combining `--maze` with
-    // `--gpu`/`--gpu-full` is rejected up-front to avoid misleading runs.
-    let maze_difficulty: Option<MazeDifficulty> = raw_args.iter().find_map(|a| {
-        if a == "--maze" {
-            Some(MazeDifficulty::Medium)
-        } else if let Some(val) = a.strip_prefix("--maze=") {
-            match MazeDifficulty::parse(val) {
-                Some(d) => Some(d),
-                None => {
-                    eprintln!(
-                        "warning: unknown --maze value '{val}', using medium. Valid: easy|medium|hard"
-                    );
-                    Some(MazeDifficulty::Medium)
-                }
+}
+
+fn parse_maze_stages(spec: &str) -> Vec<(MazeDifficulty, u64)> {
+    let mut out: Vec<(MazeDifficulty, u64)> = Vec::new();
+    let mut cum: u64 = 0;
+    let parts: Vec<&str> = spec.split(',').collect();
+    let last_idx = parts.len().saturating_sub(1);
+    for (i, p) in parts.iter().enumerate() {
+        let mut it = p.splitn(2, ':');
+        let diff_str = it.next().unwrap_or("");
+        let gens_str = it.next();
+        let diff = match MazeDifficulty::parse(diff_str) {
+            Some(d) => d,
+            None => {
+                eprintln!("warning: unknown stage difficulty '{diff_str}', skipping");
+                continue;
             }
+        };
+        let end_gen = if i == last_idx && gens_str.is_none() {
+            u64::MAX
         } else {
-            None
-        }
+            let n = gens_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(50);
+            cum = cum.saturating_add(n);
+            cum
+        };
+        out.push((diff, end_gen));
+    }
+    out
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let seed = cli.seed;
+    let max_gens = cli.max_gens;
+    let out_path = cli
+        .out_path
+        .unwrap_or_else(|| format!("run_seed{}.csv", seed));
+    let map_seed = cli.map_seed.unwrap_or(WORLD_MAP_SEED);
+    let mating_radius = cli.mating_radius.unwrap_or(MATING_RADIUS);
+    let initial_cells = cli.initial_cells.unwrap_or(INITIAL_CELLS);
+    let max_population = cli.max_population.unwrap_or(MAX_POPULATION);
+    let threads = cli.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     });
+
+    let shocks_mean_gens = cli.shocks_mean_gens;
+    let save_path = cli.save;
+    let load_path = cli.load;
+    let share_frac_override = cli.share_frac;
+    let kin_filter = cli.kin;
+    let pred_gain_override = cli.pred_gain;
+    let pred_drain_override = cli.pred_drain;
+    let food_mult_override = cli.food;
+    let maze_difficulty: Option<MazeDifficulty> = cli.maze.as_deref().map(parse_maze_lenient);
+    let maze_stages: Vec<(MazeDifficulty, u64)> = cli
+        .maze_stages
+        .as_deref()
+        .map(parse_maze_stages)
+        .unwrap_or_default();
+
     if maze_difficulty.is_some() {
         eprintln!(
             "info: --maze (Wave 7): full GPU parity — step wall collision, FieldGpu masked diffusion, sensor_gather LOS + whisker raycast, and hebbian eligibility traces (per-tick decay+accumulate + on-event trace-based reward apply) all run on-device."
         );
     }
-    // Wave 3 curriculum ramp: --maze-stages=easy:50,medium:100,hard
-    // Each segment is "difficulty:gens_in_segment". The final segment may omit
-    // its length (interpreted as "rest of run"). Implies --maze automatically
-    // (the first stage's difficulty seeds the initial obstacle field).
-    let maze_stages: Vec<(MazeDifficulty, u64)> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--maze-stages="))
-        .map(|spec| {
-            let mut out: Vec<(MazeDifficulty, u64)> = Vec::new();
-            let mut cum: u64 = 0;
-            let parts: Vec<&str> = spec.split(',').collect();
-            let last_idx = parts.len().saturating_sub(1);
-            for (i, p) in parts.iter().enumerate() {
-                let mut it = p.splitn(2, ':');
-                let diff_str = it.next().unwrap_or("");
-                let gens_str = it.next();
-                let diff = match MazeDifficulty::parse(diff_str) {
-                    Some(d) => d,
-                    None => {
-                        eprintln!("warning: unknown stage difficulty '{diff_str}', skipping");
-                        continue;
-                    }
-                };
-                let end_gen = if i == last_idx && gens_str.is_none() {
-                    u64::MAX
-                } else {
-                    let n = gens_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(50);
-                    cum = cum.saturating_add(n);
-                    cum
-                };
-                out.push((diff, end_gen));
-            }
-            out
-        })
-        .unwrap_or_default();
     if !maze_stages.is_empty() {
         eprintln!(
             "info: --maze-stages — same caveat as --maze (see startup info)."
@@ -152,44 +194,6 @@ fn main() {
     } else {
         maze_difficulty
     };
-    let args: Vec<String> = raw_args
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| !a.starts_with("--") && Some(*i) != consumed_value_idx)
-        .map(|(_, a)| a.clone())
-        .collect();
-    let seed: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let max_gens: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(500);
-    let out_path = args
-        .get(3)
-        .cloned()
-        .unwrap_or_else(|| format!("run_seed{}.csv", seed));
-    let map_seed: u64 = args
-        .get(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(WORLD_MAP_SEED);
-    let mating_radius: f32 = args
-        .get(5)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MATING_RADIUS);
-    // Sprint 43: positional override pro initial cells / max population /
-    // rayon thread count. Default zachovává pre-Sprint-43 chování.
-    let initial_cells: usize = args
-        .get(6)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(INITIAL_CELLS);
-    let max_population: usize = args
-        .get(7)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MAX_POPULATION);
-    let threads: usize = args
-        .get(8)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
 
     if threads > 0 {
         let _ = rayon::ThreadPoolBuilder::new()

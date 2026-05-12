@@ -2,12 +2,11 @@
 // implementace (variable-length loop + 3D forward + complexity factor) vs
 // zero-spike baseline (no inner spike loop, base predation gain only).
 //
-// Spuštění: `cargo bench --bench predate_gpu --features gpu`. Bez `gpu` feature
-// bench je no-op (criterion harness se zaregistruje, ale žádné test cases).
+// Spuštění: `cargo bench --bench predate_gpu`. Pokud na hostu není GPU adapter,
+// bench se skipne za běhu (runtime guard přes `GpuContext::new()`).
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-#[cfg(feature = "gpu")]
 mod gpu_bench {
     use super::*;
     use bioscape::gpu::{GpuContext, PredateGpu, PredateParamsGpu, SpatialHashGpu};
@@ -163,14 +162,8 @@ mod gpu_bench {
     }
 }
 
-#[cfg(feature = "gpu")]
 fn predate_benches(c: &mut Criterion) {
     gpu_bench::bench_predate(c);
-}
-
-#[cfg(not(feature = "gpu"))]
-fn predate_benches(_c: &mut Criterion) {
-    eprintln!("predate_gpu bench skipped: build without --features gpu");
 }
 
 criterion_group!(benches, predate_benches);
