@@ -646,6 +646,40 @@ impl Brain {
         }
     }
 
+    /// Sprint 138: row-wise L2 norm cap (synaptic scaling). For each `w1[i]`
+    /// and `w2[o]` row, if `||row||_2 > cap`, scale the row to `cap`. Bias
+    /// vectors are not touched. Mirrors `synaptic_scale.wgsl` for parity.
+    pub fn synaptic_scale(&mut self, cap: f32) {
+        let h_n = self.hidden_n as usize;
+        let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
+        let cap_sq = cap * cap;
+        for i in 0..h_n {
+            let mut sum_sq = 0.0_f32;
+            for j in 0..active_inputs {
+                sum_sq += self.w1[i][j] * self.w1[i][j];
+            }
+            if sum_sq > cap_sq {
+                let scale = cap / sum_sq.sqrt();
+                for j in 0..active_inputs {
+                    self.w1[i][j] *= scale;
+                }
+            }
+        }
+        for o in 0..BRAIN_OUTPUTS {
+            let row = &mut self.w2[o];
+            let mut sum_sq = 0.0_f32;
+            for j in 0..h_n {
+                sum_sq += row[j] * row[j];
+            }
+            if sum_sq > cap_sq {
+                let scale = cap / sum_sq.sqrt();
+                for j in 0..h_n {
+                    row[j] *= scale;
+                }
+            }
+        }
+    }
+
     pub fn mutate(&self, rng: &mut impl Rng, sigma: f32) -> Self {
         let mut out = *self;
         let h_n = self.hidden_n as usize;

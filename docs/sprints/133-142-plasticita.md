@@ -161,15 +161,23 @@ sigmas > 0) → seed-equivalentní pop diverguje od gen 1, expected.
 
 **Cíl:** zabránit weight explosion přes periodickou L2 renormalizaci row-wise.
 
-**Výstup:** _(po dokončení)_
+**Výstup:** params: `W_NORM_CAP = 8.0`, `SCALING_PERIOD_TICKS = 600`. CPU
+`Brain::synaptic_scale(cap)` (row-wise iter přes `w1`/`w2`, gating
+`sum_sq > cap²`, scale `row *= cap / sqrt(sum_sq)`, biases netknuty). Nový
+shader `shaders/synaptic_scale.wgsl` (per-cell single-thread loop přes
+hidden + output rows, share `brain_weights_buf` z `CellsGpu`). `SynapticScaleGpu`
+wrapper (2 bindings: uniform params + RW brain_weights), `with_context` /
+`dispatch(cells_gpu, n, cap)`. Re-export přes `gpu/mod.rs`. `GpuFullState`
+přidá `synaptic_scale: SynapticScaleGpu`; init v `init_gpu_full`. Trigger
+ve `tick` loop: `if clock.tick % SCALING_PERIOD_TICKS == 0 { gpu.synaptic_scale
+.dispatch(&gpu.cells, n, W_NORM_CAP); }` po `apply_episodic_novelty`.
+Lib testy 434 passed (1 ignored). Seed=0 2-gen smoke: pop 200→202→370,
+`weight_diversity_w1_norm` 16.4→17.8→17.9 (bounded vs S137 trajectory).
 
-**Poznámky:**
-- `SCALING_PERIOD_TICKS = 600` (~10 s @ 60 Hz). Pro každý cell, pro každý row
-  `w1[i]` (i `w2[o]`): pokud `||row||₂ > W_NORM_CAP` (8.0) → row ×= cap/norm.
-- CPU `Brain::synaptic_scale()` + GPU `synaptic_scale.wgsl` (per-cell 1
-  workgroup, sum-of-squares reduce + scale).
-- Trigger v tick loop (modulo SCALING_PERIOD_TICKS).
-- Parity GPU vs CPU ε=1e-4; CSV `w_norm_avg` bounded přes 50-gen single-seed.
+**Poznámky:** Storage limit hebbian shadery zůstává 6/7 z 12 (S137 stav);
+`synaptic_scale` je samostatný shader s vlastní bind-group, neovlivňuje
+hebbian limit. Trigger v tick 0 je no-op (init weights ≪ cap). 1500 cells
+× ~4400 ops/cell = ~6.6 M ops per scaling dispatch — sub-ms na GPU.
 
 ## Sprint 139 — intrinsic excitability (BCM-lite threshold drift)
 

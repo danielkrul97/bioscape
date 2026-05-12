@@ -105,3 +105,18 @@ pub const MAX_LEARNING_RATE: f32 = 0.02;
 /// `HEBBIAN_TRACE_DECAY_PER_SEC = 0.5` corresponds to a 2 s window.
 pub const MIN_TRACE_DECAY_PER_SEC: f32 = 0.1;
 pub const MAX_TRACE_DECAY_PER_SEC: f32 = 5.0;
+
+/// Sprint 138: homeostatic synaptic scaling cap. Each `SCALING_PERIOD_TICKS`
+/// we walk every cell's `w1` and `w2` row by row; rows whose L2 norm
+/// exceeds `W_NORM_CAP` are scaled back to the cap. Pre-S138 Hebbian-only
+/// runs let `||w1[i]||_2` drift past 20 on aggressive reward streaks,
+/// saturating tanh and locking the brain in a single action. Cap chosen
+/// well above gen-0 random init norm (≈ 2–3 with `sigma_brain = 0.2`) so
+/// healthy weight growth isn't clipped — only runaway accumulation is.
+pub const W_NORM_CAP: f32 = 8.0;
+
+/// Sprint 138: 600 ticks ≈ 10 s @ 60 Hz. Hebbian's trace eligibility
+/// window is ~2 s, so 10 s gives selection-driven weights a chance to
+/// settle between scaling passes; smaller periods would clip Hebbian
+/// gains before they're consolidated.
+pub const SCALING_PERIOD_TICKS: u64 = 600;

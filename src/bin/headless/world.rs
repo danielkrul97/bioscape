@@ -31,6 +31,7 @@ use bioscape::{
         FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, HebbianGpu,
         MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
         SensorGatherGpu, SensorParamsGpu, SpatialHashGpu, StepGpu, StepParamsGpu,
+        SynapticScaleGpu,
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BOND_FORMED_REWARD_MAGNITUDE, BRAIN_INPUTS_SENSORY,
     BRAIN_OUTPUTS, CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN,
@@ -38,7 +39,8 @@ use bioscape::{
     ESCAPE_REWARD_MAGNITUDE, ESCAPE_STREAK_THRESHOLD, FlushMode, GRAVITY as PHYS_GRAVITY,
     MATING_REWARD_MAGNITUDE, PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
     PREDATION_REWARD_MAX, PREDATION_REWARD_SCALE, RewardAccumulator, RewardKind,
-    SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
+    SCALING_PERIOD_TICKS, SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC,
+    THERMAL_NOISE, W_NORM_CAP,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -352,6 +354,11 @@ pub struct GpuFullState {
     /// materialise child brain weights directly into `cells.brain_weights_buf`,
     /// skipping per-child CPU `Brain::from_cppn`.
     pub cppn: CppnGpu,
+    /// Sprint 138: homeostatic synaptic scaling. Dispatched every
+    /// `SCALING_PERIOD_TICKS` against `cells.brain_weights_buf` so runaway
+    /// Hebbian growth doesn't saturate tanh and lock the brain into a
+    /// single action over a long lineage.
+    pub synaptic_scale: SynapticScaleGpu,
     /// Persistent CPU snapshots — reused per tick, zachovává kapacitu.
     pub scratch: GpuFullScratch,
 }
@@ -630,6 +637,7 @@ impl World {
             [WORLD_HALF[0], WORLD_HALF[1]],
         )?;
         let cppn = CppnGpu::with_context(&ctx, cap);
+        let synaptic_scale = SynapticScaleGpu::with_context(&ctx)?;
         // GPU eat_food candidate selection. `food_capacity` matches the
         // worst-case live food count = `food_target(1 + CYCLE_AMPLITUDE)`
         // padded by max_population (carrion drops), already computed as
@@ -673,6 +681,7 @@ impl World {
             motor,
             step,
             cppn,
+            synaptic_scale,
             scratch: GpuFullScratch::default(),
         });
 
@@ -971,6 +980,15 @@ impl World {
         // (independent of maze toggle); for a homogeneous world this rewards
         // any exploration. Helps cells break out of local minima.
         self.apply_episodic_novelty();
+        // Sprint 138: periodic homeostatic synaptic scaling. Runs after the
+        // tick's Hebbian dispatches so this period's weight growth gets
+        // capped before the next decay window opens.
+        if self.clock.tick % SCALING_PERIOD_TICKS == 0 {
+            if let Some(gpu) = self.gpu_full.as_ref() {
+                let n = self.cells.len();
+                gpu.synaptic_scale.dispatch(&gpu.cells, n, W_NORM_CAP);
+            }
+        }
         // Maze navigation tracker — no-op when obstacles is None, so the
         // homogeneous-world tick stays byte-identical with pre-maze runs.
         self.track_goal_metrics();

@@ -29,6 +29,7 @@ mod sensor_gather;
 mod spatial_hash;
 mod stats;
 mod step;
+mod synaptic_scale;
 
 #[cfg(test)]
 mod tests;
@@ -52,3 +53,4 @@ pub use sensor_gather::*;
 pub use spatial_hash::*;
 pub use stats::*;
 pub use step::*;
+pub use synaptic_scale::*;
