@@ -3074,7 +3074,8 @@ impl World {
             .enumerate()
             .filter(|(_, c)| {
                 let f = freq.get(&c.lineage_id).copied().unwrap_or(0.0);
-                let scaled = REPRODUCE_THRESHOLD * (1.0 + bioscape::LINEAGE_DIVERSITY_ALPHA * f);
+                let scaled =
+                    REPRODUCE_THRESHOLD * (1.0 + bioscape::LINEAGE_DIVERSITY_ALPHA * f * f);
                 c.energy >= scaled
                     && c.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
                     && c.reproduce_cooldown_ticks == 0

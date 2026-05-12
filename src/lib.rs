@@ -211,12 +211,14 @@ pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.04;
 /// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál pro
 /// bonding — fitness payoff přímo přes food share.
 pub const BOND_FOOD_SHARE_FRAC: f32 = 2.5;
-/// Negative frequency-dependent selection na reprodukci. `reproduce_threshold`
-/// = REPRODUCE_THRESHOLD × (1 + α × lineage_freq), kde lineage_freq je
-/// fraction of population sharing daný lineage_id. α=0.5 → monoculture lineage
-/// (freq=1.0) potřebuje 1.5× energie na reprodukci, vzácné lineages baseline.
-/// Stabilizační síla proti diversity collapse bez hard caps.
-pub const LINEAGE_DIVERSITY_ALPHA: f32 = 0.5;
+/// Negative frequency-dependent selection na reprodukci. Sprint 143:
+/// kvadratická penalty místo lineární — `threshold = REPRODUCE_THRESHOLD ×
+/// (1 + α × lineage_freq²)`. Quadratic exponent zaměřuje penalty na
+/// dominantní lineages (freq → 1.0 → 3.0× threshold) a nechává vzácné
+/// near-baseline (freq=0.1 → 1.02×). Pre-S143 měl α=0.5 + lineární — 150-gen
+/// validation ukázal collapse na 2 lineages od gen 30, takže penalty
+/// tightened: α 0.5 → 2.0 + lineární → kvadratická.
+pub const LINEAGE_DIVERSITY_ALPHA: f32 = 2.0;
 /// Sprint 87: cluster-size bonus pro food share fraction. Per-partner share =
 /// `FRAC × (1 + (n_bonds − 1) × BONUS) × donor_state`. Cells hluboko v tkáni
 /// (víc bondů) sdílí každému partnerovi vyšší podíl — empirie ze 300-gen

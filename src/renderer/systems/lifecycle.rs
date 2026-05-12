@@ -54,7 +54,7 @@ pub(crate) fn cell_reproduces_on_threshold(
             .filter(|(_, c)| {
                 let f = lineage_freq.get(&c.0.lineage_id).copied().unwrap_or(0.0);
                 let scaled =
-                    REPRODUCE_THRESHOLD * (1.0 + bioscape::LINEAGE_DIVERSITY_ALPHA * f);
+                    REPRODUCE_THRESHOLD * (1.0 + bioscape::LINEAGE_DIVERSITY_ALPHA * f * f);
                 c.0.energy >= scaled
                     && c.0.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
                     && c.0.reproduce_cooldown_ticks == 0
