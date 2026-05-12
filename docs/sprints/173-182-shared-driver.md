@@ -179,14 +179,37 @@ lifecycle,physics}.rs` zůstává v tree pro reference + safety net
 (může se vrátit user wants direct ECS pipeline back). Mass delete
 odložené do 183+ "renderer surface cleanup" sprint.
 
-## Sprint 182 — Decade retro + 183+ outline
+## Sprint 182 — Decade retro
 
-**Cíl:** retrospektiva.
+**Co bylo doručeno (S173-S178):**
+- S173: `World` extracted to `bioscape::sim::World` (3309 LOC).
+- S174: `SimWorld` Bevy Resource newtype + `SimRng` RNG.
+- S175: World instantiation v renderer setup s GPU init.
+- S176: `sim_tick` system volá `world.tick(rng)` per FixedUpdate.
+- S177: `sync_simworld_to_cellentity` SimWorld → CellEntity copy.
+- S178: legacy renderer tick systems unscheduled (25+ → 6 systems
+  v FixedUpdate chain).
 
-**Plán:** decade retro v tomto souboru. Outline 183+ work: per-cell
-STDP evolution (S171 deferred z 163-172), longer-run stability
-validation, dendritic compartments, multi-channel STDP, replicate
-runs pro statistical confidence.
+**Klíčový architectural milestone:** renderer + headless mají identický
+sim backend (`bioscape::sim::World::tick`). Plasticity sprints 133-172
+automaticky viditelné v rendereru. Budoucí plasticity work mění ONE
+místo a oba binárky to vidí.
+
+**Scope-cuts (deferred to 183+):**
+- S179 performance profiling.
+- S180 byte-identical headless ↔ renderer parity test.
+- S181 mass dead-code deletion (~2000 LOC nepoužitých renderer
+  systems v `src/renderer/systems/*.rs`).
+
+**Doporučení pro 183+:**
+1. Mass delete dead renderer system files.
+2. Consolidate dual wgpu instances (Bevy + SimWorld) přes
+   `RenderDevice` Resource sharing — odstraní 2× GPU memory hit.
+3. CSV dump z rendereru pro parity validation s headless.
+4. Resume plasticity research: replicate runs ≥5 per seed pro
+   statistical confidence on STDP findings, longer-run stability
+   (200+ gen), per-cell evolved STDP params (S171 deferred z
+   153-162).
 
 ## Velká varování pro desítku
 
