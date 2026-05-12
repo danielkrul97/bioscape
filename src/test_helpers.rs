@@ -40,6 +40,8 @@ pub fn dummy_genome() -> Genome {
         sensor_gains: [0.0; N_SENSOR_CATEGORIES],
         brain: dummy_brain(),
         cppn: default_cppn(),
+        learning_rate: LEARNING_RATE,
+        trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
     }
 }
 
@@ -69,6 +71,8 @@ pub fn zero_cfg() -> MutationConfig {
         sigma_spike_orientation: 0.0,
         sigma_spike_complexity: 0.0,
         sigma_spike_length_secondary: 0.0,
+        sigma_learning_rate: 0.0,
+        sigma_trace_decay: 0.0,
     }
 }
 

@@ -45,6 +45,12 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // Newly activated non-primary spike slots start at length = 0; this
     // sigma drives them away from zero. Same magnitude as `sigma_spike_length`.
     sigma_spike_length_secondary: 0.03,
+    // Sprint 136 ships per-cell `learning_rate` / `trace_decay_per_sec` as
+    // genome fields but leaves drift off — default sigmas = 0 keep the RNG
+    // sequence and behaviour byte-identical with pre-S136 runs. Sprint 137
+    // turns the drift on once the GPU dispatch can consume per-cell rates.
+    sigma_learning_rate: 0.0,
+    sigma_trace_decay: 0.0,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -100,6 +106,13 @@ pub struct MutationConfig {
     /// `sigma_spike_length`. When 0, non-primary slots only ever drift via
     /// activation/deactivation through `spike_count_mutation_rate`.
     pub sigma_spike_length_secondary: f32,
+    /// Sprint 136: gaussian sigma for per-cell `learning_rate`. When 0, the
+    /// rate is inherited verbatim — no RNG draw, byte-identical with the
+    /// pre-S136 baseline that read `LEARNING_RATE` const at every call site.
+    pub sigma_learning_rate: f32,
+    /// Sprint 136: gaussian sigma for per-cell `trace_decay_per_sec`. Same
+    /// gating: 0 = no drift, no RNG draw.
+    pub sigma_trace_decay: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -154,6 +167,17 @@ pub struct Genome {
     /// is inherited.
     #[serde(default = "default_cppn")]
     pub cppn: Cppn,
+    /// Sprint 136: per-cell Hebbian learning rate. Replaces the global
+    /// `LEARNING_RATE` const at every CPU call site (S137 plumbs the GPU
+    /// dispatch too). Serde default to the pre-S136 global keeps older
+    /// checkpoints loading at the legacy uniform rate.
+    #[serde(default = "default_learning_rate")]
+    pub learning_rate: f32,
+    /// Sprint 136: per-cell eligibility-trace decay (1/s). Replaces
+    /// `HEBBIAN_TRACE_DECAY_PER_SEC` at CPU call sites; same checkpoint-
+    /// compat story as `learning_rate`.
+    #[serde(default = "default_trace_decay_per_sec")]
+    pub trace_decay_per_sec: f32,
 }
 
 pub fn default_cppn() -> Cppn {
@@ -187,6 +211,14 @@ pub fn default_spikes() -> [Spike; SPIKE_SLOTS] {
 
 pub fn default_spike_count() -> u8 {
     1
+}
+
+pub fn default_learning_rate() -> f32 {
+    LEARNING_RATE
+}
+
+pub fn default_trace_decay_per_sec() -> f32 {
+    HEBBIAN_TRACE_DECAY_PER_SEC
 }
 
 impl Genome {
@@ -234,6 +266,11 @@ impl Genome {
             ],
             brain,
             cppn,
+            // Sprint 136: seed at the pre-S136 global so a fresh population
+            // matches the constant-rate baseline byte-for-byte until
+            // `sigma_learning_rate` / `sigma_trace_decay` activate.
+            learning_rate: LEARNING_RATE,
+            trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
         }
     }
 
@@ -364,6 +401,21 @@ impl Genome {
             },
             cppn: mutated_cppn,
             brain: Brain::zeros(),
+            // Sprint 136: per-cell rate drift gated by sigma > 0 short-circuit
+            // (same pattern as `vision_fov` in S82) — sigma = 0 default means
+            // no RNG draw and no behavior change vs the pre-S136 baseline.
+            learning_rate: if cfg.sigma_learning_rate > 0.0 {
+                (self.learning_rate + gaussian(rng) * cfg.sigma_learning_rate)
+                    .clamp(MIN_LEARNING_RATE, MAX_LEARNING_RATE)
+            } else {
+                self.learning_rate
+            },
+            trace_decay_per_sec: if cfg.sigma_trace_decay > 0.0 {
+                (self.trace_decay_per_sec + gaussian(rng) * cfg.sigma_trace_decay)
+                    .clamp(MIN_TRACE_DECAY_PER_SEC, MAX_TRACE_DECAY_PER_SEC)
+            } else {
+                self.trace_decay_per_sec
+            },
         }
     }
 
@@ -470,6 +522,23 @@ impl Genome {
             },
             brain: Brain::zeros(),
             cppn: child_cppn,
+            // Sprint 136: same-value short-circuit so populations seeded at
+            // the pre-S136 uniform rate (both parents = LEARNING_RATE) keep
+            // the RNG sequence stable. Only diverged lineages consume a draw.
+            learning_rate: if a.learning_rate == b.learning_rate {
+                a.learning_rate
+            } else if rng.random::<bool>() {
+                a.learning_rate
+            } else {
+                b.learning_rate
+            },
+            trace_decay_per_sec: if a.trace_decay_per_sec == b.trace_decay_per_sec {
+                a.trace_decay_per_sec
+            } else if rng.random::<bool>() {
+                a.trace_decay_per_sec
+            } else {
+                b.trace_decay_per_sec
+            },
         }
     }
 }

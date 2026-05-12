@@ -1993,11 +1993,13 @@ impl World {
             }
             let last_hidden = cell.last_hidden;
             let last_outputs = cell.last_outputs;
+            // Sprint 136: per-cell learning rate replaces the global const.
+            let lr = cell.genome.learning_rate;
             cell.genome.brain.hebbian_apply_reward(
                 &last_hidden,
                 &last_outputs,
                 NOVELTY_REWARD_MAGNITUDE,
-                LEARNING_RATE,
+                lr,
             );
         });
     }
@@ -2779,13 +2781,15 @@ impl World {
                 let cell = &mut self.cells[cell_idx];
                 let last_hidden = cell.last_hidden;
                 let last_outputs = cell.last_outputs;
+                // Sprint 136: per-cell learning rate.
+                let lr = cell.genome.learning_rate;
                 // Wave 3: trace-based reward — credits motor outputs from up
                 // to ~120 ticks back, not just this tick's pre·post.
                 cell.genome.brain.hebbian_apply_reward(
                     &last_hidden,
                     &last_outputs,
                     1.0,
-                    LEARNING_RATE,
+                    lr,
                 );
             }
         }

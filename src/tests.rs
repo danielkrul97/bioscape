@@ -64,6 +64,8 @@ fn dummy_genome() -> Genome {
         sensor_gains: [0.0; N_SENSOR_CATEGORIES],
         brain: dummy_brain(),
         cppn: default_cppn(),
+        learning_rate: LEARNING_RATE,
+        trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
     }
 }
 
@@ -93,6 +95,8 @@ fn zero_cfg() -> MutationConfig {
         sigma_spike_orientation: 0.0,
         sigma_spike_complexity: 0.0,
         sigma_spike_length_secondary: 0.0,
+        sigma_learning_rate: 0.0,
+        sigma_trace_decay: 0.0,
     }
 }
 
@@ -131,6 +135,8 @@ fn mutation_with_zero_sigma_is_identity() {
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         },
         cppn: default_cppn(),
+        learning_rate: LEARNING_RATE,
+        trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
     };
     let m = g.mutate(&mut rng, &zero_cfg());
     assert_eq!(m.max_speed, 50.0);
@@ -178,6 +184,8 @@ fn mutation_keeps_genes_in_valid_ranges() {
         sigma_spike_orientation: 10.0,
         sigma_spike_complexity: 10.0,
         sigma_spike_length_secondary: 10.0,
+        sigma_learning_rate: 10.0,
+        sigma_trace_decay: 10.0,
     };
     for _ in 0..1000 {
         let m = g.mutate(&mut rng, &cfg);
@@ -1142,6 +1150,8 @@ fn crossover_picks_genes_from_either_parent() {
         sensor_gains: [MIN_SENSOR_GAIN; N_SENSOR_CATEGORIES],
         brain: dummy_brain(),
         cppn: default_cppn(),
+        learning_rate: LEARNING_RATE,
+        trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
     };
     let b = Genome {
         max_speed: 90.0,
@@ -1167,6 +1177,8 @@ fn crossover_picks_genes_from_either_parent() {
         sensor_gains: [MAX_SENSOR_GAIN; N_SENSOR_CATEGORIES],
         brain: dummy_brain(),
         cppn: default_cppn(),
+        learning_rate: LEARNING_RATE,
+        trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
     };
     for _ in 0..100 {
         let c = Genome::crossover(&a, &b, &mut rng);
@@ -1995,6 +2007,8 @@ fn shell_mutation_clamps_to_range() {
         sigma_spike_orientation: 0.0,
         sigma_spike_complexity: 0.0,
         sigma_spike_length_secondary: 0.0,
+        sigma_learning_rate: 0.0,
+        sigma_trace_decay: 0.0,
     };
     for _ in 0..1000 {
         let m = g.mutate(&mut rng, &cfg);

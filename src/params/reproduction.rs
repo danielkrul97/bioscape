@@ -91,3 +91,17 @@ pub const BOND_FORMED_REWARD_MAGNITUDE: f32 = 0.2;
 /// principal evolutionary signal, and pre-S135 it had no per-lifetime
 /// Hebbian credit at all.
 pub const MATING_REWARD_MAGNITUDE: f32 = 0.5;
+
+/// Sprint 136: per-cell evolvable learning rate range. Below the min a
+/// lineage's Hebbian apply is a no-op; above the max the trace-amplified
+/// `Δw` saturates the weight magnitudes within a few reward events. Default
+/// `LEARNING_RATE = 0.005` sits in the middle so neutral drift goes either way.
+pub const MIN_LEARNING_RATE: f32 = 0.0;
+pub const MAX_LEARNING_RATE: f32 = 0.02;
+
+/// Sprint 136: per-cell evolvable eligibility-trace decay range, in
+/// `1 / second`. Lower decay = longer credit-assignment window (slower
+/// forget), higher decay = sharper attribution. Default
+/// `HEBBIAN_TRACE_DECAY_PER_SEC = 0.5` corresponds to a 2 s window.
+pub const MIN_TRACE_DECAY_PER_SEC: f32 = 0.1;
+pub const MAX_TRACE_DECAY_PER_SEC: f32 = 5.0;

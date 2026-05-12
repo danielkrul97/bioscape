@@ -36,12 +36,14 @@ pub(crate) fn apply_eligibility_step(
         let last_inputs = cell.0.last_inputs;
         let last_hidden = cell.0.last_hidden;
         let last_outputs = cell.0.last_outputs;
+        // Sprint 136: per-cell trace decay replaces the global const.
+        let decay = cell.0.genome.trace_decay_per_sec;
         cell.0.genome.brain.hebbian_step(
             &last_inputs,
             &last_hidden,
             &last_outputs,
             dt,
-            bioscape::HEBBIAN_TRACE_DECAY_PER_SEC,
+            decay,
         );
     });
 }
@@ -98,12 +100,14 @@ pub(crate) fn apply_episodic_novelty(
         }
         let last_hidden = cell.0.last_hidden;
         let last_outputs = cell.0.last_outputs;
+        // Sprint 136: per-cell learning rate.
+        let lr = cell.0.genome.learning_rate;
         // Wave 3: trace-based reward.
         cell.0.genome.brain.hebbian_apply_reward(
             &last_hidden,
             &last_outputs,
             bioscape::NOVELTY_REWARD_MAGNITUDE,
-            bioscape::LEARNING_RATE,
+            lr,
         );
     });
 }

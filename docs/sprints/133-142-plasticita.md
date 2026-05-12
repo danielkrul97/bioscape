@@ -109,15 +109,24 @@ canonical pro plasticity sprinty 133-141; renderer mirror v S141 retro.
 + `trace_decay_per_sec ∈ [0.1, 5.0]` v Genome; mutate + crossover; CPU
 hebbian call sites zaměnit globální konstanty za per-cell hodnoty.
 
-**Výstup:** _(po dokončení)_
+**Výstup:** nové bounds v `params/reproduction.rs`: `MIN/MAX_LEARNING_RATE`,
+`MIN/MAX_TRACE_DECAY_PER_SEC`. `Genome` rozšířen o `learning_rate: f32`,
+`trace_decay_per_sec: f32` (serde default na globální konstanty pro
+backward-compat). `MutationConfig` rozšířen o `sigma_learning_rate`,
+`sigma_trace_decay` (default 0 v `MUTATION_CONFIG`). `Genome::random`,
+`mutate_no_brain` (sigma > 0 short-circuit pattern jako S82 `vision_fov`),
+`crossover` (same-value short-circuit). CPU hebbian call sites
+(`world.rs:1996, 2784`, `renderer/systems/brains.rs:39, 102`) čtou per-cell
+hodnoty z `cell.genome`. GPU sites zatím dál uniform `LEARNING_RATE` (S137
+plumbe per-cell). Test fixtures (tests.rs × 4 sites, tests_phase2.rs × 1)
+aktualizovány. Lib testy 434 passed (1 ignored). Seed=0 1-gen smoke
+byte-identical s S135 baseline (CPU paths dead code v `--gpu-full`, GPU
+path unchanged).
 
-**Poznámky:**
-- Sigma fields: `sigma_learning_rate = 0.001`, `sigma_trace_decay = 0.05`.
-- Default v S136: `sigma_learning_rate = 0` → seed=42 30-gen byte-identical.
-- Mutate short-circuit pattern (jako Sprint 82 `vision_fov`): RNG draws **jen
-  pokud sigma > 0** → byte-identical baseline.
-- `world.rs:2703` (CPU call site) zaměnit `LEARNING_RATE` const za
-  `cell.genome.learning_rate`. Hebbian step decay totéž.
+**Poznámky:** Sigmas zůstávají `0.0` v S136 default — drift se aktivuje
+spolu s GPU plumbingem v S137 (`sigma_learning_rate = 0.001`,
+`sigma_trace_decay = 0.05`). Run-to-run pop variance při ≥2 gen pozorována
+už od S134 (multi-dispatch round-off / rayon noise), ne S136-specific.
 
 ## Sprint 137 — GPU per-cell rates
 
