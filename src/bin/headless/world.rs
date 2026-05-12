@@ -34,8 +34,9 @@ use bioscape::{
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
     CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT,
-    DRAG_COEFFICIENT, GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
-    SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
+    DRAG_COEFFICIENT, FlushMode, GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN,
+    PLANT_FOOD_VALUE, RewardAccumulator, RewardKind, SHELL_COST_PER_SEC,
+    SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -1965,15 +1966,17 @@ impl World {
         if self.gpu_full.is_some() {
             // Decide novelty per cell first (read-only on cell state); then
             // apply rewards via the GPU dispatch in one pass.
-            let mut rewards: Vec<f32> = vec![0.0; self.cells.len()];
+            let mut acc = RewardAccumulator::with_capacity(self.cells.len() / 8);
             for (i, cell) in self.cells.iter_mut().enumerate() {
                 let v = Cell::novelty_voxel_index(cell.position, half);
                 if cell.check_novelty(v) {
-                    rewards[i] = NOVELTY_REWARD_MAGNITUDE;
+                    acc.push(i, RewardKind::Novelty, NOVELTY_REWARD_MAGNITUDE);
                 }
             }
-            if rewards.iter().any(|&r| r != 0.0) {
+            if !acc.is_empty() {
                 let n = self.cells.len();
+                let mut rewards: Vec<f32> = vec![0.0; n];
+                acc.flush_to(&mut rewards, FlushMode::Replace);
                 let gpu = self.gpu_full.as_ref().unwrap();
                 gpu.cells.upload_rewards(&rewards);
                 gpu.hebbian
@@ -2526,8 +2529,10 @@ impl World {
         // scratch (built v `tick` start, cells layout v eat_food beze změny).
         let id_to_idx = &self.id_to_idx_scratch;
 
-        // GPU Hebbian is the only path post wave N.
-        let mut rewards: Vec<f32> = vec![0.0; self.cells.len()];
+        // GPU Hebbian is the only path post wave N. Sprint 133 routes eat
+        // events through `RewardAccumulator`; the rewards vec is materialised
+        // just before dispatch.
+        let mut acc = RewardAccumulator::with_capacity(self.cells.len() / 8);
         let use_gpu_hebbian = true;
 
         // Pass 1 (GPU): per-cell candidate selection. Sentinel `num_foods`
@@ -2675,7 +2680,7 @@ impl World {
                     }
                 }
                 if use_gpu_hebbian {
-                    rewards[cell_idx] = 1.0;
+                    acc.push(cell_idx, RewardKind::EatFood, 1.0);
                 } else {
                     ate_cell_indices.push(cell_idx);
                 }
@@ -2717,13 +2722,17 @@ impl World {
         // shadow that `dispatch_step_persistent` has been decaying+
         // accumulating since the last reward event. CPU `cell.genome.brain`
         // is NOT updated; sync happens at `reproduce` via `download_brain_at`.
+        //
+        // Sprint 133: unconditional dispatch preserved (matches pre-S133 even
+        // when no cell ate this tick — shader early-exits on `reward == 0`).
         if use_gpu_hebbian {
             let n = self.cells.len();
+            let mut rewards: Vec<f32> = vec![0.0; n];
+            acc.flush_to(&mut rewards, FlushMode::Replace);
             let gpu = self.gpu_full.as_ref().unwrap();
             gpu.cells.upload_rewards(&rewards);
             gpu.hebbian.dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
         }
-        let _ = rewards;
     }
 
     /// GPU rejection sampling — generates K = budget × MAX_SPAWN_ATTEMPTS
