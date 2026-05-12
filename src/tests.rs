@@ -3097,6 +3097,58 @@ fn izhikevich_strong_input_drives_spiking_over_multiple_ticks() {
 }
 
 #[test]
+fn stdp_apply_ltp_when_pre_before_post() {
+    // Sprint 155: correlated firing — input 3 spikes at tick 100, hidden 5
+    // spikes shortly after at tick 102. Pre-trace at tick 102 is still
+    // positive → w1[5][3] should grow.
+    let mut brain = dummy_brain();
+    let tau = 5.0_f32;
+    let a_plus = 0.01;
+    let a_minus = 0.01;
+    let w_before = brain.w1[5][3];
+
+    brain.last_pre_spike_ticks[3] = 100;
+    brain.stdp_step(100, tau);
+    brain.stdp_step(101, tau);
+    brain.last_post_spike_ticks[5] = 102;
+    brain.stdp_step(102, tau);
+    brain.stdp_apply(102, a_plus, a_minus);
+
+    assert!(
+        brain.w1[5][3] > w_before,
+        "LTP expected: w1 grew from {} to {}",
+        w_before,
+        brain.w1[5][3]
+    );
+}
+
+#[test]
+fn stdp_apply_ltd_when_post_before_pre() {
+    // Sprint 155: anti-correlated — hidden 5 spikes at tick 100, input 3
+    // fires at tick 102. Post-trace at tick 102 is positive → w1[5][3]
+    // should shrink.
+    let mut brain = dummy_brain();
+    let tau = 5.0_f32;
+    let a_plus = 0.01;
+    let a_minus = 0.01;
+    let w_before = brain.w1[5][3];
+
+    brain.last_post_spike_ticks[5] = 100;
+    brain.stdp_step(100, tau);
+    brain.stdp_step(101, tau);
+    brain.last_pre_spike_ticks[3] = 102;
+    brain.stdp_step(102, tau);
+    brain.stdp_apply(102, a_plus, a_minus);
+
+    assert!(
+        brain.w1[5][3] < w_before,
+        "LTD expected: w1 shrank from {} to {}",
+        w_before,
+        brain.w1[5][3]
+    );
+}
+
+#[test]
 fn stdp_step_decays_traces_and_records_spikes() {
     // Sprint 154: trace decays each tick by exp(-1/tau); when a spike-time
     // matches the current tick, the trace gets +1.0. Verified on a

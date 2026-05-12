@@ -892,6 +892,40 @@ impl Brain {
         }
     }
 
+    /// Sprint 155: classical pair-based STDP rule. Walks every spike that
+    /// happened this tick and updates the relevant `w1` synapses via
+    /// per-neuron traces:
+    /// - LTP: a post-spike at hidden neuron h reaches back via `pre_trace[i]`
+    ///   for every input i (large trace = pre fired recently → strengthen).
+    /// - LTD: a pre-spike at input i reaches forward via `post_trace[h]`
+    ///   for every hidden h (post fired recently → pre was late, weaken).
+    /// Iterates only `[0..hidden_n]` (S80 dead zone), so split-link grown
+    /// brains pay only for their active synapses. STDP only modifies `w1`
+    /// (input → hidden); `w2` keeps its rate-Hebbian path from S133.
+    pub fn stdp_apply(&mut self, tick: u32, a_plus: f32, a_minus: f32) {
+        let h_n = self.hidden_n as usize;
+        // LTP path: any hidden neuron that spiked this tick gets all of its
+        // input weights nudged up by `a_plus × pre_trace[i]`.
+        for h in 0..h_n {
+            if self.last_post_spike_ticks[h] != tick {
+                continue;
+            }
+            for j in 0..BRAIN_INPUTS {
+                self.w1[h][j] += a_plus * self.pre_trace[j];
+            }
+        }
+        // LTD path: any input that spiked this tick weakens its outgoing
+        // synapses by `a_minus × post_trace[h]` for each post neuron.
+        for j in 0..BRAIN_INPUTS {
+            if self.last_pre_spike_ticks[j] != tick {
+                continue;
+            }
+            for h in 0..h_n {
+                self.w1[h][j] -= a_minus * self.post_trace[h];
+            }
+        }
+    }
+
     /// Sprint 138: row-wise L2 norm cap (synaptic scaling). For each `w1[i]`
     /// and `w2[o]` row, if `||row||_2 > cap`, scale the row to `cap`. Bias
     /// vectors are not touched. Mirrors `synaptic_scale.wgsl` for parity.
