@@ -30,8 +30,8 @@ use bioscape::{
         BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, EatFoodGpu, EatFoodParamsGpu,
         FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, HebbianGpu,
         MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
-        SensorGatherGpu, SensorParamsGpu, SpatialHashGpu, StepGpu, StepParamsGpu,
-        SynapticScaleGpu,
+        ExcitabilityGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu, StepGpu,
+        StepParamsGpu, SynapticScaleGpu,
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BOND_FORMED_REWARD_MAGNITUDE, BRAIN_INPUTS_SENSORY,
     BRAIN_OUTPUTS, CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN,
@@ -39,8 +39,8 @@ use bioscape::{
     ESCAPE_REWARD_MAGNITUDE, ESCAPE_STREAK_THRESHOLD, FlushMode, GRAVITY as PHYS_GRAVITY,
     MATING_REWARD_MAGNITUDE, PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
     PREDATION_REWARD_MAX, PREDATION_REWARD_SCALE, RewardAccumulator, RewardKind,
-    SCALING_PERIOD_TICKS, SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC,
-    THERMAL_NOISE, W_NORM_CAP,
+    ACTIVITY_EMA_ALPHA, EXCITABILITY_DRIFT_PER_TICK, SCALING_PERIOD_TICKS, SHELL_COST_PER_SEC,
+    SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE, W_NORM_CAP,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -359,6 +359,12 @@ pub struct GpuFullState {
     /// Hebbian growth doesn't saturate tanh and lock the brain into a
     /// single action over a long lineage.
     pub synaptic_scale: SynapticScaleGpu,
+    /// Sprint 139: intrinsic excitability regulator. Per-tick linear
+    /// drift of `b1[h]` toward `-DRIFT × activity_avg[h]`, where
+    /// `activity_avg` is a per-cell, per-neuron signed EMA of `last_hidden`.
+    /// Pulls saturated neurons back into the responsive tanh zone without
+    /// disturbing the Hebbian weight matrix.
+    pub excitability: ExcitabilityGpu,
     /// Persistent CPU snapshots — reused per tick, zachovává kapacitu.
     pub scratch: GpuFullScratch,
 }
@@ -638,6 +644,7 @@ impl World {
         )?;
         let cppn = CppnGpu::with_context(&ctx, cap);
         let synaptic_scale = SynapticScaleGpu::with_context(&ctx)?;
+        let excitability = ExcitabilityGpu::with_context(&ctx, cap)?;
         // GPU eat_food candidate selection. `food_capacity` matches the
         // worst-case live food count = `food_target(1 + CYCLE_AMPLITUDE)`
         // padded by max_population (carrion drops), already computed as
@@ -682,6 +689,7 @@ impl World {
             step,
             cppn,
             synaptic_scale,
+            excitability,
             scratch: GpuFullScratch::default(),
         });
 
@@ -959,6 +967,16 @@ impl World {
                 n,
                 dt,
                 bioscape::HEBBIAN_TRACE_DECAY_PER_SEC,
+            );
+            // Sprint 139: per-tick excitability regulator. Reads
+            // `last_hidden` (already populated by brain_act above), updates
+            // its private activity EMA buffer, and slides `b1` slots of
+            // `cells.brain_weights_buf` toward the responsive tanh zone.
+            gpu.excitability.dispatch(
+                &gpu.cells,
+                n,
+                ACTIVITY_EMA_ALPHA,
+                EXCITABILITY_DRIFT_PER_TICK,
             );
         }
         timed!(emit_pheromones, self.emit_pheromones(dt));

@@ -120,3 +120,17 @@ pub const W_NORM_CAP: f32 = 8.0;
 /// settle between scaling passes; smaller periods would clip Hebbian
 /// gains before they're consolidated.
 pub const SCALING_PERIOD_TICKS: u64 = 600;
+
+/// Sprint 139: signed-EMA blend factor for per-neuron activity tracking.
+/// `0.01` gives an effective window of ~100 ticks (~1.7 s @ 60 Hz) — long
+/// enough to filter motor-output bursts but short enough that selection
+/// can still drive activity-bias divergence within a generation.
+pub const ACTIVITY_EMA_ALPHA: f32 = 0.01;
+
+/// Sprint 139: linear excitability regulator gain. Per tick we shift each
+/// hidden neuron's bias by `−DRIFT · activity_avg`, pushing the EMA toward
+/// zero. With `activity_avg ∈ [−1, +1]` and `DRIFT = 0.001`, the
+/// per-tick adjustment is bounded by `±0.001` and the time constant is
+/// ~1000 ticks (~16 s). Slow enough that Hebbian learning consolidates
+/// before homeostasis nulls it out.
+pub const EXCITABILITY_DRIFT_PER_TICK: f32 = 0.001;

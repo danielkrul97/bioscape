@@ -184,16 +184,27 @@ hebbian limit. Trigger v tick 0 je no-op (init weights ≪ cap). 1500 cells
 **Cíl:** per-neuron bias drift — chronicky over-active neuron si zvedne práh,
 under-active sníží (Turrigiano-style).
 
-**Výstup:** _(po dokončení)_
+**Výstup:** params: `ACTIVITY_EMA_ALPHA = 0.01`, `EXCITABILITY_DRIFT_PER_TICK
+= 0.001`. Nový shader `shaders/excitability.wgsl` (per-cell single-thread,
+4 bindings: params uniform, last_hidden ro, activity_avg rw, brain_weights
+rw). Místo step-threshold (sprint plan) lineární regulátor — `b1[h] -=
+DRIFT × activity_avg[h]`, kde `activity_avg` je signed EMA `last_hidden`.
+Saturated-positive cells driftují b1 dolů, saturated-negative nahoru;
+deadzone okolo nuly bez updatu. `ExcitabilityGpu` vlastní `activity_buf`
+(n × BRAIN_HIDDEN × 4 B, ~270 KB @ 1500 cells), `with_context`, `dispatch
+(cells_gpu, n, alpha, drift)`. Re-export přes `gpu/mod.rs`. `GpuFullState`
+přidá `excitability`; init v `init_gpu_full`. Trigger per tick po
+`hebbian.dispatch_step_persistent` — neuron-level EMA se updatuje každý
+tick spolu s hebbian trace step. Lib testy 434 passed (1 ignored).
+Seed=0 2-gen smoke: pop 200→194→362 (vs S138 200→202→370 — pop variance
+v rámci stochastic noise).
 
-**Poznámky:**
-- `Brain` add `pub activity_avg: [f32; BRAIN_HIDDEN]` (EMA alpha 0.01, persisted
-  přes generace přes serde default).
-- Per neuron každý tick: `if activity_avg[i] > 0.7 → b1[i] -= 0.001`;
-  `if < 0.3 → b1[i] += 0.001`. Symetrická drift k aktivnímu středu ±0.5.
-- CPU + GPU (možno fold do `hebbian_step.wgsl` jako secondary pass nebo
-  samostatný shader).
-- Validace: activity_avg distribuce per pop je centered (ne všechny ±1).
+**Poznámky:** Lineární regulátor namísto step thresholdu = smoother
+homeostasis bez discrete jump. Time constant ~1/drift = 1000 ticks (~16 s)
+— pomalejší než Hebbian apply (event-driven), takže homeostat nezasahuje
+do čerstvě naučeného. `activity_avg` GPU-only state (žádný checkpoint
+roundtrip v S139); EMA recovers v ~100 ticks po load. Storage limit:
+4 bindings v excitability shader, comfortable v rámci 12-binding budgetu.
 
 ## Sprint 140 — observability (CSV breakdown)
 
