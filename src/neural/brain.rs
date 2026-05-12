@@ -892,6 +892,24 @@ impl Brain {
         }
     }
 
+    /// Sprint 156: reward-modulated STDP — gates the S155 rule by an
+    /// external `reward` scalar (typically the per-tick value from the
+    /// S133 reward funnel). Reward 0 → no weight change; reward > 0
+    /// boosts the LTP/LTD magnitudes uniformly. Three-factor learning
+    /// in the simplest form (timing × pair × reward).
+    pub fn stdp_apply_rewarded(
+        &mut self,
+        tick: u32,
+        a_plus: f32,
+        a_minus: f32,
+        reward: f32,
+    ) {
+        if reward == 0.0 {
+            return;
+        }
+        self.stdp_apply(tick, a_plus * reward, a_minus * reward);
+    }
+
     /// Sprint 155: classical pair-based STDP rule. Walks every spike that
     /// happened this tick and updates the relevant `w1` synapses via
     /// per-neuron traces:

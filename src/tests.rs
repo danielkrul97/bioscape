@@ -3097,6 +3097,40 @@ fn izhikevich_strong_input_drives_spiking_over_multiple_ticks() {
 }
 
 #[test]
+fn stdp_apply_rewarded_zero_reward_is_noop() {
+    // Sprint 156: zero reward gates the STDP rule — weights frozen
+    // regardless of timing.
+    let mut brain = dummy_brain();
+    brain.last_pre_spike_ticks[3] = 100;
+    brain.stdp_step(100, 5.0);
+    brain.last_post_spike_ticks[5] = 102;
+    brain.stdp_step(101, 5.0);
+    brain.stdp_step(102, 5.0);
+    let w_before = brain.w1[5][3];
+    brain.stdp_apply_rewarded(102, 0.01, 0.01, 0.0);
+    assert_eq!(brain.w1[5][3], w_before);
+}
+
+#[test]
+fn stdp_apply_rewarded_positive_amplifies_ltp() {
+    // Sprint 156: positive reward boosts LTP same direction as S155 rule.
+    let mut brain = dummy_brain();
+    brain.last_pre_spike_ticks[3] = 100;
+    brain.stdp_step(100, 5.0);
+    brain.stdp_step(101, 5.0);
+    brain.last_post_spike_ticks[5] = 102;
+    brain.stdp_step(102, 5.0);
+    let w_before = brain.w1[5][3];
+    brain.stdp_apply_rewarded(102, 0.01, 0.01, 2.0);
+    assert!(
+        brain.w1[5][3] > w_before,
+        "expected reward-modulated LTP, w1 {} → {}",
+        w_before,
+        brain.w1[5][3]
+    );
+}
+
+#[test]
 fn stdp_apply_ltp_when_pre_before_post() {
     // Sprint 155: correlated firing — input 3 spikes at tick 100, hidden 5
     // spikes shortly after at tick 102. Pre-trace at tick 102 is still
