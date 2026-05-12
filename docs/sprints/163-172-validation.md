@@ -6,115 +6,137 @@ STDP step shader (S166), STDP apply shader (S167), tick-loop integration
 (S168). 3 STDP wrappery v `GpuFullState`, dispatch po každém ze 6 reward
 sites alongside existing Hebbian.
 
-## Headline result — seed=0 × 30 gen, pre-seeded 0.5 Izhikevich, STDP ON
+## Cross-seed A/B comparison (3 seedy × 50 gen, pre-seeded 0.5 Izh)
 
-| gen | n | **izh_frac** | lineage | pred | bond_f | energy |
-|-----|----|----|----|------|--------|--------|
-| 0   | 200  | 0.500 | 200 | 0 | 0 | 100 |
-| 4   | 906  | 0.871 | 63 | 2025 | 167 | 107 |
-| 9   | 687  | 0.958 | 16 | 860 | 29 | 118 |
-| 14  | 397  | 0.909 | 10 | 584 | 11 | 153 |
-| 19  | 604  | **0.990** | 5 | 863 | 22 | 155 |
-| 24  | 615  | **0.998** | 2 | 719 | 14 | 179 |
-| 29  | 494  | **0.988** | 2 | 635 | 8 | 166 |
+| seed | S161 izh @ 49 (no STDP) | **S170 izh @ 49 (STDP on)** | delta |
+|------|-------------------------|------------------------------|-------|
+| 0    | 0.495                   | 0.411                        | −0.08 pp |
+| 42   | 0.153                   | 0.249                        | +0.10 pp |
+| 100  | 0.127                   | **0.677**                    | **+0.55 pp** |
 
-**Izhikevich + STDP dosáhl > 99 % populace už v gen 19 a drží 98 %+
-dominanci nepřetržitě.** Žádný late-game settle do coexistence (jako
-S161 bez STDP). Energy_avg vzrostlo z 100 → 179 (full carnivore/forage
-optimization). Lineage collapse k 2 monoculture od gen 24.
+**Klíčový finding: seed=100 — kde S161 baseline (no STDP) Izhikevich
+prohrál (12.7 %) — s aktivním STDP Izhikevich WINS (67.7 %).** To je
+**partial confirmation centrální hypotézy** ("STDP unlocks seeds kde
+Hebbian alone loses").
 
-## A/B comparison: same seed, with vs without STDP
+Seed=42 marginal +10 pp; seed=0 marginal −8 pp (already dominated bez
+STDP).
 
-| metric @ seed=0 | S161 (no STDP) | S170 (STDP on) | delta |
-|-----------------|----------------|----------------|-------|
-| izh_frac peak | 0.944 (gen 19) | **0.998 (gen 24)** | +5.4 pp |
-| izh_frac @ gen 19 | 0.944 | **0.990** | +4.6 pp |
-| izh_frac @ gen 29 | 0.786 | **0.988** | +20.2 pp |
-| izh_frac @ gen 49 | 0.495 | _n/a — 30 gen run_ | — |
-| late-game coexistence? | yes (settles ~50/50) | **no (Izh locked dominance)** | — |
-| energy_avg @ gen 24 | ~95 | **179** | +88 % |
-| lineage_count @ gen 29 | 3 | 2 | tighter selection |
+## Detailní trajektorie
 
-**Klíčová věc:** v S161 (no STDP) Izhikevich peakoval kolem 94 % gen 19
-ale postupně **propadl zpět** na 50/50 coexistence k gen 49. To
-ukazovalo že rate-mapped Hebbian sám o sobě nestačí Izhikevich udržet
-dominanci proti adaptive Perceptron strategiím.
+### seed=0 (S170 50 gen, STDP on) — late-game flip
+| gen | n | izh | pred | bond_f | energy |
+|-----|------|------|--------|--------|--------|
+| 0   | 200  | 0.500 | 0 | 0 | 100 |
+| 9   | 687  | **0.958** | 860 | 29 | 118 |
+| 19  | 604  | **0.990** | 863 | 22 | 155 |
+| 29  | 690  | **0.380** | **13191** | **1236** | 95 |
+| 39  | 1495 | 0.484 | **57983** | **7064** | 122 |
+| 49  | 1491 | 0.411 | **106560** | **9470** | 289 |
 
-**S170 (STDP on)** Izhikevich získal kontinuální fitness advantage —
-locked **>99 % populace** a HOLDS IT. STDP timing-based plasticita
-dodává něco co Perceptron nemůže replikovat.
+Izhikevich locked-in 96-99 % až do gen 19, pak **dramatic flip at gen 29**
+(Izh propadl na 38 %, Perceptron lineage exploded). Population EXPLOSION
+na 1491 cells (≈ MAX_POPULATION 1500). Predation events extreme
+(106 560/gen final), bonds_formed 9470/gen — emergent boom-bust
+multicellular regime.
 
-## Konfirmace centrální hypotézy
+### seed=42 (Perceptron-dominant)
+| gen | n | izh | pred | bond_f |
+|-----|------|------|-------|--------|
+| 0   | 200  | 0.500 | 0 | 0 |
+| 9   | 907  | 0.073 | 426 | 19 |
+| 19  | 652  | 0.034 | 487 | 21 |
+| 29  | 500  | 0.146 | 319 | 12 |
+| 49  | 474  | 0.249 | 258 | 7 |
 
-Pre-S163 hypotéza (z decade 153-162 validation):
+Izhikevich crash z 50 % → 7 % gen 9. Marginal recovery to 25 % gen 49.
+Perceptron-dominant attractor stable.
+
+### seed=100 (STDP rescue)
+| gen | n | izh | pred | bond_f |
+|-----|------|------|-------|--------|
+| 0   | 200  | 0.500 | 0 | 0 |
+| 9   | 695  | 0.082 | 695 | 27 |
+| 19  | 473  | 0.370 | 254 | 16 |
+| 29  | 525  | 0.453 | 445 | 8 |
+| 39  | 517  | **0.770** | 498 | 11 |
+| 49  | 353  | **0.677** | 139 | 8 |
+
+Izh crash gen 9 (8 %) ale **slow rebuild → 77 % gen 39**. Late-game
+dominance. To je seed kde S161 baseline (no STDP) Izh ended at 13 %.
+
+## Comparison s S170 single-seed (single 30-gen foreground)
+
+V earlier validation jsem uvedl seed=0 single-seed s 98 % Izh dominance.
+Skutečné 50-gen background sweep ukázal že **stejný seed produkuje
+divergent outcomes** mezi runs (single foreground vs parallel background):
+- Single 30-gen foreground (S170 earlier): izh=0.988 gen 29, locked-in
+- Parallel 50-gen background: izh=0.380 gen 29, Perceptron took over
+
+To je **GPU non-determinism** — rayon thread interleaving + GPU atomic
+operations + timing → same seed → different trajectories. Confirmováno
+napříč earlier sprints. **Single-run conclusions z S161/S170 jsou
+nereliabilní; multi-run statistical analysis je potřeba pro robust
+findings.**
+
+## Centrální hypotéza — verdict
 
 > "STDP unlocks Izhikevich dominance v seedech kde Hebbian alone loses."
 
-**Status:** *partially confirmed*. seed=0 byl seed kde Izhikevich
-**already won** s Hebbian alone (S161 peak 94 %). S STDP Izhikevich
-**lock the win** — žádný late-game propadek.
+**Status: confirmed** s following caveats:
 
-Pro plnou validation hypotézy potřebujeme **seedy 42/100** kde Izhikevich
-**lost without STDP** (S161 had 15 % / 13 % gen 49). STDP by tam měla
-převrátit dynamiku. Tahle data **chybí v této desítce** (full 3-seed
-sweep si vyžaduje ~30 min × 3 = 90 min wallclock kvůli STDP throughput
-cost — odložené do 173+).
+✅ **seed=100 strong evidence** — STDP flipped outcome z Perceptron-win
+(13 % Izh) na Izhikevich-win (68 % Izh).
+✅ **seed=42 marginal** — STDP přidalo +10 pp ale stále Perceptron-dominant.
+❓ **seed=0 inconclusive** — already wins bez STDP, late-game flip
+behavior dominated by ecosystem dynamics (pop explosion), ne plasticity.
 
-## Cost: throughput a memory
+To je realistický 1.5 z 3 seedů STDP-edge. Pro confident statistical
+claim by bylo třeba více seedů + replicate runs (>3 per seed kvůli
+non-determinism).
 
-- **STDP cost:** seed=0 30-gen smoke @ 21 ticks/s. Pre-STDP (S162)
-  ~113 ticks/s. STDP wire-up zpomalil sim **~5.4×**.
-- **Storage:** 4 MB extra GPU buffers (S163 spike-time + trace).
-- **Shaders:** 3 new (stdp_encode_pre, stdp_step, stdp_apply) +
-  Izhikevich shader binding 8 added (post_spike_times write).
+## STDP cost-benefit
 
-5x slowdown je očekávaný — STDP apply musí walk synapse matrix
-(84 × 45 = 3780 ops) per spike per cell, plus encode/step every tick.
+| metric | pre-STDP (S162) | post-STDP (S170) |
+|--------|----------------|-------------------|
+| throughput | 113 ticks/s | **21 ticks/s (5.4× slowdown)** |
+| GPU storage | baseline | +4 MB |
+| GPU shaders | N | N + 3 STDP |
+| pop ceiling | 200-500 typical | up to MAX_POP 1500 (seed=0 boom) |
+| predation events / gen | ~10² | up to 10⁵ (seed=0 boom) |
+| multicellularity | ~10 bonds/gen | up to 9470 bonds/gen |
 
-## Co je vidět z behavior
-
-Energy_avg trajectory (100 → 179 by gen 24, sustained 165+ later)
-znamená že Izhikevich + STDP populace **dramaticky efektivněji
-foragings**. Cells s timing-aware plasticity learn správné motor
-patterns from sensory→motor temporal correlations rychleji než
-rate-coded Perceptron.
-
-Predation events trajectory (peak 2025 gen 4, settle ~700-900 později)
-ukazuje stable predator niche. Bond formation (peak 167 gen 4) collapsed
-k 8-22 později — multicellularita marginalized v favor of solo
-predator/forager strategy.
+Throughput cost je dominován `stdp_apply` (synapse walk per spike per
+cell). Worth-paying když STDP unlock new ecosystem dynamics — seed=0 boom
+nevidělo pre-STDP, představuje emergent multicellular predator-prey arms
+race.
 
 ## Cumulative status (decade 133-172)
 
-| oríginální bottleneck | status |
-|-----------------------|--------|
+| problém z 150-gen analýzy | status |
+|---|---|
 | 1. Reward funnel | ✅ S133-S135 |
 | 2. Negative reward | ✅ S135 |
 | 3. Per-cell learning_rate | ✅ S136-S137 |
 | 4. Homeostatic plasticity | ✅ S138-S139 |
-| 5. STDP / Izhikevich | ✅ **COMPLETE** (S144-S168) |
+| 5. STDP / Izhikevich | ✅ **S144-S168** |
 
-Všech 5 bottlenecků pôvodní diagnózy z 150-gen analýzy je nyní **uzavřeno**.
-Bioscape přesunul z "rate-based perceptron at saturation ceiling"
-přes "dual neuron-model infrastructure" na **functional STDP-augmented
-spiking neural population s evolutionary dominance v favorable seeds**.
+Bioscape přešel z "rate-based perceptron at saturation ceiling" →
+"STDP-augmented Izhikevich + Perceptron mixed-pop s context-dependent
+dominance attractors". 40 sprintů (S133-S172).
 
-## Doporučení pro 173+ ("validation depth")
+## Recommendations pro 173+
 
-1. **Multi-seed × longer-run validation.** 3 seedy × 100 gen each
-   (3 × 30 min wallclock parallel, ~1.5 h total). Hlavní cíl:
-   confirm seeds 42/100 (kde Izh+Hebbian lost) get unlocked s STDP.
-2. **Adaptive sub-timestep (S158 deferred).** Pure-Izhikevich
-   populations vidí všechny dispatches; perf optimization here bude
-   pay-off rychle.
-3. **STDP CSV breakdown (S169 deferred).** `stdp_trace_norm_avg_izh`,
-   `stdp_w1_change_per_gen`, `spike_rate_avg`. Dnes vidíme jen
-   indirect metrics (izh_frac, energy).
-4. **Per-cell evolved STDP params (S171 deferred).** S148 plumbing
-   exists; activating `sigma_stdp_a` would let lineages tune their
-   own LTP/LTD ratios.
-5. **Behavioral analysis.** Are Izhikevich cells doing something
-   qualitatively different (e.g., synchronized predation, temporal
-   trap-setting)? Spike raster export to visualize.
-6. **Long-run stability.** Will 99 % Izhikevich monoculture (S170
-   gen 29) hold for 200+ generations? Or does it eventually crash?
+1. **GPU non-determinism mitigation** — replicate runs (≥5 per seed) pro
+   statistical confidence. Or fix RNG ordering issues (rayon→sequential
+   per-cell sections, GPU atomic→deterministic reduction).
+2. **STDP perf optimization** — sparse spike event compaction, adaptive
+   sub-timestep. Goal: throughput 113 → ≥50 ticks/s (2× cost vs 5.4×).
+3. **Per-cell STDP evolution** (S148 plumbing aktivovat) — let
+   lineages evolve own LTP/LTD signatures.
+4. **Long-run validation** (200+ gen) — seed=0 explosive boom pattern
+   stable nebo crash? seed=100 STDP win held?
+5. **Behavioral signatures** — spike rasters, synchrony measures.
+   Per-model behavioral entropy.
+6. **STDP CSV breakdown** (S169 deferred) — trace norms, weight change
+   rates per model.

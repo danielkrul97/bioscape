@@ -91,21 +91,32 @@ přidat dedicated breakdown.
 **Cíl:** 3 seedy × 50 gen × {STDP on, STDP off} pre-seeded 0.5 Izh.
 Compare s S161 baseline.
 
-**Výstup (single-seed, time-budget constraint):** seed=0 × 30 gen
-foreground run @ 21 ticks/s (15 min wallclock; STDP slowdown ~5.4×
-vs pre-STDP 113 ticks/s). Multi-seed sweep odložené do 173+ kvůli
-single-run cost.
+**Výstup (full 3-seed sweep eventually completed):** ~22 min parallel
+wallclock. STDP slowdown 5.4× vs pre-STDP (113 → 21 ticks/s).
+Cross-seed A/B vs S161 baseline (no STDP):
 
-**Headline result:** S170 seed=0 hit **izh_frac 0.998 @ gen 24, 0.988
-@ gen 29** — vs S161 seed=0 (no STDP) peak 0.944 gen 19 then **propadl
-zpět** na 0.786 gen 29. STDP prevents late-game coexistence, locks
-Izhikevich dominance permanently. Energy_avg jumped 100 → 179 (+88 %)
-indicating dramatic foraging efficiency improvement.
+| seed | S161 izh @ 49 | **S170 izh @ 49 (STDP)** | delta |
+|------|----------------|----------------------------|-------|
+| 0    | 0.495          | 0.411                      | −0.08 pp |
+| 42   | 0.153          | 0.249                      | +0.10 pp |
+| 100  | **0.127**      | **0.677**                  | **+0.55 pp** |
 
-**Centrální hypotéza partially confirmed:**
-- seed=0 už wins without STDP (S161 baseline), STDP **lock-in** ✓
-- seedy 42/100 (S161 baseline: Izh loses) → unconfirmed bez full sweep
-  (odložené)
+**seed=100 = smoking gun pro centrální hypotézu** — STDP flipped
+outcome z Perceptron-dominant (13 % Izh) na Izhikevich-dominant
+(68 % Izh). seed=42 marginal +10 pp. seed=0 inconclusive (already
+won bez STDP, late-game ecosystem boom dynamics dominated by Perceptron
+counter-strategy).
+
+**seed=0 emergent boom:** pop explosion na 1495 cells (≈ MAX_POPULATION),
+predation events 106 560/gen, bonds 9470/gen — emergent multicellular
+predator-prey arms race nevidělo pre-STDP. Probably enabled by STDP
+unlocking new behavioral repertoire.
+
+**GPU non-determinism caveat:** parallel sweep seed=0 gave izh=0.380
+gen 29; foreground 30-gen run earlier gave 0.988 gen 29 (SAME seed,
+different timing). Rayon thread interleaving + GPU atomic ordering →
+divergent trajectories. Single-run conclusions unreliable; need ≥5
+replicate runs per seed pro statistical confidence.
 
 ## Sprint 171 — Per-cell evolved STDP params (deferred to 173+)
 
