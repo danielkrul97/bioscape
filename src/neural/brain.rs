@@ -87,6 +87,8 @@ impl Brain {
             recovery: [0.0; BRAIN_HIDDEN],
             last_pre_spike_ticks: [0; BRAIN_INPUTS],
             last_post_spike_ticks: [0; BRAIN_HIDDEN],
+            pre_trace: [0.0; BRAIN_INPUTS],
+            post_trace: [0.0; BRAIN_HIDDEN],
         }
     }
 
@@ -231,6 +233,8 @@ impl Brain {
             recovery: [0.0; BRAIN_HIDDEN],
             last_pre_spike_ticks: [0; BRAIN_INPUTS],
             last_post_spike_ticks: [0; BRAIN_HIDDEN],
+            pre_trace: [0.0; BRAIN_INPUTS],
+            post_trace: [0.0; BRAIN_HIDDEN],
         }
     }
 }
@@ -287,6 +291,24 @@ pub struct Brain {
     /// "0 = never fired" convention as pre-spike ticks.
     #[serde(skip, default = "default_post_spike_ticks")]
     pub last_post_spike_ticks: [u32; BRAIN_HIDDEN],
+    /// Sprint 154: per-input decaying spike trace for STDP. Bumps by 1 on
+    /// pre-spike, decays each tick by `exp(-dt / stdp_tau_ticks)`. The
+    /// classical "trace-based STDP" formulation: combining `pre_trace[i]`
+    /// at the moment of a post-spike with `a_plus` gives LTP magnitude in
+    /// O(neurons), avoiding the O(synapses) cost of per-synapse traces.
+    #[serde(default = "default_pre_trace", with = "serde_arr_inputs")]
+    pub pre_trace: [f32; BRAIN_INPUTS],
+    /// Sprint 154: matching post-spike trace for LTD path.
+    #[serde(default = "default_post_trace", with = "serde_arr_hidden")]
+    pub post_trace: [f32; BRAIN_HIDDEN],
+}
+
+fn default_pre_trace() -> [f32; BRAIN_INPUTS] {
+    [0.0; BRAIN_INPUTS]
+}
+
+fn default_post_trace() -> [f32; BRAIN_HIDDEN] {
+    [0.0; BRAIN_HIDDEN]
 }
 
 fn default_pre_spike_ticks() -> [u32; BRAIN_INPUTS] {
@@ -504,6 +526,8 @@ impl Brain {
             recovery: [0.0; BRAIN_HIDDEN],
             last_pre_spike_ticks: [0; BRAIN_INPUTS],
             last_post_spike_ticks: [0; BRAIN_HIDDEN],
+            pre_trace: [0.0; BRAIN_INPUTS],
+            post_trace: [0.0; BRAIN_HIDDEN],
         }
     }
 
@@ -844,6 +868,27 @@ impl Brain {
                 row[j] += lr * self.trace_w2[o][j];
             }
             self.b2[o] += lr * last_outputs[o];
+        }
+    }
+
+    /// Sprint 154: STDP trace step. Decays `pre_trace` and `post_trace`
+    /// according to the cell's `stdp_tau_ticks`, then bumps any trace
+    /// slot whose corresponding spike-time array matches the current
+    /// `tick` (i.e., the neuron fired this tick). Single combined pass so
+    /// we walk each array once per tick.
+    pub fn stdp_step(&mut self, tick: u32, tau_ticks: f32) {
+        let decay = (-1.0_f32 / tau_ticks.max(MIN_STDP_TAU_TICKS)).exp();
+        for j in 0..BRAIN_INPUTS {
+            self.pre_trace[j] *= decay;
+            if self.last_pre_spike_ticks[j] == tick {
+                self.pre_trace[j] += 1.0;
+            }
+        }
+        for h in 0..BRAIN_HIDDEN {
+            self.post_trace[h] *= decay;
+            if self.last_post_spike_ticks[h] == tick {
+                self.post_trace[h] += 1.0;
+            }
         }
     }
 

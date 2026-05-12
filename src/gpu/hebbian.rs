@@ -443,6 +443,8 @@ impl HebbianGpu {
                 recovery: [0.0; BRAIN_HIDDEN],
                 last_pre_spike_ticks: [0; BRAIN_INPUTS],
                 last_post_spike_ticks: [0; BRAIN_HIDDEN],
+                pre_trace: [0.0; BRAIN_INPUTS],
+                post_trace: [0.0; BRAIN_HIDDEN],
             };
             for h in 0..BRAIN_HIDDEN {
                 for in_i in 0..BRAIN_INPUTS {

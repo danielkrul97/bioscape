@@ -41,6 +41,8 @@ fn dummy_brain() -> Brain {
         recovery: [0.0; BRAIN_HIDDEN],
         last_pre_spike_ticks: [0; BRAIN_INPUTS],
         last_post_spike_ticks: [0; BRAIN_HIDDEN],
+        pre_trace: [0.0; BRAIN_INPUTS],
+        post_trace: [0.0; BRAIN_HIDDEN],
     }
 }
 
@@ -148,6 +150,8 @@ fn mutation_with_zero_sigma_is_identity() {
             recovery: [0.0; BRAIN_HIDDEN],
             last_pre_spike_ticks: [0; BRAIN_INPUTS],
             last_post_spike_ticks: [0; BRAIN_HIDDEN],
+            pre_trace: [0.0; BRAIN_INPUTS],
+            post_trace: [0.0; BRAIN_HIDDEN],
         },
         cppn: default_cppn(),
         learning_rate: LEARNING_RATE,
@@ -1367,6 +1371,8 @@ fn brain_forward_zero_weights_outputs_tanh_of_output_biases() {
         recovery: [0.0; BRAIN_HIDDEN],
         last_pre_spike_ticks: [0; BRAIN_INPUTS],
         last_post_spike_ticks: [0; BRAIN_HIDDEN],
+        pre_trace: [0.0; BRAIN_INPUTS],
+        post_trace: [0.0; BRAIN_HIDDEN],
     };
     let outputs = brain.forward(&[0.0; BRAIN_INPUTS]);
     assert_eq!(outputs.len(), BRAIN_OUTPUTS);
@@ -3088,6 +3094,36 @@ fn izhikevich_strong_input_drives_spiking_over_multiple_ticks() {
         "expected at least 1 spike per neuron over 20 ticks at strong input, got {}",
         total_spikes
     );
+}
+
+#[test]
+fn stdp_step_decays_traces_and_records_spikes() {
+    // Sprint 154: trace decays each tick by exp(-1/tau); when a spike-time
+    // matches the current tick, the trace gets +1.0. Verified on a
+    // hand-rolled brain (no Izhikevich forward involved).
+    let mut brain = dummy_brain();
+    // Pretend input 3 fired this tick and hidden 5 fired this tick.
+    let tick = 100;
+    brain.last_pre_spike_ticks[3] = tick;
+    brain.last_post_spike_ticks[5] = tick;
+    let tau = 5.0_f32;
+    let decay = (-1.0_f32 / tau).exp();
+    brain.stdp_step(tick, tau);
+    // Spike slots got the +1 bump.
+    assert!((brain.pre_trace[3] - 1.0).abs() < 1e-5);
+    assert!((brain.post_trace[5] - 1.0).abs() < 1e-5);
+    // Non-spike slots stayed at zero × decay = 0.
+    assert_eq!(brain.pre_trace[0], 0.0);
+    assert_eq!(brain.post_trace[0], 0.0);
+    // Next tick (no fresh spikes) → trace decays.
+    brain.stdp_step(tick + 1, tau);
+    assert!(
+        (brain.pre_trace[3] - decay).abs() < 1e-5,
+        "expected pre_trace[3] = {} after one decay, got {}",
+        decay,
+        brain.pre_trace[3]
+    );
+    assert!((brain.post_trace[5] - decay).abs() < 1e-5);
 }
 
 #[test]

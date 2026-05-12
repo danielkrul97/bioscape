@@ -20,6 +20,8 @@ pub fn dummy_brain() -> Brain {
         recovery: [0.0; BRAIN_HIDDEN],
         last_pre_spike_ticks: [0; BRAIN_INPUTS],
         last_post_spike_ticks: [0; BRAIN_HIDDEN],
+        pre_trace: [0.0; BRAIN_INPUTS],
+        post_trace: [0.0; BRAIN_HIDDEN],
     }
 }
 
