@@ -18,6 +18,7 @@ mod resources;
 mod resources_gpu;
 mod screencast;
 mod setup;
+mod sim_config;
 mod stats;
 mod systems;
 mod world_map;

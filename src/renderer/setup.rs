@@ -5,11 +5,11 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 use bioscape::{
-    Cell, EventCalendar, Food, MATING_RADIUS, SmellField, WorldMap, CELL_RADIUS, CYCLE_AMPLITUDE,
-    INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z,
-    SMELL_GRID_RES, SMELL_GRID_RES_Z, SPIKE_SLOTS, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z,
-    WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z,
-    WORLD_MAP_SEED, reject_food_for_richness,
+    Cell, EventCalendar, Food, INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, SmellField,
+    SPIKE_SLOTS, WorldMap, WORLD_MAP_SEED, CELL_RADIUS, CYCLE_AMPLITUDE,
+    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z,
+    VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, WORLD_HALF, WORLD_MAP_BASE_RES,
+    WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z, reject_food_for_richness,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -27,6 +27,7 @@ use super::resources::{
     OrbitCamera, PheromoneResource, SimRng, SimWorld, SmellResource, SpikeMaterial, SpikeMesh,
     VibrationResource, WorldExtent, WorldMapResource,
 };
+use super::sim_config::{SimConfig, CONFIG_FILENAME};
 use super::resources_gpu::GpuFullPipeline;
 use super::world_map::{food_target, world_map_image};
 
@@ -48,27 +49,46 @@ pub(super) fn setup(
     };
     commands.insert_resource(extent);
 
-    // Sprint 175-176: instantiate shared `bioscape::sim::World` and its
-    // per-frame RNG as Bevy Resources. GPU init runs alongside (creates a
-    // second wgpu Instance — wasteful but isolated; S177 unifies once
-    // legacy pipeline is deleted). Tick system + position sync added in
-    // schedule (see renderer/mod.rs S176 wire-up).
+    // Sprint 183 (post-S182 cleanup): load renderer overrides from
+    // `bioscape.json` in CWD. Missing/unparseable file → library
+    // defaults (identical to pre-S183 hardcoded behavior).
+    let config = SimConfig::load_or_default(std::path::Path::new(CONFIG_FILENAME));
+
+    // Sprint 175-176-183: instantiate shared `bioscape::sim::World` from
+    // resolved config. GPU init runs alongside Bevy's RenderPlugin (2 wgpu
+    // instances; consolidation in 184+).
     {
-        let mut sim_rng = StdRng::seed_from_u64(WORLD_MAP_SEED);
+        let mut sim_rng = StdRng::seed_from_u64(config.seed);
         let mut world = bioscape::sim::World::new_with_maze(
             &mut sim_rng,
-            WORLD_MAP_SEED,
-            MATING_RADIUS,
-            INITIAL_CELLS,
-            MAX_POPULATION,
+            config.resolved_map_seed(),
+            config.resolved_mating_radius(),
+            config.resolved_initial_cells(),
+            config.resolved_max_population(),
             EventCalendar::default(),
-            None,
+            config.resolved_maze(),
         );
+        // Sprint 183: pre-seed Izhikevich fraction (mirror headless
+        // `--initial-izhikevich-frac` from S159).
+        let izh_frac = config.initial_izhikevich_frac.clamp(0.0, 1.0);
+        if izh_frac > 0.0 {
+            let target = (izh_frac * world.cells.len() as f32).round() as usize;
+            for cell in world.cells.iter_mut().take(target) {
+                cell.genome.neuron_model = bioscape::NeuronModel::Izhikevich;
+            }
+            info!(
+                "sim-world: pre-seeded {} of {} cells as Izhikevich (frac={:.2})",
+                target,
+                world.cells.len(),
+                izh_frac
+            );
+        }
         match world.init_gpu_full() {
             Ok(()) => {
                 info!(
-                    "sim-world: shared sim driver initialised ({} initial cells)",
-                    world.cells.len()
+                    "sim-world: shared sim driver initialised ({} initial cells, seed={})",
+                    world.cells.len(),
+                    config.seed
                 );
             }
             Err(e) => {
