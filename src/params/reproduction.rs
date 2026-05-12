@@ -151,3 +151,10 @@ pub const MAX_STDP_A: f32 = 0.02;
 pub const DEFAULT_STDP_TAU_TICKS: f32 = 5.0;
 pub const MIN_STDP_TAU_TICKS: f32 = 1.0;
 pub const MAX_STDP_TAU_TICKS: f32 = 30.0;
+
+/// Sprint 153: threshold for continuous brain input → binary spike event.
+/// An input channel emits a spike on a given tick when its normalised
+/// value exceeds this threshold. Choice of 0.5 splits the [-1, +1] tanh
+/// output mid-range — strong sensory signals fire, weak ones stay silent.
+/// Future S163+ may swap this for a rate-coded Bernoulli encoder.
+pub const SPIKE_ENCODE_THRESHOLD: f32 = 0.5;

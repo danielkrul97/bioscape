@@ -85,6 +85,8 @@ impl Brain {
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             membrane: [IZH_V_REST; BRAIN_HIDDEN],
             recovery: [0.0; BRAIN_HIDDEN],
+            last_pre_spike_ticks: [0; BRAIN_INPUTS],
+            last_post_spike_ticks: [0; BRAIN_HIDDEN],
         }
     }
 
@@ -227,6 +229,8 @@ impl Brain {
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             membrane: [IZH_V_REST; BRAIN_HIDDEN],
             recovery: [0.0; BRAIN_HIDDEN],
+            last_pre_spike_ticks: [0; BRAIN_INPUTS],
+            last_post_spike_ticks: [0; BRAIN_HIDDEN],
         }
     }
 }
@@ -270,6 +274,27 @@ pub struct Brain {
     /// Default 0 (canonical reset value). Same model gating as `membrane`.
     #[serde(default = "default_recovery", with = "serde_arr_hidden")]
     pub recovery: [f32; BRAIN_HIDDEN],
+    /// Sprint 153: last simulation tick at which each input fired a spike
+    /// (threshold-encoded from continuous activations). `0` initially —
+    /// callers treat 0 as "never fired" because tick 0 is the simulation
+    /// start. STDP weight update (S155) computes `Δt = tick − pre_spike`
+    /// to apply the timing-dependent curve. Skipped from serde — fresh on
+    /// checkpoint load, recovers within a few ticks of spike-encoded input.
+    #[serde(skip, default = "default_pre_spike_ticks")]
+    pub last_pre_spike_ticks: [u32; BRAIN_INPUTS],
+    /// Sprint 153: last tick each hidden neuron crossed the Izhikevich
+    /// spike threshold. Updated in `forward_izhikevich_with_state`. Same
+    /// "0 = never fired" convention as pre-spike ticks.
+    #[serde(skip, default = "default_post_spike_ticks")]
+    pub last_post_spike_ticks: [u32; BRAIN_HIDDEN],
+}
+
+fn default_pre_spike_ticks() -> [u32; BRAIN_INPUTS] {
+    [0; BRAIN_INPUTS]
+}
+
+fn default_post_spike_ticks() -> [u32; BRAIN_HIDDEN] {
+    [0; BRAIN_HIDDEN]
 }
 
 /// Sprint 145: canonical Izhikevich 2003 resting potential. Pre-S145
@@ -477,6 +502,8 @@ impl Brain {
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             membrane: [IZH_V_REST; BRAIN_HIDDEN],
             recovery: [0.0; BRAIN_HIDDEN],
+            last_pre_spike_ticks: [0; BRAIN_INPUTS],
+            last_post_spike_ticks: [0; BRAIN_HIDDEN],
         }
     }
 
@@ -491,11 +518,25 @@ impl Brain {
     /// Hidden activation = `2 × (spike_count / IZH_SUBSTEPS) − 1` so the
     /// downstream `w2` motor layer sees roughly the same `[-1, +1]` range
     /// as the perceptron path.
+    /// Sprint 153: also threshold-encodes inputs into `last_pre_spike_ticks`
+    /// and records every post-neuron spike into `last_post_spike_ticks` so
+    /// the future STDP rule (S155) has the timing information it needs.
+    /// `tick` is the current simulation tick — caller threads through.
     pub fn forward_izhikevich_with_state(
         &mut self,
         inputs: &[f32; BRAIN_INPUTS],
+        tick: u32,
     ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
         let h_n = self.hidden_n as usize;
+
+        // Sprint 153: pre-spike encoding. Any input crossing the threshold
+        // this tick stamps its `last_pre_spike_ticks` slot — the STDP rule
+        // measures `Δt = tick − last_pre_spike` against the post-spike time.
+        for j in 0..BRAIN_INPUTS {
+            if inputs[j] > SPIKE_ENCODE_THRESHOLD {
+                self.last_pre_spike_ticks[j] = tick;
+            }
+        }
 
         // L1 matvec (same dot product as perceptron pre-activation) →
         // injection current. Plain scalar loop here: Izhikevich is not the
@@ -526,6 +567,10 @@ impl Brain {
                     self.membrane[i] = IZH_C;
                     self.recovery[i] = u_new + IZH_D;
                     spike_counts[i] += 1;
+                    // Sprint 153: a post-spike happened this sub-step — the
+                    // resolution we record is the whole tick (sufficient for
+                    // STDP windows ≥ 1 tick).
+                    self.last_post_spike_ticks[i] = tick;
                 } else {
                     self.membrane[i] = v_new;
                     self.recovery[i] = u_new;

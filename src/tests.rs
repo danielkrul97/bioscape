@@ -39,6 +39,8 @@ fn dummy_brain() -> Brain {
         trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         membrane: [IZH_V_REST; BRAIN_HIDDEN],
         recovery: [0.0; BRAIN_HIDDEN],
+        last_pre_spike_ticks: [0; BRAIN_INPUTS],
+        last_post_spike_ticks: [0; BRAIN_HIDDEN],
     }
 }
 
@@ -144,6 +146,8 @@ fn mutation_with_zero_sigma_is_identity() {
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             membrane: [IZH_V_REST; BRAIN_HIDDEN],
             recovery: [0.0; BRAIN_HIDDEN],
+            last_pre_spike_ticks: [0; BRAIN_INPUTS],
+            last_post_spike_ticks: [0; BRAIN_HIDDEN],
         },
         cppn: default_cppn(),
         learning_rate: LEARNING_RATE,
@@ -1361,6 +1365,8 @@ fn brain_forward_zero_weights_outputs_tanh_of_output_biases() {
         trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         membrane: [IZH_V_REST; BRAIN_HIDDEN],
         recovery: [0.0; BRAIN_HIDDEN],
+        last_pre_spike_ticks: [0; BRAIN_INPUTS],
+        last_post_spike_ticks: [0; BRAIN_HIDDEN],
     };
     let outputs = brain.forward(&[0.0; BRAIN_INPUTS]);
     assert_eq!(outputs.len(), BRAIN_OUTPUTS);
@@ -3035,7 +3041,7 @@ fn izhikevich_quiescent_neuron_does_not_spike() {
     // hidden activation: -1 (no spikes mapped to the lower bound).
     let mut brain = dummy_brain();
     let inputs = [0.0_f32; BRAIN_INPUTS];
-    let (hidden, _) = brain.forward_izhikevich_with_state(&inputs);
+    let (hidden, _) = brain.forward_izhikevich_with_state(&inputs, 0);
     for (i, h) in hidden.iter().take(brain.hidden_n as usize).enumerate() {
         assert!(
             (*h + 1.0).abs() < 1e-5,
@@ -3070,7 +3076,7 @@ fn izhikevich_strong_input_drives_spiking_over_multiple_ticks() {
     let inputs = [0.0_f32; BRAIN_INPUTS];
     let mut total_spikes = 0_u32;
     for _ in 0..20 {
-        let (hidden, _) = brain.forward_izhikevich_with_state(&inputs);
+        let (hidden, _) = brain.forward_izhikevich_with_state(&inputs, 0);
         for h in hidden.iter().take(h_n) {
             // spike_count = (h + 1) × IZH_SUBSTEPS / 2; sum across neurons.
             let spikes = (((h + 1.0) * IZH_SUBSTEPS as f32 / 2.0).round()) as u32;
@@ -3094,7 +3100,7 @@ fn izhikevich_zero_input_outputs_finite_and_in_range() {
         brain.b2[o] = 0.5;
     }
     let inputs = [0.0_f32; BRAIN_INPUTS];
-    let (_, outputs) = brain.forward_izhikevich_with_state(&inputs);
+    let (_, outputs) = brain.forward_izhikevich_with_state(&inputs, 0);
     for (o, v) in outputs.iter().enumerate() {
         assert!(v.is_finite(), "output {} not finite: {}", o, v);
         assert!(v.abs() <= 1.0 + 1e-5, "output {} out of [-1, 1]: {}", o, v);

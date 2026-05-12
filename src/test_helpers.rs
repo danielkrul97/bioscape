@@ -18,6 +18,8 @@ pub fn dummy_brain() -> Brain {
         trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         membrane: [IZH_V_REST; BRAIN_HIDDEN],
         recovery: [0.0; BRAIN_HIDDEN],
+        last_pre_spike_ticks: [0; BRAIN_INPUTS],
+        last_post_spike_ticks: [0; BRAIN_HIDDEN],
     }
 }
 
