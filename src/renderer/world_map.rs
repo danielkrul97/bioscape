@@ -58,6 +58,7 @@ pub(super) fn food_multiplier(noise: f32) -> f32 {
     WORLD_MAP_FOOD_FLOOR + WORLD_MAP_FOOD_AMP * noise
 }
 
+#[allow(dead_code)]
 pub(super) fn hazard_drain(noise: f32) -> f32 {
     HAZARD_DRAIN_PER_SEC * (HAZARD_FLOOR + HAZARD_AMP * noise)
 }
@@ -70,6 +71,7 @@ pub(super) fn food_target(extent: &WorldExtent, factor: f32) -> usize {
     ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0) * z_factor) as usize
 }
 
+#[allow(dead_code)]
 pub(super) fn update_food_density_cycle(
     mut events: MessageReader<GenerationEnded>,
     clock: Res<Clock>,

@@ -7,6 +7,7 @@ use bioscape::{
     TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_SEED,
     WORLD_UNITS_PER_FOOD,
 };
+use bioscape::sim::{food_multiplier, food_target, hazard_drain};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::path::PathBuf;

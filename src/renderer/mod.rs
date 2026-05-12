@@ -33,7 +33,6 @@ use screencast::*;
 use setup::*;
 use stats::*;
 use systems::*;
-use world_map::*;
 
 use diagnostics::{advance_clock, report_frame_diagnostics, tick_end, tick_start};
 

@@ -8,6 +8,7 @@ use bioscape::gpu::{
 /// readback covers brain + Hebbian + Brownian + Field + sensor + populate +
 /// motor + step + collision + predate + food spawn per tick. Init failure
 /// in `setup` panics — no CPU compute fallback.
+#[allow(dead_code)]
 #[derive(Resource)]
 pub(super) struct GpuFullPipeline {
     pub(super) cells: CellsGpu,

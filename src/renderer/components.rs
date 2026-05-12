@@ -5,7 +5,7 @@ use bioscape::{Cell, Food};
 pub(super) struct CellEntity(pub(super) Cell);
 
 #[derive(Component)]
-pub(super) struct FoodEntity(pub(super) Food);
+pub(super) struct FoodEntity(#[allow(dead_code)] pub(super) Food);
 
 #[derive(Component)]
 pub(super) struct Dying {

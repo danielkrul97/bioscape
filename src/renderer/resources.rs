@@ -73,6 +73,7 @@ pub(super) struct CellEntityLookups {
 }
 
 impl CellEntityLookups {
+    #[allow(dead_code)]
     pub(super) fn rebuild<'a>(
         &mut self,
         iter: impl Iterator<Item = (Entity, u64, [f32; 3])>,
@@ -124,6 +125,7 @@ pub(super) struct CellSlotMap {
     pub(super) entity_to_slot: FxHashMap<Entity, usize>,
 }
 
+#[allow(dead_code)]
 impl CellSlotMap {
     pub(super) fn allocate(&mut self, entity: Entity) -> usize {
         let slot = self.slot_to_entity.len();
