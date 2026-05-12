@@ -45,7 +45,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
             //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
             //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -516,9 +516,16 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     // scaling (S138) caps row norms at `W_NORM_CAP`; this metric tracks
     // how close the population sits to the cap on average.
     let w_norm_avg = w1_row_norm_avg(&world.cells);
+    // Sprint 142 SNN bridge: end-of-gen snapshot fraction of hidden
+    // activations close to tanh saturation (|h| > 0.8). Acts as a
+    // passive proxy for "spike events" without the per-tick GPU readback
+    // a true STDP path would need; informs whether the population is
+    // running in a saturated regime (high frac) or staying in the
+    // responsive zone (low frac).
+    let neural_spike_frac = saturation_frac(&world.cells);
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4}",
         world.clock.generation,
         n,
         spd_m,
@@ -639,6 +646,8 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         decay_avg,
         decay_std,
         w_norm_avg,
+        // Sprint 142
+        neural_spike_frac,
     )
 }
 
@@ -661,6 +670,34 @@ fn mean_std<I: IntoIterator<Item = f64>>(it: I) -> (f64, f64) {
     let mean = sum / nf;
     let var = (sumsq / nf - mean * mean).max(0.0);
     (mean, var.sqrt())
+}
+
+/// Sprint 142 SNN bridge: fraction of (cell, hidden_neuron) pairs whose
+/// final-tick `last_hidden` magnitude crossed the `0.8` saturation
+/// threshold. A passive proxy for "spike events" — high values indicate
+/// the population is running brains near tanh saturation, which is what a
+/// future Izhikevich + STDP path would explicitly model.
+fn saturation_frac(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    const THRESHOLD: f32 = 0.8;
+    let mut saturated = 0_u64;
+    let mut total = 0_u64;
+    for cell in cells {
+        let h_n = cell.genome.brain.hidden_n as usize;
+        for h in 0..h_n {
+            if cell.last_hidden[h].abs() > THRESHOLD {
+                saturated += 1;
+            }
+            total += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        saturated as f64 / total as f64
+    }
 }
 
 /// Sprint 140: mean L2 norm of `w1` rows across the population. Each

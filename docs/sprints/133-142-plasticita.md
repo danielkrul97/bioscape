@@ -254,15 +254,62 @@ metric. 4 z 5 bottlenecks zavřené; SNN/STDP (#5) pokračuje do 143-152.
 **Cíl:** připravit infrastructure pro SNN/STDP v 143–152 jako passive event
 stream nad rate-based brainem (zero behaviorální dopad).
 
-**Výstup:** _(po dokončení)_
+**Výstup:** nový CSV sloupec `neural_spike_frac` — end-of-gen snapshot fraction
+of `(cell, hidden_neuron)` pairs s `|last_hidden[h]| > 0.8`. `saturation_frac
+(&world.cells)` helper v `csv.rs`. Žádná změna brain forward; přiznané
+zjednodušení vůči sprint plánu (per-tick refractory + per-gen count) —
+snapshot stačí jako saturation proxy bez per-tick GPU readback overheadu.
+Seed=0 2-gen smoke: gen 2 `neural_spike_frac = 0.87` — populace běží v
+saturated regime, což je přesně tam kde proper Izhikevich + STDP path
+v 143–152 začne mít smysl (rate brain ztrácí informaci, spike timing
+je tam underutilized). Lib testy 434 passed (1 ignored).
 
-**Poznámky:**
-- V `Brain::forward` post-tanh: emit `spike_event` pokud `last_hidden[i] > 0.8`
-  s 1-tick refractory per neuron.
-- Akumuluj per-gen count do CSV (`spike_count_avg`).
-- Žádná logika měnící váhy.
-- Decade retrospektiva ve stejném souboru — co fungovalo, co cross-seed
-  nepřeneslo, doporučení pro 143–152.
+**Poznámky:** Snapshot vs per-tick stream: stream by potřeboval GPU shader
+(`spike_count.wgsl` se sčítáním do per-cell counter buffer) nebo per-tick
+last_hidden readback — oboje S140+ overhead, zatímco snapshot je jeden
+loop na konci generace. Pokud SNN desítka 143-152 začne se zachycováním
+spike timing, infrastructure pro per-tick events bude zaváděna tam, ne
+retrofitting zde.
+
+## Decade retro 133–142
+
+**Co fungovalo:**
+- Reward funnel rozšíření (S133–S135). Pop survival 100 % cross-seed,
+  predator policy konverguje (564–921 predation events / 10 gen).
+- Per-cell evolved Hebbian rates (S136–S137). `lr_avg` drifted +16-28 %
+  od init v 10 generacích napříč seedy; non-trivial lineage variance.
+- Homeostatic plasticita (S138–S139). `w_norm_avg` 6.2–7.3 ≤ cap 8.0;
+  bez S138 weights divergovaly nad 20 v pre-S138 smoke.
+- Decoupled RewardAccumulator pattern — 6 dispatch sites žijí nezávisle,
+  S140 observability + S142 bridge přidaly columns bez touchu reward sites.
+
+**Co nepřenosé / odložené:**
+- Cross-seed 30-gen sweep (throughput cap při 30 ticks/s post-multi-dispatch).
+  Stačil 10 gen, ale long-tail behaviors (gen 50+) nepokryté.
+- Maze mode validace — odložená.
+- Per-kind reward breakdown CSV (`reward_eat_avg` atd.) — odložené ze S140.
+- Activity_imbalance metric — vyžaduje GPU readback z `activity_buf`.
+- `damage_avoidance_score` (S135 acceptance) — pre-S133 baseline neměl
+  metric, nelze retroaktivně srovnat.
+- Per-tick spike event stream (S142 plánováno) — místo toho snapshot
+  `neural_spike_frac`.
+- Renderer parity (`src/main.rs` Bevy ECS systems) — plasticity dispatch
+  sites žijí jen v headless `World`. Renderer dál běží pre-S133 reward
+  funnel (jen eat + novelty). Renderer mirror = work item pro 143-152.
+
+**Doporučení pro 143–152 SNN/STDP:**
+1. S142 `neural_spike_frac = 0.87` ukazuje že rate brain běží v saturated
+   regime → spike timing info je tam underutilized. SNN by tu mohla získat.
+2. Začít s `enum NeuronModel { Perceptron, Izhikevich }` v Genome
+   (opt-in mutace, pre-existing perceptron lineages survive).
+3. Per-cell genome traits: `stdp_window_ms`, `stdp_a_plus`, `stdp_a_minus`
+   jako analoge S136 `learning_rate` + `trace_decay`.
+4. Forward pass = sub-timestep integrátor (dt/4) pro Izhikevich diff
+   eq. Per-cell `(v, u)` state buffer.
+5. STDP reward apply = timing-aware Δw místo trace-modulated. Zachová
+   `hebbian_apply_reward` jako legacy path pro Perceptron lineages.
+6. Storage budget: současný stav 6/7 z 12 v hebbian shadery, +3 nová binding
+   (membrane state v, recovery u, last_spike_time) fit pod 12.
 
 ## Outline navazující desítky 143–152 (SNN / STDP)
 
