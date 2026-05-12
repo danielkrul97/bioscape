@@ -102,6 +102,9 @@ impl BenchWorld {
                     smell_grad,
                     pheromone_grads,
                     temperature_local: 17.0,
+                    vibration_grad: [0.0, 0.0, 0.0],
+                    vibration_amp: 0.0,
+                    whisker_distances: [1.0; bioscape::WHISKER_COUNT],
                 };
                 let inputs = populate_brain_inputs(cell, &sensors, cell.genome.vision_radius);
                 let (_h, outputs) = brain.forward_with_state(&inputs);
