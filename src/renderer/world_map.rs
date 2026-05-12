@@ -49,6 +49,11 @@ pub(super) fn world_map_image(map: &WorldMap) -> Image {
     )
 }
 
+// Eat_food / spawn_food both compute the multiplier on the GPU directly
+// from `WORLD_MAP_FOOD_FLOOR + WORLD_MAP_FOOD_AMP × richness` — the CPU
+// helper is no longer called by either system but kept around in case a
+// future stats / overlay path needs it.
+#[allow(dead_code)]
 pub(super) fn food_multiplier(noise: f32) -> f32 {
     WORLD_MAP_FOOD_FLOOR + WORLD_MAP_FOOD_AMP * noise
 }

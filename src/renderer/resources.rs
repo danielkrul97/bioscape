@@ -1,16 +1,14 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bioscape::{
-    EventCalendar, FoodKind, ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap,
+    EventCalendar, ObstacleField, SimClock, SmellField, WorldMap,
     INITIAL_CELLS, N_PHEROMONE_CHANNELS,
 };
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::config::{
-    CAMERA_PITCH_INITIAL, CAMERA_SCALE_INITIAL, GRID_CELL_SIZE,
-};
+use super::config::{CAMERA_PITCH_INITIAL, CAMERA_SCALE_INITIAL};
 use super::material::BioMaterial;
 
 #[derive(Resource, Default)]
@@ -42,24 +40,6 @@ pub(super) struct FoodDensityFactor(pub(super) f32);
 impl Default for FoodDensityFactor {
     fn default() -> Self {
         Self(1.0)
-    }
-}
-
-#[derive(Resource)]
-pub(super) struct CellGrid(pub(super) SpatialGrid<Entity, f32>);
-
-impl Default for CellGrid {
-    fn default() -> Self {
-        Self(SpatialGrid::new(GRID_CELL_SIZE, bioscape::WORLD_HALF))
-    }
-}
-
-#[derive(Resource)]
-pub(super) struct FoodGrid(pub(super) SpatialGrid<Entity, FoodKind>);
-
-impl Default for FoodGrid {
-    fn default() -> Self {
-        Self(SpatialGrid::new(GRID_CELL_SIZE, bioscape::WORLD_HALF))
     }
 }
 

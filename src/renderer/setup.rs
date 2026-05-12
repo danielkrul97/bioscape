@@ -277,6 +277,33 @@ pub(super) fn setup(
             let motor = MotorGpu::with_context(&ctx, cap)?;
             let step = StepGpu::with_context(&ctx, cap)?;
             let predate = bioscape::gpu::PredateGpu::with_context(&ctx, cap)?;
+            // Wave J port: GPU food rejection sampling. K-attempts buffer sized
+            // for the worst-case dispatch (FOOD_SPAWN_RATE × MAX_SPAWN_ATTEMPTS).
+            // World map uploaded once at init; obstacle mask gets refreshed on
+            // each maze toggle in `input::toggle_maze_world`.
+            let food_spawn_cap =
+                bioscape::FOOD_SPAWN_RATE * bioscape::MAX_SPAWN_ATTEMPTS;
+            let world_map_size = (bioscape::WORLD_MAP_RES
+                * bioscape::WORLD_MAP_RES
+                * bioscape::WORLD_MAP_RES_Z) as u64;
+            let obstacle_mask_cap: u64 = 256 * 256 * 4;
+            let food_spawn = bioscape::gpu::FoodSpawnGpu::with_context(
+                &ctx,
+                food_spawn_cap,
+                world_map_size,
+                obstacle_mask_cap,
+            )?;
+            food_spawn.upload_world_map(world_map.field());
+            // GPU eat_food candidate selection. Capacity mirrors food_hash
+            // (field_sources_cap) so the on-device per-tick food array
+            // upload always fits.
+            let eat_food = bioscape::gpu::EatFoodGpu::with_context(
+                &ctx,
+                cap,
+                field_sources_cap,
+                world_map_size,
+            )?;
+            eat_food.upload_world_map(world_map.field());
             let collision = bioscape::gpu::CollisionGpu::with_context(
                 &ctx,
                 cap,
@@ -314,6 +341,8 @@ pub(super) fn setup(
                 step,
                 collision,
                 predate,
+                food_spawn,
+                eat_food,
                 cppn,
                 scratch: bioscape::gpu::GpuFullScratch::default(),
             })

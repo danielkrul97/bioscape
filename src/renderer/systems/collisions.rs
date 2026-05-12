@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use super::super::components::{CellEntity, Dying};
 use super::super::config::{DIAG_COLLISIONS, DIAG_PREDATION};
-use super::super::resources::{CellGrid, ContactProgress};
+use super::super::resources::ContactProgress;
 use super::super::resources_gpu::GpuFullPipeline;
 
 // Generous broad-phase upper bound on "other" effective_radius — captures
@@ -29,10 +29,26 @@ pub(crate) struct SnapEntry {
     pub(crate) bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
 }
 
+/// Persistent per-tick scratch for `cell_predates_on_neighbor`. Bundled into
+/// one `Local` so we stay under Bevy's 16-param system cap and avoid 8 fresh
+/// `Vec` allocations every tick.
+#[derive(Default)]
+pub(crate) struct PredateScratch {
+    entities: Vec<Entity>,
+    positions: Vec<[f32; 3]>,
+    eff_radii: Vec<f32>,
+    headings: Vec<f32>,
+    pitches: Vec<f32>,
+    attack_signals: Vec<f32>,
+    spike_counts: Vec<u32>,
+    spikes_packed: Vec<[f32; 4]>,
+}
+
 pub(crate) fn cell_predates_on_neighbor(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut diag: Diagnostics,
     gpu_full: Option<ResMut<GpuFullPipeline>>,
+    mut scratch: Local<PredateScratch>,
 ) {
     let t_total = Instant::now();
 
@@ -42,37 +58,38 @@ pub(crate) fn cell_predates_on_neighbor(
     // emit per-event tuples. CPU fallback still does the full metric set.
     if let Some(mut gpu_res) = gpu_full {
         let gpu = &mut *gpu_res;
-        let mut entities: Vec<Entity> = Vec::new();
-        let mut positions: Vec<[f32; 3]> = Vec::new();
-        let mut eff_radii: Vec<f32> = Vec::new();
-        let mut headings: Vec<f32> = Vec::new();
-        let mut pitches: Vec<f32> = Vec::new();
-        let mut attack_signals: Vec<f32> = Vec::new();
-        let mut spike_counts: Vec<u32> = Vec::new();
-        let mut spikes_packed: Vec<[f32; 4]> = Vec::new();
+        let s = &mut *scratch;
+        s.entities.clear();
+        s.positions.clear();
+        s.eff_radii.clear();
+        s.headings.clear();
+        s.pitches.clear();
+        s.attack_signals.clear();
+        s.spike_counts.clear();
+        s.spikes_packed.clear();
         for (e, c) in cells.iter() {
-            entities.push(e);
-            positions.push(c.0.position);
-            eff_radii.push(c.0.phenotype.effective_radius());
-            headings.push(c.0.heading);
-            pitches.push(c.0.pitch);
-            attack_signals.push(c.0.last_outputs[6].max(0.0));
+            s.entities.push(e);
+            s.positions.push(c.0.position);
+            s.eff_radii.push(c.0.phenotype.effective_radius());
+            s.headings.push(c.0.heading);
+            s.pitches.push(c.0.pitch);
+            s.attack_signals.push(c.0.last_outputs[6].max(0.0));
             let mut active = 0u32;
-            for s in 0..bioscape::SPIKE_SLOTS {
-                let spike = c.0.phenotype.spikes[s];
+            for k in 0..bioscape::SPIKE_SLOTS {
+                let spike = c.0.phenotype.spikes[k];
                 if spike.length > 0.0 {
                     active += 1;
                 }
-                spikes_packed.push([
+                s.spikes_packed.push([
                     spike.length,
                     spike.azimuth_offset,
                     spike.elevation_offset,
                     spike.complexity,
                 ]);
             }
-            spike_counts.push(active);
+            s.spike_counts.push(active);
         }
-        let n = entities.len();
+        let n = s.entities.len();
         if n == 0 {
             diag.add_measurement(&DIAG_PREDATION, || {
                 t_total.elapsed().as_secs_f64() * 1000.0
@@ -95,19 +112,19 @@ pub(crate) fn cell_predates_on_neighbor(
             world_half_y: WORLD_HALF[1],
             ..bioscape::gpu::PredateParamsGpu::default()
         };
-        gpu.cell_hash.dispatch(&positions);
+        gpu.cell_hash.dispatch(&s.positions);
         let result = gpu.predate.compute(
-            &positions,
-            &eff_radii,
-            &headings,
-            &pitches,
-            &spikes_packed,
-            &spike_counts,
-            &attack_signals,
+            &s.positions,
+            &s.eff_radii,
+            &s.headings,
+            &s.pitches,
+            &s.spikes_packed,
+            &s.spike_counts,
+            &s.attack_signals,
             &gpu.cell_hash,
             params,
         );
-        for (i, entity) in entities.iter().enumerate() {
+        for (i, entity) in s.entities.iter().enumerate() {
             if let Ok((_, mut cell)) = cells.get_mut(*entity) {
                 cell.0.energy += result.energy_delta[i];
                 cell.0.damage_accum += result.damage_delta[i];
@@ -120,7 +137,6 @@ pub(crate) fn cell_predates_on_neighbor(
 }
 
 pub(crate) fn resolve_cell_collisions(
-    grid: Res<CellGrid>,
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
     mut contact_progress: ResMut<ContactProgress>,
     mut diag: Diagnostics,
@@ -155,7 +171,6 @@ pub(crate) fn resolve_cell_collisions(
     }
     let entity_to_idx = &*entity_to_idx_scratch;
     let id_to_idx = &*id_to_idx_scratch;
-    let _ = grid;
     // Phase 1 (parallel): per-cell delta + vel_delta + collected contacts.
     // Inner Vec<u64> per cell — drop persisted approach kvůli rayon
     // collect_into_vec: existing inner Vecs se znovu použijí jen pokud délka
@@ -172,48 +187,59 @@ pub(crate) fn resolve_cell_collisions(
         let snapshot = snapshot_scratch.as_slice();
         let n = snapshot.len();
         if n > 0 {
-            let positions: Vec<[f32; 3]> = snapshot.iter().map(|s| s.position).collect();
-            let velocities: Vec<[f32; 3]> = snapshot.iter().map(|s| s.velocity).collect();
-            let eff_radii: Vec<f32> = snapshot.iter().map(|s| s.radius).collect();
-            // SnapEntry doesn't carry phenotype.max_axis(); approximate with
-            // the renderer's BROAD_PHASE_SIZE_BUDGET / 2 (the CPU broad-phase
-            // also uses `radius + BUDGET` rather than a per-cell max_axis).
-            let max_axes: Vec<f32> = snapshot
-                .iter()
-                .map(|_| BROAD_PHASE_SIZE_BUDGET * 0.5)
-                .collect();
-            let adhesion_types: Vec<u32> =
-                snapshot.iter().map(|s| s.adhesion_type as u32).collect();
+            // Late-tick scratch shared with predate/eat_food — replaces 9
+            // fresh `Vec` allocations per tick.
             let slots = MAX_BONDS_PER_CELL;
             let total = n * slots;
-            let mut partner_idx = vec![-1_i32; total];
-            let mut rest = vec![0.0_f32; total];
-            let mut stiff = vec![0.0_f32; total];
-            let mut damp = vec![0.0_f32; total];
+            let scratch = &mut gpu.scratch;
+            scratch.lt_positions.clear();
+            scratch.lt_velocities.clear();
+            scratch.lt_eff_radii.clear();
+            scratch.lt_max_axes.clear();
+            scratch.lt_adhesion_types.clear();
+            for s in snapshot.iter() {
+                scratch.lt_positions.push(s.position);
+                scratch.lt_velocities.push(s.velocity);
+                scratch.lt_eff_radii.push(s.radius);
+                // SnapEntry doesn't carry phenotype.max_axis(); approximate
+                // with the renderer's BROAD_PHASE_SIZE_BUDGET / 2 (the CPU
+                // broad-phase also uses `radius + BUDGET` rather than a
+                // per-cell max_axis).
+                scratch.lt_max_axes.push(BROAD_PHASE_SIZE_BUDGET * 0.5);
+                scratch.lt_adhesion_types.push(s.adhesion_type as u32);
+            }
+            scratch.lt_partner_idx.clear();
+            scratch.lt_partner_idx.resize(total, -1);
+            scratch.lt_bond_rest.clear();
+            scratch.lt_bond_rest.resize(total, 0.0);
+            scratch.lt_bond_stiff.clear();
+            scratch.lt_bond_stiff.resize(total, 0.0);
+            scratch.lt_bond_damp.clear();
+            scratch.lt_bond_damp.resize(total, 0.0);
             for (i, s) in snapshot.iter().enumerate() {
                 for (slot_idx, slot) in s.bonds.iter().enumerate() {
                     if let Some(b) = slot {
                         if let Some(&j) = id_to_idx_scratch.get(&b.other_cell_id) {
                             let idx = i * slots + slot_idx;
-                            partner_idx[idx] = j as i32;
-                            rest[idx] = b.rest_length;
-                            stiff[idx] = b.stiffness;
-                            damp[idx] = b.damping;
+                            scratch.lt_partner_idx[idx] = j as i32;
+                            scratch.lt_bond_rest[idx] = b.rest_length;
+                            scratch.lt_bond_stiff[idx] = b.stiffness;
+                            scratch.lt_bond_damp[idx] = b.damping;
                         }
                     }
                 }
             }
-            gpu.cell_hash.dispatch(&positions);
+            gpu.cell_hash.dispatch(&gpu.scratch.lt_positions);
             let result = gpu.collision.compute(
-                &positions,
-                &velocities,
-                &eff_radii,
-                &max_axes,
-                &adhesion_types,
-                &partner_idx,
-                &rest,
-                &stiff,
-                &damp,
+                &gpu.scratch.lt_positions,
+                &gpu.scratch.lt_velocities,
+                &gpu.scratch.lt_eff_radii,
+                &gpu.scratch.lt_max_axes,
+                &gpu.scratch.lt_adhesion_types,
+                &gpu.scratch.lt_partner_idx,
+                &gpu.scratch.lt_bond_rest,
+                &gpu.scratch.lt_bond_stiff,
+                &gpu.scratch.lt_bond_damp,
                 &gpu.cell_hash,
             );
             let max_contacts = bioscape::MAX_COLLISION_CONTACTS_PER_CELL as usize;

@@ -126,8 +126,6 @@ pub fn run() {
             GENERATIONS_PER_EPOCH,
         )))
         .insert_resource(EventCalendarResource(event_calendar))
-        .init_resource::<CellGrid>()
-        .init_resource::<FoodGrid>()
         .init_resource::<CellEntityLookups>()
         .init_resource::<FoodDensityFactor>()
         .init_resource::<NextCellId>()
@@ -137,7 +135,7 @@ pub fn run() {
         .init_resource::<MazeWorld>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
-        .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay, rebuild_cell_grid).chain())
+        .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay).chain())
         .add_systems(
             FixedUpdate,
             (
@@ -145,7 +143,6 @@ pub fn run() {
                     tick_start,
                     advance_clock,
                     update_food_density_cycle,
-                    rebuild_food_grid,
                     rebuild_cell_entity_lookups,
                     update_smell_field,
                     update_pheromone_field,
@@ -161,7 +158,6 @@ pub fn run() {
                     step_cells,
                     apply_food_gravity,
                     apply_environmental_hazards,
-                    rebuild_cell_grid,
                     resolve_cell_collisions,
                     cell_predates_on_neighbor,
                     cell_eats_food,

@@ -1,32 +1,42 @@
 use bevy::diagnostic::Diagnostics;
 use bevy::prelude::*;
 use bioscape::{
-    EAT_RADIUS, FOOD_SPAWN_RATE, Food, LEARNING_RATE, MAX_BODY_LENGTH, MAX_SPAWN_ATTEMPTS,
-    WORLD_HALF, reject_food_for_richness,
+    EAT_RADIUS, FOOD_SPAWN_RATE, Food, LEARNING_RATE, MAX_SPAWN_ATTEMPTS,
+    WORLD_HALF,
 };
+use bioscape::gpu::{EatFoodParamsGpu, FoodSpawnParamsGpu};
 use rand::Rng;
-use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::time::Instant;
 
 use super::super::components::{CellEntity, Dying, FoodEntity};
 use super::super::config::DIAG_EAT_FOOD;
 use super::super::resources::{
-    CellEntityLookups, CellGrid, CellSlotMap, Clock, CoopFoodResource, FoodDensityFactor, FoodGrid,
-    FoodMaterial, FoodMesh, WorldExtent, WorldMapResource,
+    CellSlotMap, Clock, CoopFoodResource, FoodDensityFactor, FoodMaterial, FoodMesh, MazeWorld,
+    WorldExtent,
 };
 use super::super::resources_gpu::GpuFullPipeline;
-use super::super::world_map::{food_multiplier, food_target};
+use super::super::world_map::food_target;
 
+/// GPU rejection-sampling food spawn — mirror of headless
+/// `World::spawn_food_dispatch`. Generates `to_spawn × MAX_SPAWN_ATTEMPTS`
+/// candidates in parallel on the GPU (world-map richness + obstacle mask +
+/// cell-radius exclusion), then CPU consumes the first `to_spawn` valid hits
+/// as Bevy `FoodEntity` spawn commands.
+///
+/// Replaces the previous CPU `cell_grid.for_each_in_radius_toroidal` loop
+/// which sat at the top of perf flamegraphs (~27 % of CPU). The CPU
+/// `CellGrid` / `WorldMapResource` snapshots are no longer needed by this
+/// system — the rebuild only stayed alive because of this single consumer.
 pub(crate) fn spawn_food(
     foods: Query<(), With<FoodEntity>>,
     cells: Query<&CellEntity, Without<Dying>>,
     extent: Res<WorldExtent>,
     factor: Res<FoodDensityFactor>,
-    cell_grid: Res<CellGrid>,
-    world_map: Res<WorldMapResource>,
+    maze: Res<MazeWorld>,
     food_mesh: Res<FoodMesh>,
     food_material: Res<FoodMaterial>,
+    gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
 ) {
     let target = food_target(&extent, factor.0);
@@ -35,66 +45,86 @@ pub(crate) fn spawn_food(
         return;
     }
     let to_spawn = (target - count).min(FOOD_SPAWN_RATE);
-    let mut rng = rand::rng();
-    let half = extent.as_array();
-    // Sprint 41: bump broad-phase budget na MAX_BODY_LENGTH — worst-case max_axis
-    // ellipsoid může extending podél long axis až o tuto velikost. BROAD_PHASE_SIZE_BUDGET
-    // = 3.0 (effective_radius default) by missnul cells s max_axis blízko 4.0.
-    let broad_r = EAT_RADIUS * MAX_BODY_LENGTH;
+    if to_spawn == 0 {
+        return;
+    }
+    let Some(mut gpu_res) = gpu_full else { return };
 
-    'spawn: for _ in 0..to_spawn {
-        for _ in 0..MAX_SPAWN_ATTEMPTS {
-            let candidate = Food::random(&mut rng, half);
-            // Sprint 31: rejection sampling proti uniform — bias k rich zonám.
-            // Spotřebovává retry budget jako cell-exclusion check níž.
-            let richness = world_map
-                .0
-                .sample([candidate.position[0], candidate.position[1], 0.0]);
-            if reject_food_for_richness(&mut rng, richness) {
-                continue;
-            }
-            let mut blocked = false;
-            cell_grid.0.for_each_in_radius_toroidal(
-                candidate.position,
-                broad_r,
-                WORLD_HALF,
-                |entity, cell_pos, _radius| {
-                    if blocked {
-                        return;
-                    }
-                    // Match headless: exclusion uses ellipsoid's max_axis, not
-                    // effective_radius. Elongated cells extend past their sphere
-                    // approximation along the long axis, so a sphere-radius
-                    // exclusion would let food spawn inside the ellipsoid.
-                    let max_axis = cells
-                        .get(entity)
-                        .map(|c| c.0.phenotype.max_axis())
-                        .unwrap_or(MAX_BODY_LENGTH);
-                    let exclusion = EAT_RADIUS * max_axis;
-                    let d = bioscape::min_image_delta(candidate.position, cell_pos, WORLD_HALF);
-                    if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < exclusion * exclusion {
-                        blocked = true;
-                    }
-                },
-            );
-            if !blocked {
-                commands.spawn((
-                    FoodEntity(candidate),
-                    Mesh3d(food_mesh.0.clone()),
-                    MeshMaterial3d(food_material.0.clone()),
-                    Transform::from_xyz(
-                        candidate.position[0],
-                        candidate.position[1],
-                        candidate.position[2],
-                    ),
-                    Visibility::Hidden,
-                ));
-                continue 'spawn;
-            }
+    let positions: Vec<[f32; 3]> = cells.iter().map(|c| c.0.position).collect();
+    let max_axes: Vec<f32> = cells.iter().map(|c| c.0.phenotype.max_axis()).collect();
+
+    let mut rng = rand::rng();
+    let k = to_spawn * MAX_SPAWN_ATTEMPTS;
+    let seeds: Vec<[u32; 4]> = (0..k)
+        .map(|_| {
+            [
+                rng.random::<u32>(),
+                rng.random::<u32>(),
+                rng.random::<u32>(),
+                rng.random::<u32>(),
+            ]
+        })
+        .collect();
+
+    let obstacle_active = maze.field.is_some();
+    let (obs_nx, obs_ny, obs_nz) = maze
+        .field
+        .as_ref()
+        .map(|o| {
+            (
+                o.resolution[0] as u32,
+                o.resolution[1] as u32,
+                o.resolution[2] as u32,
+            )
+        })
+        .unwrap_or((1, 1, 1));
+    let half = extent.as_array();
+    let params = FoodSpawnParamsGpu {
+        num_attempts: 0, // populated by compute()
+        rejection_strength: bioscape::FOOD_REJECTION_STRENGTH,
+        eat_radius: EAT_RADIUS,
+        cell_size: bioscape::GRID_CELL_SIZE,
+        world_half_x: half[0],
+        world_half_y: half[1],
+        world_half_z: half[2],
+        num_cells: 0, // populated by compute()
+        world_map_nx: bioscape::WORLD_MAP_RES as u32,
+        world_map_ny: bioscape::WORLD_MAP_RES as u32,
+        world_map_nz: bioscape::WORLD_MAP_RES_Z as u32,
+        obstacle_active: if obstacle_active { 1 } else { 0 },
+        obstacle_nx: obs_nx,
+        obstacle_ny: obs_ny,
+        obstacle_nz: obs_nz,
+        _pad0: 0,
+    };
+
+    let gpu = &mut *gpu_res;
+    gpu.cell_hash.dispatch(&positions);
+    gpu.food_spawn.seed_attempts(&seeds);
+    let result = gpu
+        .food_spawn
+        .compute(k, &positions, &max_axes, &gpu.cell_hash, params);
+
+    let mut pushed = 0usize;
+    for i in 0..k {
+        if pushed >= to_spawn {
+            break;
         }
-        // All MAX_SPAWN_ATTEMPTS rolls fell inside someone's eat radius — skip
-        // this slot. Population is dense enough that the food world is at
-        // (ecological) saturation; we'll catch up later when cells move.
+        if result.valid_mask[i] != 0 {
+            let food = Food {
+                position: result.candidate_positions[i],
+                age_ticks: 0,
+                kind: bioscape::FoodKind::Plant,
+            };
+            commands.spawn((
+                FoodEntity(food),
+                Mesh3d(food_mesh.0.clone()),
+                MeshMaterial3d(food_material.0.clone()),
+                Transform::from_xyz(food.position[0], food.position[1], food.position[2]),
+                Visibility::Hidden,
+            ));
+            pushed += 1;
+        }
     }
 }
 
@@ -170,183 +200,187 @@ pub(crate) fn update_coop_food(
     }
 }
 
+/// Persistent per-tick scratch for `cell_eats_food`. Bundled into one
+/// `Local` to keep the system param count under Bevy's 16 cap (Locals,
+/// Queries, Resources all count against the same budget).
+#[derive(Default)]
+pub(crate) struct EatFoodScratch {
+    cell_entities: Vec<Entity>,
+    cell_positions: Vec<[f32; 3]>,
+    cell_headings: Vec<f32>,
+    cell_pitches: Vec<f32>,
+    cell_body_dims: Vec<[f32; 3]>,
+    cell_carnivore: Vec<f32>,
+    cell_max_axes: Vec<f32>,
+    food_entities: Vec<Entity>,
+    food_positions: Vec<[f32; 3]>,
+    food_kinds: Vec<u32>,
+    food_age_ticks: Vec<u32>,
+    eaten: FxHashSet<Entity>,
+    share_deltas: Vec<(Entity, f32)>,
+    rewards: Vec<f32>,
+}
+
 pub(crate) fn cell_eats_food(
     mut cells: Query<(Entity, &mut CellEntity), Without<Dying>>,
-    food_grid: Res<FoodGrid>,
-    world_map: Res<WorldMapResource>,
+    foods: Query<(Entity, &FoodEntity)>,
     slot_map: Res<CellSlotMap>,
-    lookups: Res<CellEntityLookups>,
+    lookups: Res<super::super::resources::CellEntityLookups>,
     gpu_full: Option<ResMut<GpuFullPipeline>>,
     mut commands: Commands,
     mut diag: Diagnostics,
-    mut snapshot_scratch: Local<Vec<(Entity, [f32; 3], f32, [f32; 3], f32, f32, f32, f32, bool)>>,
-    mut cell_carnivore_scratch: Local<FxHashMap<Entity, f32>>,
-    mut candidates_scratch: Local<Vec<Option<(Entity, f32)>>>,
-    mut eaten_scratch: Local<FxHashSet<Entity>>,
-    mut share_deltas_scratch: Local<Vec<(Entity, f32)>>,
-    mut rewards_scratch: Local<Vec<f32>>,
+    mut scratch: Local<EatFoodScratch>,
 ) {
     let t_total = Instant::now();
 
-    // Sprint 52: GPU Hebbian dispatch consumes rewards Vec[N]. The
-    // GpuFullPipeline carries its own Hebbian instance.
-    let use_gpu_hebbian = gpu_full.is_some();
+    let Some(mut gpu_res) = gpu_full else { return };
 
-    rewards_scratch.clear();
-    if use_gpu_hebbian {
-        rewards_scratch.resize(slot_map.len(), 0.0);
-    }
-    let rewards = &mut *rewards_scratch;
+    let s = &mut *scratch;
+    s.rewards.clear();
+    s.rewards.resize(slot_map.len(), 0.0);
 
-    // Sprint 58: 3-pass refactor (mirror Sprint 57 headless eat_food).
-    // Pass 1 (par): per-cell candidate selection. Snapshot s pose data pro
-    // toroidal-aware eat_test_pose (lib helper bez `&Cell`).
-    // R-#13: Local scratch pro snapshot/cell_carnivore/candidates — pre-fix
-    // 3 fresh allocs per tick.
-    snapshot_scratch.clear();
-    cell_carnivore_scratch.clear();
+    // Snapshot cells (dense, slot-aligned for the GPU dispatch).
+    s.cell_entities.clear();
+    s.cell_positions.clear();
+    s.cell_headings.clear();
+    s.cell_pitches.clear();
+    s.cell_body_dims.clear();
+    s.cell_carnivore.clear();
+    s.cell_max_axes.clear();
     for (e, c) in cells.iter() {
-        let has_bonds = c.0.bonds.iter().any(|b| b.is_some());
-        snapshot_scratch.push((
-            e,
-            c.0.position,
-            c.0.phenotype.max_axis(),
-            [
-                c.0.phenotype.body_length,
-                c.0.phenotype.body_width,
-                c.0.phenotype.body_height,
-            ],
-            c.0.heading,
-            c.0.pitch,
-            c.0.last_best_food_d2,
-            c.0.genome.vision_radius,
-            has_bonds,
-        ));
-        cell_carnivore_scratch.insert(e, c.0.genome.carnivore_score);
+        s.cell_entities.push(e);
+        s.cell_positions.push(c.0.position);
+        s.cell_headings.push(c.0.heading);
+        s.cell_pitches.push(c.0.pitch);
+        s.cell_body_dims.push([
+            c.0.phenotype.body_length,
+            c.0.phenotype.body_width,
+            c.0.phenotype.body_height,
+        ]);
+        s.cell_carnivore.push(c.0.genome.carnivore_score);
+        s.cell_max_axes.push(c.0.phenotype.max_axis());
     }
-    let snapshot = snapshot_scratch.as_slice();
-    let food_grid_ref = &food_grid.0;
-    let cell_carnivore = &*cell_carnivore_scratch;
-    candidates_scratch.clear();
-    // eat_food skip optim: gate `!has_bonds` chrání determinismus — bonded cells
-    // v dense clusterech mohou mít spring-impulse pohyb > 30 jednotek/tick, což
-    // by změnilo first-cell-wins ordering v Pass 2. Solo cells mají
-    // predictable kinetiku (velocity + drag + brownian, ~5 jednotek/tick).
-    const EAT_FOOD_MOVE_SLACK: f32 = 10.0;
-    snapshot
-        .par_iter()
-        .map(|(entity, pos, max_axis, dims, heading, pitch, last_best_food_d2, vision_r, has_bonds)| {
-            let eat_r = EAT_RADIUS * *max_axis;
-            let skip_threshold = eat_r + EAT_FOOD_MOVE_SLACK;
-            let skip_threshold_sq = skip_threshold * skip_threshold;
-            let sensor_covers = vision_r * vision_r >= skip_threshold_sq;
-            if !has_bonds && sensor_covers && *last_best_food_d2 > skip_threshold_sq {
-                return None;
-            }
-            let carnivore_score = cell_carnivore.get(entity).copied().unwrap_or(0.0);
-            let mut ate: Option<(Entity, f32)> = None;
-            food_grid_ref.for_each_in_radius_toroidal(
-                *pos,
-                eat_r,
-                WORLD_HALF,
-                |food_e, food_pos, food_kind| {
-                    if ate.is_some() {
-                        return;
-                    }
-                    // Sprint 54: ghost food s min-imaged position pro toroidal eat_test.
-                    let md = bioscape::min_image_delta(*pos, food_pos, WORLD_HALF);
-                    let ghost_pos = [pos[0] + md[0], pos[1] + md[1], food_pos[2]];
-                    if bioscape::eat_test_pose(*pos, *heading, *pitch, *dims, ghost_pos, EAT_RADIUS) {
-                        // Sprint 92: food value = base_value(kind) × multiplier × value_factor
-                        // × eat_efficiency(kind, carnivore_score). Carrion vyžaduje
-                        // carnivore digestion; plant je herbivore-friendly.
-                        let efficiency = bioscape::eat_efficiency(food_kind, carnivore_score);
-                        let value = bioscape::food_base_value(food_kind)
-                            * food_multiplier(
-                                world_map.0.sample([food_pos[0], food_pos[1], 0.0]),
-                            )
-                            * Food {
-                                position: food_pos,
-                                age_ticks: 0,
-                                kind: food_kind,
-                            }
-                            .value_factor()
-                            * efficiency;
-                        ate = Some((food_e, value));
-                    }
-                },
-            );
-            ate
-        })
-        .collect_into_vec(&mut candidates_scratch);
-    let candidates = candidates_scratch.as_slice();
 
-    // R-#2: id_to_entity z persistent CellEntityLookups (built v
-    // `rebuild_cell_entity_lookups` na začátku ticku). Cells layout je stable
-    // od tady přes celé eat_food.
+    // Snapshot foods. Index in this Vec is the dense food index the shader
+    // will return via `food_idx`; we map back to Bevy `Entity` afterward.
+    s.food_entities.clear();
+    s.food_positions.clear();
+    s.food_kinds.clear();
+    s.food_age_ticks.clear();
+    for (e, f) in foods.iter() {
+        s.food_entities.push(e);
+        s.food_positions.push(f.0.position);
+        s.food_kinds.push(f.0.kind as u32);
+        s.food_age_ticks.push(f.0.age_ticks);
+    }
+    let n_cells = s.cell_entities.len();
+    let n_foods = s.food_entities.len();
+
+    // GPU Pass 1: per-cell candidate (food_idx, value). Sentinel `n_foods`
+    // means "this cell ate nothing this tick".
+    let candidates: Vec<Option<(usize, f32)>> = if n_cells == 0 || n_foods == 0 {
+        vec![None; n_cells]
+    } else {
+        let params = EatFoodParamsGpu {
+            num_cells: 0,
+            num_foods: 0,
+            cell_size: bioscape::GRID_CELL_SIZE,
+            eat_radius: EAT_RADIUS,
+            world_half_x: WORLD_HALF[0],
+            world_half_y: WORLD_HALF[1],
+            world_half_z: WORLD_HALF[2],
+            world_map_nx: bioscape::WORLD_MAP_RES as u32,
+            world_map_ny: bioscape::WORLD_MAP_RES as u32,
+            world_map_nz: bioscape::WORLD_MAP_RES_Z as u32,
+            fixed_timestep_hz: bioscape::FIXED_TIMESTEP_HZ,
+            plant_food_value: bioscape::PLANT_FOOD_VALUE,
+            carrion_food_value: bioscape::CARRION_FOOD_VALUE,
+            carrion_decay_per_sec: bioscape::CARRION_DECAY_PER_SEC,
+            world_map_food_floor: bioscape::WORLD_MAP_FOOD_FLOOR,
+            world_map_food_amp: bioscape::WORLD_MAP_FOOD_AMP,
+        };
+        let gpu = &mut *gpu_res;
+        // food_hash needs current food positions; predate dispatches the
+        // cell_hash with up-to-date positions, but the food_hash hasn't been
+        // refreshed since spawn_food (which uses cell_hash not food_hash).
+        gpu.food_hash.dispatch(&s.food_positions);
+        let result = gpu.eat_food.compute(
+            &s.cell_positions,
+            &s.cell_headings,
+            &s.cell_pitches,
+            &s.cell_body_dims,
+            &s.cell_carnivore,
+            &s.cell_max_axes,
+            &s.food_positions,
+            &s.food_kinds,
+            &s.food_age_ticks,
+            &gpu.food_hash,
+            params,
+        );
+        let sentinel = n_foods as u32;
+        (0..n_cells)
+            .map(|i| {
+                let f = result.food_idx[i];
+                if f >= sentinel {
+                    None
+                } else {
+                    Some((f as usize, result.value[i]))
+                }
+            })
+            .collect()
+    };
+
     let id_to_entity = &lookups.id_to_entity;
 
     // Pass 2 (sequential): resolve race + apply energy + Hebbian. First-cell-wins
     // per food entity (matches pre-Sprint-58 ordering).
     // Sprint 78: cluster food share. Sebráno do share_deltas Vec během iterace,
     // aplikováno post-loop kvůli simultaneous mutable borrow.
-    eaten_scratch.clear();
-    share_deltas_scratch.clear();
-    let eaten = &mut *eaten_scratch;
-    let share_deltas = &mut *share_deltas_scratch;
-    for ((entity, _, _, _, _, _, _, _, _), opt) in snapshot.iter().zip(candidates.iter()) {
-        if let Some((food_e, value)) = opt {
-            if eaten.contains(food_e) {
-                continue;
-            }
-            eaten.insert(*food_e);
-            let (bonds_copy, donor_state) = if let Ok((_, mut cell)) = cells.get_mut(*entity) {
-                cell.0.energy += *value;
-                let copy = cell.0.bonds;
-                let state = cell.0.cell_state;
-                if use_gpu_hebbian {
-                    if let Some(slot) = slot_map.slot_of(*entity) {
-                        if slot < rewards.len() {
-                            rewards[slot] = 1.0;
-                        }
-                    }
-                } else {
-                    let last_hidden = cell.0.last_hidden;
-                    let last_outputs = cell.0.last_outputs;
-                    // Wave 3: trace-based reward — credits motor outputs from
-                    // up to ~120 ticks back (1/HEBBIAN_TRACE_DECAY_PER_SEC at
-                    // 60 Hz), not just this tick's pre·post.
-                    cell.0.genome.brain.hebbian_apply_reward(
-                        &last_hidden,
-                        &last_outputs,
-                        1.0,
-                        LEARNING_RATE,
-                    );
+    s.eaten.clear();
+    s.share_deltas.clear();
+    // Pass 2 (CPU, sequential): map GPU candidate indices back to Bevy
+    // entities, resolve first-cell-wins race, apply energy + share + reward.
+    for (cell_idx, opt) in candidates.iter().enumerate() {
+        let Some((food_idx, value)) = opt else { continue };
+        if *food_idx >= s.food_entities.len() {
+            continue;
+        }
+        let food_e = s.food_entities[*food_idx];
+        if s.eaten.contains(&food_e) {
+            continue;
+        }
+        s.eaten.insert(food_e);
+        let entity = s.cell_entities[cell_idx];
+        let (bonds_copy, donor_state) = if let Ok((_, mut cell)) = cells.get_mut(entity) {
+            cell.0.energy += *value;
+            let copy = cell.0.bonds;
+            let state = cell.0.cell_state;
+            if let Some(slot) = slot_map.slot_of(entity) {
+                if slot < s.rewards.len() {
+                    s.rewards[slot] = 1.0;
                 }
-                (copy, state)
-            } else {
-                continue;
-            };
-            // Sprint 78: share s bonded partnery (free reward, no
-            // conservation — modeluje tissue cooperation).
-            // Sprint 80: donor's cell_state moduluje fraction. State≈0
-            // (selfish) → ~0% share; state≈1 (altruist) → plný 30% share.
-            // Sprint 87: cluster-size bonus — cells hluboko v tkáni sdílí
-            // víc, posiluje selekci proti tissue-regime collapse.
-            let n_bonds = bonds_copy.iter().filter(|b| b.is_some()).count() as f32;
-            let cluster_mult = 1.0 + (n_bonds - 1.0).max(0.0)
-                * bioscape::BOND_FOOD_SHARE_CLUSTER_BONUS;
-            let share_value =
-                *value * bioscape::BOND_FOOD_SHARE_FRAC * donor_state * cluster_mult;
-            if share_value > 0.0 {
-                for bond_opt in bonds_copy.iter() {
-                    if let Some(bond) = bond_opt {
-                        if let Some(&partner_e) =
-                            id_to_entity.get(&bond.other_cell_id)
-                        {
-                            if partner_e != *entity {
-                                share_deltas.push((partner_e, share_value));
-                            }
+            }
+            (copy, state)
+        } else {
+            continue;
+        };
+        // Sprint 78: share s bonded partnery (free reward, no
+        // conservation — modeluje tissue cooperation).
+        // Sprint 80: donor's cell_state moduluje fraction. State≈0
+        // (selfish) → ~0% share; state≈1 (altruist) → plný 30% share.
+        // Sprint 87: cluster-size bonus — cells hluboko v tkáni sdílí
+        // víc, posiluje selekci proti tissue-regime collapse.
+        let n_bonds = bonds_copy.iter().filter(|b| b.is_some()).count() as f32;
+        let cluster_mult = 1.0
+            + (n_bonds - 1.0).max(0.0) * bioscape::BOND_FOOD_SHARE_CLUSTER_BONUS;
+        let share_value =
+            *value * bioscape::BOND_FOOD_SHARE_FRAC * donor_state * cluster_mult;
+        if share_value > 0.0 {
+            for bond_opt in bonds_copy.iter() {
+                if let Some(bond) = bond_opt {
+                    if let Some(&partner_e) = id_to_entity.get(&bond.other_cell_id) {
+                        if partner_e != entity {
+                            s.share_deltas.push((partner_e, share_value));
                         }
                     }
                 }
@@ -355,32 +389,32 @@ pub(crate) fn cell_eats_food(
     }
 
     // Sprint 78: aplikuj food share delty (po Pass 2 main loop).
-    for &(e, delta) in share_deltas.iter() {
+    // Drain into a temporary to release the &mut borrow on `s` before
+    // touching `cells.get_mut`.
+    let share_deltas: Vec<(Entity, f32)> = s.share_deltas.drain(..).collect();
+    for (e, delta) in share_deltas {
         if let Ok((_, mut cell)) = cells.get_mut(e) {
             cell.0.energy += delta;
         }
     }
 
     // Pass 3: main-thread Commands flush (despawn nelze v par_iter).
-    for food_e in eaten.iter() {
+    for food_e in s.eaten.iter() {
         commands.entity(*food_e).despawn();
     }
 
-    // Wave 7: trace-based reward apply replaces the legacy instantaneous
-    // `compute_persistent`. The GPU hebbian_step pass (run per-tick from
-    // `apply_eligibility_step`) has been decaying + accumulating
-    // `cells.brain_traces`; this dispatch credits the recent motor
-    // pattern with `Δw = lr · reward · trace`.
-    if let Some(mut gpu_full) = gpu_full {
-        let n = slot_map.len();
-        if n > 0 && rewards.iter().any(|&r| r > 0.0) {
-            let pipeline = &mut *gpu_full;
-            pipeline.cells.upload_rewards(rewards);
-            pipeline
-                .hebbian
-                .dispatch_apply_reward_persistent(&pipeline.cells, n, LEARNING_RATE);
-        }
+    // Wave 7: trace-based reward apply against `cells.brain_traces`.
+    let n_alive = slot_map.len();
+    if n_alive > 0 && s.rewards.iter().any(|&r| r > 0.0) {
+        let pipeline = &mut *gpu_res;
+        pipeline.cells.upload_rewards(&s.rewards);
+        pipeline
+            .hebbian
+            .dispatch_apply_reward_persistent(&pipeline.cells, n_alive, LEARNING_RATE);
     }
-    let _ = rewards;
+    // CPU `cell.last_hidden` / `last_outputs` Hebbian path was the
+    // pre-Wave-N fallback when GPU was absent — removed since gpu_full is
+    // mandatory. `LEARNING_RATE` only flows through the GPU dispatch.
+    let _ = LEARNING_RATE;
     diag.add_measurement(&DIAG_EAT_FOOD, || t_total.elapsed().as_secs_f64() * 1000.0);
 }

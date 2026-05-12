@@ -163,6 +163,10 @@ pub(super) fn toggle_maze_world(
             gpu.smell.clear_obstacle_mask();
             gpu.pheromone.clear_obstacle_mask();
             gpu.vibration.clear_obstacle_mask();
+            // FoodSpawn obstacle mask is read only when `obstacle_active`
+            // param is set; the next spawn_food dispatch will pass 0 and
+            // skip the mask binding regardless of buffer content.
+            let _ = &gpu.food_spawn;
         }
         return;
     }
@@ -232,6 +236,9 @@ pub(super) fn toggle_maze_world(
         gpu.smell.upload_obstacle_mask(&smell_mask_for_gpu);
         gpu.pheromone.upload_obstacle_mask(&phero_mask_for_gpu);
         gpu.vibration.upload_obstacle_mask(&vib_mask_for_gpu);
+        // Wave J port: food spawn shader rejects candidates inside walls
+        // using the same packed mask as the step / sensor shaders.
+        gpu.food_spawn.upload_obstacle(&packed);
     }
     maze.field = Some(field);
     maze.smell_mask = smell_mask;

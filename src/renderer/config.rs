@@ -30,6 +30,10 @@ pub(super) const DIAG_RENDER_OVERHEAD: DiagnosticPath =
 // dělalo 2.5 mesh visuálně dominantní).
 pub(super) const FOOD_RADIUS: f32 = 1.0;
 pub(super) const DEATH_FADE_TICKS: u32 = 30;
+// Used by the (removed) CPU CellGrid/FoodGrid resources. Both grids moved to
+// GPU spatial hashes; the constant stays for any external tool that still
+// expects it but is otherwise dead.
+#[allow(dead_code)]
 pub(super) const GRID_CELL_SIZE: f32 = 100.0;
 pub(super) const CAMERA_ZOOM_STEP: f32 = 0.1;
 // Sprint 36: orbit Camera3d s ORTHOGRAPHIC projection. Distance je fixní;
