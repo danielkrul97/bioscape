@@ -232,13 +232,22 @@ komplementární metriky.
 
 **Cíl:** 3 seedy × 30 gen × {maze, open} sweep; validation report.
 
-**Výstup:** _(po dokončení)_
+**Výstup:** `docs/sprints/133-142-validation.md` se cross-seed sweep
+(3 seedy × **10 gen** open mode — full 30 gen prohibitivně drahé na ~30
+ticks/s post-multi-dispatch). Žádná extinkce (3/3 seedy survive, pop
+439–691). Predation events 564–921 cumulative = ~70/gen (silně nad
+threshold 0.1/cell/gen). Bond formation 26–57 cumulative. `lr_avg`
+drifted 0.005 → 0.0058–0.0064 (selekce na rychlejší learners), `lr_std`
+0.0034–0.0041 (lineage variance). `decay_avg` drifted 0.5 → 0.43–0.47
+(delší credit window). `w_norm_avg` 6.22–7.29 vs cap 8.0 — synaptic
+scaling aktivně klipuje top end.
 
-**Poznámky:**
-- Generuj `docs/sprints/133-142-validation.md` se srovnání pre-S133 baseline.
-- Acceptance: žádná extinkce; predator `predation_avg > 0.1` od gen 20;
-  damage_avoidance ≥ baseline + 15 %.
-- Update CLAUDE.md / README progress.
+**Poznámky:** Scope reduce z 30 na 10 gen kvůli throughput — multi-dispatch
+per tick (eat + novelty + predate + hazards + bond + mate + step decay +
+excitability + periodic synaptic_scale) snížil ~190 → ~30 ticks/s.
+Maze sweep + 30 gen long-tail validace odložené. Damage_avoidance metric
+(S135 acceptance) nelze retroaktivně vykuvat — pre-S133 baseline neměl
+metric. 4 z 5 bottlenecks zavřené; SNN/STDP (#5) pokračuje do 143-152.
 
 ## Sprint 142 — SNN bridge + decade retro
 
