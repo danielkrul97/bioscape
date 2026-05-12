@@ -83,6 +83,8 @@ impl Brain {
             b2: [0.0; BRAIN_OUTPUTS],
             trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            membrane: [IZH_V_REST; BRAIN_HIDDEN],
+            recovery: [0.0; BRAIN_HIDDEN],
         }
     }
 
@@ -223,6 +225,8 @@ impl Brain {
             b2,
             trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            membrane: [IZH_V_REST; BRAIN_HIDDEN],
+            recovery: [0.0; BRAIN_HIDDEN],
         }
     }
 }
@@ -254,6 +258,31 @@ pub struct Brain {
     pub trace_w1: [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN],
     #[serde(default = "default_trace_w2", with = "serde_arrays_w2")]
     pub trace_w2: [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+    /// Sprint 145: per-hidden-neuron Izhikevich membrane potential `v`
+    /// (in mV-ish units; the canonical Izhikevich 2003 model uses
+    /// `v_rest = -65`). For `NeuronModel::Perceptron` cells these slots
+    /// are unused and stay at the resting potential. S146 onward (CPU) and
+    /// S147 (GPU) consume them on `NeuronModel::Izhikevich` cells. Pre-S145
+    /// checkpoints deserialize at the resting potential default.
+    #[serde(default = "default_membrane", with = "serde_arr_hidden")]
+    pub membrane: [f32; BRAIN_HIDDEN],
+    /// Sprint 145: per-hidden-neuron Izhikevich recovery variable `u`.
+    /// Default 0 (canonical reset value). Same model gating as `membrane`.
+    #[serde(default = "default_recovery", with = "serde_arr_hidden")]
+    pub recovery: [f32; BRAIN_HIDDEN],
+}
+
+/// Sprint 145: canonical Izhikevich 2003 resting potential. Pre-S145
+/// checkpoints serde-default into this so the membrane buffer starts at
+/// rest, exactly where a fresh Izhikevich cell would begin.
+pub const IZH_V_REST: f32 = -65.0;
+
+fn default_membrane() -> [f32; BRAIN_HIDDEN] {
+    [IZH_V_REST; BRAIN_HIDDEN]
+}
+
+fn default_recovery() -> [f32; BRAIN_HIDDEN] {
+    [0.0; BRAIN_HIDDEN]
 }
 
 fn default_trace_w1() -> [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN] {
@@ -425,6 +454,8 @@ impl Brain {
             b2,
             trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            membrane: [IZH_V_REST; BRAIN_HIDDEN],
+            recovery: [0.0; BRAIN_HIDDEN],
         }
     }
 

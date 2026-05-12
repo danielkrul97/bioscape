@@ -55,6 +55,14 @@ pub struct CellsGpu {
     /// Sprint 137: per-cell eligibility-trace decay (1/s), read by
     /// `hebbian_step.wgsl`. Same init/upload story as `learning_rates_buf`.
     trace_decays_buf: wgpu::Buffer,
+    /// Sprint 145: per-cell, per-hidden-neuron Izhikevich membrane
+    /// potential `v`. Layout: `[capacity × BRAIN_HIDDEN]` f32, row-major
+    /// (cell i hidden h at index `i * BRAIN_HIDDEN + h`). Initialised at
+    /// allocation to `IZH_V_REST = -65.0`; Izhikevich forward (S146/S147)
+    /// reads and mutates; Perceptron path ignores it.
+    membrane_buf: wgpu::Buffer,
+    /// Sprint 145: matching recovery variable `u`. Default 0.0.
+    recovery_buf: wgpu::Buffer,
     /// Cell metadata fed to the `populate_brain_inputs` shader.
     /// `energy`, `heading`, `pitch`, `damage_accum` are uploaded per tick;
     /// `max_speed` and `eff_radius` only change on reproduce / morph but the
@@ -168,6 +176,29 @@ impl CellsGpu {
             0,
             bytemuck::cast_slice(&default_decay_fill),
         );
+        // Sprint 145: Izhikevich (v, u) buffers, sized like `last_hidden`.
+        // Initial fill at resting potential / zero recovery so any cell
+        // that's flipped to `NeuronModel::Izhikevich` mid-run starts the
+        // membrane dynamics from rest.
+        let membrane_buf = mk(
+            "cells-membrane",
+            n * (BRAIN_HIDDEN as u64) * f,
+            stor_dst_src,
+        );
+        let recovery_buf = mk(
+            "cells-recovery",
+            n * (BRAIN_HIDDEN as u64) * f,
+            stor_dst_src,
+        );
+        let default_membrane_fill = vec![IZH_V_REST; capacity * BRAIN_HIDDEN];
+        queue.write_buffer(
+            &membrane_buf,
+            0,
+            bytemuck::cast_slice(&default_membrane_fill),
+        );
+        // Zero-init recovery — write_buffer with zero slice is cheap.
+        let zero_recovery = vec![0.0_f32; capacity * BRAIN_HIDDEN];
+        queue.write_buffer(&recovery_buf, 0, bytemuck::cast_slice(&zero_recovery));
         // populate_inputs metadata.
         let energy_buf = mk("cells-energy", n * f, stor_dst_src);
         let heading_buf = mk("cells-heading", n * f, stor_dst_src);
@@ -230,6 +261,8 @@ impl CellsGpu {
             rewards_buf,
             learning_rates_buf,
             trace_decays_buf,
+            membrane_buf,
+            recovery_buf,
             energy_buf,
             heading_buf,
             pitch_buf,
@@ -289,6 +322,8 @@ impl CellsGpu {
     pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
     pub fn learning_rates_buffer(&self) -> &wgpu::Buffer { &self.learning_rates_buf }
     pub fn trace_decays_buffer(&self) -> &wgpu::Buffer { &self.trace_decays_buf }
+    pub fn membrane_buffer(&self) -> &wgpu::Buffer { &self.membrane_buf }
+    pub fn recovery_buffer(&self) -> &wgpu::Buffer { &self.recovery_buf }
     /// `populate_inputs` metadata buffer accessors.
     pub fn energy_buffer(&self) -> &wgpu::Buffer { &self.energy_buf }
     pub fn heading_buffer(&self) -> &wgpu::Buffer { &self.heading_buf }
@@ -744,6 +779,8 @@ impl CellsGpu {
                 b2: [0.0; BRAIN_OUTPUTS],
                 trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
                 trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+                membrane: [IZH_V_REST; BRAIN_HIDDEN],
+                recovery: [0.0; BRAIN_HIDDEN],
             };
             for h in 0..BRAIN_HIDDEN {
                 for in_i in 0..BRAIN_INPUTS {
@@ -1116,6 +1153,8 @@ impl CellsGpu {
             b2: [0.0; BRAIN_OUTPUTS],
             trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
             trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            membrane: [IZH_V_REST; BRAIN_HIDDEN],
+            recovery: [0.0; BRAIN_HIDDEN],
         };
         for h in 0..BRAIN_HIDDEN {
             for in_i in 0..BRAIN_INPUTS {

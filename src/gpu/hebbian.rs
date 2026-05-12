@@ -439,6 +439,8 @@ impl HebbianGpu {
                 b2: [0.0; BRAIN_OUTPUTS],
                 trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
                 trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+                membrane: [IZH_V_REST; BRAIN_HIDDEN],
+                recovery: [0.0; BRAIN_HIDDEN],
             };
             for h in 0..BRAIN_HIDDEN {
                 for in_i in 0..BRAIN_INPUTS {
