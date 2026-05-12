@@ -133,6 +133,10 @@ pub(crate) fn cell_reproduces_on_threshold(
             // GPU per-slot stream matches CPU `Cell.xoshiro_state`.
             gpu.cells.upload_xoshiro_seed_at(slot, cell.cell_id);
             gpu.cells.upload_turn_rate_at(slot, turn_rate);
+            // Slot may have been previously occupied by a since-dead cell;
+            // zero Hebbian traces + recurrent state so the child doesn't
+            // inherit them. (CPPN dispatch refreshes brain_weights below.)
+            gpu.cells.reset_persistent_brain_state_at(slot);
             cppn_dispatch_scratch.push((slot, cppn_copy));
         }
         let _ = slot;

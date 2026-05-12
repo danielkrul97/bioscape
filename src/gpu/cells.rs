@@ -785,11 +785,46 @@ impl CellsGpu {
         self.queue.write_buffer(&self.bonded_inbox_buf, 0, &zeros[..inbox_bytes]);
     }
 
+    /// Zero per-slot persistent brain state that does NOT get refreshed each
+    /// tick from the CPU: `brain_traces` (Hebbian eligibility, decayed over
+    /// ~120 ticks), `last_hidden` (read next tick as recurrent input by
+    /// populate_inputs), plus `last_inputs` / `last_outputs` for hygiene.
+    /// Must be called whenever a slot changes occupant — either after
+    /// `swap_to` (the moved cell starts fresh in its new slot) or after a
+    /// new cell is allocated into a previously-used slot. Without this,
+    /// the new occupant inherits the previous cell's eligibility traces
+    /// and gets spurious Hebbian weight updates during the trace decay
+    /// window.
+    pub fn reset_persistent_brain_state_at(&self, slot: usize) {
+        assert!(slot < self.capacity);
+        let f = std::mem::size_of::<f32>();
+        let traces_bytes = BRAIN_WEIGHTS_PER_CELL * f;
+        let inputs_bytes = BRAIN_INPUTS * f;
+        let hidden_bytes = BRAIN_HIDDEN * f;
+        let outputs_bytes = BRAIN_OUTPUTS * f;
+        let zeros = vec![0u8; traces_bytes];
+        self.queue
+            .write_buffer(&self.brain_traces_buf, (slot * traces_bytes) as u64, &zeros);
+        self.queue
+            .write_buffer(&self.last_inputs_buf, (slot * inputs_bytes) as u64, &zeros[..inputs_bytes]);
+        self.queue
+            .write_buffer(&self.last_hidden_buf, (slot * hidden_bytes) as u64, &zeros[..hidden_bytes]);
+        self.queue
+            .write_buffer(&self.last_outputs_buf, (slot * outputs_bytes) as u64, &zeros[..outputs_bytes]);
+    }
+
     /// GPU-side copy `slot[src] → slot[dst]` for `brain_weights`,
     /// `xoshiro_state`, and `turn_rate`. Used by the swap-remove pattern in
     /// `die_and_drop_carrion`: when the cell at `dst` dies, `src` is the
     /// last live cell moved into its place. Pure on-device memcpy — no
     /// upload or download.
+    ///
+    /// The moved cell's `brain_traces` / `last_hidden` / `last_outputs` /
+    /// `last_inputs` do NOT follow — the previous occupant of `dst` left
+    /// stale data there, so we zero the destination after the copy. The
+    /// moved cell loses at most ~2 s of Hebbian trace context (which the
+    /// trace decay would have wiped anyway), but does not inherit the
+    /// dead cell's pre×post accumulator.
     pub fn swap_to(&self, dst: usize, src: usize) {
         assert!(dst < self.capacity && src < self.capacity);
         if dst == src {
@@ -851,6 +886,9 @@ impl CellsGpu {
             tr_bytes,
         );
         self.queue.submit(Some(encoder.finish()));
+        // Hebbian traces + recurrent state belong to the slot's occupant;
+        // the dead cell's leftovers must not bleed into the moved cell.
+        self.reset_persistent_brain_state_at(dst);
     }
 
     /// Seed the xoshiro state for a single slot. Used after reproduction so

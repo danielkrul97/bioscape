@@ -328,6 +328,9 @@ pub(super) fn god_mode_handle_action(
             if let Some(mut gpu) = gpu_full {
                 gpu.cells.upload_xoshiro_seed_at(slot, cell_id_for_seed);
                 gpu.cells.upload_turn_rate_at(slot, turn_rate);
+                // Re-used slot may carry Hebbian traces / recurrent state
+                // from a previous occupant; reset before CPPN dispatch.
+                gpu.cells.reset_persistent_brain_state_at(slot);
                 let pipeline = &mut *gpu;
                 pipeline
                     .cppn
