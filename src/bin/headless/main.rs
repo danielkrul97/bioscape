@@ -8,16 +8,12 @@
 
 use bioscape::{
     EventCalendar, MazeDifficulty,
-    ShockScheduleConfig, CYCLE_AMPLITUDE, GRID_CELL_SIZE,
+    ShockScheduleConfig, CYCLE_AMPLITUDE,
     INITIAL_CELLS,
     MATING_RADIUS, MAX_POPULATION,
     N_PHEROMONE_CHANNELS,
-    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z, TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_SEED,
+    TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_SEED,
 };
-use bioscape::gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, CppnGpu, FieldGpu, GpuContext, GpuFullScratch,
-        HebbianGpu, MotorGpu, PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
-    };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::env;
@@ -302,187 +298,13 @@ fn main() {
 
     {
         let cap = initial_cells.max(max_population).max(64);
-        // Sprint 59: FieldGpu sources capacity. Per-tick deposit count =
-        // foods (smell) + cells (pheromone). food_target může bumpnout přes
-        // density cycles (CYCLE_AMPLITUDE), s safety margin × 2.
         let field_sources_cap = (food_target(1.0 + CYCLE_AMPLITUDE) + max_population) * 2;
-        let init = || -> Result<GpuFullState, String> {
-            let ctx = GpuContext::new()?;
-            let cells_gpu = CellsGpu::with_context(&ctx, cap);
-            cells_gpu.upload_brains(world.cells.iter().map(|c| &c.genome.brain));
-            // V7-unification: seed from `cell_id` so the GPU per-slot stream
-            // matches the CPU `Cell.xoshiro_state` (also derived from cell_id
-            // at spawn). Tests now expect CPU and GPU brownian outputs to be
-            // byte-identical for any cell with a given cell_id.
-            cells_gpu.upload_xoshiro_seeds(world.cells.iter().map(|c| c.cell_id));
-            let brain = BrainGpu::with_context(&ctx, cap)?;
-            let hebbian = HebbianGpu::with_context(&ctx, cap)?;
-            let brownian = BrownianGpu::with_context(&ctx, cap)?;
-            // Sprint 59: smell + pheromone FieldGpu instances, sdílí GpuContext.
-            let smell = FieldGpu::with_context(
-                &ctx,
-                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
-                WORLD_HALF,
-                field_sources_cap,
-            )?;
-            let pheromone = FieldGpu::with_context(
-                &ctx,
-                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-                WORLD_HALF,
-                field_sources_cap,
-            )?;
-            let pheromone_ch1 = FieldGpu::with_context(
-                &ctx,
-                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-                WORLD_HALF,
-                field_sources_cap,
-            )?;
-            let pheromone_ch2 = FieldGpu::with_context(
-                &ctx,
-                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-                WORLD_HALF,
-                field_sources_cap,
-            )?;
-            // V7: motion-driven vibration field on GPU. Source capacity is
-            // `cap` (one deposit per cell per tick — far fewer sources than
-            // smell which also takes food).
-            let vibration = FieldGpu::with_context(
-                &ctx,
-                [
-                    bioscape::VIBRATION_GRID_RES,
-                    bioscape::VIBRATION_GRID_RES,
-                    bioscape::VIBRATION_GRID_RES_Z,
-                ],
-                WORLD_HALF,
-                cap,
-            )?;
-            // Sprint 60: spatial hashes pro sensor broad-phase. Sdílí
-            // GRID_CELL_SIZE konstantu s CPU SpatialGrid; xy world bounds
-            // pro toroidal bucket wrap.
-            let cell_hash = SpatialHashGpu::with_context(
-                &ctx,
-                cap,
-                GRID_CELL_SIZE,
-                [WORLD_HALF[0], WORLD_HALF[1]],
-            )?;
-            let food_capacity = field_sources_cap;
-            let food_hash = SpatialHashGpu::with_context(
-                &ctx,
-                food_capacity,
-                GRID_CELL_SIZE,
-                [WORLD_HALF[0], WORLD_HALF[1]],
-            )?;
-            let sensor = SensorGatherGpu::with_context(&ctx, cap, food_capacity)?;
-            let populate = PopulateInputsGpu::with_context(&ctx)?;
-            let motor = MotorGpu::with_context(&ctx, cap)?;
-            let step = StepGpu::with_context(&ctx, cap)?;
-            // Wave H: GPU predation (herd + atomic attack accumulator).
-            // Pack-hunting CSV metrics (`bonded_attacks_gen` etc.) stay zero
-            // on the GPU path until predate.wgsl learns to emit events.
-            let predate = bioscape::gpu::PredateGpu::with_context(&ctx, cap)?;
-            // Wave J: GPU food rejection sampling. K-attempts buffer sized
-            // for the worst-case dispatch (budget × MAX_SPAWN_ATTEMPTS).
-            // WorldMap buffer sized to current WORLD_MAP_RES; obstacle mask
-            // sized generously enough to hold any maze res (resolution
-            // up to ~256³ voxels = ~64 MB cap, plenty for Hard difficulty).
-            let food_spawn_cap =
-                bioscape::FOOD_SPAWN_RATE * bioscape::MAX_SPAWN_ATTEMPTS;
-            let world_map_size = (bioscape::WORLD_MAP_RES
-                * bioscape::WORLD_MAP_RES
-                * bioscape::WORLD_MAP_RES_Z) as u64;
-            let obstacle_mask_cap: u64 = 256 * 256 * 4;
-            let food_spawn = bioscape::gpu::FoodSpawnGpu::with_context(
-                &ctx,
-                food_spawn_cap,
-                world_map_size,
-                obstacle_mask_cap,
-            )?;
-            food_spawn.upload_world_map(world.map.field());
-            if let Some(obs) = world.obstacles.as_ref() {
-                food_spawn.upload_obstacle(&obs.packed_for_gpu());
-            }
-            // Wave H: full-scope collision shader (depenetration + velocity
-            // damping + adhesion + spring bonds + contact events).
-            let collision = bioscape::gpu::CollisionGpu::with_context(
-                &ctx,
-                cap,
-                bioscape::GRID_CELL_SIZE,
-                bioscape::CELL_RADIUS,
-                bioscape::COLLISION_RESTITUTION,
-                bioscape::gpu::AdhesionParams {
-                    strength: bioscape::ADHESION_STRENGTH,
-                    cross_type: bioscape::ADHESION_CROSS_TYPE,
-                    range_factor: bioscape::ADHESION_RANGE_FACTOR,
-                },
-                bioscape::gpu::BondParams {
-                    bonds_per_cell: bioscape::MAX_BONDS_PER_CELL as u32,
-                    break_factor: bioscape::BOND_BREAK_FACTOR,
-                },
-                bioscape::MAX_COLLISION_CONTACTS_PER_CELL,
-                [WORLD_HALF[0], WORLD_HALF[1]],
-            )?;
-            // GPU CPPN materialises child brain weights direct → cells.brain_weights_buf.
-            // Capacity = cap (worst case: all cells reproduce in one tick after a
-            // mass extinction; init upload is cap children too).
-            let cppn = CppnGpu::with_context(&ctx, cap);
-            // Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim
-            // init; reproduce volá `upload_turn_rates` znovu (per-event sparse).
-            let turn_rates: Vec<f32> = world.cells.iter().map(|c| c.genome.turn_rate).collect();
-            cells_gpu.upload_turn_rates(&turn_rates);
-            Ok(GpuFullState {
-                cells: cells_gpu,
-                brain,
-                hebbian,
-                brownian,
-                collision,
-                predate,
-                food_spawn,
-                smell,
-                pheromone,
-                pheromone_ch1,
-                pheromone_ch2,
-                vibration,
-                cell_hash,
-                food_hash,
-                sensor,
-                populate,
-                motor,
-                step,
-                cppn,
-                scratch: GpuFullScratch::default(),
-            })
-        };
-        match init() {
-            Ok(state) => {
+        match world.init_gpu_full() {
+            Ok(()) => {
                 eprintln!(
                     "gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
-                world.gpu_full = Some(state);
-                // Wave 4: upload maze masks once if obstacles already present
-                // at init time. Curriculum rebuilds re-upload via tick path.
-                if let Some(field) = world.obstacles.as_ref() {
-                    let packed = field.packed_for_gpu();
-                    let smell_mask =
-                        field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]);
-                    let phero_mask = field.mask_for_grid([
-                        PHEROMONE_GRID_RES,
-                        PHEROMONE_GRID_RES,
-                        PHEROMONE_GRID_RES_Z,
-                    ]);
-                    let vib_mask = field.mask_for_grid([
-                        bioscape::VIBRATION_GRID_RES,
-                        bioscape::VIBRATION_GRID_RES,
-                        bioscape::VIBRATION_GRID_RES_Z,
-                    ]);
-                    if let Some(gpu) = world.gpu_full.as_mut() {
-                        gpu.step.upload_maze(&packed);
-                        gpu.sensor.upload_maze(&packed);
-                        gpu.smell.upload_obstacle_mask(&smell_mask);
-                        gpu.pheromone.upload_obstacle_mask(&phero_mask);
-                        gpu.vibration.upload_obstacle_mask(&vib_mask);
-                    }
-                }
             }
             Err(e) => {
                 // Wave N: no CPU fallback. GPU is the only compute path —

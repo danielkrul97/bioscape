@@ -27,15 +27,15 @@ use bioscape::{
 use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
 use bioscape::{
     gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, FieldGpu, FoodSpawnGpu,
-        FoodSpawnParamsGpu, GpuFullScratch, HebbianGpu, MotorGpu, PopulateInputsGpu,
-        PopulateInputsParams, PredateGpu, PredateParamsGpu, SensorGatherGpu, SensorParamsGpu,
-        SpatialHashGpu, StepGpu, StepParamsGpu,
+        BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, EatFoodGpu, EatFoodParamsGpu,
+        FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, HebbianGpu,
+        MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
+        SensorGatherGpu, SensorParamsGpu, SpatialHashGpu, StepGpu, StepParamsGpu,
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
-    DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT, GRAVITY as PHYS_GRAVITY,
-    PHEROMONE_NORMALIZATION_GAIN, SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN,
-    SPIKE_COST_PER_SEC, THERMAL_NOISE,
+    CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT,
+    DRAG_COEFFICIENT, GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
+    SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -303,6 +303,14 @@ pub struct GpuFullState {
     /// owns `World::foods: Vec<Food>` (variable allocation = control
     /// plane); GPU just does the rejection work.
     pub food_spawn: FoodSpawnGpu,
+    /// GPU eat_food candidate selection. Mirrors `World::eat_food` Pass 1:
+    /// per cell, walk `food_hash` buckets within `EAT_RADIUS × max_axis`
+    /// and return the first food whose center lies inside the pose-rotated
+    /// ellipsoid. CPU does Pass 2 (first-cell-wins race + cluster share +
+    /// Hebbian reward) on the returned `(food_idx, value)` arrays. Cuts
+    /// the largest CPU hotspot (`SpatialGrid::for_each_in_radius`, ~27 %
+    /// of total CPU pre-fix).
+    pub eat_food: EatFoodGpu,
     /// Sprint 59: GPU smell + pheromone field (3D 7-point Jacobi).
     /// Sprint 60: po wire SensorGatherGpu už NEČTE CPU SmellField shadow —
     /// sensor shader bere field grid storage buffer direct. Per-tick readback
@@ -517,6 +525,166 @@ impl World {
             gpu: None,
             gpu_full: None,
         }
+    }
+
+    /// Allocate and wire the full GPU pipeline that the post-Wave-N tick
+    /// hard-depends on. Mirrors `main.rs`'s GPU init: builds a shared
+    /// `GpuContext`, allocates every per-subsystem pipeline at a capacity
+    /// covering the initial population, max population, and a 64-cell
+    /// floor, uploads the starting brain weights / xoshiro seeds / turn
+    /// rates, and finally uploads maze occupancy masks if obstacles are
+    /// already present.
+    ///
+    /// Returns the wgpu adapter error verbatim on failure so the test
+    /// helper that calls this can panic with a meaningful message. Tests
+    /// expect a GPU to be present; if you want a CPU-only path you'd have
+    /// to revive the legacy code that Wave N deleted.
+    pub fn init_gpu_full(&mut self) -> Result<(), String> {
+        let cap = self.cells.len().max(self.max_population).max(64);
+        let field_sources_cap =
+            (food_target(1.0 + CYCLE_AMPLITUDE) + self.max_population) * 2;
+        let ctx = GpuContext::new()?;
+        let cells_gpu = CellsGpu::with_context(&ctx, cap);
+        cells_gpu.upload_brains(self.cells.iter().map(|c| &c.genome.brain));
+        cells_gpu.upload_xoshiro_seeds(self.cells.iter().map(|c| c.cell_id));
+        let brain = BrainGpu::with_context(&ctx, cap)?;
+        let hebbian = HebbianGpu::with_context(&ctx, cap)?;
+        let brownian = BrownianGpu::with_context(&ctx, cap)?;
+        let smell = FieldGpu::with_context(
+            &ctx,
+            [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+            WORLD_HALF,
+            field_sources_cap,
+        )?;
+        let pheromone = FieldGpu::with_context(
+            &ctx,
+            [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+            WORLD_HALF,
+            field_sources_cap,
+        )?;
+        let pheromone_ch1 = FieldGpu::with_context(
+            &ctx,
+            [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+            WORLD_HALF,
+            field_sources_cap,
+        )?;
+        let pheromone_ch2 = FieldGpu::with_context(
+            &ctx,
+            [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+            WORLD_HALF,
+            field_sources_cap,
+        )?;
+        let vibration = FieldGpu::with_context(
+            &ctx,
+            [VIBRATION_GRID_RES, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z],
+            WORLD_HALF,
+            cap,
+        )?;
+        let cell_hash = SpatialHashGpu::with_context(
+            &ctx,
+            cap,
+            GRID_CELL_SIZE,
+            [WORLD_HALF[0], WORLD_HALF[1]],
+        )?;
+        let food_capacity = field_sources_cap;
+        let food_hash = SpatialHashGpu::with_context(
+            &ctx,
+            food_capacity,
+            GRID_CELL_SIZE,
+            [WORLD_HALF[0], WORLD_HALF[1]],
+        )?;
+        let sensor = SensorGatherGpu::with_context(&ctx, cap, food_capacity)?;
+        let populate = PopulateInputsGpu::with_context(&ctx)?;
+        let motor = MotorGpu::with_context(&ctx, cap)?;
+        let step = StepGpu::with_context(&ctx, cap)?;
+        let predate = PredateGpu::with_context(&ctx, cap)?;
+        let food_spawn_cap = FOOD_SPAWN_RATE * MAX_SPAWN_ATTEMPTS;
+        let world_map_size =
+            (bioscape::WORLD_MAP_RES * bioscape::WORLD_MAP_RES * bioscape::WORLD_MAP_RES_Z) as u64;
+        let obstacle_mask_cap: u64 = 256 * 256 * 4;
+        let food_spawn =
+            FoodSpawnGpu::with_context(&ctx, food_spawn_cap, world_map_size, obstacle_mask_cap)?;
+        food_spawn.upload_world_map(self.map.field());
+        if let Some(obs) = self.obstacles.as_ref() {
+            food_spawn.upload_obstacle(&obs.packed_for_gpu());
+        }
+        let collision = CollisionGpu::with_context(
+            &ctx,
+            cap,
+            GRID_CELL_SIZE,
+            CELL_RADIUS,
+            bioscape::COLLISION_RESTITUTION,
+            bioscape::gpu::AdhesionParams {
+                strength: bioscape::ADHESION_STRENGTH,
+                cross_type: bioscape::ADHESION_CROSS_TYPE,
+                range_factor: bioscape::ADHESION_RANGE_FACTOR,
+            },
+            bioscape::gpu::BondParams {
+                bonds_per_cell: MAX_BONDS_PER_CELL as u32,
+                break_factor: bioscape::BOND_BREAK_FACTOR,
+            },
+            bioscape::MAX_COLLISION_CONTACTS_PER_CELL,
+            [WORLD_HALF[0], WORLD_HALF[1]],
+        )?;
+        let cppn = CppnGpu::with_context(&ctx, cap);
+        // GPU eat_food candidate selection. `food_capacity` matches the
+        // worst-case live food count = `food_target(1 + CYCLE_AMPLITUDE)`
+        // padded by max_population (carrion drops), already computed as
+        // `field_sources_cap` above and stored as the food_hash capacity.
+        let eat_food =
+            EatFoodGpu::with_context(&ctx, cap, field_sources_cap, world_map_size)?;
+        eat_food.upload_world_map(self.map.field());
+        let turn_rates: Vec<f32> =
+            self.cells.iter().map(|c| c.genome.turn_rate).collect();
+        cells_gpu.upload_turn_rates(&turn_rates);
+
+        self.gpu_full = Some(GpuFullState {
+            cells: cells_gpu,
+            brain,
+            hebbian,
+            brownian,
+            collision,
+            predate,
+            food_spawn,
+            eat_food,
+            smell,
+            pheromone,
+            pheromone_ch1,
+            pheromone_ch2,
+            vibration,
+            cell_hash,
+            food_hash,
+            sensor,
+            populate,
+            motor,
+            step,
+            cppn,
+            scratch: GpuFullScratch::default(),
+        });
+
+        if let Some(field) = self.obstacles.as_ref() {
+            let packed = field.packed_for_gpu();
+            let smell_mask =
+                field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]);
+            let phero_mask = field.mask_for_grid([
+                PHEROMONE_GRID_RES,
+                PHEROMONE_GRID_RES,
+                PHEROMONE_GRID_RES_Z,
+            ]);
+            let vib_mask = field.mask_for_grid([
+                VIBRATION_GRID_RES,
+                VIBRATION_GRID_RES,
+                VIBRATION_GRID_RES_Z,
+            ]);
+            if let Some(gpu) = self.gpu_full.as_mut() {
+                gpu.step.upload_maze(&packed);
+                gpu.sensor.upload_maze(&packed);
+                gpu.smell.upload_obstacle_mask(&smell_mask);
+                gpu.pheromone.upload_obstacle_mask(&phero_mask);
+                gpu.vibration.upload_obstacle_mask(&vib_mask);
+            }
+        }
+        Ok(())
     }
 
     /// Sprint 48: snapshot sim state do versioned binary blob. Format:
@@ -1919,35 +2087,47 @@ impl World {
         if n == 0 {
             return;
         }
-        let positions: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
-        let velocities: Vec<[f32; 3]> = self.cells.iter().map(|c| c.velocity).collect();
-        let eff_radii: Vec<f32> = self
-            .cells
-            .iter()
-            .map(|c| c.phenotype.effective_radius())
-            .collect();
-        let max_axes: Vec<f32> = self.cells.iter().map(|c| c.phenotype.max_axis()).collect();
-        let adhesion_types: Vec<u32> = self
-            .cells
-            .iter()
-            .map(|c| c.genome.adhesion_type as u32)
-            .collect();
-
         let slots = MAX_BONDS_PER_CELL;
         let total = n * slots;
-        let mut partner_idx = vec![-1_i32; total];
-        let mut rest = vec![0.0_f32; total];
-        let mut stiff = vec![0.0_f32; total];
-        let mut damp = vec![0.0_f32; total];
-        for i in 0..n {
-            for (s, slot) in self.cells[i].bonds.iter().enumerate() {
+        // Borrow `id_to_idx_scratch` as a fresh `&` before we hand out a
+        // `&mut` to `gpu_full` below — disjoint fields, but the compiler
+        // needs us to pin the read borrow first.
+        let id_to_idx = &self.id_to_idx_scratch;
+        let cells = &self.cells;
+
+        let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
+        let s = &mut gpu.scratch;
+        // Late-tick scratch — same Vec across ticks, capacity grows as
+        // population peaks. Replaces 9 fresh allocations per tick.
+        s.lt_positions.clear();
+        s.lt_velocities.clear();
+        s.lt_eff_radii.clear();
+        s.lt_max_axes.clear();
+        s.lt_adhesion_types.clear();
+        for c in cells.iter() {
+            s.lt_positions.push(c.position);
+            s.lt_velocities.push(c.velocity);
+            s.lt_eff_radii.push(c.phenotype.effective_radius());
+            s.lt_max_axes.push(c.phenotype.max_axis());
+            s.lt_adhesion_types.push(c.genome.adhesion_type as u32);
+        }
+        s.lt_partner_idx.clear();
+        s.lt_partner_idx.resize(total, -1);
+        s.lt_bond_rest.clear();
+        s.lt_bond_rest.resize(total, 0.0);
+        s.lt_bond_stiff.clear();
+        s.lt_bond_stiff.resize(total, 0.0);
+        s.lt_bond_damp.clear();
+        s.lt_bond_damp.resize(total, 0.0);
+        for (i, c) in cells.iter().enumerate() {
+            for (k, slot) in c.bonds.iter().enumerate() {
                 if let Some(b) = slot {
-                    if let Some(&j) = self.id_to_idx_scratch.get(&b.other_cell_id) {
-                        let idx = i * slots + s;
-                        partner_idx[idx] = j as i32;
-                        rest[idx] = b.rest_length;
-                        stiff[idx] = b.stiffness;
-                        damp[idx] = b.damping;
+                    if let Some(&j) = id_to_idx.get(&b.other_cell_id) {
+                        let idx = i * slots + k;
+                        s.lt_partner_idx[idx] = j as i32;
+                        s.lt_bond_rest[idx] = b.rest_length;
+                        s.lt_bond_stiff[idx] = b.stiffness;
+                        s.lt_bond_damp[idx] = b.damping;
                     }
                 }
             }
@@ -1956,22 +2136,19 @@ impl World {
         // Refresh GPU spatial hash with current (post-step) positions. The
         // hash from brain_act was keyed on pre-step positions; cells have
         // moved since.
-        let result = {
-            let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
-            gpu.cell_hash.dispatch(&positions);
-            gpu.collision.compute(
-                &positions,
-                &velocities,
-                &eff_radii,
-                &max_axes,
-                &adhesion_types,
-                &partner_idx,
-                &rest,
-                &stiff,
-                &damp,
-                &gpu.cell_hash,
-            )
-        };
+        gpu.cell_hash.dispatch(&s.lt_positions);
+        let result = gpu.collision.compute(
+            &s.lt_positions,
+            &s.lt_velocities,
+            &s.lt_eff_radii,
+            &s.lt_max_axes,
+            &s.lt_adhesion_types,
+            &s.lt_partner_idx,
+            &s.lt_bond_rest,
+            &s.lt_bond_stiff,
+            &s.lt_bond_damp,
+            &gpu.cell_hash,
+        );
 
         let max_contacts = bioscape::MAX_COLLISION_CONTACTS_PER_CELL as usize;
         for i in 0..n {
@@ -2011,12 +2188,19 @@ impl World {
         // (2) persistent spring bonds (per-cell list, hookean spring + damping).
         // Plus per-pair contact tick tracker pro hybrid bond formation.
         let n = self.cells.len();
-        self.cell_grid.rebuild(
-            self.cells
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
-        );
+        // CPU `cell_grid` is consumed only by the legacy CPU `brain_act` /
+        // `brain_act_gpu` paths — both unreachable when `gpu_full` is Some
+        // (run_brain_act dispatches to `brain_act_gpu_full` instead). In the
+        // gpu-full hot path this rebuild was pure overhead: 1000-cell
+        // SpatialGrid rebuild every tick that nothing read. Guard it.
+        if self.gpu_full.is_none() {
+            self.cell_grid.rebuild(
+                self.cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (i, c.position, c.phenotype.effective_radius())),
+            );
+        }
         self.deltas_scratch.clear();
         self.deltas_scratch.resize(n, [0.0, 0.0, 0.0]);
         self.velocity_deltas_scratch.clear();
@@ -2252,37 +2436,6 @@ impl World {
         if n == 0 {
             return;
         }
-        let positions: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
-        let eff_radii: Vec<f32> = self
-            .cells
-            .iter()
-            .map(|c| c.phenotype.effective_radius())
-            .collect();
-        let headings: Vec<f32> = self.cells.iter().map(|c| c.heading).collect();
-        let pitches: Vec<f32> = self.cells.iter().map(|c| c.pitch).collect();
-        let attack_signals: Vec<f32> = self
-            .cells
-            .iter()
-            .map(|c| c.last_outputs[6].max(0.0))
-            .collect();
-        let mut spike_counts: Vec<u32> = Vec::with_capacity(n);
-        let mut spikes_packed: Vec<[f32; 4]> = Vec::with_capacity(n * bioscape::SPIKE_SLOTS);
-        for cell in &self.cells {
-            let mut active = 0u32;
-            for s in 0..bioscape::SPIKE_SLOTS {
-                let spike = cell.phenotype.spikes[s];
-                if spike.length > 0.0 {
-                    active += 1;
-                }
-                spikes_packed.push([
-                    spike.length,
-                    spike.azimuth_offset,
-                    spike.elevation_offset,
-                    spike.complexity,
-                ]);
-            }
-            spike_counts.push(active);
-        }
         let params = PredateParamsGpu {
             num_cells: 0, // filled by compute()
             cell_size: bioscape::GRID_CELL_SIZE,
@@ -2299,23 +2452,52 @@ impl World {
             world_half_y: WORLD_HALF[1],
             ..PredateParamsGpu::default()
         };
-        let result = {
-            let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
-            // Refresh GPU spatial hash with current (post-resolve_collisions)
-            // positions before the predate dispatch.
-            gpu.cell_hash.dispatch(&positions);
-            gpu.predate.compute(
-                &positions,
-                &eff_radii,
-                &headings,
-                &pitches,
-                &spikes_packed,
-                &spike_counts,
-                &attack_signals,
-                &gpu.cell_hash,
-                params,
-            )
-        };
+        let cells = &self.cells;
+        let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
+        let s = &mut gpu.scratch;
+        // Persistent scratch fill — replaces 7 fresh Vec allocations.
+        s.lt_positions.clear();
+        s.lt_eff_radii.clear();
+        s.lt_headings.clear();
+        s.lt_pitches.clear();
+        s.lt_attack_signals.clear();
+        s.lt_spike_counts.clear();
+        s.lt_spikes_packed.clear();
+        for cell in cells.iter() {
+            s.lt_positions.push(cell.position);
+            s.lt_eff_radii.push(cell.phenotype.effective_radius());
+            s.lt_headings.push(cell.heading);
+            s.lt_pitches.push(cell.pitch);
+            s.lt_attack_signals.push(cell.last_outputs[6].max(0.0));
+            let mut active = 0u32;
+            for k in 0..bioscape::SPIKE_SLOTS {
+                let spike = cell.phenotype.spikes[k];
+                if spike.length > 0.0 {
+                    active += 1;
+                }
+                s.lt_spikes_packed.push([
+                    spike.length,
+                    spike.azimuth_offset,
+                    spike.elevation_offset,
+                    spike.complexity,
+                ]);
+            }
+            s.lt_spike_counts.push(active);
+        }
+        // Refresh GPU spatial hash with current (post-resolve_collisions)
+        // positions before the predate dispatch.
+        gpu.cell_hash.dispatch(&s.lt_positions);
+        let result = gpu.predate.compute(
+            &s.lt_positions,
+            &s.lt_eff_radii,
+            &s.lt_headings,
+            &s.lt_pitches,
+            &s.lt_spikes_packed,
+            &s.lt_spike_counts,
+            &s.lt_attack_signals,
+            &gpu.cell_hash,
+            params,
+        );
         for (i, cell) in self.cells.iter_mut().enumerate() {
             cell.energy += result.energy_delta[i];
             cell.damage_accum += result.damage_delta[i];
@@ -2330,12 +2512,13 @@ impl World {
         // food per cell (read-only test), Pass 2 sekvenčně resolvne race
         // (first-cell-wins per food + Hebbian na CPU), Pass 3 swap_remove.
         // GPU Hebbian zůstává na konci jako pre-Sprint-57.
-        self.food_grid.rebuild(
-            self.foods
-                .iter()
-                .enumerate()
-                .map(|(i, f)| (i, f.position, f.kind)),
-        );
+        //
+        // Wave N+: Pass 1 moved to GPU (`EatFoodGpu`). The CPU
+        // `SpatialGrid::for_each_in_radius` was the single largest hot
+        // spot (~27 % of CPU per `perf report`). The new path uploads
+        // food positions/kinds/ages + cell pose snapshots and reads back
+        // per-cell `(food_idx, value)` candidates. CPU still does Pass 2
+        // (race resolution) and Pass 3 (swap_remove) sequentially.
         self.eaten_scratch.clear();
         self.eaten_scratch.resize(self.foods.len(), false);
 
@@ -2347,61 +2530,92 @@ impl World {
         let mut rewards: Vec<f32> = vec![0.0; self.cells.len()];
         let use_gpu_hebbian = true;
 
-        // Pass 1 (parallel): per-cell candidate selection. Žádná mutace.
-        // First match v grid traversal wins (zachovává pre-Sprint-57 sémantiku).
-        let cells = &self.cells;
-        let foods = &self.foods;
-        let map = &self.map;
-        let food_grid = &self.food_grid;
-        // eat_food skip optim experiment (Sprint 132+ navrh): cache d² nejbližšího
-        // food ze sensor scan, skipnout food_grid query pokud `> threshold`.
-        // PROBLÉM: cell může být pohlcen kolizí s bonded sousedem (mass-symmetric
-        // depenetration + spring impulse), pohyb překračuje konzervativní slack.
-        // Pass 2 first-cell-wins ordering pak diverguje → CSV reproducibility
-        // breaks. Skip je v headless **disabled** (determinismus je sacred);
-        // `cell.last_best_food_d2` field se v headless nečte (renderer ho používá
-        // pro interaktivní speed při lower determinism budget).
-        let candidates: Vec<Option<(usize, f32)>> = cells
-            .par_iter()
-            .map(|cell| {
-                let pos = cell.position;
-                let search_r = EAT_RADIUS * cell.phenotype.max_axis();
-                let mut ate: Option<(usize, f32)> = None;
-                food_grid.for_each_in_radius_toroidal(
-                    pos,
-                    search_r,
-                    WORLD_HALF,
-                    |idx, _fp, _kind| {
-                        if ate.is_some() {
-                            return;
-                        }
-                        let food = &foods[idx];
-                        let md = bioscape::min_image_delta(pos, food.position, WORLD_HALF);
-                        let ghost = Food {
-                            position: [pos[0] + md[0], pos[1] + md[1], food.position[2]],
-                            age_ticks: food.age_ticks,
-                            kind: food.kind,
-                        };
-                        if cell.eat_test(&ghost, EAT_RADIUS) {
-                            // Sprint 92: food value = base_value(kind) ×
-                            // multiplier × decay × eat_efficiency(kind, score).
-                            let efficiency = bioscape::eat_efficiency(
-                                food.kind,
-                                cell.genome.carnivore_score,
-                            );
-                            let value = bioscape::food_base_value(food.kind)
-                                * food_multiplier(
-                                    map.sample([food.position[0], food.position[1], 0.0]),
-                                )
-                                * food.value_factor()
-                                * efficiency;
-                            ate = Some((idx, value));
-                        }
-                    },
-                );
-                ate
-            })
-            .collect();
+        // Pass 1 (GPU): per-cell candidate selection. Sentinel `num_foods`
+        // is "no match this tick". Empty population → no dispatch, empty
+        // candidates.
+        let n = self.cells.len();
+        let n_foods = self.foods.len();
+        let candidates: Vec<Option<(usize, f32)>> = if n == 0 || n_foods == 0 {
+            vec![None; n]
+        } else {
+            let params = EatFoodParamsGpu {
+                num_cells: 0,
+                num_foods: 0,
+                cell_size: GRID_CELL_SIZE,
+                eat_radius: EAT_RADIUS,
+                world_half_x: WORLD_HALF[0],
+                world_half_y: WORLD_HALF[1],
+                world_half_z: WORLD_HALF[2],
+                world_map_nx: bioscape::WORLD_MAP_RES as u32,
+                world_map_ny: bioscape::WORLD_MAP_RES as u32,
+                world_map_nz: bioscape::WORLD_MAP_RES_Z as u32,
+                fixed_timestep_hz: FIXED_TIMESTEP_HZ,
+                plant_food_value: PLANT_FOOD_VALUE,
+                carrion_food_value: CARRION_FOOD_VALUE,
+                carrion_decay_per_sec: CARRION_DECAY_PER_SEC,
+                world_map_food_floor: bioscape::WORLD_MAP_FOOD_FLOOR,
+                world_map_food_amp: bioscape::WORLD_MAP_FOOD_AMP,
+            };
+            let cells = &self.cells;
+            let foods = &self.foods;
+            let gpu = self.gpu_full.as_mut().expect("gpu_full Some");
+            let s = &mut gpu.scratch;
+            // Persistent scratch — replaces 9 fresh Vec allocations.
+            s.lt_positions.clear();
+            s.lt_headings.clear();
+            s.lt_pitches.clear();
+            s.lt_body_dims.clear();
+            s.lt_carnivore.clear();
+            s.lt_max_axes.clear();
+            for c in cells.iter() {
+                s.lt_positions.push(c.position);
+                s.lt_headings.push(c.heading);
+                s.lt_pitches.push(c.pitch);
+                s.lt_body_dims.push([
+                    c.phenotype.body_length,
+                    c.phenotype.body_width,
+                    c.phenotype.body_height,
+                ]);
+                s.lt_carnivore.push(c.genome.carnivore_score);
+                s.lt_max_axes.push(c.phenotype.max_axis());
+            }
+            s.lt_food_positions.clear();
+            s.lt_food_kinds.clear();
+            s.lt_food_age_ticks.clear();
+            for f in foods.iter() {
+                s.lt_food_positions.push(f.position);
+                s.lt_food_kinds.push(f.kind as u32);
+                s.lt_food_age_ticks.push(f.age_ticks);
+            }
+            // food_hash needs to reflect the current food set — refresh
+            // before the eat_food dispatch (predate's hash is keyed on
+            // cells, not foods).
+            gpu.food_hash.dispatch(&s.lt_food_positions);
+            let result = gpu.eat_food.compute(
+                &s.lt_positions,
+                &s.lt_headings,
+                &s.lt_pitches,
+                &s.lt_body_dims,
+                &s.lt_carnivore,
+                &s.lt_max_axes,
+                &s.lt_food_positions,
+                &s.lt_food_kinds,
+                &s.lt_food_age_ticks,
+                &gpu.food_hash,
+                params,
+            );
+            let sentinel = n_foods as u32;
+            (0..n)
+                .map(|i| {
+                    let f = result.food_idx[i];
+                    if f >= sentinel {
+                        None
+                    } else {
+                        Some((f as usize, result.value[i]))
+                    }
+                })
+                .collect()
+        };
 
         // Pass 2 (sequential): resolve. Per cell_idx v insertion order — first
         // cell to claim a food wins. Matches pre-Sprint-57 ordering (sekvenční
@@ -2662,6 +2876,10 @@ impl World {
                 // xoshiro streams in lockstep across reproduce events.
                 gpu.cells.upload_xoshiro_seed_at(slot, child.cell_id);
                 gpu.cells.upload_turn_rate_at(slot, child.genome.turn_rate);
+                // Slot may be a recycled one (post-swap_to from a death this
+                // tick or earlier); zero per-slot Hebbian state so the child
+                // doesn't inherit previous-occupant traces or recurrent input.
+                gpu.cells.reset_persistent_brain_state_at(slot);
             }
         }
         let _ = n_births;
@@ -2802,6 +3020,9 @@ impl World {
     }
 }
 
+// World-map richness → food-value multiplier. Used only by tests now (eat_food
+// moved to GPU shader which inlines the formula directly).
+#[allow(dead_code)]
 pub fn food_multiplier(noise: f32) -> f32 {
     WORLD_MAP_FOOD_FLOOR + WORLD_MAP_FOOD_AMP * noise
 }

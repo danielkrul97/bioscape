@@ -13,14 +13,18 @@ fn approx_eq(a: f32, b: f32, eps: f32) -> bool {
 
 fn fresh_world(seed: u64) -> World {
     let mut rng = StdRng::seed_from_u64(seed);
-    World::new(
+    let mut world = World::new(
         &mut rng,
         WORLD_MAP_SEED,
         MATING_RADIUS,
         20,
         100,
         EventCalendar::default(),
-    )
+    );
+    world
+        .init_gpu_full()
+        .expect("GPU adapter required for headless tests (Wave N removed CPU fallback)");
+    world
 }
 
 fn unique_temp_path(label: &str) -> PathBuf {
@@ -280,6 +284,9 @@ fn world_extinction_with_zero_initial_cells_does_not_panic() {
         50,
         EventCalendar::default(),
     );
+    world
+        .init_gpu_full()
+        .expect("GPU adapter required for headless tests (Wave N removed CPU fallback)");
     let mut tick_rng = StdRng::seed_from_u64(99);
     let _ = world.tick(&mut tick_rng);
     assert!(world.cells.is_empty());
@@ -295,14 +302,18 @@ fn run_ticks(world: &mut World, rng: &mut StdRng, n: u64) -> Vec<Option<u64>> {
 
 fn small_world(seed: u64, init: usize, max_pop: usize) -> World {
     let mut rng = StdRng::seed_from_u64(seed);
-    World::new(
+    let mut world = World::new(
         &mut rng,
         WORLD_MAP_SEED,
         MATING_RADIUS,
         init,
         max_pop,
         EventCalendar::default(),
-    )
+    );
+    world
+        .init_gpu_full()
+        .expect("GPU adapter required for headless tests (Wave N removed CPU fallback)");
+    world
 }
 
 // ============================================================================
@@ -888,6 +899,9 @@ fn checkpoint_roundtrip_after_running_ticks_continues_safely() {
     let path = unique_temp_path("continue");
     world.save_checkpoint(&path).expect("save");
     let mut loaded = World::load_checkpoint(&path).expect("load");
+    loaded
+        .init_gpu_full()
+        .expect("GPU adapter required for headless tests (Wave N removed CPU fallback)");
     let mut rng2 = StdRng::seed_from_u64(211);
     let _ = loaded.tick(&mut rng2);
     assert_eq!(loaded.clock.tick, world.clock.tick + 1);
