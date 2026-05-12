@@ -134,3 +134,20 @@ pub const ACTIVITY_EMA_ALPHA: f32 = 0.01;
 /// ~1000 ticks (~16 s). Slow enough that Hebbian learning consolidates
 /// before homeostasis nulls it out.
 pub const EXCITABILITY_DRIFT_PER_TICK: f32 = 0.001;
+
+/// Sprint 148: STDP magnitude defaults. Standard asymmetric STDP has
+/// LTP (`a_plus`, pre-before-post) slightly weaker than LTD (`a_minus`,
+/// post-before-pre) so net effect is stabilising. Both bounded by genome
+/// range `[0, MAX_STDP_A]` so STDP gain stays in a sane regime even after
+/// long evolutionary drift.
+pub const DEFAULT_STDP_A_PLUS: f32 = 0.001;
+pub const DEFAULT_STDP_A_MINUS: f32 = 0.0012;
+pub const MAX_STDP_A: f32 = 0.02;
+
+/// Sprint 148: STDP temporal window, expressed in simulation ticks. Default
+/// 5 ticks ≈ 83 ms @ 60 Hz, on the longer end of biological windows
+/// (~20–100 ms reported in cortex). Range `[1, MAX_STDP_TAU]` keeps the
+/// trace decay numerically stable.
+pub const DEFAULT_STDP_TAU_TICKS: f32 = 5.0;
+pub const MIN_STDP_TAU_TICKS: f32 = 1.0;
+pub const MAX_STDP_TAU_TICKS: f32 = 30.0;

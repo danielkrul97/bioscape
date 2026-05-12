@@ -55,6 +55,10 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // Sprint 144 ships `NeuronModel` plumbing but keeps flip off so the
     // entire population stays Perceptron until S150 turns it on.
     model_flip_rate: 0.0,
+    // Sprint 148: STDP drift sigmas default off — S149 activates with
+    // reward modulation once the integration is wired through CPU/GPU.
+    sigma_stdp_a: 0.0,
+    sigma_stdp_tau: 0.0,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -121,6 +125,12 @@ pub struct MutationConfig {
     /// (Perceptron ↔ Izhikevich). Short-circuited so a zero rate skips the
     /// RNG draw — keeps the pre-S144 RNG sequence intact.
     pub model_flip_rate: f32,
+    /// Sprint 148: gaussian sigma for `stdp_a_plus` / `stdp_a_minus`.
+    /// Single knob drives both magnitudes (LTP / LTD ratio stays roughly
+    /// constant). Default 0 → no drift, no RNG draw.
+    pub sigma_stdp_a: f32,
+    /// Sprint 148: gaussian sigma for `stdp_tau_ticks`.
+    pub sigma_stdp_tau: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -192,6 +202,18 @@ pub struct Genome {
     /// baseline until S150 mixed-population validation flips it on).
     #[serde(default)]
     pub neuron_model: NeuronModel,
+    /// Sprint 148: per-cell STDP LTP magnitude (pre-before-post pairing).
+    /// Activates only on `NeuronModel::Izhikevich` lineages (the spike
+    /// timing path) — `Perceptron` cells ignore. Serde default to the
+    /// pre-S148 placeholder so old checkpoints load.
+    #[serde(default = "default_stdp_a_plus")]
+    pub stdp_a_plus: f32,
+    /// Sprint 148: per-cell STDP LTD magnitude (post-before-pre).
+    #[serde(default = "default_stdp_a_minus")]
+    pub stdp_a_minus: f32,
+    /// Sprint 148: per-cell STDP temporal window (ticks).
+    #[serde(default = "default_stdp_tau_ticks")]
+    pub stdp_tau_ticks: f32,
 }
 
 pub fn default_cppn() -> Cppn {
@@ -233,6 +255,18 @@ pub fn default_learning_rate() -> f32 {
 
 pub fn default_trace_decay_per_sec() -> f32 {
     HEBBIAN_TRACE_DECAY_PER_SEC
+}
+
+pub fn default_stdp_a_plus() -> f32 {
+    DEFAULT_STDP_A_PLUS
+}
+
+pub fn default_stdp_a_minus() -> f32 {
+    DEFAULT_STDP_A_MINUS
+}
+
+pub fn default_stdp_tau_ticks() -> f32 {
+    DEFAULT_STDP_TAU_TICKS
 }
 
 impl Genome {
@@ -289,6 +323,12 @@ impl Genome {
             // Izhikevich switches on via mutation once S150 flips
             // `MutationConfig::model_flip_rate` above 0.
             neuron_model: NeuronModel::Perceptron,
+            // Sprint 148: STDP parameters seeded at canonical defaults.
+            // Inactive while the cell is Perceptron; S149 wires them into
+            // the Izhikevich plasticity path.
+            stdp_a_plus: DEFAULT_STDP_A_PLUS,
+            stdp_a_minus: DEFAULT_STDP_A_MINUS,
+            stdp_tau_ticks: DEFAULT_STDP_TAU_TICKS,
         }
     }
 
@@ -446,6 +486,23 @@ impl Genome {
             } else {
                 self.neuron_model
             },
+            // Sprint 148: STDP parameter drift gated by sigma > 0.
+            stdp_a_plus: if cfg.sigma_stdp_a > 0.0 {
+                (self.stdp_a_plus + gaussian(rng) * cfg.sigma_stdp_a).clamp(0.0, MAX_STDP_A)
+            } else {
+                self.stdp_a_plus
+            },
+            stdp_a_minus: if cfg.sigma_stdp_a > 0.0 {
+                (self.stdp_a_minus + gaussian(rng) * cfg.sigma_stdp_a).clamp(0.0, MAX_STDP_A)
+            } else {
+                self.stdp_a_minus
+            },
+            stdp_tau_ticks: if cfg.sigma_stdp_tau > 0.0 {
+                (self.stdp_tau_ticks + gaussian(rng) * cfg.sigma_stdp_tau)
+                    .clamp(MIN_STDP_TAU_TICKS, MAX_STDP_TAU_TICKS)
+            } else {
+                self.stdp_tau_ticks
+            },
         }
     }
 
@@ -577,6 +634,28 @@ impl Genome {
                 a.neuron_model
             } else {
                 b.neuron_model
+            },
+            // Sprint 148: STDP params follow same-value short-circuit.
+            stdp_a_plus: if a.stdp_a_plus == b.stdp_a_plus {
+                a.stdp_a_plus
+            } else if rng.random::<bool>() {
+                a.stdp_a_plus
+            } else {
+                b.stdp_a_plus
+            },
+            stdp_a_minus: if a.stdp_a_minus == b.stdp_a_minus {
+                a.stdp_a_minus
+            } else if rng.random::<bool>() {
+                a.stdp_a_minus
+            } else {
+                b.stdp_a_minus
+            },
+            stdp_tau_ticks: if a.stdp_tau_ticks == b.stdp_tau_ticks {
+                a.stdp_tau_ticks
+            } else if rng.random::<bool>() {
+                a.stdp_tau_ticks
+            } else {
+                b.stdp_tau_ticks
             },
         }
     }

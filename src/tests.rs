@@ -69,6 +69,9 @@ fn dummy_genome() -> Genome {
         learning_rate: LEARNING_RATE,
         trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
         neuron_model: NeuronModel::Perceptron,
+        stdp_a_plus: DEFAULT_STDP_A_PLUS,
+        stdp_a_minus: DEFAULT_STDP_A_MINUS,
+        stdp_tau_ticks: DEFAULT_STDP_TAU_TICKS,
     }
 }
 
@@ -101,6 +104,8 @@ fn zero_cfg() -> MutationConfig {
         sigma_learning_rate: 0.0,
         sigma_trace_decay: 0.0,
         model_flip_rate: 0.0,
+        sigma_stdp_a: 0.0,
+        sigma_stdp_tau: 0.0,
     }
 }
 
@@ -144,6 +149,9 @@ fn mutation_with_zero_sigma_is_identity() {
         learning_rate: LEARNING_RATE,
         trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
         neuron_model: NeuronModel::Perceptron,
+        stdp_a_plus: DEFAULT_STDP_A_PLUS,
+        stdp_a_minus: DEFAULT_STDP_A_MINUS,
+        stdp_tau_ticks: DEFAULT_STDP_TAU_TICKS,
     };
     let m = g.mutate(&mut rng, &zero_cfg());
     assert_eq!(m.max_speed, 50.0);
@@ -194,6 +202,8 @@ fn mutation_keeps_genes_in_valid_ranges() {
         sigma_learning_rate: 10.0,
         sigma_trace_decay: 10.0,
         model_flip_rate: 1.0,
+        sigma_stdp_a: 10.0,
+        sigma_stdp_tau: 100.0,
     };
     for _ in 0..1000 {
         let m = g.mutate(&mut rng, &cfg);
@@ -1161,6 +1171,9 @@ fn crossover_picks_genes_from_either_parent() {
         learning_rate: LEARNING_RATE,
         trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
         neuron_model: NeuronModel::Perceptron,
+        stdp_a_plus: DEFAULT_STDP_A_PLUS,
+        stdp_a_minus: DEFAULT_STDP_A_MINUS,
+        stdp_tau_ticks: DEFAULT_STDP_TAU_TICKS,
     };
     let b = Genome {
         max_speed: 90.0,
@@ -1189,6 +1202,9 @@ fn crossover_picks_genes_from_either_parent() {
         learning_rate: LEARNING_RATE,
         trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
         neuron_model: NeuronModel::Perceptron,
+        stdp_a_plus: DEFAULT_STDP_A_PLUS,
+        stdp_a_minus: DEFAULT_STDP_A_MINUS,
+        stdp_tau_ticks: DEFAULT_STDP_TAU_TICKS,
     };
     for _ in 0..100 {
         let c = Genome::crossover(&a, &b, &mut rng);
@@ -2022,6 +2038,8 @@ fn shell_mutation_clamps_to_range() {
         sigma_learning_rate: 0.0,
         sigma_trace_decay: 0.0,
         model_flip_rate: 0.0,
+        sigma_stdp_a: 0.0,
+        sigma_stdp_tau: 0.0,
     };
     for _ in 0..1000 {
         let m = g.mutate(&mut rng, &cfg);

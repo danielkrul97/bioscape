@@ -339,6 +339,8 @@ fn aggressive_cfg() -> MutationConfig {
         sigma_learning_rate: 100.0,
         sigma_trace_decay: 100.0,
         model_flip_rate: 1.0,
+        sigma_stdp_a: 100.0,
+        sigma_stdp_tau: 100.0,
     }
 }
 
