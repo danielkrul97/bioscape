@@ -68,6 +68,24 @@ pub struct CellsGpu {
     /// whose entry isn't `Izhikevich`. Initialised to all-zeros so a fresh
     /// capacity defaults to Perceptron (matches pre-S147 behavior).
     neuron_models_buf: wgpu::Buffer,
+    /// Sprint 163: per-cell, per-input last spike tick (u32). Layout
+    /// `[capacity × BRAIN_INPUTS]`. Pre-spike encoder shader (S165)
+    /// stamps this when `inputs[i] > SPIKE_ENCODE_THRESHOLD`. STDP rule
+    /// reads to determine LTD timing windows.
+    pre_spike_times_buf: wgpu::Buffer,
+    /// Sprint 163: per-cell, per-hidden last spike tick (u32). Layout
+    /// `[capacity × BRAIN_HIDDEN]`. Izhikevich forward shader (S164)
+    /// stamps this when membrane crosses threshold. STDP rule reads to
+    /// determine LTP timing windows.
+    post_spike_times_buf: wgpu::Buffer,
+    /// Sprint 163: per-cell, per-input STDP trace (f32). Layout
+    /// `[capacity × BRAIN_INPUTS]`. Decayed + accumulated by stdp_step
+    /// shader (S166). LTP magnitude on post-spike = `a_plus × pre_trace[i]`.
+    pre_trace_buf: wgpu::Buffer,
+    /// Sprint 163: per-cell, per-hidden STDP trace (f32). Layout
+    /// `[capacity × BRAIN_HIDDEN]`. LTD magnitude on pre-spike = `a_minus
+    /// × post_trace[h]`.
+    post_trace_buf: wgpu::Buffer,
     /// Cell metadata fed to the `populate_brain_inputs` shader.
     /// `energy`, `heading`, `pitch`, `damage_accum` are uploaded per tick;
     /// `max_speed` and `eff_radius` only change on reproduce / morph but the
@@ -216,6 +234,36 @@ impl CellsGpu {
             0,
             bytemuck::cast_slice(&zero_models),
         );
+        // Sprint 163: STDP spike-time + trace buffers, zero-initialised.
+        let u32sz = std::mem::size_of::<u32>() as u64;
+        let pre_spike_times_buf = mk(
+            "cells-pre-spike-times",
+            n * (BRAIN_INPUTS as u64) * u32sz,
+            stor_dst_src,
+        );
+        let post_spike_times_buf = mk(
+            "cells-post-spike-times",
+            n * (BRAIN_HIDDEN as u64) * u32sz,
+            stor_dst_src,
+        );
+        let pre_trace_buf = mk(
+            "cells-pre-trace",
+            n * (BRAIN_INPUTS as u64) * f,
+            stor_dst_src,
+        );
+        let post_trace_buf = mk(
+            "cells-post-trace",
+            n * (BRAIN_HIDDEN as u64) * f,
+            stor_dst_src,
+        );
+        let zero_pre_u32 = vec![0_u32; capacity * BRAIN_INPUTS];
+        let zero_post_u32 = vec![0_u32; capacity * BRAIN_HIDDEN];
+        let zero_pre_f32 = vec![0.0_f32; capacity * BRAIN_INPUTS];
+        let zero_post_f32 = vec![0.0_f32; capacity * BRAIN_HIDDEN];
+        queue.write_buffer(&pre_spike_times_buf, 0, bytemuck::cast_slice(&zero_pre_u32));
+        queue.write_buffer(&post_spike_times_buf, 0, bytemuck::cast_slice(&zero_post_u32));
+        queue.write_buffer(&pre_trace_buf, 0, bytemuck::cast_slice(&zero_pre_f32));
+        queue.write_buffer(&post_trace_buf, 0, bytemuck::cast_slice(&zero_post_f32));
         // populate_inputs metadata.
         let energy_buf = mk("cells-energy", n * f, stor_dst_src);
         let heading_buf = mk("cells-heading", n * f, stor_dst_src);
@@ -281,6 +329,10 @@ impl CellsGpu {
             membrane_buf,
             recovery_buf,
             neuron_models_buf,
+            pre_spike_times_buf,
+            post_spike_times_buf,
+            pre_trace_buf,
+            post_trace_buf,
             energy_buf,
             heading_buf,
             pitch_buf,
@@ -343,6 +395,10 @@ impl CellsGpu {
     pub fn membrane_buffer(&self) -> &wgpu::Buffer { &self.membrane_buf }
     pub fn recovery_buffer(&self) -> &wgpu::Buffer { &self.recovery_buf }
     pub fn neuron_models_buffer(&self) -> &wgpu::Buffer { &self.neuron_models_buf }
+    pub fn pre_spike_times_buffer(&self) -> &wgpu::Buffer { &self.pre_spike_times_buf }
+    pub fn post_spike_times_buffer(&self) -> &wgpu::Buffer { &self.post_spike_times_buf }
+    pub fn pre_trace_buffer(&self) -> &wgpu::Buffer { &self.pre_trace_buf }
+    pub fn post_trace_buffer(&self) -> &wgpu::Buffer { &self.post_trace_buf }
     /// `populate_inputs` metadata buffer accessors.
     pub fn energy_buffer(&self) -> &wgpu::Buffer { &self.energy_buf }
     pub fn heading_buffer(&self) -> &wgpu::Buffer { &self.heading_buf }
@@ -938,10 +994,13 @@ impl CellsGpu {
     pub fn reset_persistent_brain_state_at(&self, slot: usize) {
         assert!(slot < self.capacity);
         let f = std::mem::size_of::<f32>();
+        let u32sz = std::mem::size_of::<u32>();
         let traces_bytes = BRAIN_WEIGHTS_PER_CELL * f;
         let inputs_bytes = BRAIN_INPUTS * f;
         let hidden_bytes = BRAIN_HIDDEN * f;
         let outputs_bytes = BRAIN_OUTPUTS * f;
+        let pre_u32_bytes = BRAIN_INPUTS * u32sz;
+        let post_u32_bytes = BRAIN_HIDDEN * u32sz;
         let zeros = vec![0u8; traces_bytes];
         self.queue
             .write_buffer(&self.brain_traces_buf, (slot * traces_bytes) as u64, &zeros);
@@ -951,6 +1010,28 @@ impl CellsGpu {
             .write_buffer(&self.last_hidden_buf, (slot * hidden_bytes) as u64, &zeros[..hidden_bytes]);
         self.queue
             .write_buffer(&self.last_outputs_buf, (slot * outputs_bytes) as u64, &zeros[..outputs_bytes]);
+        // Sprint 163: clear STDP state so a recycled slot doesn't inherit
+        // the previous cell's spike timings / traces.
+        self.queue.write_buffer(
+            &self.pre_spike_times_buf,
+            (slot * pre_u32_bytes) as u64,
+            &zeros[..pre_u32_bytes],
+        );
+        self.queue.write_buffer(
+            &self.post_spike_times_buf,
+            (slot * post_u32_bytes) as u64,
+            &zeros[..post_u32_bytes],
+        );
+        self.queue.write_buffer(
+            &self.pre_trace_buf,
+            (slot * inputs_bytes) as u64,
+            &zeros[..inputs_bytes],
+        );
+        self.queue.write_buffer(
+            &self.post_trace_buf,
+            (slot * hidden_bytes) as u64,
+            &zeros[..hidden_bytes],
+        );
     }
 
     /// GPU-side copy `slot[src] → slot[dst]` for `brain_weights`,
