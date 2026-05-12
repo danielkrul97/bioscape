@@ -31,9 +31,9 @@ const NEURON_MODEL_IZHIKEVICH: u32 = 1u;
 
 struct Params {
     num_cells: u32,
+    tick: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -44,6 +44,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> membrane: array<f32>;
 @group(0) @binding(6) var<storage, read_write> recovery: array<f32>;
 @group(0) @binding(7) var<storage, read> neuron_models: array<u32>;
+@group(0) @binding(8) var<storage, read_write> post_spike_times: array<u32>;
 
 @compute @workgroup_size(64)
 fn forward_izhikevich(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -98,6 +99,8 @@ fn forward_izhikevich(@builtin(global_invocation_id) gid: vec3<u32>) {
                 v_local[h] = IZH_C;
                 u_local[h] = u_new + IZH_D;
                 spike_counts[h] = spike_counts[h] + 1u;
+                // Sprint 164: record post-spike timing for STDP.
+                post_spike_times[hid_off + h] = params.tick;
             } else {
                 v_local[h] = v_new;
                 u_local[h] = u_new;

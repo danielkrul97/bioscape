@@ -9,9 +9,9 @@ use super::*;
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 struct IzhikevichParams {
     num_cells: u32,
+    tick: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 /// Sprint 147: GPU Izhikevich forward. Runs after `BrainGpu` (Perceptron)
@@ -46,14 +46,13 @@ impl IzhikevichGpu {
                 include_str!("../../shaders/brain_forward_izhikevich.wgsl").into(),
             ),
         });
-        // 8 bindings: params + inputs + weights + hidden + outputs +
-        // membrane + recovery + neuron_models. hidden/outputs/membrane/
-        // recovery are rw; inputs/weights/neuron_models are ro.
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..8)
+        // Sprint 164: 9 bindings — adds binding 8 for post_spike_times
+        // (rw). Bindings 3, 4, 5, 6, 8 are rw; 1, 2, 7 are ro; 0 is uniform.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..9)
             .map(|i| {
                 let ty = match i {
                     0 => wgpu::BufferBindingType::Uniform,
-                    3 | 4 | 5 | 6 => wgpu::BufferBindingType::Storage { read_only: false },
+                    3 | 4 | 5 | 6 | 8 => wgpu::BufferBindingType::Storage { read_only: false },
                     _ => wgpu::BufferBindingType::Storage { read_only: true },
                 };
                 wgpu::BindGroupLayoutEntry {
@@ -99,12 +98,13 @@ impl IzhikevichGpu {
         })
     }
 
-    pub fn dispatch(&self, cells_gpu: &CellsGpu, n: usize) {
+    pub fn dispatch(&self, cells_gpu: &CellsGpu, n: usize, tick: u32) {
         if n == 0 {
             return;
         }
         let params = IzhikevichParams {
             num_cells: n as u32,
+            tick,
             ..IzhikevichParams::default()
         };
         self.queue
@@ -144,6 +144,10 @@ impl IzhikevichGpu {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: cells_gpu.neuron_models_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: cells_gpu.post_spike_times_buffer().as_entire_binding(),
                 },
             ],
         });

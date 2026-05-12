@@ -1412,7 +1412,7 @@ impl World {
         // last_hidden / last_outputs with spike-rate outputs. Perceptron
         // cells are early-exited inside the shader (zero overhead per
         // skipped cell beyond a single buffer read).
-        gpu.izhikevich.dispatch(&gpu.cells, n);
+        gpu.izhikevich.dispatch(&gpu.cells, n, self.clock.tick as u32);
 
         // Phase 7: GPU motor.dispatch_with_cells. Čte last_outputs + heading/
         // pitch/turn_rate/eff_radius/max_speed, mutuje velocity/angular_vel/
