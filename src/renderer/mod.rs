@@ -201,14 +201,18 @@ pub fn run() {
             FixedUpdate,
             apply_episodic_novelty.after(step_cells),
         )
-        // Sprint 176: shared-driver tick. Runs `world.tick(&mut rng)` each
-        // FixedUpdate. Sequenced AFTER the legacy `tick_end` so the
-        // existing pipeline finishes first; SimWorld then runs on its
-        // own (parallel) state. S177 will add position sync; S178 will
-        // remove the legacy chain.
+        // Sprint 176-177: shared-driver tick + entity sync. `sim_tick`
+        // calls `world.tick(&mut rng)` once per FixedUpdate after the
+        // legacy chain (so SimWorld evolves on its own). Then
+        // `sync_simworld_to_cellentity` overwrites the existing
+        // `CellEntity` components with `world.cells[slot]` so the visual
+        // pipeline (sync_transforms, gizmos, materials) renders SimWorld
+        // dynamics. S178 will delete the legacy chain entirely.
         .add_systems(
             FixedUpdate,
-            sim_tick.after(tick_end),
+            (sim_tick, sync_simworld_to_cellentity)
+                .chain()
+                .after(tick_end),
         )
         // Wave 3: per-tick eligibility-trace decay+accumulate. Runs after
         // brain_act so traces capture this tick's activations before any

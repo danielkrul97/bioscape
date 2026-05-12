@@ -98,17 +98,28 @@ S176 = "wire", S177 = "sync", S178 = "delete legacy". Memory: 2 wgpu
 instances + 2× cell populations + ~5-10% perf hit (acceptable for
 this transition decade).
 
-## Sprint 177 — Spawn / despawn entity sync
+## Sprint 177 — Entity sync (position copy only)
 
-**Cíl:** when `world.cells` grows (reproduce) nebo shrinks (die),
-renderer entities follow.
+**Cíl original:** when `world.cells` grows / shrinks, renderer entities
+follow (spawn / despawn).
 
-**Plán:** Bevy system tracks `world.cells.len()` delta per tick. New
-slot → spawn entity with mesh/material; removed slot → despawn entity.
-Stable per-cell_id mapping.
+**Výstup (scope-cut to "position sync only"):** new system
+`sync_simworld_to_cellentity` v `renderer/systems/sim_tick.rs`. Per
+FixedUpdate po `sim_tick`: iterates `CellSlotMap.slot_to_entity` 0..min(N,
+world.cells.len()) a kopíruje `world.cells[slot]` přes `&mut CellEntity`.
+Index-based pairing — předpokládá že legacy lifecycle drives slot
+allocation/release v sync s SimWorld swap_remove. Out-of-range slots
+silently skipped (no panic). Pop changes from SimWorld nyní viditelné
+v renderer visual pipeline (sync_transforms reads `CellEntity` which
+SimWorld now drives).
 
-**Acceptance:** vizuálně pop boom (např. seed=0 with STDP) vidíš v real
-time. Birth/death cycling visible.
+**Poznámky scope-cut:** plný spawn/despawn (entity lifecycle synchronized
+with SimWorld cell birth/death events) odložené do S178+. Důvod: renderer
+legacy `cell_reproduces_on_threshold` + `cell_dies_on_zero_energy`
+systems still allocate/release slots; deleting them (S178) by současně
+přesměrovalo lifecycle k SimWorld events. Index-based sync v S177 funguje
+v overlapping regime; po S178 legacy je gone a SimWorld diverging length
+becomes a real issue → S178 must include lifecycle migration.
 
 ## Sprint 178 — Restore renderer-specific affordances
 
