@@ -1,15 +1,16 @@
 # Projekt
 
-Cílem výzkumného projektu Bioscape je vytvořit simulaci evoluce, abych pochopil, jak vzniká inteligence. Projekt je napsán v Rustu. Výpočty se provádějí jak na CPU, tak na GPU.
+Cílem výzkumného projektu Bioscape je vytvořit simulaci evoluce, abych pochopil, jak vzniká inteligence. Projekt je napsán v Rustu. **Veškerý sim compute běží na GPU** přes wgpu compute shadery — CPU drží jen control plane (CLI, CSV, checkpoint, ECS sync, tick driver).
 
 **Architektura:**
 
 - **Engine:** Bevy 0.18 (ECS, 3D rendering přes wgpu — orbit Camera3d, StandardMaterial, sphere mesh + non-uniform scale pro ellipsoid těla). `default-features = false` plus ručně vybraný feature set bez `bevy_gilrs` a `audio` — projekt nepotřebuje gamepad ani zvuk a tahle volba odstraňuje závislost na systémových `libudev-dev` / `libasound2-dev`.
 - **Split kódu:**
-  - `src/lib.rs` — čistá simulační logika (`Cell`, `step()`, `WorldMap`, …), bez Bevy. Drží taky všechny sdílené `pub const` sim parametry + `MUTATION_CONFIG` / `PHYSICS_CONFIG` — **single source of truth** pro renderer i headless. Nové tuneables, které ovlivňují simulaci, patří sem; renderer/headless-only knoby zůstávají ve svých binárkách.
-  - `src/main.rs` — Bevy app, který drží svět v ECS a synchronizuje `Cell` stav s `Transform`em.
-  - `src/bin/headless.rs` — bezokenní harness pro batch experimenty (CSV log per generaci, deterministický seed). Konzumuje stejné parametry z `lib.rs` jako `main.rs`, takže seed reprodukuje identický běh napříč rendererem a headlessem.
-- **GPU:** Bevy táhne wgpu interně pro rendering. Pro vlastní compute kernely je v `Cargo.toml` opt-in feature `gpu` (přímý `wgpu` + `bytemuck` + `pollster`).
+  - `src/lib.rs` — sim type definitions (`Cell`, `Genome`, `Bond`, `Spike`, …) + `params/*` `pub const` parametry + `MUTATION_CONFIG` / `PHYSICS_CONFIG`. **Single source of truth** pro renderer i headless — uploaduje se přímo do GPU bufferů. Nové tuneables patří sem.
+  - `src/gpu/*` — GPU compute layer: per-pipeline Rust API kolem `shaders/*.wgsl` (brain, sensor_gather, populate_inputs, motor, brownian, step, hebbian, collision, predate, food_spawn, field, …). Tahle vrstva je sdílená renderer + headless.
+  - `src/main.rs` — Bevy app, ECS world + `Transform` synchronizace z GPU bufferů.
+  - `src/bin/headless/` — bezokenní harness pro batch experimenty (CSV log per generaci, deterministický seed). Konzumuje stejné parametry z `lib.rs` jako renderer, takže seed reprodukuje identický běh napříč oběma binárkami.
+- **GPU:** mandatory, ne opt-in. `wgpu` + `bytemuck` + `pollster` jsou core dependencies (žádná `gpu` feature). Spuštění vyžaduje wgpu-compatible adapter s compute supportem + ≥ 20 storage buffers per shader stage. Init failure je fatal (panic).
 - **Dev smyčka:** `cargo run --features dev` zapne `bevy/dynamic_linking` pro rychlou inkrementální iteraci po prvním buildu.
 
 **Zdroj pravdy pro biologii a evoluci:** Pokud prompt řeší evoluční mechanismy, genotyp/fenotyp, selekci, fitness, mutace nebo podobné koncepty, primárně čerpej z `docs/` — odráží to specifický framing tohoto výzkumu. Generické znalosti z tréninku použij jen jako doplněk a při konfliktu s `docs/` na to upozorni.

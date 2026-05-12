@@ -12,26 +12,25 @@ Build an open-ended system in which meaningful behavior evolves on its own from 
 
 ## Architecture
 
-- **Language:** Rust (CPU + GPU)
+- **Language:** Rust, GPU-only compute
 - **Engine:** [Bevy 0.18](https://bevyengine.org) (ECS + 3D rendering via wgpu — orbit Camera3d, StandardMaterial, ellipsoid bodies), trimmed feature set without `bevy_gilrs` and `audio` (no system `libudev-dev` / `libasound2-dev`)
 - **Code split:**
-  - `src/lib.rs` — pure simulation logic (`Cell`, `step()`, brain, world map, smell/pheromone fields …) without Bevy. Single source of truth for simulation constants + helpers (`populate_brain_inputs`, `pair_fertile`, `make_mating_child`).
+  - `src/lib.rs` — simulation types (`Cell`, `Genome`, `Bond`, …), constants, and the GPU compute layer (`src/gpu/*`). Single source of truth for sim parameters used both by the renderer and by the headless harness.
   - `src/main.rs` — Bevy app, ECS world + `Transform` synchronization, 3D renderer.
-  - `src/bin/headless.rs` — windowless harness for batch experiments (CSV log per generation, deterministic seed).
-- **GPU compute:** opt-in `gpu` feature (raw wgpu + bytemuck + pollster) for custom kernels; Bevy already pulls in wgpu for rendering
+  - `src/bin/headless/` — windowless harness for batch experiments (CSV log per generation, deterministic seed).
+- **GPU compute:** mandatory. The simulation tick — sensor gather, brain forward, motor, brownian, kinematics, hebbian, collision broad-phase, predate, food rejection sampling, multi-channel pheromone diffusion — all runs on-device via wgpu compute shaders (`shaders/*.wgsl`). CPU keeps only the control plane: tick driver, CSV writer, checkpoint serialization, ECS sync.
 
 ## Running
 
 **Renderer (3D viz):**
 
 ```bash
-# Default run — `gpu` feature active, GPU compute pipeline default-on
-# (sensor + populate + brain + motor + brownian + step on GPU,
-# single-Wait readback per tick).
+# Default run — GPU compute pipeline is mandatory (sensor + populate +
+# brain + motor + brownian + step + collision + predate + food spawn +
+# multi-channel pheromone on GPU, single-Wait readback per tick).
+# Requires a wgpu-compatible adapter with compute support and at least
+# 20 storage buffers per shader stage (modern desktop GPUs comfortably).
 cargo run --release
-
-# Force CPU SIMD path (for comparison or on adapters without compute).
-BIOSCAPE_GPU_FULL=0 cargo run --release
 
 # Faster incremental iteration (Bevy dynamic linking).
 cargo run --features dev
@@ -76,9 +75,12 @@ rayon parallelization (S113, 4.6× per phase), SIMD field diffusion (S117,
 
 **Decade 128–137 (renderer-side perf)** continues: per-system scratch
 reuse in hot loops (Local + persistent Resources, ~30–40 alloc/tick →
-0), `--gpu-full` single-Wait pipeline default-on in the renderer (replaces
-the fragmented S132 path), `eat_food` solo-skip via the sensor cache.
+0), GPU full pipeline default-on in the renderer (replaces the
+fragmented S132 path), `eat_food` solo-skip via the sensor cache.
 Detail: [`docs/sprints/128-137-perf.md`](docs/sprints/128-137-perf.md).
+The `cpu-removal.md` plan (Waves H–N, branch `gpu-only`) then made the
+GPU pipeline mandatory and removed the CPU compute fallbacks
+entirely. Detail: [`docs/cpu-removal.md`](docs/cpu-removal.md).
 
 Detailed sprint-by-sprint status: [`docs/sprints/`](docs/sprints/).
 
