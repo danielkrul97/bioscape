@@ -104,6 +104,13 @@ struct Cli {
     /// length = rest of run). Implies `--maze` from the first stage.
     #[arg(long, value_name = "SPEC")]
     maze_stages: Option<String>,
+
+    /// Sprint 159: fraction of initial population assigned `NeuronModel::
+    /// Izhikevich` at gen 0 (default 0 = all Perceptron). Used to bypass
+    /// the slow mutation-driven bootstrap so cross-seed validation can
+    /// observe Izhikevich niche dynamics from tick 1.
+    #[arg(long, value_name = "FRAC", default_value_t = 0.0)]
+    initial_izhikevich_frac: f32,
 }
 
 fn parse_maze_lenient(s: &str) -> MazeDifficulty {
@@ -298,6 +305,23 @@ fn main() {
     }
     if let Some(v) = food_mult_override {
         world.food_factor_mult = v;
+    }
+
+    // Sprint 159: pre-seed a fraction of the initial population as
+    // Izhikevich. Run BEFORE `init_gpu_full` so the GPU upload picks up
+    // the per-cell neuron_model assignments.
+    if cli.initial_izhikevich_frac > 0.0 {
+        let frac = cli.initial_izhikevich_frac.clamp(0.0, 1.0);
+        let target = (frac * world.cells.len() as f32).round() as usize;
+        for cell in world.cells.iter_mut().take(target) {
+            cell.genome.neuron_model = bioscape::NeuronModel::Izhikevich;
+        }
+        eprintln!(
+            "info: pre-seeded {} of {} cells as Izhikevich (frac={:.2})",
+            target,
+            world.cells.len(),
+            frac
+        );
     }
 
     {
