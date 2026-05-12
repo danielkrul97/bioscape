@@ -138,6 +138,20 @@ pub struct Cell {
     pub novelty_history: [u32; NOVELTY_HISTORY_LEN],
     #[serde(default)]
     pub novelty_head: u8,
+    /// Sprint 134: consecutive ticks the cell took non-zero damage from the
+    /// predate dispatch. Reset to 0 on the first damage-free tick. Drives the
+    /// `EscapedAttack` reward — once the streak crosses
+    /// `ESCAPE_STREAK_THRESHOLD` and the cell makes it through a tick without
+    /// new damage, it earns a Hebbian credit for whatever motor pattern
+    /// pulled it out.
+    #[serde(default)]
+    pub under_attack_streak: u16,
+    /// Sprint 134: throttle so the escape reward fires at most once per
+    /// `ESCAPE_COOLDOWN_TICKS` window. Without it, a cell oscillating between
+    /// `damage > 0` and `damage = 0` ticks would harvest the bonus every
+    /// other tick.
+    #[serde(default)]
+    pub escape_cooldown_ticks: u16,
     pub phenotype: Phenotype,
     pub genome: Genome,
 }
@@ -263,6 +277,8 @@ impl Cell {
             last_whisker_distances: [1.0; WHISKER_COUNT],
             novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
             novelty_head: 0,
+            under_attack_streak: 0,
+            escape_cooldown_ticks: 0,
             phenotype,
             genome,
         }

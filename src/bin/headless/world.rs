@@ -34,9 +34,10 @@ use bioscape::{
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
     CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT,
-    DRAG_COEFFICIENT, FlushMode, GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN,
-    PLANT_FOOD_VALUE, RewardAccumulator, RewardKind, SHELL_COST_PER_SEC,
-    SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
+    DRAG_COEFFICIENT, ESCAPE_COOLDOWN_TICKS, ESCAPE_REWARD_MAGNITUDE, ESCAPE_STREAK_THRESHOLD,
+    FlushMode, GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
+    PREDATION_REWARD_MAX, PREDATION_REWARD_SCALE, RewardAccumulator, RewardKind,
+    SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -2501,11 +2502,50 @@ impl World {
             &gpu.cell_hash,
             params,
         );
+        // Sprint 134: attacker `Predation(+gain × scale)` + victim
+        // `EscapedAttack(+magnitude)` once `under_attack_streak` clears
+        // a damage-free tick. Push events through the per-tick accumulator
+        // and dispatch a separate Hebbian apply pass on the GPU.
+        let mut acc = RewardAccumulator::with_capacity(self.cells.len() / 8);
         for (i, cell) in self.cells.iter_mut().enumerate() {
-            cell.energy += result.energy_delta[i];
-            cell.damage_accum += result.damage_delta[i];
+            let gained = result.energy_delta[i];
+            let damage_this_tick = result.damage_delta[i];
+
+            cell.energy += gained;
+            cell.damage_accum += damage_this_tick;
+
+            if cell.escape_cooldown_ticks > 0 {
+                cell.escape_cooldown_ticks -= 1;
+            }
+
+            if gained > 0.0 {
+                let mag = (gained * PREDATION_REWARD_SCALE).min(PREDATION_REWARD_MAX);
+                acc.push(i, RewardKind::Predation, mag);
+            }
+
+            if damage_this_tick > 0.0 {
+                cell.under_attack_streak = cell.under_attack_streak.saturating_add(1);
+            } else {
+                if cell.under_attack_streak >= ESCAPE_STREAK_THRESHOLD
+                    && cell.escape_cooldown_ticks == 0
+                {
+                    acc.push(i, RewardKind::EscapedAttack, ESCAPE_REWARD_MAGNITUDE);
+                    cell.escape_cooldown_ticks = ESCAPE_COOLDOWN_TICKS;
+                }
+                cell.under_attack_streak = 0;
+            }
         }
         self.predation_events_gen += result.total_events as u64;
+
+        if !acc.is_empty() {
+            let n = self.cells.len();
+            let mut rewards: Vec<f32> = vec![0.0; n];
+            acc.flush_to(&mut rewards, FlushMode::SumAndClamp);
+            let gpu = self.gpu_full.as_ref().unwrap();
+            gpu.cells.upload_rewards(&rewards);
+            gpu.hebbian
+                .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+        }
     }
 
 

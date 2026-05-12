@@ -210,6 +210,8 @@ pub fn make_mating_child_no_brain(
         last_whisker_distances: [1.0; WHISKER_COUNT],
         novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
         novelty_head: 0,
+        under_attack_streak: 0,
+        escape_cooldown_ticks: 0,
         phenotype: child_phenotype,
         genome: child_genome,
     }

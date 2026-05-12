@@ -49,3 +49,23 @@ pub const SMELL_SAMPLE_EPSILON: f32 = 10.0;
 pub const SMELL_NORMALIZATION_GAIN: f32 = 0.5;
 
 pub const LEARNING_RATE: f32 = 0.005;
+
+/// Sprint 134: predator reward = `gain_this_tick × PREDATION_REWARD_SCALE`,
+/// then clamped at `PREDATION_REWARD_MAX` before the global accumulator clamp.
+/// Tuned so a typical multi-tick attack (per-tick gain ~2.25 across 3–5 ticks)
+/// stays under saturation but is well above the eat-event magnitude (1.0) —
+/// predation is a stronger learning signal because it's costlier to execute.
+pub const PREDATION_REWARD_SCALE: f32 = 0.4;
+pub const PREDATION_REWARD_MAX: f32 = 1.0;
+
+/// Sprint 134: escape reward fires when a cell that was being damaged makes
+/// it through a tick clean. `MAGNITUDE` smaller than predation/eat — escape
+/// is a secondary signal, the primary motivator is avoiding death.
+/// `STREAK_THRESHOLD = 30 ticks` (~0.5 s @ 60 Hz) — random one-tick contacts
+/// don't qualify; the cell must have been under attack long enough that
+/// surviving represents a learned behaviour.
+/// `COOLDOWN_TICKS = 60` (~1 s) prevents reward farming via damage flicker
+/// (in / out / in / out of an attack cone).
+pub const ESCAPE_REWARD_MAGNITUDE: f32 = 0.3;
+pub const ESCAPE_STREAK_THRESHOLD: u16 = 30;
+pub const ESCAPE_COOLDOWN_TICKS: u16 = 60;

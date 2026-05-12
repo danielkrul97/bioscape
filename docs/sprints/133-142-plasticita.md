@@ -60,12 +60,23 @@ na S135 spolu s expanzí flush sites (damage / bond / mate).
 obeť dostane `EscapedAttack(+0.3)` pokud `under_attack_streak ≥ 30 ticks`
 a v aktuálním ticku `damage_accum == 0` (cooldown 60 ticks aby se neopakovalo).
 
-**Výstup:** _(po dokončení)_
+**Výstup:** new fields `Cell.under_attack_streak: u16`, `Cell.escape_cooldown_ticks: u16`
+(serde default 0, backward-compat s pre-S134 checkpointy). Nové params v
+`params/reproduction.rs`: `PREDATION_REWARD_SCALE = 0.4`, `PREDATION_REWARD_MAX = 1.0`,
+`ESCAPE_REWARD_MAGNITUDE = 0.3`, `ESCAPE_STREAK_THRESHOLD = 30`, `ESCAPE_COOLDOWN_TICKS = 60`.
+`World::predate` po aplikaci `energy_delta` / `damage_delta` buduje per-tick
+`RewardAccumulator` (`SumAndClamp` flush), dispatchne separátní GPU Hebbian
+apply pass (LEARNING_RATE). Streak inkrementuje při damage > 0, reset na
+damage-free ticku; escape reward fire jen pokud streak ≥ threshold a cooldown
+== 0. Lib testy 434 passed (1 ignored). Seed=0 2-gen smoke: pop 312 (zachováno),
+`weight_diversity_w1_norm` drift 61.10→61.56 (gen 1) — očekávaná divergence
+od reward signal pro predátory.
 
-**Poznámky:** new `Cell.under_attack_streak: u16` (+ cooldown counter). Emit
-ve `predate` dispatch (`world.rs:2428`). Acceptance: 3 seedy × 15 gen — predátorské
-lineages konvergují k attack policy o ≥30 % rychleji než pre-S134 baseline
-(měřeno přes attack_output_avg trajectory).
+**Poznámky:** Renderer (`src/main.rs`) má vlastní predate path; S134 mění
+jen headless. Renderer mirror odložen do S141 retro pokud cross-seed validace
+potvrdí pozitivní efekt. Acceptance: 3 seedy × 15 gen — predátorské lineages
+konvergují k attack policy o ≥30 % rychleji než pre-S134 baseline (validace
+S141, ne v rámci S134 acceptance).
 
 ## Sprint 135 — damage = negative reward + bond/mating rewards
 
