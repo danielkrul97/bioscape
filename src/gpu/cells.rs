@@ -46,6 +46,15 @@ pub struct CellsGpu {
     velocities_buf: wgpu::Buffer,
     xoshiro_state_buf: wgpu::Buffer,
     rewards_buf: wgpu::Buffer,
+    /// Sprint 137: per-cell Hebbian learning rate, read by
+    /// `hebbian_apply_reward.wgsl`. Initialised at allocation to the
+    /// pre-S137 global `LEARNING_RATE`; uploaded from `Genome.learning_rate`
+    /// every reproduce phase so newborns and post-swap slots track the
+    /// child's gene.
+    learning_rates_buf: wgpu::Buffer,
+    /// Sprint 137: per-cell eligibility-trace decay (1/s), read by
+    /// `hebbian_step.wgsl`. Same init/upload story as `learning_rates_buf`.
+    trace_decays_buf: wgpu::Buffer,
     /// Cell metadata fed to the `populate_brain_inputs` shader.
     /// `energy`, `heading`, `pitch`, `damage_accum` are uploaded per tick;
     /// `max_speed` and `eff_radius` only change on reproduce / morph but the
@@ -141,6 +150,24 @@ impl CellsGpu {
             n * f,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
+        // Sprint 137: per-cell Hebbian rates. COPY_SRC included so `swap_to`
+        // can route slot data through the staging temp. Initial fill at the
+        // pre-S137 globals so a fresh capacity (no upload yet) still produces
+        // the legacy uniform-rate behaviour at the first dispatch.
+        let learning_rates_buf = mk("cells-learning-rates", n * f, stor_dst_src);
+        let trace_decays_buf = mk("cells-trace-decays", n * f, stor_dst_src);
+        let default_lr_fill = vec![LEARNING_RATE; capacity];
+        queue.write_buffer(
+            &learning_rates_buf,
+            0,
+            bytemuck::cast_slice(&default_lr_fill),
+        );
+        let default_decay_fill = vec![HEBBIAN_TRACE_DECAY_PER_SEC; capacity];
+        queue.write_buffer(
+            &trace_decays_buf,
+            0,
+            bytemuck::cast_slice(&default_decay_fill),
+        );
         // populate_inputs metadata.
         let energy_buf = mk("cells-energy", n * f, stor_dst_src);
         let heading_buf = mk("cells-heading", n * f, stor_dst_src);
@@ -201,6 +228,8 @@ impl CellsGpu {
             velocities_buf,
             xoshiro_state_buf,
             rewards_buf,
+            learning_rates_buf,
+            trace_decays_buf,
             energy_buf,
             heading_buf,
             pitch_buf,
@@ -258,6 +287,8 @@ impl CellsGpu {
     pub fn velocities_buffer(&self) -> &wgpu::Buffer { &self.velocities_buf }
     pub fn xoshiro_state_buffer(&self) -> &wgpu::Buffer { &self.xoshiro_state_buf }
     pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
+    pub fn learning_rates_buffer(&self) -> &wgpu::Buffer { &self.learning_rates_buf }
+    pub fn trace_decays_buffer(&self) -> &wgpu::Buffer { &self.trace_decays_buf }
     /// `populate_inputs` metadata buffer accessors.
     pub fn energy_buffer(&self) -> &wgpu::Buffer { &self.energy_buf }
     pub fn heading_buffer(&self) -> &wgpu::Buffer { &self.heading_buf }
@@ -756,6 +787,38 @@ impl CellsGpu {
         self.queue.write_buffer(&self.rewards_buf, 0, bytemuck::cast_slice(rewards));
     }
 
+    /// Sprint 137: full-population upload of per-cell `genome.learning_rate`
+    /// and `genome.trace_decay_per_sec`. Called once per reproduce phase
+    /// (after births append) so newborn slots reflect their genome before
+    /// the next Hebbian dispatch fires.
+    pub fn upload_learning_rates(&self, rates: &[f32]) {
+        self.queue
+            .write_buffer(&self.learning_rates_buf, 0, bytemuck::cast_slice(rates));
+    }
+
+    pub fn upload_trace_decays(&self, decays: &[f32]) {
+        self.queue
+            .write_buffer(&self.trace_decays_buf, 0, bytemuck::cast_slice(decays));
+    }
+
+    /// Sprint 137: write the rates for a single slot. Used by post-swap_to
+    /// path so the moved cell's gene-encoded rates land in its new slot
+    /// without re-uploading the entire population.
+    pub fn upload_rates_at(&self, slot: usize, learning_rate: f32, trace_decay: f32) {
+        assert!(slot < self.capacity);
+        let f = std::mem::size_of::<f32>() as u64;
+        self.queue.write_buffer(
+            &self.learning_rates_buf,
+            slot as u64 * f,
+            bytemuck::bytes_of(&learning_rate),
+        );
+        self.queue.write_buffer(
+            &self.trace_decays_buf,
+            slot as u64 * f,
+            bytemuck::bytes_of(&trace_decay),
+        );
+    }
+
     /// Zero per-slot buffers that accumulate state across ticks: Hebbian
     /// eligibility traces, last_inputs / last_hidden / last_outputs (the
     /// BRAIN_RECURRENT feedback path reads `last_hidden` next tick), rewards,
@@ -882,6 +945,37 @@ impl CellsGpu {
             &self.swap_turn_rate_temp,
             0,
             &self.turn_rate_buf,
+            tr_dst,
+            tr_bytes,
+        );
+        // Sprint 137: route per-cell Hebbian rates through the same swap.
+        // Reuse `swap_turn_rate_temp` — all three buffers are f32 / 4 B
+        // wide so the staging slot fits, and encoder calls serialise.
+        encoder.copy_buffer_to_buffer(
+            &self.learning_rates_buf,
+            tr_src,
+            &self.swap_turn_rate_temp,
+            0,
+            tr_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.swap_turn_rate_temp,
+            0,
+            &self.learning_rates_buf,
+            tr_dst,
+            tr_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.trace_decays_buf,
+            tr_src,
+            &self.swap_turn_rate_temp,
+            0,
+            tr_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.swap_turn_rate_temp,
+            0,
+            &self.trace_decays_buf,
             tr_dst,
             tr_bytes,
         );

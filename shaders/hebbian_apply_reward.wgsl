@@ -8,9 +8,10 @@
 //   w2[o][h]  += lr · reward · trace_w2[o][h];
 //   b2[o]     += lr · reward · last_outputs[o]
 //
-// Replaces the legacy `hebbian.wgsl` (instantaneous Δw = lr·reward·pre·post)
-// for the persistent GPU pipeline. The legacy shader is retained for the
-// non-persistent `compute()` parity test path.
+// Sprint 137: `lr` comes from a per-cell `learning_rates` storage binding,
+// not a uniform scalar — each cell scales its Hebbian update with its
+// genome `learning_rate`. The legacy `hebbian.wgsl` parity-test path keeps
+// the uniform scalar.
 
 const BRAIN_INPUTS: u32 = 84u;
 const BRAIN_HIDDEN: u32 = 45u;
@@ -23,9 +24,9 @@ const WEIGHTS_PER_CELL: u32 = 4469u;
 
 struct ApplyParams {
     num_cells: u32,
-    learning_rate: f32,
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: ApplyParams;
@@ -34,6 +35,7 @@ struct ApplyParams {
 @group(0) @binding(3) var<storage, read> rewards: array<f32>;
 @group(0) @binding(4) var<storage, read_write> brain_weights: array<f32>;
 @group(0) @binding(5) var<storage, read> brain_traces: array<f32>;
+@group(0) @binding(6) var<storage, read> learning_rates: array<f32>;
 
 @compute @workgroup_size(64)
 fn hebbian_apply_reward(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -45,7 +47,7 @@ fn hebbian_apply_reward(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (reward == 0.0) {
         return;
     }
-    let lr = params.learning_rate * reward;
+    let lr = learning_rates[i] * reward;
     let w_off = i * WEIGHTS_PER_CELL;
     let t_off = i * WEIGHTS_PER_CELL;
     let hid_off = i * BRAIN_HIDDEN;

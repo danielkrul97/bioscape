@@ -640,6 +640,17 @@ impl World {
         let turn_rates: Vec<f32> =
             self.cells.iter().map(|c| c.genome.turn_rate).collect();
         cells_gpu.upload_turn_rates(&turn_rates);
+        // Sprint 137: initial population may carry loaded-checkpoint or
+        // sigma-drifted rates that differ from the buffer's default fill.
+        let learning_rates: Vec<f32> =
+            self.cells.iter().map(|c| c.genome.learning_rate).collect();
+        let trace_decays: Vec<f32> = self
+            .cells
+            .iter()
+            .map(|c| c.genome.trace_decay_per_sec)
+            .collect();
+        cells_gpu.upload_learning_rates(&learning_rates);
+        cells_gpu.upload_trace_decays(&trace_decays);
 
         self.gpu_full = Some(GpuFullState {
             cells: cells_gpu,
@@ -2990,6 +3001,13 @@ impl World {
                 // xoshiro streams in lockstep across reproduce events.
                 gpu.cells.upload_xoshiro_seed_at(slot, child.cell_id);
                 gpu.cells.upload_turn_rate_at(slot, child.genome.turn_rate);
+                // Sprint 137: child's per-cell Hebbian rates inherited /
+                // mutated from parents.
+                gpu.cells.upload_rates_at(
+                    slot,
+                    child.genome.learning_rate,
+                    child.genome.trace_decay_per_sec,
+                );
                 // Slot may be a recycled one (post-swap_to from a death this
                 // tick or earlier); zero per-slot Hebbian state so the child
                 // doesn't inherit previous-occupant traces or recurrent input.

@@ -15,14 +15,16 @@ struct HebbianParams {
     _pad1: u32,
 }
 
-/// Wave 7: per-tick step params for `hebbian_step.wgsl`. `decay` is the
-/// CPU-precomputed `(1 - decay_per_sec * dt).max(0)` factor, identical to
-/// the CPU `Brain::hebbian_step` formula.
+/// Wave 7 / Sprint 137: per-tick step params for `hebbian_step.wgsl`. `dt` is
+/// the raw timestep; the shader combines it with the per-cell
+/// `trace_decays[i]` storage binding to compute each cell's decay factor.
+/// Pre-S137 this slot held the CPU-precomputed `(1 - decay·dt)` scalar
+/// because the rate was uniform.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 struct HebbianStepParams {
     num_cells: u32,
-    decay: f32,
+    dt: f32,
     _pad0: u32,
     _pad1: u32,
 }
@@ -119,9 +121,11 @@ impl HebbianGpu {
             cache: None,
         });
 
-        // Wave 7 step pipeline: 5 bindings (params, inputs, hidden, outputs,
-        // traces). Trace buffer is the only writable slot.
-        let step_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..5)
+        // Wave 7 / Sprint 137 step pipeline: 6 bindings (params, inputs,
+        // hidden, outputs, traces rw, trace_decays ro). Pre-S137 was 5
+        // bindings — trace_decays added so each cell can carry its own
+        // genome-encoded decay rate.
+        let step_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..6)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -156,9 +160,11 @@ impl HebbianGpu {
             cache: None,
         });
 
-        // Wave 7 apply pipeline: 6 bindings (params, hidden, outputs,
-        // rewards, weights rw, traces ro).
-        let apply_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..6)
+        // Wave 7 / Sprint 137 apply pipeline: 7 bindings (params, hidden,
+        // outputs, rewards, weights rw, traces ro, learning_rates ro).
+        // Pre-S137 was 6 bindings — learning_rates added so each cell scales
+        // its Hebbian update with its genome rate.
+        let apply_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..7)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -264,15 +270,16 @@ impl HebbianGpu {
         cells_gpu: &CellsGpu,
         n: usize,
         dt: f32,
-        decay_per_sec: f32,
+        _decay_per_sec_unused: f32,
     ) {
         if n == 0 {
             return;
         }
-        let decay = (1.0 - decay_per_sec * dt).max(0.0);
+        // Sprint 137: `decay_per_sec` arg kept for call-site compat but
+        // ignored — the shader reads per-cell rate from `trace_decays_buf`.
         let params = HebbianStepParams {
             num_cells: n as u32,
-            decay,
+            dt,
             ..HebbianStepParams::default()
         };
         self.queue
@@ -286,6 +293,7 @@ impl HebbianGpu {
                 wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.brain_traces_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cells_gpu.trace_decays_buffer().as_entire_binding() },
             ],
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -311,14 +319,16 @@ impl HebbianGpu {
         &self,
         cells_gpu: &CellsGpu,
         n: usize,
-        learning_rate: f32,
+        _learning_rate_unused: f32,
     ) {
         if n == 0 {
             return;
         }
+        // Sprint 137: `learning_rate` arg kept for call-site compat but
+        // ignored — the shader reads per-cell rate from `learning_rates_buf`.
         let params = HebbianParams {
             num_cells: n as u32,
-            learning_rate,
+            learning_rate: 0.0,
             ..HebbianParams::default()
         };
         self.queue
@@ -333,6 +343,7 @@ impl HebbianGpu {
                 wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.rewards_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: cells_gpu.brain_traces_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: cells_gpu.learning_rates_buffer().as_entire_binding() },
             ],
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

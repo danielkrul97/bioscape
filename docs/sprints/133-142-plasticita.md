@@ -133,16 +133,29 @@ už od S134 (multi-dispatch round-off / rayon noise), ne S136-specific.
 **Cíl:** GPU `hebbian_step.wgsl` + `hebbian_apply_reward.wgsl` čtou rates
 z storage bufferů místo uniform scalaru. Sigmas zapnuty.
 
-**Výstup:** _(po dokončení)_
+**Výstup:** `CellsGpu` rozšířen o `learning_rates_buf` + `trace_decays_buf`
+(8 B/cell, ~12 KB @ 1500 cells, COPY_SRC pro `swap_to` routing). Initial
+fill při alokaci na pre-S137 globální konstanty → byte-identical baseline
+v sigma=0 režimu. Accessors + `upload_learning_rates` / `upload_trace_decays`
+/ `upload_rates_at(slot, lr, decay)`. `swap_to` rozšířen o per-cell rate
+copy přes `swap_turn_rate_temp` (sdílený f32 staging). `init_gpu_full` +
+reproduce per-child slot uploadují rates z `Genome`. `hebbian_step.wgsl`
+nová binding (5) `trace_decays`; shader spočítá `decay = max(0, 1 −
+trace_decays[i] · dt)` per cell. `hebbian_apply_reward.wgsl` nová binding (6)
+`learning_rates`; shader `lr = learning_rates[i] · reward`. `HebbianGpu`
+bind-group layouty step 5→6, apply 6→7 (pod 12 limitem). Dispatch fn
+signatury zachované (uniform params slot pro lr/decay ignorován, předáno
+pro call-site compat). Sigmas zapnuty: `sigma_learning_rate = 0.001`,
+`sigma_trace_decay = 0.05`. Lib testy 434 passed (1 ignored). Seed=0 1-gen
+sigma=0 baseline byte-identical s S135 (jen `ticks_per_sec` drift); sigma=on
+seed=0 2-gen pop 200→202→447 (vs S135 200→196→361) — rate variance
+amplifikuje reward-driven divergenci napříč lineages.
 
-**Poznámky:**
-- Nové bindings `learning_rates: array<f32>` + `trace_decays: array<f32>`
-  (16 B/cell, ~24 KB @ 1500 cells).
-- Storage limit check: dnes hebbian shadery 6 bindings, +2 = 8 (pod limitem 12).
-- Upload v `reproduce` phase z Genome.
-- Zapnout `sigma_learning_rate = 0.001` + `sigma_trace_decay = 0.05`.
-- Parity test `hebbian_apply_reward_gpu_matches_cpu` s per-cell rates (ε=1e-4).
-- Cross-seed 15 gen ukazuje non-trivial drift `lr_avg` z init mean.
+**Poznámky:** Storage limit po S137 = 6/7 z 12 (hebbian-step / -apply
+shadery), comfortable rezerva pro S138 synaptic scaling. `compute()`
+non-persistent path nezměněn — drží uniform `learning_rate` pro legacy
+parity test. RNG ordering: mutate dělá dva nové gaussian draws (jen pokud
+sigmas > 0) → seed-equivalentní pop diverguje od gen 1, expected.
 
 ## Sprint 138 — synaptic scaling (L2 norm cap)
 

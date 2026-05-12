@@ -7,10 +7,11 @@
 //   trace_w1[h][in] = decay · trace_w1[h][in] + last_hidden[h] · last_inputs[in]
 //   trace_w2[o][h]  = decay · trace_w2[o][h]  + last_outputs[o] · last_hidden[h]
 //
-// `decay` arrives precomputed as `(1 - decay_per_sec * dt).max(0)` so the
-// shader has no per-cell mul. Bias terms (`b1`, `b2`) skip traces — they
-// ride directly on `last_hidden` / `last_outputs` at reward time, matching
-// the CPU implementation.
+// Sprint 137: `decay = max(0, 1 - trace_decays[i] * dt)` evaluated per cell
+// against the per-cell genome rate. Pre-S137 used a uniform CPU-precomputed
+// scalar; the new binding is `trace_decays: array<f32>` of length `num_cells`.
+// Bias terms (`b1`, `b2`) skip traces — they ride directly on `last_hidden`
+// / `last_outputs` at reward time, matching the CPU implementation.
 
 const BRAIN_INPUTS: u32 = 84u;       // 27 + 2 bond inbox + 4 vibration + 6 whisker + 45 recurrent
 const BRAIN_HIDDEN: u32 = 45u;
@@ -26,7 +27,7 @@ const WEIGHTS_PER_CELL: u32 = 4469u; // B2_OFFSET + BRAIN_OUTPUTS
 
 struct StepParams {
     num_cells: u32,
-    decay: f32,
+    dt: f32,
     _pad0: u32,
     _pad1: u32,
 }
@@ -36,6 +37,7 @@ struct StepParams {
 @group(0) @binding(2) var<storage, read> last_hidden: array<f32>;
 @group(0) @binding(3) var<storage, read> last_outputs: array<f32>;
 @group(0) @binding(4) var<storage, read_write> brain_traces: array<f32>;
+@group(0) @binding(5) var<storage, read> trace_decays: array<f32>;
 
 @compute @workgroup_size(64)
 fn hebbian_step(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -43,7 +45,7 @@ fn hebbian_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_cells) {
         return;
     }
-    let decay = params.decay;
+    let decay = max(0.0, 1.0 - trace_decays[i] * params.dt);
     let t_off = i * WEIGHTS_PER_CELL;
     let inp_off = i * BRAIN_INPUTS;
     let hid_off = i * BRAIN_HIDDEN;

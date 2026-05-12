@@ -45,12 +45,13 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // Newly activated non-primary spike slots start at length = 0; this
     // sigma drives them away from zero. Same magnitude as `sigma_spike_length`.
     sigma_spike_length_secondary: 0.03,
-    // Sprint 136 ships per-cell `learning_rate` / `trace_decay_per_sec` as
-    // genome fields but leaves drift off — default sigmas = 0 keep the RNG
-    // sequence and behaviour byte-identical with pre-S136 runs. Sprint 137
-    // turns the drift on once the GPU dispatch can consume per-cell rates.
-    sigma_learning_rate: 0.0,
-    sigma_trace_decay: 0.0,
+    // Sprint 137: drift activated once the GPU pipeline consumes per-cell
+    // rates. `sigma_learning_rate` slow (~5 % of range per gen) — Hebbian
+    // rate is multiplicative on every reward, so cells over-shooting the
+    // sweet spot lose quickly. `sigma_trace_decay` an order of magnitude
+    // larger because the [0.1, 5.0] range spans two octaves.
+    sigma_learning_rate: 0.001,
+    sigma_trace_decay: 0.05,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
