@@ -32,10 +32,11 @@ use bioscape::{
         MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
         SensorGatherGpu, SensorParamsGpu, SpatialHashGpu, StepGpu, StepParamsGpu,
     },
-    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, BRAIN_OUTPUTS,
-    CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN, DENSITY_NORM_COUNT,
-    DRAG_COEFFICIENT, ESCAPE_COOLDOWN_TICKS, ESCAPE_REWARD_MAGNITUDE, ESCAPE_STREAK_THRESHOLD,
-    FlushMode, GRAVITY as PHYS_GRAVITY, PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
+    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BOND_FORMED_REWARD_MAGNITUDE, BRAIN_INPUTS_SENSORY,
+    BRAIN_OUTPUTS, CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN,
+    DAMAGE_REWARD_GAIN, DENSITY_NORM_COUNT, DRAG_COEFFICIENT, ESCAPE_COOLDOWN_TICKS,
+    ESCAPE_REWARD_MAGNITUDE, ESCAPE_STREAK_THRESHOLD, FlushMode, GRAVITY as PHYS_GRAVITY,
+    MATING_REWARD_MAGNITUDE, PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
     PREDATION_REWARD_MAX, PREDATION_REWARD_SCALE, RewardAccumulator, RewardKind,
     SHELL_COST_PER_SEC, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
 };
@@ -1977,7 +1978,7 @@ impl World {
             if !acc.is_empty() {
                 let n = self.cells.len();
                 let mut rewards: Vec<f32> = vec![0.0; n];
-                acc.flush_to(&mut rewards, FlushMode::Replace);
+                acc.flush_to(&mut rewards, FlushMode::SumAndClamp);
                 let gpu = self.gpu_full.as_ref().unwrap();
                 gpu.cells.upload_rewards(&rewards);
                 gpu.hebbian
@@ -2064,7 +2065,8 @@ impl World {
         let gen = self.clock.generation;
         let tick = self.clock.tick;
         let events = &self.events.events;
-        for cell in &mut self.cells {
+        let mut acc = RewardAccumulator::with_capacity(self.cells.len() / 16);
+        for (i, cell) in self.cells.iter_mut().enumerate() {
             let noise = self
                 .map
                 .sample([cell.position[0], cell.position[1], cell.position[2]]);
@@ -2078,6 +2080,18 @@ impl World {
             let drain = hazard_drain(noise) * dt * shock_mult;
             cell.energy -= drain;
             cell.damage_accum += drain;
+            if drain > 0.0 {
+                acc.push(i, RewardKind::Damage, -(drain * DAMAGE_REWARD_GAIN));
+            }
+        }
+        if !acc.is_empty() && self.gpu_full.is_some() {
+            let n = self.cells.len();
+            let mut rewards: Vec<f32> = vec![0.0; n];
+            acc.flush_to(&mut rewards, FlushMode::SumAndClamp);
+            let gpu = self.gpu_full.as_ref().unwrap();
+            gpu.cells.upload_rewards(&rewards);
+            gpu.hebbian
+                .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
         }
     }
 
@@ -2327,6 +2341,9 @@ impl World {
         // Sprint 66: attempt bond formation pro pairs co dosáhly thresholdu.
         // Kontrola: same adhesion_type, oba bond_active, oba mají volný slot.
         // Při úspěchu: zápis bondu na obou stranách + cost na obě cells.
+        // Sprint 135: collect BondFormed rewards along the way; dispatch
+        // once after the formation loop.
+        let mut bond_acc = RewardAccumulator::new();
         let mut bonds_formed_this_tick: u64 = 0;
         self.bond_candidates_scratch.clear();
         for (&(a, b), &ticks) in self.contact_progress.iter() {
@@ -2417,6 +2434,11 @@ impl World {
             self.cells[i_b].energy -= BOND_FORMATION_COST;
             bonds_formed_this_tick += 1;
             bonded_pairs.insert(pair);
+            // Sprint 135: credit both new partners with a one-shot positive
+            // reward — bond formation is the prerequisite for any
+            // multicellular niche the cluster might evolve into.
+            bond_acc.push(i_a, RewardKind::BondFormed, BOND_FORMED_REWARD_MAGNITUDE);
+            bond_acc.push(i_b, RewardKind::BondFormed, BOND_FORMED_REWARD_MAGNITUDE);
             // Reset progress entry — nepokouší se znova ihned formovat.
             self.contact_progress.remove(&(id_a, id_b));
         }
@@ -2427,6 +2449,16 @@ impl World {
         self.bonded_pairs_scratch = bonded_pairs;
         self.bonds_formed_gen += bonds_formed_this_tick;
         self.bonds_broken_gen += bonds_broken_this_tick;
+
+        if !bond_acc.is_empty() && self.gpu_full.is_some() {
+            let n = self.cells.len();
+            let mut rewards: Vec<f32> = vec![0.0; n];
+            bond_acc.flush_to(&mut rewards, FlushMode::SumAndClamp);
+            let gpu = self.gpu_full.as_ref().unwrap();
+            gpu.cells.upload_rewards(&rewards);
+            gpu.hebbian
+                .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+        }
     }
 
     /// Predation dispatch — computes herd_counts + per-pair energy/damage
@@ -2525,6 +2557,14 @@ impl World {
 
             if damage_this_tick > 0.0 {
                 cell.under_attack_streak = cell.under_attack_streak.saturating_add(1);
+                // Sprint 135: damage = negative reinforcer. Magnitude is
+                // negative; SumAndClamp at flush time keeps net per-cell
+                // reward inside `[REWARD_CLAMP_MIN, REWARD_CLAMP_MAX]`.
+                acc.push(
+                    i,
+                    RewardKind::Damage,
+                    -(damage_this_tick * DAMAGE_REWARD_GAIN),
+                );
             } else {
                 if cell.under_attack_streak >= ESCAPE_STREAK_THRESHOLD
                     && cell.escape_cooldown_ticks == 0
@@ -2765,10 +2805,12 @@ impl World {
         //
         // Sprint 133: unconditional dispatch preserved (matches pre-S133 even
         // when no cell ate this tick — shader early-exits on `reward == 0`).
+        // Sprint 135: flush mode migrated to `SumAndClamp` for consistency
+        // with the predate / hazard / bond / mate dispatch sites.
         if use_gpu_hebbian {
             let n = self.cells.len();
             let mut rewards: Vec<f32> = vec![0.0; n];
-            acc.flush_to(&mut rewards, FlushMode::Replace);
+            acc.flush_to(&mut rewards, FlushMode::SumAndClamp);
             let gpu = self.gpu_full.as_ref().unwrap();
             gpu.cells.upload_rewards(&rewards);
             gpu.hebbian.dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
@@ -2897,6 +2939,25 @@ impl World {
         let to_spawn = self.spawn_children_from_matings(&matings, rng);
         let n_births = to_spawn.len();
         self.births_gen += n_births as u64;
+
+        // Sprint 135: credit both parents with `MateSignalAccepted` before
+        // appending children — parent indices and GPU trace slots are still
+        // pre-extend at this point.
+        if !matings.is_empty() && self.gpu_full.is_some() {
+            let n = self.cells.len();
+            let mut mate_acc = RewardAccumulator::with_capacity(matings.len() * 2);
+            for &(a, b) in matings.iter() {
+                mate_acc.push(a, RewardKind::MateSignalAccepted, MATING_REWARD_MAGNITUDE);
+                mate_acc.push(b, RewardKind::MateSignalAccepted, MATING_REWARD_MAGNITUDE);
+            }
+            let mut rewards: Vec<f32> = vec![0.0; n];
+            mate_acc.flush_to(&mut rewards, FlushMode::SumAndClamp);
+            let gpu = self.gpu_full.as_ref().unwrap();
+            gpu.cells.upload_rewards(&rewards);
+            gpu.hebbian
+                .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+        }
+
         self.cells.extend(to_spawn);
         // GPU child upload. In `--gpu-full`, brain weights are produced
         // directly on the device via `CppnGpu::dispatch`, so we skip the

@@ -83,16 +83,25 @@ S141, ne v rámci S134 acceptance).
 **Cíl:** uzavřít zápornou smyčku + odměnit social events. Migrate flush
 na **sum semantiku** + globální clamp.
 
-**Výstup:** _(po dokončení)_
+**Výstup:** nové params: `DAMAGE_REWARD_GAIN = 0.1`, `BOND_FORMED_REWARD_MAGNITUDE
+= 0.2`, `MATING_REWARD_MAGNITUDE = 0.5`. `World::predate` emit `Damage(-damage
+× gain)` u damage_this_tick > 0 (joined predate accumulator). `World::apply_hazards`
+nový dispatch — push `Damage` per cell where `drain > 0`. `World::resolve_collisions`
+bond-formation site collectne `BondFormed` pro oba i_a/i_b a dispatchne post-loop.
+`World::reproduce` přidá pre-extend dispatch `MateSignalAccepted` pro oba
+parents v matings list. Migrace eat + novelty flush mode na `SumAndClamp`
+(byte-equivalent v single-event-per-cell režimu). Lib testy 434 passed (1 ignored).
+Seed=0 2-gen smoke: pop 200→196→361, bonds_formed 0→2 (gen 2), predation_events
+12→78 (predator brain odměňován → silnější attack policy). Žádná extinkce,
+populace v rozsahu.
 
-**Poznámky:**
-- `Damage(-drain × DAMAGE_REWARD_GAIN)` u `world.rs:2076` a `world.rs:2503`.
-- `BondFormed(+0.2)` u `world.rs:2397/2404` (oba bonded cells).
-- `MateSignalAccepted(+0.5)` ve `spawn_children_from_matings` (`world.rs:2922`)
-  pro oba rodiče.
-- Asymetrické magnitude — attacker `+0.5`, victim `−1.0` → útok je net-negative
-  pro victima i po clampu.
-- Nová CSV metrika `damage_avoidance_score` ≥ baseline + 15 % cross-seed.
+**Poznámky:** Asymetrické magnitudy potvrzeny — attacker `+1.0` cap (S134
+PREDATION_REWARD_MAX), victim `-0.6/tick` typický (damage_delta 6 × gain 0.1)
+→ útok je net-negative pro victima i po globálním clampu `[-2, +2]`. Damage
+reward dominuje hazard signal (hazard drain ~0.01/tick × gain → -0.001 reward,
+near noise floor). CSV metrika `damage_avoidance_score` odložena do S140
+observability sprintu. Renderer (`src/main.rs`) nezahrnut — headless je
+canonical pro plasticity sprinty 133-141; renderer mirror v S141 retro.
 
 ## Sprint 136 — Genome: per-cell `learning_rate` + `trace_decay` (CPU)
 

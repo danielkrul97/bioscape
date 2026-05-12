@@ -69,3 +69,25 @@ pub const PREDATION_REWARD_MAX: f32 = 1.0;
 pub const ESCAPE_REWARD_MAGNITUDE: f32 = 0.3;
 pub const ESCAPE_STREAK_THRESHOLD: u16 = 30;
 pub const ESCAPE_COOLDOWN_TICKS: u16 = 60;
+
+/// Sprint 135: damage = negative reinforcer. Reward magnitude = `-drain ×
+/// DAMAGE_REWARD_GAIN`. With per-tick predation drain ~6 and gain `0.1`,
+/// one attacker delivers ~`-0.6`/tick — under the global accumulator clamp
+/// of `-2.0`, two simultaneous attackers saturate. Hazard drains (scale
+/// ~0.01/tick) stay near noise floor. Asymmetric vs attacker reward
+/// (`PREDATION_REWARD_MAX = 1.0`) so an attack is net-negative for the
+/// victim even after the clamp.
+pub const DAMAGE_REWARD_GAIN: f32 = 0.1;
+
+/// Sprint 135: positive reward when a bond forms. Both partners credited.
+/// Magnitude smaller than predation/eat — bond formation is a single
+/// transient event, not a per-tick stream, so the credit needs to be
+/// substantial enough that the eligibility trace catches it but not so
+/// large it dominates foraging.
+pub const BOND_FORMED_REWARD_MAGNITUDE: f32 = 0.2;
+
+/// Sprint 135: positive reward for both parents when a mating produces a
+/// child. Larger than bond formation — successful reproduction is the
+/// principal evolutionary signal, and pre-S135 it had no per-lifetime
+/// Hebbian credit at all.
+pub const MATING_REWARD_MAGNITUDE: f32 = 0.5;
