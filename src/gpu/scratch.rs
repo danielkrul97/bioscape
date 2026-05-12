@@ -37,6 +37,32 @@ pub struct GpuFullScratch {
     pub dl_ages: Vec<u32>,
     pub dl_cooldowns: Vec<u32>,
     pub dl_energies: Vec<f32>,
+    // Late-tick phase scratch — populated AFTER brain_act_gpu_full
+    // (i.e. after the step shader has written new positions/velocities).
+    // resolve_collisions / predate / eat_food clear + refill these every
+    // tick, so the capacity persists and per-tick allocations drop to zero.
+    pub lt_positions: Vec<[f32; 3]>,
+    pub lt_velocities: Vec<[f32; 3]>,
+    pub lt_headings: Vec<f32>,
+    pub lt_pitches: Vec<f32>,
+    pub lt_eff_radii: Vec<f32>,
+    pub lt_max_axes: Vec<f32>,
+    pub lt_body_dims: Vec<[f32; 3]>,
+    pub lt_carnivore: Vec<f32>,
+    pub lt_attack_signals: Vec<f32>,
+    pub lt_adhesion_types: Vec<u32>,
+    pub lt_spike_counts: Vec<u32>,
+    pub lt_spikes_packed: Vec<[f32; 4]>,
+    pub lt_partner_idx: Vec<i32>,
+    pub lt_bond_rest: Vec<f32>,
+    pub lt_bond_stiff: Vec<f32>,
+    pub lt_bond_damp: Vec<f32>,
+    pub lt_rewards: Vec<f32>,
+    // Per-food scratch (eat_food). Lengths == self.foods.len(), variable
+    // across ticks as carrion drops/decays.
+    pub lt_food_positions: Vec<[f32; 3]>,
+    pub lt_food_kinds: Vec<u32>,
+    pub lt_food_age_ticks: Vec<u32>,
 }
 
 impl GpuFullScratch {
