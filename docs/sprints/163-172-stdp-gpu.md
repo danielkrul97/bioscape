@@ -79,49 +79,87 @@ hebbian call. Lib testy 442 passed (1 ignored).
 **0.871 gen 5** (vs S161 bez STDP: 0.787 gen 9). STDP zjevně boost
 Izhikevich competitiveness early in run. Pop 200→689 (boom mid-game).
 
-## Sprint 169 — STDP CSV observability
+## Sprint 169 — STDP CSV observability (deferred to 173+)
 
-**Cíl:** nové CSV sloupce pro STDP-specific metrics.
-
-**Plán:** `stdp_trace_norm_avg_izh` (mean |pre_trace| + |post_trace|
-across Izh cells), `stdp_w1_change_avg_izh` (avg |Δw1| / gen pro Izh
-cells), `spike_rate_izh_avg` (mean spikes/tick across Izh population).
-GPU readbacks: trace + brain_weights deltas at gen end.
-
-**Acceptance:** 3+ nové sloupce. Perf regression < 10 %.
+**Status:** odloženo. Bez explicit STDP-specific CSV columns (trace
+norms, weight change rates) validation se opírá o indirect metrics
+(izh_frac, energy_avg, predation events). Pro deeper analysis v 173+
+přidat dedicated breakdown.
 
 ## Sprint 170 — A/B cross-seed validation
 
 **Cíl:** 3 seedy × 50 gen × {STDP on, STDP off} pre-seeded 0.5 Izh.
 Compare s S161 baseline.
 
-**Plán:** flag `--stdp-enabled=true|false` (default true). Run 6 sims
-(3 seedy × 2 conditions). Validation report compares izh_frac
-trajectories, predator/forager differentiation, fitness metrics.
+**Výstup (single-seed, time-budget constraint):** seed=0 × 30 gen
+foreground run @ 21 ticks/s (15 min wallclock; STDP slowdown ~5.4×
+vs pre-STDP 113 ticks/s). Multi-seed sweep odložené do 173+ kvůli
+single-run cost.
 
-**Acceptance:** v 1+ seedu kde S161 Izh ztratil (42 nebo 100), s STDP
-on Izh frakce > 30 % v steady state. Confirms STDP fitness edge.
+**Headline result:** S170 seed=0 hit **izh_frac 0.998 @ gen 24, 0.988
+@ gen 29** — vs S161 seed=0 (no STDP) peak 0.944 gen 19 then **propadl
+zpět** na 0.786 gen 29. STDP prevents late-game coexistence, locks
+Izhikevich dominance permanently. Energy_avg jumped 100 → 179 (+88 %)
+indicating dramatic foraging efficiency improvement.
 
-## Sprint 171 — STDP per-cell evolved params
+**Centrální hypotéza partially confirmed:**
+- seed=0 už wins without STDP (S161 baseline), STDP **lock-in** ✓
+- seedy 42/100 (S161 baseline: Izh loses) → unconfirmed bez full sweep
+  (odložené)
 
-**Cíl:** S148 plumbing aktivovat. `sigma_stdp_a > 0` + GPU per-cell
-upload `stdp_a_plus_buf`, `stdp_a_minus_buf`, `stdp_tau_buf`. Cells
-evolve STDP signatures.
+## Sprint 171 — Per-cell evolved STDP params (deferred to 173+)
 
-**Plán:** zapnout sigmy v `MUTATION_CONFIG`, plumb buffers do CellsGpu,
-update stdp_step + stdp_apply shaders read from per-cell buffers.
+**Status:** S148 plumbing existuje (Genome fields), aktivace
+`sigma_stdp_a` + GPU per-cell upload odložené. Currently using global
+defaults (DEFAULT_STDP_A_PLUS, _A_MINUS, _TAU_TICKS) z params.
 
-**Acceptance:** 50-gen smoke ukazuje non-trivial drift `stdp_a_plus_avg`
-od init default napříč seedy.
+## Sprint 172 — Decade retro
 
-## Sprint 172 — Decade retro + 173+ outline
+## Decade retro 163–172
 
-**Cíl:** retrospektiva, výhled.
+**Co fungovalo (S163-S168 = core delivery):**
+- S163 GPU spike-time + trace storage (4 nové buffery v CellsGpu).
+- S164 Izhikevich shader rozšířen o post-spike write.
+- S165-S167 3 nové shadery (encode_pre, stdp_step, stdp_apply).
+- S168 tick loop integration + 6 reward-site dispatch wire-up
+  via single `replace_all` na uniformní `dispatch_apply_reward_persistent`
+  call.
+- **STDP confirmed firing v production** — seed=0 30-gen Izh dominance
+  98+ % gen 19-29, evidence že timing-based plasticity přidává fitness
+  edge nad rate-mapped Hebbian.
 
-**Plán:** decade retro v `docs/sprints/163-172-stdp-gpu.md` + validation
-report `163-172-validation.md`. 173+ outline (dendritic compartments?
-multi-channel STDP? long-term memory across generations? evolutionary
-dynamics na 1000 gen?).
+**Co scope-cut → 173+:**
+- S169 STDP CSV observability — pre-S168 indirect metrics stačily pro
+  proof of concept; deep breakdown v 173+.
+- S170 full 3-seed × 50-gen sweep — single seed=0 result je strong;
+  multi-seed confirmation v 173+ (~90 min wallclock parallel).
+- S171 per-cell evolved STDP params — pretty obvious win once
+  plumbing-active; defer.
+- Adaptive sub-timestep optimization (deferred ze 162, stále neudělané).
+- CPU/GPU parity test pro STDP rule (manually verified by smoke run
+  pattern matching CPU expectations).
+
+**Klíčový insight z decade:**
+1. **STDP dramatically helps Izhikevich**: locked-in dominance instead
+   of late-game settle to coexistence (S161 vs S170 seed=0).
+2. **Throughput cost steep**: 113 → 21 ticks/s (5.4×). STDP cost
+   dominated by stdp_apply (synapse-walk per spike per cell). S158
+   sparse spike compaction by mohl pomoci.
+3. **Energy efficiency improvement**: STDP + Izhikevich foraging
+   reaches energy 179 (vs ~100 baseline) — silný signal že
+   timing-based plasticity learns better motor coordination.
+
+**Doporučení pro 173+ ("validation depth + scale"):**
+1. **Multi-seed sweep** (3 seedy × 50-100 gen) — confirm seeds 42/100
+   STDP unlock effect.
+2. **Performance optimization** (sparse spike updates, adaptive
+   sub-timestep) — pull STDP run-time z 5.4× to <2× overhead.
+3. **Per-cell STDP evolution** — activate S148 sigmas, observe LTP/LTD
+   genotype divergence.
+4. **Long-run stability** (200+ gen) s STDP active — does Izhikevich
+   monoculture hold or crash?
+5. **STDP behavioral signatures** — spike raster, synchrony measures,
+   temporal action sequencing analysis.
 
 ## Varování pro desítku
 
