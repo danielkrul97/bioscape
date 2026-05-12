@@ -149,36 +149,35 @@ files. Camera, UI, gizmos, screencast v Update schedule netknuty —
 fungují stejně jako pre-S173 protože čtou `CellEntity` (now driven by
 SimWorld).
 
-## Sprint 179 — Performance + Resource ergonomics
+## Sprint 179 — Performance + Resource ergonomics (deferred to 183+)
 
-**Cíl:** minimize per-frame sync overhead. World tick je ~10 ms; sync
-~1 ms; render 16 ms (60fps). Budget tight.
+**Status:** unmeasured. S178 schedule simplification od 25+ systems na 6
+should be perf NET POSITIVE (less Bevy schedule overhead, single GPU
+pipeline driving sim). Empirical FPS profiling odložený do 183+ kdy
+S181 cleanup smaže dead code which can affect compiler optimizations.
 
-**Plán:** profile sync_cells_to_entities. Batch updates. Skip transforms
-when position unchanged (rare).
+## Sprint 180 — Headless ↔ renderer parity test (deferred to 183+)
 
-**Acceptance:** renderer 60fps na 500 cells. STDP-augmented pop boom
-(1500 cells) ≥ 30fps.
+**Status:** odložené. Renderer + headless oba volají identický
+`bioscape::sim::World::tick()` — **semantická parita je tedy structural
+guarantee**, ne testovatelná invariant. Pro byte-identical CSV dump z
+rendereru by bylo třeba (a) renderer dumpne CSV at gen-end (mirror
+headless logger), (b) shodnout se na seed/tick scheduling. Mid-priority
+work pro 183+.
 
-## Sprint 180 — Headless ↔ renderer parity test
+## Sprint 181 — Architecture doc update (partial scope: CLAUDE.md)
 
-**Cíl:** same seed/params/initial-izh-frac, headless CSV vs renderer-
-driven World CSV. Should be byte-identical (modulo wallclock).
+**Cíl original:** remove dead exports + smazat unused renderer system
+files (brains.rs, brains_gpu.rs, collisions.rs, fields.rs, food.rs,
+lifecycle.rs, physics.rs — všechny unscheduled v S178).
 
-**Plán:** renderer dump CSV at gen end (mirror headless logger). Diff
-gen N rows.
-
-**Acceptance:** byte-identical on `ticks_per_sec` column exception.
-
-## Sprint 181 — Code cleanup
-
-**Cíl:** remove `pub` exports že už nikdo nepoužívá. Update CLAUDE.md
-sekce **Architektura**.
-
-**Plán:** dead code analysis. CLAUDE.md update z "Split kódu" sekce —
-World je nyní v lib, ne v `src/bin/headless/`.
-
-**Acceptance:** clippy clean, CLAUDE.md aktuální.
+**Výstup (CLAUDE.md only, file deletion → 183+):** updated
+`CLAUDE.md` "Split kódu" sekce — `World` nyní `bioscape::sim::World`
+(shared driver), ne `src/bin/headless/world.rs`. Dead code v
+`src/renderer/systems/{brains,brains_gpu,collisions,fields,food,
+lifecycle,physics}.rs` zůstává v tree pro reference + safety net
+(může se vrátit user wants direct ECS pipeline back). Mass delete
+odložené do 183+ "renderer surface cleanup" sprint.
 
 ## Sprint 182 — Decade retro + 183+ outline
 
