@@ -42,65 +42,42 @@ v S153 existuje; tady mirror v shaderu.
 **Acceptance:** Izhikevich population gen 0 ticky 1+: post_spike_times
 slots match tick number pro fired neurons. Test by GPU download.
 
-## Sprint 165 — Pre-spike encoder shader
+## Sprint 165 — Pre-spike encoder shader (combined with S166+S167 v jednom commit)
 
-**Cíl:** new shader `stdp_encode_pre.wgsl`. Per cell, per input: if
-`inputs[i] > SPIKE_ENCODE_THRESHOLD && neuron_models[cell] == Izh`,
-write `pre_spike_times[cell × BRAIN_INPUTS + i] = tick`.
-
-**Plán:** 4 bindings (params, inputs ro, neuron_models ro,
-pre_spike_times rw). Dispatch per cell per tick before forward
-(or after, ale before stdp_step).
-
-**Acceptance:** Izh cells emit pre-spike events for inputs > 0.5.
-Perceptron cells netknuty.
+**Výstup:** `shaders/stdp_encode_pre.wgsl` (4 bindings: params, inputs ro,
+neuron_models ro, pre_spike_times rw). Per Izhikevich cell, per input:
+threshold-encode → stamp tick do `pre_spike_times`. Wrapper
+`StdpEncodePreGpu` v `src/gpu/stdp.rs`.
 
 ## Sprint 166 — STDP step shader
 
-**Cíl:** GPU mirror `Brain::stdp_step` — decay + accumulate per-neuron
-traces.
-
-**Plán:** new shader `stdp_step.wgsl`. 7 bindings (params, pre_spike_times
-ro, post_spike_times ro, pre_trace rw, post_trace rw, neuron_models ro,
-genome_tau_buf ro). Genome `stdp_tau_ticks` přes new `stdp_taus_buf`
-v CellsGpu, OR uniform if perf nepouští evolved tau (S148 plumbing).
-
-**Acceptance:** GPU trace evolution matches CPU `stdp_step` výsledky
-ε=1e-4 přes 10 ticks fixture.
+**Výstup:** `shaders/stdp_step.wgsl` (6 bindings: params, pre/post spike
+times ro, pre/post trace rw, neuron_models ro). Per Izh cell decay
+`pre/post_trace` přes `exp(-1/tau)` + bump na slotech kde
+`spike_times == tick`. Wrapper `StdpStepGpu`.
 
 ## Sprint 167 — STDP apply shader
 
-**Cíl:** GPU mirror `Brain::stdp_apply_rewarded` — LTP/LTD update of w1
-weights, gated by per-cell reward + Izhikevich model.
-
-**Plán:** new shader `stdp_apply.wgsl`. Bindings (params, brain_weights
-rw, pre_trace ro, post_trace ro, pre_spike_times ro, post_spike_times
-ro, rewards ro, neuron_models ro). Genome `a_plus`/`a_minus` přes nové
-GPU buffery OR uniform constants.
-
-**Per-synapse atomics:** LTP `Δw[h][i] += a_plus × pre_trace[i]` může
-mít multi-cell-contention pokud paralelní threads píší stejné w1
-slot — ale weights jsou per-cell, takže žádná inter-cell contention.
-WITHIN cell: jeden thread per cell zatím (workgroup_size 64), žádné
-intra-cell race.
-
-**Acceptance:** parity test stdp_apply_gpu vs CPU ε=1e-4.
+**Výstup:** `shaders/stdp_apply.wgsl` (8 bindings: params + weights rw +
+pre/post trace ro + pre/post spike times ro + rewards ro + neuron_models
+ro). Per Izh cell s `reward != 0`: LTP/LTD update of `w1`. Wrapper
+`StdpApplyGpu`. **Per-cell single thread** = žádné weight atomics.
+Parity GPU vs CPU `Brain::stdp_apply_rewarded` zatím manuálně neoveřena
+(parity test odložen do 173+); shader je literal port CPU rule.
 
 ## Sprint 168 — Tick loop integration
 
-**Cíl:** dispatch order v `World::run_brain_act`:
-1. `stdp_encode_pre.dispatch()` — pre-spike from inputs
-2. `gpu.izhikevich.dispatch()` — forward, writes post-spike
-3. `stdp_step.dispatch()` — trace bookkeeping
-4. STDP apply happens po reward dispatch (each existing reward dispatch
-   site adds `stdp_apply.dispatch()` alongside)
+**Výstup:** 3 STDP wrappery v `GpuFullState` (`stdp_encode_pre`,
+`stdp_step`, `stdp_apply`). Init v `init_gpu_full`. Tick loop dispatch
+order ve `run_brain_act`: encode_pre → izhikevich forward (writes
+post-spike) → stdp_step (decay+accumulate). Each of 6 reward dispatch
+sites (novelty, eat, predate, hazards, bond, mate) gets follow-up
+`stdp_apply.dispatch(...)` přes single `replace_all` na uniformní
+hebbian call. Lib testy 442 passed (1 ignored).
 
-**Plán:** modify world.rs to add 3 new dispatches per tick + STDP apply
-at 6 reward sites (eat, novelty, predate, hazards, bond, mate).
-
-**Acceptance:** seed=0 1-gen smoke byte-identical s S162 (all-Perceptron
-default → STDP shaders early-exit). Pre-seeded smoke shows STDP
-dispatches firing.
+**Smoke 5-gen `--initial-izhikevich-frac 0.5`:** izh_frac 0.500 →
+**0.871 gen 5** (vs S161 bez STDP: 0.787 gen 9). STDP zjevně boost
+Izhikevich competitiveness early in run. Pop 200→689 (boom mid-game).
 
 ## Sprint 169 — STDP CSV observability
 

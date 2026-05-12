@@ -30,6 +30,7 @@ mod spatial_hash;
 mod excitability;
 mod izhikevich;
 mod stats;
+mod stdp;
 mod step;
 mod synaptic_scale;
 
@@ -56,5 +57,6 @@ pub use spatial_hash::*;
 pub use excitability::*;
 pub use izhikevich::*;
 pub use stats::*;
+pub use stdp::*;
 pub use step::*;
 pub use synaptic_scale::*;

@@ -31,7 +31,7 @@ use bioscape::{
         FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, HebbianGpu,
         MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
         ExcitabilityGpu, IzhikevichGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
-        StepGpu, StepParamsGpu, SynapticScaleGpu,
+        StdpApplyGpu, StdpEncodePreGpu, StdpStepGpu, StepGpu, StepParamsGpu, SynapticScaleGpu,
     },
     AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BOND_FORMED_REWARD_MAGNITUDE, BRAIN_INPUTS_SENSORY,
     BRAIN_OUTPUTS, CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN,
@@ -39,7 +39,8 @@ use bioscape::{
     ESCAPE_REWARD_MAGNITUDE, ESCAPE_STREAK_THRESHOLD, FlushMode, GRAVITY as PHYS_GRAVITY,
     MATING_REWARD_MAGNITUDE, PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
     PREDATION_REWARD_MAX, PREDATION_REWARD_SCALE, RewardAccumulator, RewardKind,
-    ACTIVITY_EMA_ALPHA, EXCITABILITY_DRIFT_PER_TICK, SCALING_PERIOD_TICKS, SHELL_COST_PER_SEC,
+    ACTIVITY_EMA_ALPHA, DEFAULT_STDP_A_MINUS, DEFAULT_STDP_A_PLUS,
+    EXCITABILITY_DRIFT_PER_TICK, SCALING_PERIOD_TICKS, SHELL_COST_PER_SEC,
     SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE, W_NORM_CAP,
 };
 use rand::Rng;
@@ -358,6 +359,12 @@ pub struct GpuFullState {
     /// shared `BrainGpu` output — Perceptron cells are filtered out inside
     /// the shader). Runs immediately after `BrainGpu::forward_persistent`.
     pub izhikevich: IzhikevichGpu,
+    /// Sprint 165-S167: STDP go-live pipeline. Pre-spike encoder marks
+    /// `pre_spike_times` from sensory inputs; `stdp_step` decays + bumps
+    /// per-neuron traces; `stdp_apply` mutates `w1` on reward events.
+    pub stdp_encode_pre: StdpEncodePreGpu,
+    pub stdp_step: StdpStepGpu,
+    pub stdp_apply: StdpApplyGpu,
     /// Sprint 138: homeostatic synaptic scaling. Dispatched every
     /// `SCALING_PERIOD_TICKS` against `cells.brain_weights_buf` so runaway
     /// Hebbian growth doesn't saturate tanh and lock the brain into a
@@ -650,6 +657,9 @@ impl World {
         let synaptic_scale = SynapticScaleGpu::with_context(&ctx)?;
         let excitability = ExcitabilityGpu::with_context(&ctx, cap)?;
         let izhikevich = IzhikevichGpu::with_context(&ctx)?;
+        let stdp_encode_pre = StdpEncodePreGpu::with_context(&ctx)?;
+        let stdp_step = StdpStepGpu::with_context(&ctx)?;
+        let stdp_apply = StdpApplyGpu::with_context(&ctx)?;
         // GPU eat_food candidate selection. `food_capacity` matches the
         // worst-case live food count = `food_target(1 + CYCLE_AMPLITUDE)`
         // padded by max_population (carrion drops), already computed as
@@ -703,6 +713,9 @@ impl World {
             step,
             cppn,
             izhikevich,
+            stdp_encode_pre,
+            stdp_step,
+            stdp_apply,
             synaptic_scale,
             excitability,
             scratch: GpuFullScratch::default(),
@@ -1412,7 +1425,15 @@ impl World {
         // last_hidden / last_outputs with spike-rate outputs. Perceptron
         // cells are early-exited inside the shader (zero overhead per
         // skipped cell beyond a single buffer read).
-        gpu.izhikevich.dispatch(&gpu.cells, n, self.clock.tick as u32);
+        // Sprint 168: STDP pre-spike encoder runs before Izhikevich forward
+        // so the forward shader's post-spike write + the encoder's pre-spike
+        // write are both visible to the trace step that follows.
+        let tick_u32 = self.clock.tick as u32;
+        gpu.stdp_encode_pre.dispatch(&gpu.cells, n, tick_u32);
+        gpu.izhikevich.dispatch(&gpu.cells, n, tick_u32);
+        // Trace decay+accumulate based on both pre and post spike-times.
+        gpu.stdp_step
+            .dispatch(&gpu.cells, n, tick_u32, bioscape::DEFAULT_STDP_TAU_TICKS);
 
         // Phase 7: GPU motor.dispatch_with_cells. Čte last_outputs + heading/
         // pitch/turn_rate/eff_radius/max_speed, mutuje velocity/angular_vel/
@@ -2051,6 +2072,13 @@ impl World {
                 gpu.cells.upload_rewards(&rewards);
                 gpu.hebbian
                     .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+            gpu.stdp_apply.dispatch(
+                &gpu.cells,
+                n,
+                self.clock.tick as u32,
+                DEFAULT_STDP_A_PLUS,
+                DEFAULT_STDP_A_MINUS,
+            );
             }
             return;
         }
@@ -2162,6 +2190,13 @@ impl World {
             gpu.cells.upload_rewards(&rewards);
             gpu.hebbian
                 .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+            gpu.stdp_apply.dispatch(
+                &gpu.cells,
+                n,
+                self.clock.tick as u32,
+                DEFAULT_STDP_A_PLUS,
+                DEFAULT_STDP_A_MINUS,
+            );
         }
     }
 
@@ -2528,6 +2563,13 @@ impl World {
             gpu.cells.upload_rewards(&rewards);
             gpu.hebbian
                 .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+            gpu.stdp_apply.dispatch(
+                &gpu.cells,
+                n,
+                self.clock.tick as u32,
+                DEFAULT_STDP_A_PLUS,
+                DEFAULT_STDP_A_MINUS,
+            );
         }
     }
 
@@ -2655,6 +2697,13 @@ impl World {
             gpu.cells.upload_rewards(&rewards);
             gpu.hebbian
                 .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+            gpu.stdp_apply.dispatch(
+                &gpu.cells,
+                n,
+                self.clock.tick as u32,
+                DEFAULT_STDP_A_PLUS,
+                DEFAULT_STDP_A_MINUS,
+            );
         }
     }
 
@@ -2886,6 +2935,13 @@ impl World {
             let gpu = self.gpu_full.as_ref().unwrap();
             gpu.cells.upload_rewards(&rewards);
             gpu.hebbian.dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+            gpu.stdp_apply.dispatch(
+                &gpu.cells,
+                n,
+                self.clock.tick as u32,
+                DEFAULT_STDP_A_PLUS,
+                DEFAULT_STDP_A_MINUS,
+            );
         }
     }
 
@@ -3028,6 +3084,13 @@ impl World {
             gpu.cells.upload_rewards(&rewards);
             gpu.hebbian
                 .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+            gpu.stdp_apply.dispatch(
+                &gpu.cells,
+                n,
+                self.clock.tick as u32,
+                DEFAULT_STDP_A_PLUS,
+                DEFAULT_STDP_A_MINUS,
+            );
         }
 
         self.cells.extend(to_spawn);
