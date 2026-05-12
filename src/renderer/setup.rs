@@ -24,7 +24,7 @@ use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
     AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh,
-    OrbitCamera, PheromoneResource, SimWorld, SmellResource, SpikeMaterial, SpikeMesh,
+    OrbitCamera, PheromoneResource, SimRng, SimWorld, SmellResource, SpikeMaterial, SpikeMesh,
     VibrationResource, WorldExtent, WorldMapResource,
 };
 use super::resources_gpu::GpuFullPipeline;
@@ -48,15 +48,14 @@ pub(super) fn setup(
     };
     commands.insert_resource(extent);
 
-    // Sprint 175: instantiate shared `bioscape::sim::World` as a Bevy
-    // Resource. GPU init (`world.init_gpu_full()`) is intentionally
-    // skipped here — the renderer still owns its own `GpuFullPipeline`
-    // until S176 deletes that path and switches everything to
-    // `world.tick()`. Until then `SimWorld.0.gpu_full` stays `None` and
-    // the resource is essentially a passive CPU mirror.
+    // Sprint 175-176: instantiate shared `bioscape::sim::World` and its
+    // per-frame RNG as Bevy Resources. GPU init runs alongside (creates a
+    // second wgpu Instance — wasteful but isolated; S177 unifies once
+    // legacy pipeline is deleted). Tick system + position sync added in
+    // schedule (see renderer/mod.rs S176 wire-up).
     {
         let mut sim_rng = StdRng::seed_from_u64(WORLD_MAP_SEED);
-        let world = bioscape::sim::World::new_with_maze(
+        let mut world = bioscape::sim::World::new_with_maze(
             &mut sim_rng,
             WORLD_MAP_SEED,
             MATING_RADIUS,
@@ -65,7 +64,19 @@ pub(super) fn setup(
             EventCalendar::default(),
             None,
         );
+        match world.init_gpu_full() {
+            Ok(()) => {
+                info!(
+                    "sim-world: shared sim driver initialised ({} initial cells)",
+                    world.cells.len()
+                );
+            }
+            Err(e) => {
+                panic!("sim-world: init_gpu_full failed ({e}); GPU mandatory");
+            }
+        }
         commands.insert_resource(SimWorld(world));
+        commands.insert_resource(SimRng(sim_rng));
     }
 
     // Sprint 36: Camera3d s orthographic projection — "scale" zoom feel bez

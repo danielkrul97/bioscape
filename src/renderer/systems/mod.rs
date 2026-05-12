@@ -6,6 +6,7 @@ pub(super) mod food;
 pub(super) mod grids;
 pub(super) mod lifecycle;
 pub(super) mod physics;
+pub(super) mod sim_tick;
 pub(super) mod spikes;
 pub(super) mod transforms;
 
@@ -17,5 +18,6 @@ pub(super) use food::*;
 pub(super) use grids::*;
 pub(super) use lifecycle::*;
 pub(super) use physics::*;
+pub(super) use sim_tick::*;
 pub(super) use spikes::*;
 pub(super) use transforms::*;

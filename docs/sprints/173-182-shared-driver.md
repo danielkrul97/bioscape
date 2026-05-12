@@ -74,18 +74,29 @@ nehodí inkrementálně. Sprint 176 spojuje tick wire-up + legacy system
 deletion do single coordinated commit. Sprint 175 zde dodává jen
 foundational World init.
 
-## Sprint 176 — Delete legacy renderer tick systems
+## Sprint 176 — Shared-driver tick wired (parallel to legacy)
 
-**Cíl:** remove `apply_eligibility_step`, `apply_episodic_novelty`,
+**Cíl original:** remove `apply_eligibility_step`, `apply_episodic_novelty`,
 `cells_brain_act`, `cell_predates_on_neighbor`, motor/step/brownian
 systems v renderer. World::tick handles vše.
 
-**Plán:** scan `src/renderer/systems/` pro tick-logic systems, remove.
-Keep visualization-only systems (camera, UI, mesh management).
+**Výstup (scope-pivot — add, then delete):** rather than atomic
+substitution (high risk), add `sim_tick` system that calls
+`world.tick(&mut rng)` per `FixedUpdate`, **sequenced after legacy
+`tick_end`**. Both pipelines tick concurrently — SimWorld evolves on
+its own state, legacy cells stay canonical for rendering. World GPU
+init happens at setup (creates 2nd wgpu Instance alongside Bevy's
+RenderPlugin's own — wasteful but functional). `SimRng` Resource added
+for deterministic seed. `sync_simworld_to_cellentity` (position copy
+from SimWorld → CellEntity components) + actual deletion of legacy
+systems pushed to S177-S178.
 
-**Acceptance:** lib + renderer binary kompiluje. Spustit smoke — pop
-dynamics now driven by shared World. **Plasticity z S134/S135/S147/S168
-viditelná v renderu poprvé**.
+**Poznámky:** S176 přinesl WORKING WIRE-UP — World tickne každý frame
+v renderer process. Vizuální payoff (renderer mirror plasticity z
+133-172) přijde s S177 sync + S178 delete. Decade scope-revised:
+S176 = "wire", S177 = "sync", S178 = "delete legacy". Memory: 2 wgpu
+instances + 2× cell populations + ~5-10% perf hit (acceptable for
+this transition decade).
 
 ## Sprint 177 — Spawn / despawn entity sync
 

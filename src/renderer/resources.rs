@@ -19,12 +19,19 @@ pub(super) struct TickCounter {
 }
 
 /// Sprint 174: newtype wrapping shared `bioscape::sim::World`. Initialised
-/// at startup alongside renderer's existing `GpuFullPipeline`. Sits unused
-/// for now — S175 wires the tick system; S176 deletes the legacy ECS
-/// pipeline and switches to `world.tick()`. Until then both representations
-/// coexist (memory hit but no functional conflict).
+/// at startup alongside renderer's existing `GpuFullPipeline`. Sprint 176
+/// adds the per-frame `sim_tick` system + `sync_simworld_to_cellentity`
+/// position copy; legacy renderer tick systems continue running in
+/// parallel until S177 removes them.
 #[derive(Resource)]
 pub(super) struct SimWorld(pub(super) bioscape::sim::World);
+
+/// Sprint 176: deterministic RNG for the renderer's `sim_tick`. Mirrors
+/// headless `StdRng::seed_from_u64(seed)` so the same seed reproduces
+/// the same trajectory across both binaries. Seeded with `WORLD_MAP_SEED`
+/// at startup — overridable via CLI in a future sprint.
+#[derive(Resource)]
+pub(super) struct SimRng(pub(super) rand::rngs::StdRng);
 
 #[derive(Resource, Debug, Clone, Copy)]
 pub(super) struct WorldExtent {

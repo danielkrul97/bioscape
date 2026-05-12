@@ -201,6 +201,15 @@ pub fn run() {
             FixedUpdate,
             apply_episodic_novelty.after(step_cells),
         )
+        // Sprint 176: shared-driver tick. Runs `world.tick(&mut rng)` each
+        // FixedUpdate. Sequenced AFTER the legacy `tick_end` so the
+        // existing pipeline finishes first; SimWorld then runs on its
+        // own (parallel) state. S177 will add position sync; S178 will
+        // remove the legacy chain.
+        .add_systems(
+            FixedUpdate,
+            sim_tick.after(tick_end),
+        )
         // Wave 3: per-tick eligibility-trace decay+accumulate. Runs after
         // brain_act so traces capture this tick's activations before any
         // event reward (eat/predation/novelty) fires.
