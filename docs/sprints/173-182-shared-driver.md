@@ -121,15 +121,33 @@ přesměrovalo lifecycle k SimWorld events. Index-based sync v S177 funguje
 v overlapping regime; po S178 legacy je gone a SimWorld diverging length
 becomes a real issue → S178 must include lifecycle migration.
 
-## Sprint 178 — Restore renderer-specific affordances
+## Sprint 178 — Unschedule legacy renderer tick systems
 
-**Cíl:** wire screen overlay (CSV stats live), camera controls,
-keyboard shortcuts (toggle maze, pause, speed) k novému shared driver.
+**Cíl original:** wire renderer affordances (camera, UI, keyboard) k novému
+shared driver.
 
-**Plán:** existing keyboard/UI systems read `World` state přes Resource.
-Pause: `world.tick()` skipne. Speed: multi-tick per frame.
+**Výstup (scope-pivot k legacy deletion):** Bevy FixedUpdate schedule
+zredukován z **25+ systémů přes 3 chained tuples + 4 standalone**
+registrací na **single 6-system chain**:
+- `tick_start` → frame-timing diagnostic open
+- `advance_clock` → renderer's SimClock resource (UI dependency)
+- `sim_tick` → `world.tick(rng)` — full S133-S172 plasticity
+- `sync_simworld_to_cellentity` → cell positions/state copy
+- `tick_death_fade` → visual fade-out for Dying entities
+- `tick_end` → frame-timing diagnostic close
 
-**Acceptance:** ekvivalentní interaction k pre-S173 rendereru.
+Code v `src/renderer/systems/{brains,brains_gpu,collisions,fields,food,
+lifecycle,physics}.rs` zůstává v tree (dead_code warnings emerge, S181
+will sweep them). Renderer **kompiluje green** s SimWorld jako jediným
+sim driverem. Pre-S173 dual-tick (legacy + SimWorld) je gone — single
+canonical pipeline.
+
+**Poznámky:** GPU memory: 2 wgpu instances stále — Bevy's RenderPlugin
++ SimWorld's GpuContext. Legacy `GpuFullPipeline` Resource zůstává
+inserted (nikdo ji nečte). S181 cleanup smaže Resource + delete dead-code
+files. Camera, UI, gizmos, screencast v Update schedule netknuty —
+fungují stejně jako pre-S173 protože čtou `CellEntity` (now driven by
+SimWorld).
 
 ## Sprint 179 — Performance + Resource ergonomics
 

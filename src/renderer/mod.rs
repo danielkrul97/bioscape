@@ -136,92 +136,32 @@ pub fn run() {
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
         .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay).chain())
+        // Sprint 178: minimal FixedUpdate chain — shared `sim_tick` is now
+        // canonical. Legacy renderer tick systems (~25 functions across
+        // `brains.rs`, `brains_gpu.rs`, `collisions.rs`, `fields.rs`,
+        // `food.rs`, `lifecycle.rs`, `physics.rs`) jsou unscheduled here;
+        // jejich code zatím zůstává v tree pro reference, ale Bevy je
+        // nikdy nevolá. Dead-code warnings se objeví v cargo build —
+        // S181 cleanup je smaže.
+        //
+        // Schedule:
+        //   tick_start  → frame-timing diagnostic open
+        //   advance_clock  → renderer's SimClock resource (used by some UI)
+        //   sim_tick  → world.tick(&mut rng), all S133-S172 plasticity
+        //   sync_simworld_to_cellentity  → world.cells → CellEntity copy
+        //   tick_death_fade  → visual fade-out animation pro Dying entities
+        //   tick_end  → frame-timing diagnostic close
         .add_systems(
             FixedUpdate,
             (
-                (
-                    tick_start,
-                    advance_clock,
-                    update_food_density_cycle,
-                    rebuild_cell_entity_lookups,
-                    update_smell_field,
-                    update_pheromone_field,
-                    pool_bonded_hidden_cells,
-                    pool_bond_messages_cells,
-                    cells_brain_act_gpu_full,
-                    emit_pheromones,
-                    apply_cell_morph,
-                    apply_brownian_motion,
-                )
-                    .chain(),
-                (
-                    step_cells,
-                    apply_food_gravity,
-                    apply_environmental_hazards,
-                    resolve_cell_collisions,
-                    cell_predates_on_neighbor,
-                    cell_eats_food,
-                    spawn_food,
-                    spawn_coop_food,
-                    update_coop_food,
-                    cell_reproduces_on_threshold,
-                    cell_dies_on_zero_energy,
-                    tick_death_fade,
-                    tick_end,
-                )
-                    .chain(),
+                tick_start,
+                advance_clock,
+                sim_tick,
+                sync_simworld_to_cellentity,
+                tick_death_fade,
+                tick_end,
             )
                 .chain(),
-        )
-        // `update_vibration_field` sits between `update_pheromone_field` and
-        // `pool_bonded_hidden_cells` — registered separately because folding
-        // it into the Phase 1 chain pushes the tuple past Bevy's `chain` impl
-        // size cap. The two explicit ordering constraints pin it in place.
-        .add_systems(
-            FixedUpdate,
-            update_vibration_field
-                .after(update_pheromone_field)
-                .before(pool_bonded_hidden_cells),
-        )
-        // Wave 2: whisker raycast pre-pass. Reads `MazeWorld.field`, writes
-        // `cell.last_whisker_distances`. Must precede `cells_brain_act`
-        // (which reads from the cell). Registered separately for the same
-        // chain-size reason as `update_vibration_field`.
-        .add_systems(
-            FixedUpdate,
-            update_whisker_distances
-                .after(pool_bond_messages_cells)
-                .before(cells_brain_act_gpu_full),
-        )
-        // Wave 2: episodic novelty Hebbian reward — runs after motor /
-        // physics so the cell's voxel reflects this tick's motion. Modifies
-        // CPU brain weights; on `--gpu-full` the patches don't reach the
-        // persistent GPU buffer until next gen sync. Wave 4 brings GPU hook.
-        .add_systems(
-            FixedUpdate,
-            apply_episodic_novelty.after(step_cells),
-        )
-        // Sprint 176-177: shared-driver tick + entity sync. `sim_tick`
-        // calls `world.tick(&mut rng)` once per FixedUpdate after the
-        // legacy chain (so SimWorld evolves on its own). Then
-        // `sync_simworld_to_cellentity` overwrites the existing
-        // `CellEntity` components with `world.cells[slot]` so the visual
-        // pipeline (sync_transforms, gizmos, materials) renders SimWorld
-        // dynamics. S178 will delete the legacy chain entirely.
-        .add_systems(
-            FixedUpdate,
-            (sim_tick, sync_simworld_to_cellentity)
-                .chain()
-                .after(tick_end),
-        )
-        // Wave 3: per-tick eligibility-trace decay+accumulate. Runs after
-        // brain_act so traces capture this tick's activations before any
-        // event reward (eat/predation/novelty) fires.
-        .add_systems(
-            FixedUpdate,
-            apply_eligibility_step
-                .after(cells_brain_act_gpu_full)
-                .before(step_cells),
         )
         .add_systems(
             Update,
