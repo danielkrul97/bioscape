@@ -16,6 +16,12 @@ pub(crate) fn sim_tick(
 ) {
     let rng = &mut sim_rng.0;
     sim_world.0.tick(rng);
+    // Sprint 183+: keep the CPU vibration shadow current so the stats
+    // overlay can sample it without per-frame GPU readback. `tick` is
+    // 60 Hz so this download adds ~few ms/tick — acceptable for renderer
+    // diagnostics. Headless skips this because it samples vibration only
+    // at gen-end (`sync_vibration_from_gpu` directly).
+    sim_world.0.sync_vibration_from_gpu();
 }
 
 /// Sprint 177: copy each `world.cells[slot]` into the `CellEntity` of

@@ -2,8 +2,8 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use rustc_hash::FxHashSet;
 
-use super::components::{CellEntity, Dying, EpochEnded, FoodEntity, GenerationEnded, StatsText};
-use super::resources::{Clock, FoodDensityFactor, VibrationResource};
+use super::components::{EpochEnded, GenerationEnded, StatsText};
+use super::resources::{Clock, FoodDensityFactor, SimWorld};
 
 pub(super) fn log_clock_events(
     mut generation_ended: MessageReader<GenerationEnded>,
@@ -22,9 +22,7 @@ pub(super) fn update_stats_overlay(
     time: Res<Time<Virtual>>,
     density: Res<FoodDensityFactor>,
     diagnostics: Res<DiagnosticsStore>,
-    vibration: Res<VibrationResource>,
-    cells: Query<&CellEntity, Without<Dying>>,
-    foods: Query<(), With<FoodEntity>>,
+    sim_world: Res<SimWorld>,
     text: Single<&mut Text, With<StatsText>>,
     mut lineages_scratch: Local<FxHashSet<u64>>,
 ) {
@@ -54,21 +52,27 @@ pub(super) fn update_stats_overlay(
     let mut vib_emit_sum = 0.0_f64;
     let mut vib_amp_sum = 0.0_f64;
     let mut vib_grad_sum = 0.0_f64;
-    // R-#15: per-frame Update system. Persistent Local set zachová capacity.
+    // Sprint 183+: stats aggregated from `SimWorld.0.cells` (canonical
+    // since S177); legacy `CellEntity` query is no longer reliable —
+    // entity lifecycle sync (S177 scope-cut) keeps only the initial 200
+    // entities. Vibration field samples from `SimWorld.0.vibration`
+    // (CPU shadow); `sim_tick` system syncs it periodically from GPU.
     lineages_scratch.clear();
     let lineages = &mut *lineages_scratch;
     let mut oldest_age: u64 = 0;
     let current_gen = clock.0.generation;
-    for c in &cells {
+    let world = &sim_world.0;
+    let vibration_field = &world.vibration;
+    for cell in &world.cells {
         count += 1;
-        let s = c.0.genome.max_speed as f64;
-        let v = c.0.genome.vision_radius as f64;
-        let t = c.0.genome.turn_rate as f64;
-        let l = c.0.phenotype.body_length as f64;
-        let w = c.0.phenotype.body_width as f64;
+        let s = cell.genome.max_speed as f64;
+        let v = cell.genome.vision_radius as f64;
+        let t = cell.genome.turn_rate as f64;
+        let l = cell.phenotype.body_length as f64;
+        let w = cell.phenotype.body_width as f64;
         let aspect = if w > 1e-6 { l / w } else { 0.0 };
-        let spk = c.0.phenotype.primary_spike_length() as f64;
-        let e = c.0.energy as f64;
+        let spk = cell.phenotype.primary_spike_length() as f64;
+        let e = cell.energy as f64;
         spd_sum += s;
         spd_sumsq += s * s;
         vis_sum += v;
@@ -83,22 +87,18 @@ pub(super) fn update_stats_overlay(
             spk_max = spk;
         }
         e_sum += e;
-        // V7: motion-driven emission + locally-sampled field — gives a quick
-        // "how loud is the medium" readout to compare against gizmo intensity.
-        let pos = c.0.position;
-        vib_emit_sum += bioscape::vibration_emit_for_cell(&c.0) as f64;
-        vib_amp_sum += vibration.0.sample(pos) as f64;
-        let g = vibration
-            .0
-            .gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
+        let pos = cell.position;
+        vib_emit_sum += bioscape::vibration_emit_for_cell(cell) as f64;
+        vib_amp_sum += vibration_field.sample(pos) as f64;
+        let g = vibration_field.gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
         vib_grad_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
-        lineages.insert(c.0.lineage_id);
-        let age = current_gen.saturating_sub(c.0.lineage_birth_gen);
+        lineages.insert(cell.lineage_id);
+        let age = current_gen.saturating_sub(cell.lineage_birth_gen);
         if age > oldest_age {
             oldest_age = age;
         }
     }
-    let food_count = foods.iter().count();
+    let food_count = world.foods.len();
     let lineage_count = lineages.len();
 
     let (spd_avg, spd_dev, vis_avg, vis_dev, trn_avg, len_avg, wid_avg, asp_avg, asp_dev, spk_avg, e_avg) =
