@@ -50,6 +50,8 @@ pub use physics_utils::*;
 pub mod sensors;
 pub use sensors::*;
 
+pub mod sim;
+
 pub mod xoshiro;
 pub use xoshiro::*;
 

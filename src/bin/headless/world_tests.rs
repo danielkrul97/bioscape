@@ -1,6 +1,12 @@
 use super::*;
 
-use bioscape::{EventCalendar, ShockEvent, ShockKind, MATING_RADIUS, WORLD_MAP_SEED};
+use bioscape::{
+    BOND_FORM_TICKS, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, EventCalendar, HAZARD_AMP,
+    HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, MATING_RADIUS, N_PHEROMONE_CHANNELS,
+    REPRODUCE_THRESHOLD, ShockEvent, ShockKind, SMELL_GRID_RES, SMELL_GRID_RES_Z,
+    TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_SEED,
+    WORLD_UNITS_PER_FOOD,
+};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::path::PathBuf;

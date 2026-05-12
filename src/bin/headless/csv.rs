@@ -1,6 +1,6 @@
 //! CSV per-generation logging and analytics for headless harness.
 
-use super::world::{World, EDGE_FRAC_THRESHOLD};
+use bioscape::sim::{World, EDGE_FRAC_THRESHOLD};
 
 use bioscape::{
     Cell, EventCalendar, SpatialGrid, BRAIN_RECURRENT, GRID_CELL_SIZE,

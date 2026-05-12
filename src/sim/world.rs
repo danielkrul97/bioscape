@@ -6,7 +6,7 @@
 //! Logs per-generation stats (cell_count, mean/dev for max_speed/vision/body_size,
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
-use bioscape::{
+use crate::{
     reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, MazeDifficulty,
     ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
@@ -24,8 +24,8 @@ use bioscape::{
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP,
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
 };
-use bioscape::{BRAIN_HIDDEN, BRAIN_INPUTS};
-use bioscape::{
+use crate::{BRAIN_HIDDEN, BRAIN_INPUTS};
+use crate::{
     gpu::{
         BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, EatFoodGpu, EatFoodParamsGpu,
         FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, HebbianGpu,
@@ -152,7 +152,7 @@ pub struct World {
     pub pheromone_fields: [SmellField; N_PHEROMONE_CHANNELS],
     /// V7: motion-driven mechanosensory field. Each cell deposits an
     /// amplitude proportional to its kinetic + rotational activity (see
-    /// `bioscape::vibration_emit_for_cell`); the field then diffuses + decays
+    /// `crate::vibration_emit_for_cell`); the field then diffuses + decays
     /// every tick. Brain reads gradient + amplitude as inputs [29..32]. CPU
     /// only — no GPU shader counterpart in this cut.
     pub vibration: SmellField,
@@ -161,7 +161,7 @@ pub struct World {
     // neighbors používá — `cell_grid` před brain_act/resolve_collisions/predate,
     // `food_grid` před brain_act/eat_food.
     pub cell_grid: SpatialGrid<usize, f32>,
-    pub food_grid: SpatialGrid<usize, bioscape::FoodKind>,
+    pub food_grid: SpatialGrid<usize, crate::FoodKind>,
     // Persistent scratch — reused per tick to avoid hot-loop allocations.
     pub deltas_scratch: Vec<[f32; 3]>,
     /// Sprint 65: collision velocity damping (inelastic) — per pair, closing
@@ -285,7 +285,7 @@ pub struct World {
     pub gpu_full: Option<GpuFullState>,
 }
 
-// `GpuFullScratch` přesunut do `bioscape::gpu::scratch` (lib) — sdílen mezi
+// `GpuFullScratch` přesunut do `crate::gpu::scratch` (lib) — sdílen mezi
 // headless `--gpu-full` pathem a renderer `BIOSCAPE_GPU_FULL=1` pathem.
 
 pub struct GpuFullState {
@@ -534,7 +534,7 @@ impl World {
             mating_radius,
             max_population,
             events,
-            share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
+            share_frac: crate::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
             predation_gain_mult: 1.0,
             predation_drain_mult: 1.0,
@@ -627,7 +627,7 @@ impl World {
         let predate = PredateGpu::with_context(&ctx, cap)?;
         let food_spawn_cap = FOOD_SPAWN_RATE * MAX_SPAWN_ATTEMPTS;
         let world_map_size =
-            (bioscape::WORLD_MAP_RES * bioscape::WORLD_MAP_RES * bioscape::WORLD_MAP_RES_Z) as u64;
+            (crate::WORLD_MAP_RES * crate::WORLD_MAP_RES * crate::WORLD_MAP_RES_Z) as u64;
         let obstacle_mask_cap: u64 = 256 * 256 * 4;
         let food_spawn =
             FoodSpawnGpu::with_context(&ctx, food_spawn_cap, world_map_size, obstacle_mask_cap)?;
@@ -640,17 +640,17 @@ impl World {
             cap,
             GRID_CELL_SIZE,
             CELL_RADIUS,
-            bioscape::COLLISION_RESTITUTION,
-            bioscape::gpu::AdhesionParams {
-                strength: bioscape::ADHESION_STRENGTH,
-                cross_type: bioscape::ADHESION_CROSS_TYPE,
-                range_factor: bioscape::ADHESION_RANGE_FACTOR,
+            crate::COLLISION_RESTITUTION,
+            crate::gpu::AdhesionParams {
+                strength: crate::ADHESION_STRENGTH,
+                cross_type: crate::ADHESION_CROSS_TYPE,
+                range_factor: crate::ADHESION_RANGE_FACTOR,
             },
-            bioscape::gpu::BondParams {
+            crate::gpu::BondParams {
                 bonds_per_cell: MAX_BONDS_PER_CELL as u32,
-                break_factor: bioscape::BOND_BREAK_FACTOR,
+                break_factor: crate::BOND_BREAK_FACTOR,
             },
-            bioscape::MAX_COLLISION_CONTACTS_PER_CELL,
+            crate::MAX_COLLISION_CONTACTS_PER_CELL,
             [WORLD_HALF[0], WORLD_HALF[1]],
         )?;
         let cppn = CppnGpu::with_context(&ctx, cap);
@@ -867,7 +867,7 @@ impl World {
             // deterministicky odvozen z World seed). Resume CLI musí znovu
             // předat `--shocks-mean-gens`; jinak fresh empty.
             events: EventCalendar::default(),
-            share_frac: bioscape::BOND_FOOD_SHARE_FRAC,
+            share_frac: crate::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
             predation_gain_mult: 1.0,
             predation_drain_mult: 1.0,
@@ -947,7 +947,7 @@ impl World {
             let seasonal = 1.0 + CYCLE_AMPLITUDE * phase.sin();
             // Sprint 113: FoodCrash multiplikátor (1.0 default). Compound
             // přes všechny aktivní FoodCrash, clamp na FOOD_CRASH_MIN_FACTOR.
-            let shock_mult = bioscape::food_density_shock_multiplier(
+            let shock_mult = crate::food_density_shock_multiplier(
                 &self.events.events,
                 self.clock.generation,
             );
@@ -994,7 +994,7 @@ impl World {
                 &gpu.cells,
                 n,
                 dt,
-                bioscape::HEBBIAN_TRACE_DECAY_PER_SEC,
+                crate::HEBBIAN_TRACE_DECAY_PER_SEC,
             );
             // Sprint 139: per-tick excitability regulator. Reads
             // `last_hidden` (already populated by brain_act above), updates
@@ -1052,7 +1052,7 @@ impl World {
         if rng.random::<f32>() >= COOP_FOOD_SPAWN_RATE_PER_TICK {
             return;
         }
-        let pos = bioscape::random_coop_position(rng, WORLD_HALF);
+        let pos = crate::random_coop_position(rng, WORLD_HALF);
         self.coop_foods
             .push(CoopFood::new(pos, self.clock.tick));
     }
@@ -1064,7 +1064,7 @@ impl World {
         if self.coop_foods.is_empty() {
             return;
         }
-        bioscape::register_coop_arrivals_for_all(
+        crate::register_coop_arrivals_for_all(
             &mut self.coop_foods,
             &self.cells,
             WORLD_HALF,
@@ -1073,7 +1073,7 @@ impl World {
         let cells = &mut self.cells;
         let mut i = 0;
         while i < self.coop_foods.len() {
-            let triggered_now = bioscape::try_trigger_coop(&mut self.coop_foods[i], cells);
+            let triggered_now = crate::try_trigger_coop(&mut self.coop_foods[i], cells);
             if triggered_now {
                 self.coop_food_solved_gen += 1;
                 self.coop_food_arrivals_sum_gen +=
@@ -1126,7 +1126,7 @@ impl World {
         gpu.brownian.compute_persistent(
             &gpu.cells,
             n,
-            bioscape::THERMAL_NOISE,
+            crate::THERMAL_NOISE,
             dt,
             WORLD_HALF[2] > 0.0,
         );
@@ -1175,7 +1175,7 @@ impl World {
         // a propagated field that already reflects this tick's motion.
         let gpu = self.gpu_full.as_mut().expect("gpu_full mandatory");
         for cell in &self.cells {
-            let emit = bioscape::vibration_emit_for_cell(cell);
+            let emit = crate::vibration_emit_for_cell(cell);
             if emit > 0.0 {
                 gpu.vibration.add_source(cell.position, emit * dt);
             }
@@ -1411,7 +1411,7 @@ impl World {
             damage_norm_gain: DAMAGE_NORMALIZATION_GAIN,
             density_norm: DENSITY_NORM_COUNT,
             reproduce_threshold: REPRODUCE_THRESHOLD,
-            vibration_norm_gain: bioscape::VIBRATION_NORMALIZATION_GAIN,
+            vibration_norm_gain: crate::VIBRATION_NORMALIZATION_GAIN,
             _pad0: 0,
         };
         gpu.populate
@@ -1433,7 +1433,7 @@ impl World {
         gpu.izhikevich.dispatch(&gpu.cells, n, tick_u32);
         // Trace decay+accumulate based on both pre and post spike-times.
         gpu.stdp_step
-            .dispatch(&gpu.cells, n, tick_u32, bioscape::DEFAULT_STDP_TAU_TICKS);
+            .dispatch(&gpu.cells, n, tick_u32, crate::DEFAULT_STDP_TAU_TICKS);
 
         // Phase 7: GPU motor.dispatch_with_cells. Čte last_outputs + heading/
         // pitch/turn_rate/eff_radius/max_speed, mutuje velocity/angular_vel/
@@ -1474,20 +1474,20 @@ impl World {
             shell_cost_per_sec: SHELL_COST_PER_SEC,
             attack_cost_per_sec: ATTACK_COST_PER_SEC,
             pitch_clamp: core::f32::consts::FRAC_PI_6 * 0.5,
-            thermal_top: bioscape::THERMAL_TOP,
-            thermal_bottom: bioscape::THERMAL_BOTTOM,
-            thermal_q10: bioscape::THERMAL_Q10,
-            thermal_ref_temp: bioscape::THERMAL_REF_TEMP,
+            thermal_top: crate::THERMAL_TOP,
+            thermal_bottom: crate::THERMAL_BOTTOM,
+            thermal_q10: crate::THERMAL_Q10,
+            thermal_ref_temp: crate::THERMAL_REF_TEMP,
             // Sprint 86: per-tick phase fractions, pre-computed na CPU aby
             // shader nemusel řešit u64 modulo + f32 cast.
-            thermal_diurnal_amp: bioscape::THERMAL_DIURNAL_AMP,
-            thermal_seasonal_amp: bioscape::THERMAL_SEASONAL_AMP,
-            thermal_diurnal_phase: (self.clock.tick % bioscape::THERMAL_DIURNAL_PERIOD_TICKS)
+            thermal_diurnal_amp: crate::THERMAL_DIURNAL_AMP,
+            thermal_seasonal_amp: crate::THERMAL_SEASONAL_AMP,
+            thermal_diurnal_phase: (self.clock.tick % crate::THERMAL_DIURNAL_PERIOD_TICKS)
                 as f32
-                / bioscape::THERMAL_DIURNAL_PERIOD_TICKS as f32,
+                / crate::THERMAL_DIURNAL_PERIOD_TICKS as f32,
             thermal_seasonal_phase: (self.clock.generation % CYCLE_GEN_PERIOD) as f32
                 / CYCLE_GEN_PERIOD as f32,
-            thermal_log2_q10: bioscape::THERMAL_Q10.log2(),
+            thermal_log2_q10: crate::THERMAL_Q10.log2(),
             // Wave 4: maze fields. When obstacles present, mask was uploaded
             // at allocation time (`World::sync_maze_to_gpu`); shader uses it.
             maze_active: if self.obstacles.is_some() { 1 } else { 0 },
@@ -1588,19 +1588,19 @@ impl World {
                 let vr2 = vision_r * vision_r;
                 // Sprint 83: cone filter — viz `gather` v main.rs.
                 let fov = cell.genome.vision_fov;
-                let skip_cone = fov >= bioscape::MAX_VISION_FOV;
+                let skip_cone = fov >= crate::MAX_VISION_FOV;
                 let cos_fov = fov.cos();
-                let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
+                let fwd = crate::forward_vector(cell.heading, cell.pitch);
 
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
                 food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, _| {
-                    let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
+                    let d = crate::min_image_delta(pos, fp, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 > vr2 || d2 >= best_food_d2 {
                         return;
                     }
-                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                    if !skip_cone && !crate::fov_cone_accept(d, d2, fwd, cos_fov) {
                         return;
                     }
                     best_food_d2 = d2;
@@ -1612,12 +1612,12 @@ impl World {
                 // distance — coop food má vyšší expected value, ale solo
                 // arrival nedostane reward.
                 for coop in coop_foods.iter() {
-                    let d = bioscape::min_image_delta(pos, coop.position, WORLD_HALF);
+                    let d = crate::min_image_delta(pos, coop.position, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 > vr2 || d2 >= best_food_d2 {
                         continue;
                     }
-                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                    if !skip_cone && !crate::fov_cone_accept(d, d2, fwd, cos_fov) {
                         continue;
                     }
                     best_food_d2 = d2;
@@ -1631,12 +1631,12 @@ impl World {
                     if id == i {
                         return;
                     }
-                    let d = bioscape::min_image_delta(pos, op, WORLD_HALF);
+                    let d = crate::min_image_delta(pos, op, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 > vr2 {
                         return;
                     }
-                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                    if !skip_cone && !crate::fov_cone_accept(d, d2, fwd, cos_fov) {
                         return;
                     }
                     neighbors_in_vision += 1;
@@ -1654,11 +1654,11 @@ impl World {
                         pheromone_fields[ch].gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
                 }
                 let temperature_local =
-                    bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
+                    crate::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
                 let vibration_grad =
                     vibration.gradient_at(pos_xyz, VIBRATION_SAMPLE_EPSILON);
                 let vibration_amp = vibration.sample(pos_xyz);
-                let sensors = bioscape::BrainSensors {
+                let sensors = crate::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
                     neighbors_in_vision,
@@ -1672,8 +1672,8 @@ impl World {
                 cell.apply_shell_absorb(dt);
                 // eat_food skip optim: cache nejbližší food d² (viz CPU path).
                 cell.last_best_food_d2 = best_food_d2;
-                let mut inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
-                bioscape::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
+                let mut inputs = crate::populate_brain_inputs(cell, &sensors, vision_r);
+                crate::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
                 inputs
             })
             .collect();
@@ -1687,7 +1687,7 @@ impl World {
             .enumerate()
             .map(|(i, cell)| {
                 let own = inputs_vec[i];
-                bioscape::pool_bonded_sensors(cell, &own, |partner_id| {
+                crate::pool_bonded_sensors(cell, &own, |partner_id| {
                     let idx = id_to_idx.get(&partner_id).copied()?;
                     if idx == i {
                         return None;
@@ -1740,7 +1740,7 @@ impl World {
         let id_to_idx = &self.id_to_idx_scratch;
         let snapshot = &self.hidden_snapshot_scratch;
         for (i, cell) in self.cells.iter_mut().enumerate() {
-            let pooled = bioscape::pool_bonded_hidden(cell, |partner_id| {
+            let pooled = crate::pool_bonded_hidden(cell, |partner_id| {
                 let idx = id_to_idx.get(&partner_id).copied()?;
                 if idx == i {
                     return None;
@@ -1758,11 +1758,11 @@ impl World {
         if self.cells.is_empty() {
             return;
         }
-        let snapshot: Vec<[f32; bioscape::BRAIN_OUTPUTS]> =
+        let snapshot: Vec<[f32; crate::BRAIN_OUTPUTS]> =
             self.cells.iter().map(|c| c.last_outputs).collect();
         let id_to_idx = &self.id_to_idx_scratch;
         for (i, cell) in self.cells.iter_mut().enumerate() {
-            let inbox = bioscape::pool_bond_messages(cell, |partner_id| {
+            let inbox = crate::pool_bond_messages(cell, |partner_id| {
                 let idx = id_to_idx.get(&partner_id).copied()?;
                 if idx == i {
                     return None;
@@ -1814,22 +1814,22 @@ impl World {
                 let vision_r = cell.genome.vision_radius;
                 let vr2 = vision_r * vision_r;
                 let fov = cell.genome.vision_fov;
-                let skip_cone = fov >= bioscape::MAX_VISION_FOV;
+                let skip_cone = fov >= crate::MAX_VISION_FOV;
                 let cos_fov = fov.cos();
-                let fwd = bioscape::forward_vector(cell.heading, cell.pitch);
+                let fwd = crate::forward_vector(cell.heading, cell.pitch);
 
                 let mut best_food: Option<[f32; 3]> = None;
                 let mut best_food_d2 = f32::MAX;
                 food_grid.for_each_in_radius_toroidal(pos, vision_r, WORLD_HALF, |_id, fp, _| {
-                    let d = bioscape::min_image_delta(pos, fp, WORLD_HALF);
+                    let d = crate::min_image_delta(pos, fp, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 > vr2 || d2 >= best_food_d2 {
                         return;
                     }
-                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                    if !skip_cone && !crate::fov_cone_accept(d, d2, fwd, cos_fov) {
                         return;
                     }
-                    if !bioscape::los_clear(obstacles, pos, fp) {
+                    if !crate::los_clear(obstacles, pos, fp) {
                         return;
                     }
                     best_food_d2 = d2;
@@ -1838,15 +1838,15 @@ impl World {
                 // Sprint 128: coop food candidates injected do same nearest_food
                 // selection. Linear scan — typický coop_foods.len() ≤ 8.
                 for coop in coop_foods.iter() {
-                    let d = bioscape::min_image_delta(pos, coop.position, WORLD_HALF);
+                    let d = crate::min_image_delta(pos, coop.position, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 > vr2 || d2 >= best_food_d2 {
                         continue;
                     }
-                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                    if !skip_cone && !crate::fov_cone_accept(d, d2, fwd, cos_fov) {
                         continue;
                     }
-                    if !bioscape::los_clear(obstacles, pos, coop.position) {
+                    if !crate::los_clear(obstacles, pos, coop.position) {
                         continue;
                     }
                     best_food_d2 = d2;
@@ -1860,15 +1860,15 @@ impl World {
                     if id == i {
                         return;
                     }
-                    let d = bioscape::min_image_delta(pos, op, WORLD_HALF);
+                    let d = crate::min_image_delta(pos, op, WORLD_HALF);
                     let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if d2 > vr2 {
                         return;
                     }
-                    if !skip_cone && !bioscape::fov_cone_accept(d, d2, fwd, cos_fov) {
+                    if !skip_cone && !crate::fov_cone_accept(d, d2, fwd, cos_fov) {
                         return;
                     }
-                    if !bioscape::los_clear(obstacles, pos, op) {
+                    if !crate::los_clear(obstacles, pos, op) {
                         return;
                     }
                     neighbors_in_vision += 1;
@@ -1886,11 +1886,11 @@ impl World {
                         pheromone_fields[ch].gradient_at(pos_xyz, PHEROMONE_SAMPLE_EPSILON);
                 }
                 let temperature_local =
-                    bioscape::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
+                    crate::temperature_at_z(pos[2], WORLD_HALF, tick, gen);
                 let vibration_grad =
                     vibration.gradient_at(pos_xyz, VIBRATION_SAMPLE_EPSILON);
                 let vibration_amp = vibration.sample(pos_xyz);
-                let sensors = bioscape::BrainSensors {
+                let sensors = crate::BrainSensors {
                     nearest_food: best_food,
                     nearest_cell: best_cell,
                     neighbors_in_vision,
@@ -1906,8 +1906,8 @@ impl World {
                 // eat_food skip optim: cache squared distance k nejbližšímu food
                 // (vision-radius scope) pro pozdější `eat_food` early skip.
                 cell.last_best_food_d2 = best_food_d2;
-                let mut inputs = bioscape::populate_brain_inputs(cell, &sensors, vision_r);
-                bioscape::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
+                let mut inputs = crate::populate_brain_inputs(cell, &sensors, vision_r);
+                crate::apply_sensor_gains(&mut inputs, &cell.genome.sensor_gains);
                 *inputs_slot = inputs;
             });
 
@@ -1919,7 +1919,7 @@ impl World {
             .enumerate()
             .for_each(|(i, cell)| {
                 let own = inputs_scratch[i];
-                let pooled = bioscape::pool_bonded_sensors(cell, &own, |partner_id| {
+                let pooled = crate::pool_bonded_sensors(cell, &own, |partner_id| {
                     let idx = id_to_idx.get(&partner_id).copied()?;
                     if idx == i {
                         return None;
@@ -1953,10 +1953,10 @@ impl World {
         let tick = self.clock.tick;
         let gen = self.clock.generation;
         let events = &self.events.events;
-        let ctx = bioscape::ThermalCtx::for_tick(tick, gen);
+        let ctx = crate::ThermalCtx::for_tick(tick, gen);
         let obstacles = self.obstacles.as_ref();
         for cell in &mut self.cells {
-            let climate_offset = bioscape::climate_shock_offset(
+            let climate_offset = crate::climate_shock_offset(
                 events,
                 gen,
                 [cell.position[0], cell.position[1]],
@@ -2052,7 +2052,7 @@ impl World {
     /// reward dispatch. CPU and GPU paths now both credit novelty against
     /// the same eligibility trace.
     pub fn apply_episodic_novelty(&mut self) {
-        use bioscape::{LEARNING_RATE, NOVELTY_REWARD_MAGNITUDE};
+        use crate::{LEARNING_RATE, NOVELTY_REWARD_MAGNITUDE};
         let half = WORLD_HALF;
         if self.gpu_full.is_some() {
             // Decide novelty per cell first (read-only on cell state); then
@@ -2140,7 +2140,7 @@ impl World {
     /// Sprint 112: per-cell climate offset helper, sdílený mezi tick hot path
     /// a `write_stats` (CSV column `shock_climate_offset`).
     pub fn climate_offset_at(&self, pos_xy: [f32; 2]) -> f32 {
-        bioscape::climate_shock_offset(
+        crate::climate_shock_offset(
             &self.events.events,
             self.clock.generation,
             pos_xy,
@@ -2168,7 +2168,7 @@ impl World {
             let noise = self
                 .map
                 .sample([cell.position[0], cell.position[1], cell.position[2]]);
-            let shock_mult = bioscape::hazard_shock_multiplier(
+            let shock_mult = crate::hazard_shock_multiplier(
                 cell.position,
                 events,
                 gen,
@@ -2273,7 +2273,7 @@ impl World {
             &gpu.cell_hash,
         );
 
-        let max_contacts = bioscape::MAX_COLLISION_CONTACTS_PER_CELL as usize;
+        let max_contacts = crate::MAX_COLLISION_CONTACTS_PER_CELL as usize;
         for i in 0..n {
             self.deltas_scratch[i] = result.position_deltas[i];
             self.velocity_deltas_scratch[i] = result.velocity_deltas[i];
@@ -2394,9 +2394,9 @@ impl World {
                     continue;
                 };
                 let pos_j = positions_snapshot[j_idx];
-                let d_vec = bioscape::min_image_delta(pos_j, pos_i, WORLD_HALF);
+                let d_vec = crate::min_image_delta(pos_j, pos_i, WORLD_HALF);
                 let d = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
-                if d > bond.rest_length * bioscape::BOND_BREAK_FACTOR || d <= f32::EPSILON {
+                if d > bond.rest_length * crate::BOND_BREAK_FACTOR || d <= f32::EPSILON {
                     self.cells[i].bonds[slot] = None;
                     bonds_broken_this_tick += 1;
                     continue;
@@ -2509,7 +2509,7 @@ impl World {
             }
             let pos_a = positions_snapshot[i_a];
             let pos_b = positions_snapshot[i_b];
-            let d_vec = bioscape::min_image_delta(pos_b, pos_a, WORLD_HALF);
+            let d_vec = crate::min_image_delta(pos_b, pos_a, WORLD_HALF);
             let dist =
                 (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
             let rest = dist * BOND_REST_LENGTH_SLACK;
@@ -2586,16 +2586,16 @@ impl World {
         }
         let params = PredateParamsGpu {
             num_cells: 0, // filled by compute()
-            cell_size: bioscape::GRID_CELL_SIZE,
-            cell_radius_const: bioscape::CELL_RADIUS,
-            size_ratio_threshold: bioscape::SIZE_RATIO_THRESHOLD,
-            herd_radius_sq: bioscape::HERD_RADIUS * bioscape::HERD_RADIUS,
-            attack_threshold: bioscape::ATTACK_THRESHOLD,
-            predation_gain: bioscape::PREDATION_GAIN_PER_TICK * self.predation_gain_mult,
-            predation_drain: bioscape::PREDATION_DRAIN_PER_TICK * self.predation_drain_mult,
-            spike_dot_threshold: bioscape::SPIKE_DOT_THRESHOLD,
-            spike_bonus: bioscape::SPIKE_PREDATION_BONUS,
-            dilution_k: bioscape::DILUTION_K,
+            cell_size: crate::GRID_CELL_SIZE,
+            cell_radius_const: crate::CELL_RADIUS,
+            size_ratio_threshold: crate::SIZE_RATIO_THRESHOLD,
+            herd_radius_sq: crate::HERD_RADIUS * crate::HERD_RADIUS,
+            attack_threshold: crate::ATTACK_THRESHOLD,
+            predation_gain: crate::PREDATION_GAIN_PER_TICK * self.predation_gain_mult,
+            predation_drain: crate::PREDATION_DRAIN_PER_TICK * self.predation_drain_mult,
+            spike_dot_threshold: crate::SPIKE_DOT_THRESHOLD,
+            spike_bonus: crate::SPIKE_PREDATION_BONUS,
+            dilution_k: crate::DILUTION_K,
             world_half_x: WORLD_HALF[0],
             world_half_y: WORLD_HALF[1],
             ..PredateParamsGpu::default()
@@ -2618,7 +2618,7 @@ impl World {
             s.lt_pitches.push(cell.pitch);
             s.lt_attack_signals.push(cell.last_outputs[6].max(0.0));
             let mut active = 0u32;
-            for k in 0..bioscape::SPIKE_SLOTS {
+            for k in 0..crate::SPIKE_SLOTS {
                 let spike = cell.phenotype.spikes[k];
                 if spike.length > 0.0 {
                     active += 1;
@@ -2750,15 +2750,15 @@ impl World {
                 world_half_x: WORLD_HALF[0],
                 world_half_y: WORLD_HALF[1],
                 world_half_z: WORLD_HALF[2],
-                world_map_nx: bioscape::WORLD_MAP_RES as u32,
-                world_map_ny: bioscape::WORLD_MAP_RES as u32,
-                world_map_nz: bioscape::WORLD_MAP_RES_Z as u32,
+                world_map_nx: crate::WORLD_MAP_RES as u32,
+                world_map_ny: crate::WORLD_MAP_RES as u32,
+                world_map_nz: crate::WORLD_MAP_RES_Z as u32,
                 fixed_timestep_hz: FIXED_TIMESTEP_HZ,
                 plant_food_value: PLANT_FOOD_VALUE,
                 carrion_food_value: CARRION_FOOD_VALUE,
                 carrion_decay_per_sec: CARRION_DECAY_PER_SEC,
-                world_map_food_floor: bioscape::WORLD_MAP_FOOD_FLOOR,
-                world_map_food_amp: bioscape::WORLD_MAP_FOOD_AMP,
+                world_map_food_floor: crate::WORLD_MAP_FOOD_FLOOR,
+                world_map_food_amp: crate::WORLD_MAP_FOOD_AMP,
             };
             let cells = &self.cells;
             let foods = &self.foods;
@@ -2857,7 +2857,7 @@ impl World {
                 // do partnerů s jiným lineage_id (= test relatedness coefficientu r).
                 let n_bonds = bonds_copy.iter().filter(|b| b.is_some()).count() as f32;
                 let cluster_mult = 1.0 + (n_bonds - 1.0).max(0.0)
-                    * bioscape::BOND_FOOD_SHARE_CLUSTER_BONUS;
+                    * crate::BOND_FOOD_SHARE_CLUSTER_BONUS;
                 let share_value =
                     *value * self.share_frac * donor_state * cluster_mult;
                 if share_value > 0.0 {
@@ -2953,7 +2953,7 @@ impl World {
         if budget == 0 {
             return;
         }
-        let k = budget * bioscape::MAX_SPAWN_ATTEMPTS;
+        let k = budget * crate::MAX_SPAWN_ATTEMPTS;
         let positions: Vec<[f32; 3]> = self.cells.iter().map(|c| c.position).collect();
         let max_axes: Vec<f32> = self.cells.iter().map(|c| c.phenotype.max_axis()).collect();
         let seeds: Vec<[u32; 4]> = (0..k)
@@ -2974,9 +2974,9 @@ impl World {
             .unwrap_or((1, 1, 1));
         let params = FoodSpawnParamsGpu {
             num_attempts: 0, // populated by compute()
-            rejection_strength: bioscape::FOOD_REJECTION_STRENGTH,
-            eat_radius: bioscape::EAT_RADIUS,
-            cell_size: bioscape::GRID_CELL_SIZE,
+            rejection_strength: crate::FOOD_REJECTION_STRENGTH,
+            eat_radius: crate::EAT_RADIUS,
+            cell_size: crate::GRID_CELL_SIZE,
             world_half_x: WORLD_HALF[0],
             world_half_y: WORLD_HALF[1],
             world_half_z: WORLD_HALF[2],
@@ -3005,7 +3005,7 @@ impl World {
                 self.foods.push(Food {
                     position: result.candidate_positions[i],
                     age_ticks: 0,
-                    kind: bioscape::FoodKind::Plant,
+                    kind: crate::FoodKind::Plant,
                 });
                 pushed += 1;
             }
@@ -3062,7 +3062,7 @@ impl World {
         let fertile = self.collect_fertile();
         self.fertile_ticks_gen += fertile.len() as u64;
         let mating_r2 = self.mating_radius * self.mating_radius;
-        let matings = bioscape::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
+        let matings = crate::pair_fertile(&fertile, mating_r2, budget, WORLD_HALF);
         let child_start = self.cells.len();
         let to_spawn = self.spawn_children_from_matings(&matings, rng);
         let n_births = to_spawn.len();
@@ -3105,7 +3105,7 @@ impl World {
             // then take `&mut self.gpu_full` for dispatch. Rust's disjoint
             // field borrows handle this because `cells` and `gpu_full` are
             // distinct fields of `self`.
-            let pairs: Vec<(usize, &bioscape::Cppn)> = (0..n_births)
+            let pairs: Vec<(usize, &crate::Cppn)> = (0..n_births)
                 .map(|off| {
                     let slot = child_start + off;
                     (slot, &self.cells[slot].genome.cppn)
@@ -3163,7 +3163,7 @@ impl World {
             .filter(|(_, c)| {
                 let f = freq.get(&c.lineage_id).copied().unwrap_or(0.0);
                 let scaled =
-                    REPRODUCE_THRESHOLD * (1.0 + bioscape::LINEAGE_DIVERSITY_ALPHA * f * f);
+                    REPRODUCE_THRESHOLD * (1.0 + crate::LINEAGE_DIVERSITY_ALPHA * f * f);
                 c.energy >= scaled
                     && c.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
                     && c.reproduce_cooldown_ticks == 0
@@ -3219,9 +3219,9 @@ impl World {
             cell_a.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
             cell_b.reproduce_cooldown_ticks = MATING_COOLDOWN_TICKS;
             let child = if use_gpu_cppn {
-                bioscape::make_mating_child_no_brain(cell_a, cell_b, rng, child_ids[i])
+                crate::make_mating_child_no_brain(cell_a, cell_b, rng, child_ids[i])
             } else {
-                bioscape::make_mating_child(cell_a, cell_b, rng, child_ids[i])
+                crate::make_mating_child(cell_a, cell_b, rng, child_ids[i])
             };
             children.push(child);
         }
@@ -3246,7 +3246,7 @@ impl World {
                     new_foods.push(Food {
                         position: pos,
                         age_ticks: 0,
-                        kind: bioscape::FoodKind::Carrion,
+                        kind: crate::FoodKind::Carrion,
                     });
                 }
             }
@@ -3303,7 +3303,9 @@ pub fn food_target(factor: f32) -> usize {
 // "in corner" if both axes simultaneously meet that criterion.
 pub const EDGE_FRAC_THRESHOLD: f32 = 0.9;
 
-#[cfg(test)]
-#[path = "world_tests.rs"]
-mod tests;
+// Sprint 173: integration test fixtures moved to `src/bin/headless/world_tests.rs`
+// (declared via `#[cfg(test)] mod world_tests;` in `headless/main.rs`). Keeps
+// them under the binary's test runner where they were before the World
+// extraction, so `cargo test --lib` doesn't see GPU-adapter-heavy tests that
+// fan-out-fail under shared init.
 

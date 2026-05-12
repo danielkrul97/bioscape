@@ -22,7 +22,10 @@ use std::path::Path;
 use std::time::Instant;
 
 mod csv;
-mod world;
+use bioscape::sim as world;
+
+#[cfg(test)]
+mod world_tests;
 
 use csv::*;
 use world::*;
