@@ -10,7 +10,7 @@ pub const PREDATION_GAIN_PER_TICK: f32 = 2.25;
 /// predate-on-contact spustila. Bez aktivního brain signálu jsou `cell × cell`
 /// kolize jen kolize — energy se nepřevádí. Mirroruje semantiku
 /// `MATING_PHEROMONE_THRESHOLD` (input → behaviorální gate).
-pub const ATTACK_THRESHOLD: f32 = 0.2;
+pub const ATTACK_THRESHOLD: f32 = 0.15;
 /// Cena udržování attack módu: COST × max(0, output[6]) za sekundu, paid each
 /// tick i když k predaci nedojde. Energie protiváhy "claws out". Bez ceny by
 /// selekce favorizovala vždy-zapnutý attack output.
@@ -84,7 +84,7 @@ pub const DAMAGE_REWARD_GAIN: f32 = 0.1;
 /// transient event, not a per-tick stream, so the credit needs to be
 /// substantial enough that the eligibility trace catches it but not so
 /// large it dominates foraging.
-pub const BOND_FORMED_REWARD_MAGNITUDE: f32 = 0.2;
+pub const BOND_FORMED_REWARD_MAGNITUDE: f32 = 0.6;
 
 /// Sprint 135: positive reward for both parents when a mating produces a
 /// child. Larger than bond formation — successful reproduction is the

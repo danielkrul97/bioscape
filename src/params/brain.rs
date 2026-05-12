@@ -138,7 +138,7 @@ pub const INNATE_PHEROMONE_AUX_BIAS: f32 = 0.5;
 /// Inicializační bias na attack output (b2[6]). Sprint 27: predace je opt-in,
 /// ne default. Záměrně 0 — chceme měřit, jestli selekce attack chování objeví
 /// sama, nebo zůstane utlumený. Negative bias by ho aktivně potlačoval.
-pub const INNATE_ATTACK_BIAS: f32 = 0.0;
+pub const INNATE_ATTACK_BIAS: f32 = 0.4;
 /// Bond signal bias (b2[9]). Real bottleneck v emergence multicellularity
 /// není maintenance cost, ale formation gating: s bias=0 random brain dává
 /// output > BOND_FORM_THRESHOLD jen sporadicky, takže bondy se nikdy

@@ -152,7 +152,7 @@ pub const MAX_COLLISION_CONTACTS_PER_CELL: u32 = 32;
 /// candidates. 10 ticks dovolí formaci i z krátkých but consenting contactů.
 /// Risk: nestabilní bondy formující se z náhodného mihem (mitigated tím,
 /// že bond_signal threshold zůstává 0.2).
-pub const BOND_FORM_TICKS: u32 = 5;
+pub const BOND_FORM_TICKS: u32 = 3;
 /// Tiků bez kontaktu po kterých contact_progress klesne na 0 (cleanup sparse
 /// FxHashMap). Krátký timeout — pár, který se rozejde, ztrácí "track" hned.
 pub const CONTACT_DECAY_TICKS: u32 = 5;
@@ -200,11 +200,11 @@ pub const BOND_FORM_THRESHOLD: f32 = 0.0;
 pub const BOND_BREAK_THRESHOLD: f32 = -1.0;
 /// Energy cost při formaci bondu (one-shot, paid by initiator). Ne-trivial,
 /// aby selekce váhala bonding vs free-roaming.
-pub const BOND_FORMATION_COST: f32 = 0.2;
+pub const BOND_FORMATION_COST: f32 = 0.05;
 /// Per-second cost udržování každého bondu (paid každý tick). Drobný — bond
 /// je výhoda (tissue stability), ale ne free. Tuned tak, aby cluster benefit
 /// rostl relativně k maintenance cost při low food periods.
-pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.04;
+pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.015;
 /// Sprint 78: food-share fraction per bond. Když bonded cell eats food
 /// (FOOD_VALUE energy), každý bonded partner dostane `FOOD_VALUE × FRAC`
 /// extra energy (free reward, no energy conservation — modeluje „tissue
@@ -227,7 +227,7 @@ pub const LINEAGE_DIVERSITY_ALPHA: f32 = 2.0;
 /// runs ukázala kolaps tissue regimu (bond_active_frac → 0 do gen 200), takže
 /// linear bonus per added bond posiluje selekci pro velké clustery. n=1 →
 /// ×1.00, n=2 → ×1.15, n=6 (max) → ×1.75. Žádný cap (max je MAX_BONDS_PER_CELL=6).
-pub const BOND_FOOD_SHARE_CLUSTER_BONUS: f32 = 0.15;
+pub const BOND_FOOD_SHARE_CLUSTER_BONUS: f32 = 0.40;
 
 // ─── Sprint 80: bistabilní cell-state (epigenetic-like memory) ──────────────
 // Per-cell continuous scalar [0,1] s pozitivním feedbackem okolo 0.5 →
