@@ -18,6 +18,14 @@ pub(super) struct TickCounter {
     pub(super) tick_start: Option<Instant>,
 }
 
+/// Sprint 174: newtype wrapping shared `bioscape::sim::World`. Initialised
+/// at startup alongside renderer's existing `GpuFullPipeline`. Sits unused
+/// for now — S175 wires the tick system; S176 deletes the legacy ECS
+/// pipeline and switches to `world.tick()`. Until then both representations
+/// coexist (memory hit but no functional conflict).
+#[derive(Resource)]
+pub(super) struct SimWorld(pub(super) bioscape::sim::World);
+
 #[derive(Resource, Debug, Clone, Copy)]
 pub(super) struct WorldExtent {
     pub(super) half_x: f32,

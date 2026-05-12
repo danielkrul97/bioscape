@@ -44,12 +44,16 @@ lib reveal failures. Workaround = keep tests v binary. Proper fix
 Existing renderer ECS systems zatím zůstávají (parallel path), `World`
 just sits unused.
 
-**Plán:** `World` musí být `Resource`-compatible (potential `Send + Sync`
-issues s wgpu Device). Použít `Resource` wrapper nebo `Arc<Mutex<World>>`.
-Init at startup.
+**Výstup (foundational scope):** `#[derive(Resource)] pub(super) struct
+SimWorld(pub(super) bioscape::sim::World);` newtype wrapper v
+`renderer/resources.rs`. World je `Send + Sync + 'static` (Cell, Bond,
+SimClock, wgpu types vše Send+Sync), takže Resource derive funguje bez
+`Arc<Mutex<_>>` overhead. Renderer kompiluje (warning: dead_code, expected
+— actual init + wire-up přichází v S175).
 
-**Acceptance:** renderer kompiluje + spustí s embedded `World`, žádný
-behavioral change vs pre-S174.
+**Poznámky:** Init `World::new_with_maze(...)` ponechán do S175 spolu s
+tick system wire-up. Důvod: bare type declaration je 5-řádkový change,
+kompletní init + tick + sync je další 200+ řádků a vlastní commit.
 
 ## Sprint 175 — Single tick system + cell sync
 
