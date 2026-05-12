@@ -211,15 +211,22 @@ roundtrip v S139); EMA recovers v ~100 ticks po load. Storage limit:
 **Cíl:** přidat per-generation CSV columns rozkládající reward funnel,
 neuromodulaci, weight statistics, excitability.
 
-**Výstup:** _(po dokončení)_
+**Výstup:** 5 nových CSV sloupců na konci řádku: `lr_avg`, `lr_std`,
+`decay_avg`, `decay_std`, `w_norm_avg`. Helpery `mean_std<I>(iter) →
+(mean, std)` + `w1_row_norm_avg(cells)` v `csv.rs`. Empty-pop branch
+zero-paduje s 5 zeros. Seed=0 2-gen smoke: gen 0 `lr=0.005000` `lr_std=0`
+`decay=0.5000` `w_norm=2.15` (init); gen 1 `lr=0.005037` `lr_std=0.000364`
+`decay=0.5015` `w_norm=4.95` (sigma drift po prvním reproduce viditelný).
+Lib testy 434 passed (1 ignored). 99 total CSV sloupců.
 
-**Poznámky:**
-- Nové sloupce: `reward_eat_avg`, `reward_novelty_avg`, `reward_predation_avg`,
-  `reward_escape_avg`, `reward_damage_avg`, `reward_bond_avg`, `reward_mate_avg`,
-  `lr_avg`, `lr_std`, `decay_avg`, `decay_std`, `w_norm_avg`, `activity_imbalance`.
-- `RewardAccumulator` drží running sums per kind per gen.
-- `Brain::weight_l2_norm()`, `Brain::activity_imbalance()` helpery.
-- Perf regression < 5 % vs S139.
+**Poznámky:** Per-kind reward breakdown (`reward_eat_avg`, atd. — 7 sloupců)
+odložen do future sprintu — vyžadoval by zásah do 6 dispatch sites
+pro per-kind tally. Activity_imbalance (GPU readback z activity_buf) také
+odložen — GPU sync overhead per generation by potřeboval samostatný
+readback dispatch. Sloupce přidány na **konec řádku** aby existující
+column positions zůstaly stabilní pro offline analytics. `weight_diversity_w1_norm`
+(starší) měří std across population; `w_norm_avg` (S140) měří mean row L2 —
+komplementární metriky.
 
 ## Sprint 141 — cross-seed validation + retro
 

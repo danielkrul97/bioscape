@@ -45,7 +45,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
             //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
             //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{}",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -508,9 +508,17 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         0.0
     };
     let maze_first_reach_total = world.goal_first_reach_tick.len() as u64;
+    // Sprint 140: per-cell rate stats from Sprint 136/137 genome fields.
+    let (lr_avg, lr_std) = mean_std(world.cells.iter().map(|c| c.genome.learning_rate as f64));
+    let (decay_avg, decay_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.trace_decay_per_sec as f64));
+    // Sprint 140: mean L2 norm across w1 rows of all cells. Synaptic
+    // scaling (S138) caps row norms at `W_NORM_CAP`; this metric tracks
+    // how close the population sits to the cap on average.
+    let w_norm_avg = w1_row_norm_avg(&world.cells);
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -625,7 +633,60 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         maze_in_goal_frac,
         maze_unique_reach_frac,
         maze_first_reach_total,
+        // Sprint 140
+        lr_avg,
+        lr_std,
+        decay_avg,
+        decay_std,
+        w_norm_avg,
     )
+}
+
+/// Sprint 140: shared mean/stddev reducer for the new per-cell genome
+/// rate columns. Returns `(0.0, 0.0)` for an empty iterator so the empty-
+/// population row stays well-formed.
+fn mean_std<I: IntoIterator<Item = f64>>(it: I) -> (f64, f64) {
+    let mut sum = 0.0_f64;
+    let mut sumsq = 0.0_f64;
+    let mut n = 0_u64;
+    for v in it {
+        sum += v;
+        sumsq += v * v;
+        n += 1;
+    }
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let nf = n as f64;
+    let mean = sum / nf;
+    let var = (sumsq / nf - mean * mean).max(0.0);
+    (mean, var.sqrt())
+}
+
+/// Sprint 140: mean L2 norm of `w1` rows across the population. Each
+/// cell contributes `BRAIN_HIDDEN` row norms; we average over `n_cells ×
+/// BRAIN_HIDDEN` samples. With the S138 synaptic scaling cap at
+/// `W_NORM_CAP = 8.0`, healthy populations sit at `1–4`; saturation toward
+/// the cap signals chronic Hebbian overgrowth.
+fn w1_row_norm_avg(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0_f64;
+    let mut count = 0_u64;
+    for cell in cells {
+        let h_n = cell.genome.brain.hidden_n as usize;
+        for row in cell.genome.brain.w1.iter().take(h_n) {
+            let sq: f64 = row.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+            sum += sq.sqrt();
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f64
+    }
 }
 
 /// Sprint 111: aktivní shock summary pro CSV. Vrací `(count, hazard_intensity_max)`,
