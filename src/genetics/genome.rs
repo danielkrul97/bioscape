@@ -52,9 +52,13 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // larger because the [0.1, 5.0] range spans two octaves.
     sigma_learning_rate: 0.001,
     sigma_trace_decay: 0.05,
-    // Sprint 144 ships `NeuronModel` plumbing but keeps flip off so the
-    // entire population stays Perceptron until S150 turns it on.
-    model_flip_rate: 0.0,
+    // Sprint 149: activate model flips at low rate. 0.005 = ~0.5 % children
+    // per generation switch Perceptron ↔ Izhikevich. Over 50 gens × ~200
+    // reproductions/gen = ~50 cumulative flips; with selection, viable
+    // lineages persist, doomed ones die out. Lets us measure whether
+    // Izhikevich + Hebbian (current rule) carves out a niche before we
+    // commit to the heavier STDP integration in 153-162.
+    model_flip_rate: 0.005,
     // Sprint 148: STDP drift sigmas default off — S149 activates with
     // reward modulation once the integration is wired through CPU/GPU.
     sigma_stdp_a: 0.0,
