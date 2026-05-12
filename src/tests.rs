@@ -3009,3 +3009,76 @@ fn food_multiplier_compound_clamped() {
         m4
     );
 }
+
+#[test]
+fn izhikevich_quiescent_neuron_does_not_spike() {
+    // Sprint 146: zero input, weights all zero → membrane settles near the
+    // stable subthreshold equilibrium without crossing 30 mV. Expected
+    // hidden activation: -1 (no spikes mapped to the lower bound).
+    let mut brain = dummy_brain();
+    let inputs = [0.0_f32; BRAIN_INPUTS];
+    let (hidden, _) = brain.forward_izhikevich_with_state(&inputs);
+    for (i, h) in hidden.iter().take(brain.hidden_n as usize).enumerate() {
+        assert!(
+            (*h + 1.0).abs() < 1e-5,
+            "neuron {} should be silent (hidden = -1), got {}",
+            i,
+            h
+        );
+    }
+    // Membrane stays well below the 30 mV spike threshold. Drift toward the
+    // subthreshold fixed point is fine; only "no AP fired" matters here.
+    for v in brain.membrane.iter().take(brain.hidden_n as usize) {
+        assert!(
+            *v < 0.0,
+            "quiescent membrane should remain hyperpolarized, got {}",
+            v
+        );
+    }
+}
+
+#[test]
+fn izhikevich_strong_input_drives_spiking_over_multiple_ticks() {
+    // Sprint 146: regular-spiking neuron at I≈50 (strong tonic drive)
+    // fires within a few ticks. We run several ticks because one 16 ms
+    // tick may straddle the inter-spike interval at lower currents — the
+    // CPU forward is correct iff any tick crosses threshold over the
+    // simulated window.
+    let mut brain = dummy_brain();
+    let h_n = brain.hidden_n as usize;
+    for i in 0..h_n {
+        brain.b1[i] = 50.0;
+    }
+    let inputs = [0.0_f32; BRAIN_INPUTS];
+    let mut total_spikes = 0_u32;
+    for _ in 0..20 {
+        let (hidden, _) = brain.forward_izhikevich_with_state(&inputs);
+        for h in hidden.iter().take(h_n) {
+            // spike_count = (h + 1) × IZH_SUBSTEPS / 2; sum across neurons.
+            let spikes = (((h + 1.0) * IZH_SUBSTEPS as f32 / 2.0).round()) as u32;
+            total_spikes += spikes;
+        }
+    }
+    assert!(
+        total_spikes >= h_n as u32,
+        "expected at least 1 spike per neuron over 20 ticks at strong input, got {}",
+        total_spikes
+    );
+}
+
+#[test]
+fn izhikevich_zero_input_outputs_finite_and_in_range() {
+    // Sprint 146: sanity check — even with no input, the L2 motor layer
+    // should produce finite outputs in [-1, +1] (tanh-clamped).
+    let mut brain = dummy_brain();
+    // Non-trivial b2 so outputs aren't trivially zero.
+    for o in 0..BRAIN_OUTPUTS {
+        brain.b2[o] = 0.5;
+    }
+    let inputs = [0.0_f32; BRAIN_INPUTS];
+    let (_, outputs) = brain.forward_izhikevich_with_state(&inputs);
+    for (o, v) in outputs.iter().enumerate() {
+        assert!(v.is_finite(), "output {} not finite: {}", o, v);
+        assert!(v.abs() <= 1.0 + 1e-5, "output {} out of [-1, 1]: {}", o, v);
+    }
+}

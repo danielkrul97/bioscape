@@ -277,6 +277,27 @@ pub struct Brain {
 /// rest, exactly where a fresh Izhikevich cell would begin.
 pub const IZH_V_REST: f32 = -65.0;
 
+/// Sprint 146: canonical Izhikevich 2003 regular-spiking parameters.
+/// `a` = recovery time constant, `b` = recovery sensitivity to membrane,
+/// `c` = post-spike membrane reset, `d` = post-spike recovery jump.
+/// Threshold for spike emission is 30 mV.
+pub const IZH_A: f32 = 0.02;
+pub const IZH_B: f32 = 0.2;
+pub const IZH_C: f32 = -65.0;
+pub const IZH_D: f32 = 8.0;
+pub const IZH_SPIKE_THRESHOLD: f32 = 30.0;
+
+/// Sprint 146: sub-step count per simulation tick for Izhikevich. Each
+/// tick covers `IZH_TICK_MS` ms of biological time split into
+/// `IZH_SUBSTEPS` Euler integration steps. 32 sub-steps × 0.5 ms = 16 ms
+/// matches the 60 Hz simulation tick. The `0.04 v²` term makes the ODE
+/// stiff — 2 ms steps were numerically unstable (caused spurious spikes
+/// even at zero input). 0.5 ms is the canonical Izhikevich recommendation.
+/// S151 may push this lower if precision becomes a blocker.
+pub const IZH_SUBSTEPS: usize = 32;
+pub const IZH_TICK_MS: f32 = 16.0;
+pub const IZH_DT_PER_SUBSTEP_MS: f32 = IZH_TICK_MS / IZH_SUBSTEPS as f32;
+
 fn default_membrane() -> [f32; BRAIN_HIDDEN] {
     [IZH_V_REST; BRAIN_HIDDEN]
 }
@@ -461,6 +482,77 @@ impl Brain {
 
     pub fn forward(&self, inputs: &[f32; BRAIN_INPUTS]) -> [f32; BRAIN_OUTPUTS] {
         self.forward_with_state(inputs).1
+    }
+
+    /// Sprint 146: Izhikevich forward. `pre_hidden = w1·inputs + b1`
+    /// becomes the injection current `I` for the diff equations, integrated
+    /// over `IZH_SUBSTEPS` sub-steps per tick. Membrane / recovery state
+    /// persists across ticks (mutates `self.membrane` / `self.recovery`).
+    /// Hidden activation = `2 × (spike_count / IZH_SUBSTEPS) − 1` so the
+    /// downstream `w2` motor layer sees roughly the same `[-1, +1]` range
+    /// as the perceptron path.
+    pub fn forward_izhikevich_with_state(
+        &mut self,
+        inputs: &[f32; BRAIN_INPUTS],
+    ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
+        let h_n = self.hidden_n as usize;
+
+        // L1 matvec (same dot product as perceptron pre-activation) →
+        // injection current. Plain scalar loop here: Izhikevich is not the
+        // perf-critical path in S146 (Perceptron lineages dominate), and a
+        // scalar loop matches the GPU shader S147 will mirror.
+        let mut current = [0.0_f32; BRAIN_HIDDEN];
+        for i in 0..h_n {
+            let row = &self.w1[i];
+            let mut acc = 0.0_f32;
+            for j in 0..BRAIN_INPUTS {
+                acc += row[j] * inputs[j];
+            }
+            current[i] = acc + self.b1[i];
+        }
+
+        // Sub-step Euler integration of the (v, u) ODE.
+        let dt = IZH_DT_PER_SUBSTEP_MS;
+        let mut spike_counts = [0_u32; BRAIN_HIDDEN];
+        for _ in 0..IZH_SUBSTEPS {
+            for i in 0..h_n {
+                let v = self.membrane[i];
+                let u = self.recovery[i];
+                let dv = 0.04 * v * v + 5.0 * v + 140.0 - u + current[i];
+                let du = IZH_A * (IZH_B * v - u);
+                let v_new = v + dv * dt;
+                let u_new = u + du * dt;
+                if v_new >= IZH_SPIKE_THRESHOLD {
+                    self.membrane[i] = IZH_C;
+                    self.recovery[i] = u_new + IZH_D;
+                    spike_counts[i] += 1;
+                } else {
+                    self.membrane[i] = v_new;
+                    self.recovery[i] = u_new;
+                }
+            }
+        }
+
+        // Map spike count to hidden activation in [-1, +1].
+        let scale = 2.0 / IZH_SUBSTEPS as f32;
+        let mut hidden = [0.0_f32; BRAIN_HIDDEN];
+        for i in 0..h_n {
+            hidden[i] = (spike_counts[i] as f32) * scale - 1.0;
+        }
+
+        // L2 matvec + tanh — identical shape to perceptron path so
+        // `w2`/`b2` evolved under perceptron can run with Izhikevich hidden.
+        let mut outputs = [0.0_f32; BRAIN_OUTPUTS];
+        for o in 0..BRAIN_OUTPUTS {
+            let row = &self.w2[o];
+            let mut acc = 0.0_f32;
+            for j in 0..h_n {
+                acc += row[j] * hidden[j];
+            }
+            outputs[o] = (acc + self.b2[o]).tanh();
+        }
+
+        (hidden, outputs)
     }
 
     /// Forward pass that also returns hidden activations (needed for Hebbian
