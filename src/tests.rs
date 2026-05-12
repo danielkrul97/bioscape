@@ -66,6 +66,7 @@ fn dummy_genome() -> Genome {
         cppn: default_cppn(),
         learning_rate: LEARNING_RATE,
         trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
+        neuron_model: NeuronModel::Perceptron,
     }
 }
 
@@ -97,6 +98,7 @@ fn zero_cfg() -> MutationConfig {
         sigma_spike_length_secondary: 0.0,
         sigma_learning_rate: 0.0,
         sigma_trace_decay: 0.0,
+        model_flip_rate: 0.0,
     }
 }
 
@@ -137,6 +139,7 @@ fn mutation_with_zero_sigma_is_identity() {
         cppn: default_cppn(),
         learning_rate: LEARNING_RATE,
         trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
+        neuron_model: NeuronModel::Perceptron,
     };
     let m = g.mutate(&mut rng, &zero_cfg());
     assert_eq!(m.max_speed, 50.0);
@@ -186,6 +189,7 @@ fn mutation_keeps_genes_in_valid_ranges() {
         sigma_spike_length_secondary: 10.0,
         sigma_learning_rate: 10.0,
         sigma_trace_decay: 10.0,
+        model_flip_rate: 1.0,
     };
     for _ in 0..1000 {
         let m = g.mutate(&mut rng, &cfg);
@@ -1152,6 +1156,7 @@ fn crossover_picks_genes_from_either_parent() {
         cppn: default_cppn(),
         learning_rate: LEARNING_RATE,
         trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
+        neuron_model: NeuronModel::Perceptron,
     };
     let b = Genome {
         max_speed: 90.0,
@@ -1179,6 +1184,7 @@ fn crossover_picks_genes_from_either_parent() {
         cppn: default_cppn(),
         learning_rate: LEARNING_RATE,
         trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
+        neuron_model: NeuronModel::Perceptron,
     };
     for _ in 0..100 {
         let c = Genome::crossover(&a, &b, &mut rng);
@@ -2009,6 +2015,7 @@ fn shell_mutation_clamps_to_range() {
         sigma_spike_length_secondary: 0.0,
         sigma_learning_rate: 0.0,
         sigma_trace_decay: 0.0,
+        model_flip_rate: 0.0,
     };
     for _ in 0..1000 {
         let m = g.mutate(&mut rng, &cfg);

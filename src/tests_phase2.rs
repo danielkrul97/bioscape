@@ -338,6 +338,7 @@ fn aggressive_cfg() -> MutationConfig {
         sigma_spike_length_secondary: 100.0,
         sigma_learning_rate: 100.0,
         sigma_trace_decay: 100.0,
+        model_flip_rate: 1.0,
     }
 }
 

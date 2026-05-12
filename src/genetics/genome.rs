@@ -52,6 +52,9 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // larger because the [0.1, 5.0] range spans two octaves.
     sigma_learning_rate: 0.001,
     sigma_trace_decay: 0.05,
+    // Sprint 144 ships `NeuronModel` plumbing but keeps flip off so the
+    // entire population stays Perceptron until S150 turns it on.
+    model_flip_rate: 0.0,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -114,6 +117,10 @@ pub struct MutationConfig {
     /// Sprint 136: gaussian sigma for per-cell `trace_decay_per_sec`. Same
     /// gating: 0 = no drift, no RNG draw.
     pub sigma_trace_decay: f32,
+    /// Sprint 144: per-child probability that `Genome::neuron_model` flips
+    /// (Perceptron ↔ Izhikevich). Short-circuited so a zero rate skips the
+    /// RNG draw — keeps the pre-S144 RNG sequence intact.
+    pub model_flip_rate: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -179,6 +186,12 @@ pub struct Genome {
     /// compat story as `learning_rate`.
     #[serde(default = "default_trace_decay_per_sec")]
     pub trace_decay_per_sec: f32,
+    /// Sprint 144: which compute model the hidden layer uses. Pre-S144
+    /// checkpoints deserialize as `Perceptron`. Mutation flips with rate
+    /// `MutationConfig::model_flip_rate` (default 0 → byte-identical
+    /// baseline until S150 mixed-population validation flips it on).
+    #[serde(default)]
+    pub neuron_model: NeuronModel,
 }
 
 pub fn default_cppn() -> Cppn {
@@ -272,6 +285,10 @@ impl Genome {
             // `sigma_learning_rate` / `sigma_trace_decay` activate.
             learning_rate: LEARNING_RATE,
             trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
+            // Sprint 144: all gen-0 cells run the rate-coded perceptron;
+            // Izhikevich switches on via mutation once S150 flips
+            // `MutationConfig::model_flip_rate` above 0.
+            neuron_model: NeuronModel::Perceptron,
         }
     }
 
@@ -417,6 +434,18 @@ impl Genome {
             } else {
                 self.trace_decay_per_sec
             },
+            // Sprint 144: flip neuron model with low rate, short-circuited
+            // so a zero rate skips the RNG draw (byte-identical baseline).
+            neuron_model: if cfg.model_flip_rate > 0.0
+                && rng.random::<f32>() < cfg.model_flip_rate
+            {
+                match self.neuron_model {
+                    NeuronModel::Perceptron => NeuronModel::Izhikevich,
+                    NeuronModel::Izhikevich => NeuronModel::Perceptron,
+                }
+            } else {
+                self.neuron_model
+            },
         }
     }
 
@@ -539,6 +568,15 @@ impl Genome {
                 a.trace_decay_per_sec
             } else {
                 b.trace_decay_per_sec
+            },
+            // Sprint 144: same-value short-circuit so populations with all-
+            // Perceptron parents (S144 default) keep the pre-S144 RNG sequence.
+            neuron_model: if a.neuron_model == b.neuron_model {
+                a.neuron_model
+            } else if rng.random::<bool>() {
+                a.neuron_model
+            } else {
+                b.neuron_model
             },
         }
     }

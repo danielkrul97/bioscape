@@ -6,6 +6,39 @@ use super::activation::tanh_fast_simd;
 use super::cppn::Cppn;
 use crate::*;
 
+/// Sprint 144: per-cell neuron compute model. `Perceptron` is the pre-S144
+/// rate-coded tanh path (default); `Izhikevich` switches the hidden layer
+/// to a spiking model (membrane potential + recovery variable + sub-timestep
+/// integration). S144 just plumbs the enum through Genome; the actual
+/// Izhikevich forward arrives in S146 (CPU) and S147 (GPU).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum NeuronModel {
+    Perceptron = 0,
+    Izhikevich = 1,
+}
+
+impl Default for NeuronModel {
+    fn default() -> Self {
+        NeuronModel::Perceptron
+    }
+}
+
+impl NeuronModel {
+    /// GPU side stores the model as `u32` per cell; this is the canonical
+    /// encoding for that buffer.
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => NeuronModel::Izhikevich,
+            _ => NeuronModel::Perceptron,
+        }
+    }
+}
+
 /// One Kahan compensated add of `addend` into 8-lane SIMD accumulator
 /// `acc` with 8-lane compensation `comp`. Mirrors the scalar GPU-shader
 /// loop step in `shaders/brain_forward.wgsl` so error budgets line up
