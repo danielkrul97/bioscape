@@ -5,12 +5,14 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 use bioscape::{
-    Cell, Food, SmellField, WorldMap, CELL_RADIUS, CYCLE_AMPLITUDE,
+    Cell, EventCalendar, Food, MATING_RADIUS, SmellField, WorldMap, CELL_RADIUS, CYCLE_AMPLITUDE,
     INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z,
     SMELL_GRID_RES, SMELL_GRID_RES_Z, SPIKE_SLOTS, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z,
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z,
     WORLD_MAP_SEED, reject_food_for_richness,
 };
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use bioscape::gpu::{
     BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
     PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
@@ -22,8 +24,8 @@ use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
     AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh,
-    OrbitCamera, PheromoneResource, SmellResource, SpikeMaterial, SpikeMesh, VibrationResource,
-    WorldExtent, WorldMapResource,
+    OrbitCamera, PheromoneResource, SimWorld, SmellResource, SpikeMaterial, SpikeMesh,
+    VibrationResource, WorldExtent, WorldMapResource,
 };
 use super::resources_gpu::GpuFullPipeline;
 use super::world_map::{food_target, world_map_image};
@@ -45,6 +47,26 @@ pub(super) fn setup(
         half_z: half[2],
     };
     commands.insert_resource(extent);
+
+    // Sprint 175: instantiate shared `bioscape::sim::World` as a Bevy
+    // Resource. GPU init (`world.init_gpu_full()`) is intentionally
+    // skipped here — the renderer still owns its own `GpuFullPipeline`
+    // until S176 deletes that path and switches everything to
+    // `world.tick()`. Until then `SimWorld.0.gpu_full` stays `None` and
+    // the resource is essentially a passive CPU mirror.
+    {
+        let mut sim_rng = StdRng::seed_from_u64(WORLD_MAP_SEED);
+        let world = bioscape::sim::World::new_with_maze(
+            &mut sim_rng,
+            WORLD_MAP_SEED,
+            MATING_RADIUS,
+            INITIAL_CELLS,
+            MAX_POPULATION,
+            EventCalendar::default(),
+            None,
+        );
+        commands.insert_resource(SimWorld(world));
+    }
 
     // Sprint 36: Camera3d s orthographic projection — "scale" zoom feel bez
     // perspective void okolo scény. `IsDefaultUiCamera` marker říká

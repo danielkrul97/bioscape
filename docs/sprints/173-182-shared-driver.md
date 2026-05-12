@@ -55,19 +55,24 @@ SimClock, wgpu types vše Send+Sync), takže Resource derive funguje bez
 tick system wire-up. Důvod: bare type declaration je 5-řádkový change,
 kompletní init + tick + sync je další 200+ řádků a vlastní commit.
 
-## Sprint 175 — Single tick system + cell sync
+## Sprint 175 — SimWorld instantiation (scope-cut: tick system → S176)
 
-**Cíl:** add Bevy system `sim_tick_system` který volá `world.tick(rng)`
-každý frame. Add `sync_cells_to_entities` system který po tick čte
-`world.cells` a updatuje Bevy `Transform` komponenty pro existing
-CellEntity entities.
+**Cíl original:** add Bevy system `sim_tick_system` calling `world.tick`
++ `sync_cells_to_entities` system po tick.
 
-**Plán:** Bevy schedule order: input → tick → sync → render. Cell ID
-mapping přes existing `CellSlotMap` resource.
+**Výstup (instantiation only):** v `renderer/setup.rs` se vytvoří
+`SimWorld(World::new_with_maze(&mut rng, WORLD_MAP_SEED, MATING_RADIUS,
+INITIAL_CELLS, MAX_POPULATION, EventCalendar::default(), None))` a
+inserts as Resource. GPU init záměrně skipped (`world.gpu_full = None`)
+— renderer drží vlastní `GpuFullPipeline` jako canonical pipeline až do
+S176. Renderer kompiluje + boots; SimWorld sits as passive CPU mirror.
 
-**Acceptance:** renderer spustí simulaci přes shared `World.tick()`,
-existing entities update positions. **Žádné dramatic visual change
-zatím** (existing renderer systems pořád běží, double-tick problem).
+**Poznámky scope-cut:** tick system + sync_cells_to_entities přesunuto
+do S176. Důvod: renderer má 2050 LOC vlastních tick systémů; substituce
+za world.tick() je atomic surgery (compile must stay green) která se
+nehodí inkrementálně. Sprint 176 spojuje tick wire-up + legacy system
+deletion do single coordinated commit. Sprint 175 zde dodává jen
+foundational World init.
 
 ## Sprint 176 — Delete legacy renderer tick systems
 
