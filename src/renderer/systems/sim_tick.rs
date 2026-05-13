@@ -6,10 +6,13 @@
 //! but their writes are immediately clobbered.
 
 use bevy::prelude::*;
-use bioscape::N_PHEROMONE_CHANNELS;
+use bioscape::{N_PHEROMONE_CHANNELS, SPIKE_SLOTS};
 
-use super::super::components::CellEntity;
-use super::super::resources::{CellSlotMap, SimRng, SimWorld};
+use super::super::components::{CellEntity, SpikeEntity};
+use super::super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
+use super::super::resources::{
+    AdhesionMaterials, CellMesh, CellSlotMap, SimRng, SimWorld, SpikeMaterial, SpikeMesh,
+};
 
 pub(crate) fn sim_tick(
     mut sim_world: ResMut<SimWorld>,
@@ -56,20 +59,73 @@ pub(crate) fn sim_tick(
     }
 }
 
-/// Sprint 177: copy each `world.cells[slot]` into the `CellEntity` of
-/// the entity registered at the same slot in `CellSlotMap`. Index-based
-/// pairing — works while the legacy lifecycle (S178) drives slot
-/// allocation/release matching SimWorld's swap_remove order. Misalignment
-/// after long runs causes cosmetic glitches but never panics: out-of-range
-/// slots are silently skipped.
+/// Sprint 185: lifecycle-aware sync. Before per-slot data copy:
+/// - if `slot_map.len() < world.cells.len()` (sim grew), spawn fresh
+///   `CellEntity` + `SPIKE_SLOTS` spike children for each new slot and
+///   register them in `slot_map`.
+/// - if `slot_map.len() > world.cells.len()` (sim shrank via
+///   `swap_remove`), despawn the trailing `CellEntity` and drop their
+///   slots; `sync_spikes` self-despawns orphan spikes on the next tick.
+///
+/// Then `world.cells[slot]` is copied into every `CellEntity` we already
+/// own. Brand-new entities don't appear in the `cells` query during this
+/// same system run — they're seeded with the correct cell data at spawn
+/// time and overwritten normally next tick.
 pub(crate) fn sync_simworld_to_cellentity(
     sim_world: Res<SimWorld>,
-    slot_map: Res<CellSlotMap>,
+    mut slot_map: ResMut<CellSlotMap>,
+    cell_mesh: Res<CellMesh>,
+    spike_mesh: Res<SpikeMesh>,
+    spike_material: Res<SpikeMaterial>,
+    mut adhesion_materials: ResMut<AdhesionMaterials>,
+    mut bio_materials: ResMut<Assets<BioMaterial>>,
+    mut commands: Commands,
     mut cells: Query<&mut CellEntity>,
 ) {
     let world_cells = &sim_world.0.cells;
-    let n = slot_map.slot_to_entity.len().min(world_cells.len());
-    for slot in 0..n {
+    let current_len = slot_map.slot_to_entity.len();
+    let target_len = world_cells.len();
+
+    if current_len > target_len {
+        for slot in (target_len..current_len).rev() {
+            let entity = slot_map.slot_to_entity[slot];
+            commands.entity(entity).despawn();
+            slot_map.entity_to_slot.remove(&entity);
+        }
+        slot_map.slot_to_entity.truncate(target_len);
+    } else if current_len < target_len {
+        for slot in current_len..target_len {
+            let cell = &world_cells[slot];
+            let material = adhesion_material(
+                &mut adhesion_materials,
+                &mut bio_materials,
+                cell.genome.adhesion_type,
+            );
+            let entity = commands
+                .spawn((
+                    CellEntity(*cell),
+                    Mesh3d(cell_mesh.0.clone()),
+                    MeshMaterial3d(material),
+                    Transform::from_xyz(cell.position[0], cell.position[1], cell.position[2])
+                        .with_rotation(cell_rotation(cell.heading, cell.pitch))
+                        .with_scale(cell_scale(&cell.phenotype)),
+                ))
+                .id();
+            for s in 0..SPIKE_SLOTS as u8 {
+                commands.spawn((
+                    SpikeEntity { owner: entity, slot: s },
+                    Mesh3d(spike_mesh.0.clone()),
+                    MeshMaterial3d(spike_material.0.clone()),
+                    Transform::default(),
+                    Visibility::Hidden,
+                ));
+            }
+            slot_map.allocate(entity);
+        }
+    }
+
+    let synced = slot_map.slot_to_entity.len().min(target_len);
+    for slot in 0..synced {
         let entity = slot_map.slot_to_entity[slot];
         if let Ok(mut cell_entity) = cells.get_mut(entity) {
             cell_entity.0 = world_cells[slot];
