@@ -1,8 +1,7 @@
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::prelude::*;
 use bioscape::{
-    EventCalendar, ShockScheduleConfig, SimClock, FIXED_TIMESTEP_HZ, GENERATIONS_PER_EPOCH,
-    TICKS_PER_GENERATION, WORLD_MAP_SEED,
+    SimClock, FIXED_TIMESTEP_HZ, GENERATIONS_PER_EPOCH, TICKS_PER_GENERATION,
 };
 use std::path::PathBuf;
 
@@ -85,30 +84,10 @@ pub fn run() {
         diagnostics::register_diagnostics(&mut app);
     }
 
-    // Sprint 109: shock kalendář z env var `BIOSCAPE_SHOCKS_MEAN_GENS`. Když
-    // unset / 0 / parse fail, kalendář je prázdný (no-op, default). MAX_GENS
-    // pro rendererský běh je velký — interaktivní session typicky < 10k gen,
-    // 1M je hard cap aby `EventCalendar::generate` netočilo donekonečna.
-    let shocks_mean_gens: u32 = std::env::var("BIOSCAPE_SHOCKS_MEAN_GENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let shock_cfg = if shocks_mean_gens > 0 {
-        ShockScheduleConfig {
-            mean_gens_between: shocks_mean_gens,
-            ..Default::default()
-        }
-    } else {
-        ShockScheduleConfig::default()
-    };
-    let event_calendar = EventCalendar::generate(WORLD_MAP_SEED, &shock_cfg, 1_000_000);
-    if shocks_mean_gens > 0 {
-        eprintln!(
-            "shocks: mean_gens_between={} scheduled={} (sim integration arrives in S110+)",
-            shocks_mean_gens,
-            event_calendar.events.len()
-        );
-    }
+    // Sprint 184: EventCalendar generation moved into `setup` so it can
+    // pick up `SimConfig::seed` (loaded from `bioscape.json`). Pre-S184
+    // this used the literal `WORLD_MAP_SEED`, which made the shock
+    // schedule diverge from the headless run for any non-default seed.
 
     app.init_resource::<gizmos::ShowVibration>()
         .init_resource::<TickCounter>()
@@ -125,7 +104,6 @@ pub fn run() {
             TICKS_PER_GENERATION,
             GENERATIONS_PER_EPOCH,
         )))
-        .insert_resource(EventCalendarResource(event_calendar))
         .init_resource::<CellEntityLookups>()
         .init_resource::<FoodDensityFactor>()
         .init_resource::<NextCellId>()

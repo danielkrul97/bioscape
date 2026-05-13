@@ -5,9 +5,9 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 use bioscape::{
-    Cell, EventCalendar, Food, INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, SmellField,
-    SPIKE_SLOTS, WorldMap, WORLD_MAP_SEED, CELL_RADIUS, CYCLE_AMPLITUDE,
-    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z,
+    Cell, EventCalendar, Food, INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    ShockScheduleConfig, SmellField, SPIKE_SLOTS, WorldMap, WORLD_MAP_SEED, CELL_RADIUS,
+    CYCLE_AMPLITUDE, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z,
     VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, WORLD_HALF, WORLD_MAP_BASE_RES,
     WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z, reject_food_for_richness,
 };
@@ -23,7 +23,7 @@ use super::components::{CellEntity, FoodEntity, SpikeEntity, StatsRoot, StatsTex
 use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
-    AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh,
+    AdhesionMaterials, CellMesh, CellSlotMap, EventCalendarResource, FoodMaterial, FoodMesh,
     OrbitCamera, PheromoneResource, SimRng, SimWorld, SmellResource, SpikeMaterial, SpikeMesh,
     VibrationResource, WorldExtent, WorldMapResource,
 };
@@ -54,6 +54,32 @@ pub(super) fn setup(
     // defaults (identical to pre-S183 hardcoded behavior).
     let config = SimConfig::load_or_default(std::path::Path::new(CONFIG_FILENAME));
 
+    // Sprint 184: build the event calendar from `config.seed` (not the
+    // literal `WORLD_MAP_SEED` as pre-S184) and feed it into the shared
+    // `World`. Without this the renderer's sim ran with an empty calendar
+    // — shocks never fired regardless of `BIOSCAPE_SHOCKS_MEAN_GENS`.
+    let shocks_mean_gens: u32 = std::env::var("BIOSCAPE_SHOCKS_MEAN_GENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let shock_cfg = if shocks_mean_gens > 0 {
+        ShockScheduleConfig {
+            mean_gens_between: shocks_mean_gens,
+            ..Default::default()
+        }
+    } else {
+        ShockScheduleConfig::default()
+    };
+    let event_calendar = EventCalendar::generate(config.seed, &shock_cfg, 1_000_000);
+    if shocks_mean_gens > 0 {
+        info!(
+            "shocks: mean_gens_between={} scheduled={} (seed={})",
+            shocks_mean_gens,
+            event_calendar.events.len(),
+            config.seed,
+        );
+    }
+
     // Sprint 175-176-183: instantiate shared `bioscape::sim::World` from
     // resolved config. GPU init runs alongside Bevy's RenderPlugin (2 wgpu
     // instances; consolidation in 184+).
@@ -65,7 +91,7 @@ pub(super) fn setup(
             config.resolved_mating_radius(),
             config.resolved_initial_cells(),
             config.resolved_max_population(),
-            EventCalendar::default(),
+            event_calendar.clone(),
             config.resolved_maze(),
         );
         // Sprint 183: pre-seed Izhikevich fraction (mirror headless
@@ -457,6 +483,8 @@ pub(super) fn setup(
         half,
     )));
     commands.insert_resource(WorldMapResource(world_map));
+    commands.insert_resource(EventCalendarResource(event_calendar));
+    commands.insert_resource(config);
 }
 
 /// Cap virtual-time delta na 50 ms — limit catch-up FixedUpdate ticků (~4 při

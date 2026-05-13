@@ -19,6 +19,7 @@
 //! Anything not listed inherits from `bioscape::*` const defaults.
 
 use bevy::log;
+use bevy::prelude::Resource;
 use bioscape::{INITIAL_CELLS, MATING_RADIUS, MAX_POPULATION, MazeDifficulty, WORLD_MAP_SEED};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -26,7 +27,7 @@ use std::path::Path;
 /// Default filename loaded from the renderer's working directory.
 pub(super) const CONFIG_FILENAME: &str = "bioscape.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Resource, Serialize, Deserialize)]
 pub(super) struct SimConfig {
     /// Seed for the renderer's `SimRng` (drives reproduce mutations etc).
     #[serde(default = "default_seed")]

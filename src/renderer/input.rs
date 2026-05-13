@@ -1,11 +1,14 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bioscape::{
-    reject_food_for_richness, Cell, Food, GENERATIONS_PER_EPOCH, INITIAL_CELLS,
+    reject_food_for_richness, EventCalendar, Food, GENERATIONS_PER_EPOCH,
     MAX_SPAWN_ATTEMPTS, MazeDifficulty, N_PHEROMONE_CHANNELS, ObstacleField, PHEROMONE_GRID_RES,
-    PHEROMONE_GRID_RES_Z, SimClock, SmellField, SMELL_GRID_RES, SMELL_GRID_RES_Z, SPIKE_SLOTS,
-    TICKS_PER_GENERATION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, WORLD_HALF, WORLD_MAP_SEED,
+    PHEROMONE_GRID_RES_Z, ShockScheduleConfig, SimClock, SmellField, SMELL_GRID_RES,
+    SMELL_GRID_RES_Z, SPIKE_SLOTS, TICKS_PER_GENERATION, VIBRATION_GRID_RES,
+    VIBRATION_GRID_RES_Z, WORLD_HALF, WORLD_MAP_SEED,
 };
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 
 use super::components::{CellEntity, FoodEntity, MazeWallEntity, SpikeEntity, StatsRoot, WorldMapOverlay};
 use super::gizmos::ShowVibration;
@@ -13,11 +16,12 @@ use super::godmode::{GodMenuRoot, GodMode, GodModeState};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
     AdhesionMaterials, CellEntityLookups, CellMesh, CellSlotMap, Clock, ContactProgress,
-    CoopFoodResource, FoodDensityFactor, FoodMaterial, FoodMesh, MazeWorld, NextCellId,
-    PheromoneResource, SmellResource, SpikeMaterial, SpikeMesh, TickCounter, VibrationResource,
-    WorldExtent, WorldMapResource,
+    CoopFoodResource, EventCalendarResource, FoodDensityFactor, FoodMaterial, FoodMesh,
+    MazeWorld, NextCellId, PheromoneResource, SimRng, SimWorld, SmellResource, SpikeMaterial,
+    SpikeMesh, TickCounter, VibrationResource, WorldExtent, WorldMapResource,
 };
 use super::resources_gpu::GpuFullPipeline;
+use super::sim_config::SimConfig;
 use super::world_map::food_target;
 
 pub(super) fn speed_input(
@@ -272,6 +276,10 @@ pub(super) struct RestartSimResources<'w> {
     pub(super) coop_food: ResMut<'w, CoopFoodResource>,
     pub(super) lookups: ResMut<'w, CellEntityLookups>,
     pub(super) god: ResMut<'w, GodMode>,
+    pub(super) sim_world: ResMut<'w, SimWorld>,
+    pub(super) sim_rng: ResMut<'w, SimRng>,
+    pub(super) event_calendar: ResMut<'w, EventCalendarResource>,
+    pub(super) sim_config: Res<'w, SimConfig>,
 }
 
 #[derive(SystemParam)]
@@ -282,9 +290,18 @@ pub(super) struct RestartEntities<'w, 's> {
     pub(super) menus: Query<'w, 's, Entity, With<GodMenuRoot>>,
 }
 
-/// `KeyR` restarts the simulation in place: despawn all cells / food / spikes,
-/// reset sim state, re-seed INITIAL_CELLS fresh cells + initial food. Camera,
-/// maze toggle, time speed, world map and event calendar are preserved.
+/// `KeyR` restarts the simulation in place: despawn all entities, rebuild
+/// the shared `SimWorld` from `SimConfig` (matching the original startup),
+/// and respawn visual entities sized to the freshly-initialised world.
+/// Camera, maze toggle and time speed are preserved.
+///
+/// Sprint 184: pre-S184 restart only reset the renderer-side scaffolding
+/// and spawned fresh `CellEntity` items from a thread-local `rand::rng()`;
+/// `SimWorld` was left untouched, so the next `sync_simworld_to_cellentity`
+/// immediately overwrote the new entities with the old, in-flight sim
+/// state. The fix rebuilds the shared world (the only canonical sim
+/// state) and lets the legacy GPU pipeline tag along on the upload it
+/// still mirrors.
 pub(super) fn restart_simulation(
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
@@ -323,7 +340,6 @@ pub(super) fn restart_simulation(
     sim_res.lookups.entity_to_idx.clear();
     sim_res.lookups.positions_by_idx.clear();
     sim_res.god.state = GodModeState::Idle;
-    registries.next_id.0 = INITIAL_CELLS as u64;
     registries.slot_map.slot_to_entity.clear();
     registries.slot_map.entity_to_slot.clear();
 
@@ -345,10 +361,44 @@ pub(super) fn restart_simulation(
         half,
     )));
 
-    let mut rng = rand::rng();
-    let mut initial_cells: Vec<Cell> = Vec::with_capacity(INITIAL_CELLS);
-    for i in 0..INITIAL_CELLS {
-        let cell = Cell::random(&mut rng, half, i as u64, 0, i as u64);
+    let config: &SimConfig = &sim_res.sim_config;
+    let mut new_sim_rng = StdRng::seed_from_u64(config.seed);
+    let shocks_mean_gens: u32 = std::env::var("BIOSCAPE_SHOCKS_MEAN_GENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let shock_cfg = if shocks_mean_gens > 0 {
+        ShockScheduleConfig {
+            mean_gens_between: shocks_mean_gens,
+            ..Default::default()
+        }
+    } else {
+        ShockScheduleConfig::default()
+    };
+    let new_calendar = EventCalendar::generate(config.seed, &shock_cfg, 1_000_000);
+    let mut new_world = bioscape::sim::World::new_with_maze(
+        &mut new_sim_rng,
+        config.resolved_map_seed(),
+        config.resolved_mating_radius(),
+        config.resolved_initial_cells(),
+        config.resolved_max_population(),
+        new_calendar.clone(),
+        config.resolved_maze(),
+    );
+    let izh_frac = config.initial_izhikevich_frac.clamp(0.0, 1.0);
+    if izh_frac > 0.0 {
+        let target = (izh_frac * new_world.cells.len() as f32).round() as usize;
+        for cell in new_world.cells.iter_mut().take(target) {
+            cell.genome.neuron_model = bioscape::NeuronModel::Izhikevich;
+        }
+    }
+    if let Err(e) = new_world.init_gpu_full() {
+        panic!("sim: restart init_gpu_full failed ({e})");
+    }
+
+    registries.next_id.0 = new_world.cells.len() as u64;
+
+    for cell in &new_world.cells {
         let mat = adhesion_material(
             &mut registries.adhesion_materials,
             &mut registries.bio_materials,
@@ -356,7 +406,7 @@ pub(super) fn restart_simulation(
         );
         let entity = commands
             .spawn((
-                CellEntity(cell),
+                CellEntity(*cell),
                 Mesh3d(assets.cell_mesh.0.clone()),
                 MeshMaterial3d(mat),
                 Transform::from_xyz(cell.position[0], cell.position[1], cell.position[2])
@@ -374,28 +424,38 @@ pub(super) fn restart_simulation(
             ));
         }
         registries.slot_map.allocate(entity);
-        initial_cells.push(cell);
     }
 
     gpu_full
         .cells
-        .upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
+        .upload_brains(new_world.cells.iter().map(|c| &c.genome.brain));
     gpu_full
         .cells
-        .upload_xoshiro_seeds(initial_cells.iter().map(|c| c.cell_id));
-    let turn_rates: Vec<f32> = initial_cells.iter().map(|c| c.genome.turn_rate).collect();
+        .upload_xoshiro_seeds(new_world.cells.iter().map(|c| c.cell_id));
+    let turn_rates: Vec<f32> = new_world
+        .cells
+        .iter()
+        .map(|c| c.genome.turn_rate)
+        .collect();
     gpu_full.cells.upload_turn_rates(&turn_rates);
     gpu_full.cells.zero_persistent_state();
 
+    let new_cell_count = new_world.cells.len();
+    let new_food_count = new_world.foods.len();
+    sim_res.sim_world.0 = new_world;
+    sim_res.sim_rng.0 = new_sim_rng;
+    sim_res.event_calendar.0 = new_calendar;
+
+    let mut food_rng = rand::rng();
     let initial_food = food_target(&extent, 1.0);
     for _ in 0..initial_food {
-        let mut food = Food::random(&mut rng, half);
+        let mut food = Food::random(&mut food_rng, half);
         for _ in 0..MAX_SPAWN_ATTEMPTS {
             let richness = world_map_res.0.sample([food.position[0], food.position[1], 0.0]);
-            if !reject_food_for_richness(&mut rng, richness) {
+            if !reject_food_for_richness(&mut food_rng, richness) {
                 break;
             }
-            food = Food::random(&mut rng, half);
+            food = Food::random(&mut food_rng, half);
         }
         commands.spawn((
             FoodEntity(food),
@@ -406,5 +466,8 @@ pub(super) fn restart_simulation(
         ));
     }
 
-    info!("sim: restarted ({} cells, {} food)", INITIAL_CELLS, initial_food);
+    info!(
+        "sim: restarted (seed={}, sim cells={}, sim food={}, visual food={})",
+        config.seed, new_cell_count, new_food_count, initial_food
+    );
 }
