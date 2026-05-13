@@ -1,10 +1,153 @@
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use wide::f32x8;
 
-use super::activation::tanh_fast_simd;
+use super::activation::{tanh_fast_scalar, tanh_fast_simd};
 use super::cppn::Cppn;
 use crate::*;
+
+/// Sprint 191: amplitude of the per-(row, weight) gaussian perturbation
+/// added on top of CPPN-derived weights in `Brain::from_cppn`. The CPPN
+/// substrate maps nearby (hidden) coordinates to nearly identical weight
+/// rows; without an explicit symmetry break Hebbian + Oja amplify only
+/// the variance the substrate already carries, leaving ~22 of 25 hidden
+/// neurons converged onto identical responses (observed in a real cell
+/// dump). `0.05` is small enough that the CPPN-encoded structure stays
+/// dominant at gen-0 but large enough that no two rows are bit-equal,
+/// giving the learning rules something to amplify.
+const INIT_JITTER_SIGMA: f32 = 0.05;
+/// Sprint 191: fixed RNG seed for the init jitter so `Brain::from_cppn`
+/// remains a pure function of its `Cppn` argument (same CPPN → same
+/// Brain across runs / lineages / replays). The variance per row comes
+/// from advancing the RNG stream as we walk `(h, i)` pairs, not from a
+/// CPPN-derived seed.
+const INIT_JITTER_SEED: u64 = 0xb13c_a591_91d3_9a17;
+
+/// Sprint 144: per-cell neuron compute model. `Perceptron` is the pre-S144
+/// rate-coded tanh path (default); `Izhikevich` switches the hidden layer
+/// to a spiking model (membrane potential + recovery variable + sub-timestep
+/// integration). S144 just plumbs the enum through Genome; the actual
+/// Izhikevich forward arrives in S146 (CPU) and S147 (GPU).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum NeuronModel {
+    Perceptron = 0,
+    Izhikevich = 1,
+}
+
+impl Default for NeuronModel {
+    fn default() -> Self {
+        NeuronModel::Perceptron
+    }
+}
+
+impl NeuronModel {
+    /// GPU side stores the model as `u32` per cell; this is the canonical
+    /// encoding for that buffer.
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => NeuronModel::Izhikevich,
+            _ => NeuronModel::Perceptron,
+        }
+    }
+}
+
+/// One Kahan compensated add of `addend` into 8-lane SIMD accumulator
+/// `acc` with 8-lane compensation `comp`. Mirrors the scalar GPU-shader
+/// loop step in `shaders/brain_forward.wgsl` so error budgets line up
+/// across compute paths.
+#[inline(always)]
+fn kahan_step_simd(addend: f32x8, acc: &mut f32x8, comp: &mut f32x8) {
+    let y = addend - *comp;
+    let t = *acc + y;
+    *comp = (t - *acc) - y;
+    *acc = t;
+}
+
+/// Horizontally combine an 8-lane Kahan accumulator into a scalar using
+/// the same compensated-summation pattern. Per-lane partial sums merge in
+/// fixed order (lane 0 → lane 7) so different runs produce identical
+/// last-bit results given identical lane contents.
+#[inline(always)]
+fn kahan_reduce_lanes(acc: f32x8) -> f32 {
+    let arr = acc.to_array();
+    let mut sum = 0.0_f32;
+    let mut comp = 0.0_f32;
+    for &x in &arr {
+        let y = x - comp;
+        let t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+    sum
+}
+
+/// Sprint 189: LayerNorm — mean-centre + unit-variance the first `n` slots
+/// of `xs` in place. Mirror of the GPU forward shader (`shaders/
+/// brain_forward.wgsl`); CPU and GPU must produce bit-close results so
+/// the parity tests stay green. Inactive slots (`i ≥ n`) are untouched
+/// and excluded from the mean / variance estimate.
+#[inline]
+fn layer_norm_in_place(xs: &mut [f32], n: usize) {
+    if n == 0 {
+        return;
+    }
+    let inv_n = 1.0_f32 / n as f32;
+    let mut sum = 0.0_f32;
+    for &x in &xs[..n] {
+        sum += x;
+    }
+    let mean = sum * inv_n;
+    let mut var_sum = 0.0_f32;
+    for &x in &xs[..n] {
+        let d = x - mean;
+        var_sum += d * d;
+    }
+    let inv_std = 1.0_f32 / (var_sum * inv_n + 1e-6_f32).sqrt();
+    for x in &mut xs[..n] {
+        *x = (*x - mean) * inv_std;
+    }
+}
+
+/// Sprint 192: numerically stable softplus mirroring the GPU helper in
+/// `brain_forward.wgsl`. The `min(x, 20)` clamp keeps `exp()` from
+/// blowing past f32 range; above 20 the function is indistinguishable
+/// from `x` itself in IEEE-754 anyway.
+#[inline]
+fn softplus_stable(x: f32) -> f32 {
+    let capped = x.min(20.0);
+    (1.0 + capped.exp()).ln()
+}
+
+/// Sprint 192: subtractive lateral inhibition on a preact vector. Each
+/// `xs[i]` (for `i < n`) is reduced by `α × mean_{j ≠ i}(softplus(xs[j]))`.
+/// Strongly-positive entries dominate the inhibition pool and force
+/// weakly-positive entries closer to zero — over many ticks this keeps
+/// the Hebbian update per-neuron-distinct, preventing the row-collapse
+/// that returns after S188-S191 alone (~6000 ticks observed).
+#[inline]
+fn lateral_inhibition_in_place(xs: &mut [f32], n: usize, alpha: f32) {
+    if alpha <= 0.0 || n < 2 {
+        return;
+    }
+    let mut sp_sum = 0.0_f32;
+    let mut sp_self = [0.0_f32; BRAIN_HIDDEN];
+    for i in 0..n {
+        let sp = softplus_stable(xs[i]);
+        sp_self[i] = sp;
+        sp_sum += sp;
+    }
+    let inv_others = 1.0_f32 / (n - 1) as f32;
+    for i in 0..n {
+        let others = sp_sum - sp_self[i];
+        xs[i] -= alpha * others * inv_others;
+    }
+}
 
 impl Brain {
     /// All-zero brain. Used as a placeholder when the caller knows the
@@ -18,6 +161,14 @@ impl Brain {
             b1: [0.0; BRAIN_HIDDEN],
             w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
             b2: [0.0; BRAIN_OUTPUTS],
+            trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            membrane: [IZH_V_REST; BRAIN_HIDDEN],
+            recovery: [0.0; BRAIN_HIDDEN],
+            last_pre_spike_ticks: [0; BRAIN_INPUTS],
+            last_post_spike_ticks: [0; BRAIN_HIDDEN],
+            pre_trace: [0.0; BRAIN_INPUTS],
+            post_trace: [0.0; BRAIN_HIDDEN],
         }
     }
 
@@ -150,12 +301,39 @@ impl Brain {
             o += 8;
         }
 
+        // Sprint 191: symmetry-breaking jitter. Walks (h, i) in fixed order
+        // so the RNG draws are deterministic — the function stays pure in
+        // its `Cppn` argument. Per-row stream advance means different rows
+        // get different perturbation patterns, which is what Oja's rule
+        // needs as a starting point to drive decorrelation.
+        let mut rng = StdRng::seed_from_u64(INIT_JITTER_SEED);
+        for h in 0..BRAIN_HIDDEN {
+            for i in 0..BRAIN_INPUTS {
+                w1[h][i] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
+            }
+            b1[h] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
+        }
+        for o in 0..BRAIN_OUTPUTS {
+            for h in 0..BRAIN_HIDDEN {
+                w2[o][h] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
+            }
+            b2[o] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
+        }
+
         Brain {
             hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
             w1,
             b1,
             w2,
             b2,
+            trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            membrane: [IZH_V_REST; BRAIN_HIDDEN],
+            recovery: [0.0; BRAIN_HIDDEN],
+            last_pre_spike_ticks: [0; BRAIN_INPUTS],
+            last_post_spike_ticks: [0; BRAIN_HIDDEN],
+            pre_trace: [0.0; BRAIN_INPUTS],
+            post_trace: [0.0; BRAIN_HIDDEN],
         }
     }
 }
@@ -175,6 +353,111 @@ pub struct Brain {
     #[serde(with = "serde_arrays_w2")]
     pub w2: [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
     pub b2: [f32; BRAIN_OUTPUTS],
+    /// Wave 3 eligibility trace shadow buffers — same shape as `w1`/`w2`.
+    /// Each tick, `hebbian_step` decays and accumulates `pre × post` into
+    /// these slots. When a reward event fires (eat / predation / novelty),
+    /// `hebbian_apply_reward` does `w += lr · reward · trace` instead of
+    /// the classic instantaneous `w += lr · reward · pre · post`. Effective
+    /// reward window scales with `1 / decay_per_sec` — sparse-reward maze
+    /// goal-reaching can credit motor outputs from many ticks earlier.
+    /// Defaults to all-zeros for old checkpoints so they keep loading.
+    #[serde(default = "default_trace_w1", with = "serde_arrays_w1")]
+    pub trace_w1: [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN],
+    #[serde(default = "default_trace_w2", with = "serde_arrays_w2")]
+    pub trace_w2: [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+    /// Sprint 145: per-hidden-neuron Izhikevich membrane potential `v`
+    /// (in mV-ish units; the canonical Izhikevich 2003 model uses
+    /// `v_rest = -65`). For `NeuronModel::Perceptron` cells these slots
+    /// are unused and stay at the resting potential. S146 onward (CPU) and
+    /// S147 (GPU) consume them on `NeuronModel::Izhikevich` cells. Pre-S145
+    /// checkpoints deserialize at the resting potential default.
+    #[serde(default = "default_membrane", with = "serde_arr_hidden")]
+    pub membrane: [f32; BRAIN_HIDDEN],
+    /// Sprint 145: per-hidden-neuron Izhikevich recovery variable `u`.
+    /// Default 0 (canonical reset value). Same model gating as `membrane`.
+    #[serde(default = "default_recovery", with = "serde_arr_hidden")]
+    pub recovery: [f32; BRAIN_HIDDEN],
+    /// Sprint 153: last simulation tick at which each input fired a spike
+    /// (threshold-encoded from continuous activations). `0` initially —
+    /// callers treat 0 as "never fired" because tick 0 is the simulation
+    /// start. STDP weight update (S155) computes `Δt = tick − pre_spike`
+    /// to apply the timing-dependent curve. Skipped from serde — fresh on
+    /// checkpoint load, recovers within a few ticks of spike-encoded input.
+    #[serde(skip, default = "default_pre_spike_ticks")]
+    pub last_pre_spike_ticks: [u32; BRAIN_INPUTS],
+    /// Sprint 153: last tick each hidden neuron crossed the Izhikevich
+    /// spike threshold. Updated in `forward_izhikevich_with_state`. Same
+    /// "0 = never fired" convention as pre-spike ticks.
+    #[serde(skip, default = "default_post_spike_ticks")]
+    pub last_post_spike_ticks: [u32; BRAIN_HIDDEN],
+    /// Sprint 154: per-input decaying spike trace for STDP. Bumps by 1 on
+    /// pre-spike, decays each tick by `exp(-dt / stdp_tau_ticks)`. The
+    /// classical "trace-based STDP" formulation: combining `pre_trace[i]`
+    /// at the moment of a post-spike with `a_plus` gives LTP magnitude in
+    /// O(neurons), avoiding the O(synapses) cost of per-synapse traces.
+    #[serde(default = "default_pre_trace", with = "serde_arr_inputs")]
+    pub pre_trace: [f32; BRAIN_INPUTS],
+    /// Sprint 154: matching post-spike trace for LTD path.
+    #[serde(default = "default_post_trace", with = "serde_arr_hidden")]
+    pub post_trace: [f32; BRAIN_HIDDEN],
+}
+
+fn default_pre_trace() -> [f32; BRAIN_INPUTS] {
+    [0.0; BRAIN_INPUTS]
+}
+
+fn default_post_trace() -> [f32; BRAIN_HIDDEN] {
+    [0.0; BRAIN_HIDDEN]
+}
+
+fn default_pre_spike_ticks() -> [u32; BRAIN_INPUTS] {
+    [0; BRAIN_INPUTS]
+}
+
+fn default_post_spike_ticks() -> [u32; BRAIN_HIDDEN] {
+    [0; BRAIN_HIDDEN]
+}
+
+/// Sprint 145: canonical Izhikevich 2003 resting potential. Pre-S145
+/// checkpoints serde-default into this so the membrane buffer starts at
+/// rest, exactly where a fresh Izhikevich cell would begin.
+pub const IZH_V_REST: f32 = -65.0;
+
+/// Sprint 146: canonical Izhikevich 2003 regular-spiking parameters.
+/// `a` = recovery time constant, `b` = recovery sensitivity to membrane,
+/// `c` = post-spike membrane reset, `d` = post-spike recovery jump.
+/// Threshold for spike emission is 30 mV.
+pub const IZH_A: f32 = 0.02;
+pub const IZH_B: f32 = 0.2;
+pub const IZH_C: f32 = -65.0;
+pub const IZH_D: f32 = 8.0;
+pub const IZH_SPIKE_THRESHOLD: f32 = 30.0;
+
+/// Sprint 146: sub-step count per simulation tick for Izhikevich. Each
+/// tick covers `IZH_TICK_MS` ms of biological time split into
+/// `IZH_SUBSTEPS` Euler integration steps. 32 sub-steps × 0.5 ms = 16 ms
+/// matches the 60 Hz simulation tick. The `0.04 v²` term makes the ODE
+/// stiff — 2 ms steps were numerically unstable (caused spurious spikes
+/// even at zero input). 0.5 ms is the canonical Izhikevich recommendation.
+/// S151 may push this lower if precision becomes a blocker.
+pub const IZH_SUBSTEPS: usize = 32;
+pub const IZH_TICK_MS: f32 = 16.0;
+pub const IZH_DT_PER_SUBSTEP_MS: f32 = IZH_TICK_MS / IZH_SUBSTEPS as f32;
+
+fn default_membrane() -> [f32; BRAIN_HIDDEN] {
+    [IZH_V_REST; BRAIN_HIDDEN]
+}
+
+fn default_recovery() -> [f32; BRAIN_HIDDEN] {
+    [0.0; BRAIN_HIDDEN]
+}
+
+fn default_trace_w1() -> [[f32; BRAIN_INPUTS]; BRAIN_HIDDEN] {
+    [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN]
+}
+
+fn default_trace_w2() -> [[f32; BRAIN_HIDDEN]; BRAIN_OUTPUTS] {
+    [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS]
 }
 
 fn default_hidden_n() -> u32 {
@@ -330,21 +613,147 @@ impl Brain {
         // wants a high baseline). Just enough to avoid a cold start near 0.
         b2[10] += INNATE_PHEROMONE_AUX_BIAS;
         b2[11] += INNATE_PHEROMONE_AUX_BIAS;
-        Self { hidden_n, w1, b1, w2, b2 }
+        Self {
+            hidden_n,
+            w1,
+            b1,
+            w2,
+            b2,
+            trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+            trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+            membrane: [IZH_V_REST; BRAIN_HIDDEN],
+            recovery: [0.0; BRAIN_HIDDEN],
+            last_pre_spike_ticks: [0; BRAIN_INPUTS],
+            last_post_spike_ticks: [0; BRAIN_HIDDEN],
+            pre_trace: [0.0; BRAIN_INPUTS],
+            post_trace: [0.0; BRAIN_HIDDEN],
+        }
     }
 
     pub fn forward(&self, inputs: &[f32; BRAIN_INPUTS]) -> [f32; BRAIN_OUTPUTS] {
-        self.forward_with_state(inputs).1
+        self.forward_with_state(inputs, LATERAL_INHIBITION_ALPHA).1
+    }
+
+    /// Sprint 146: Izhikevich forward. `pre_hidden = w1·inputs + b1`
+    /// becomes the injection current `I` for the diff equations, integrated
+    /// over `IZH_SUBSTEPS` sub-steps per tick. Membrane / recovery state
+    /// persists across ticks (mutates `self.membrane` / `self.recovery`).
+    /// Hidden activation = `2 × (spike_count / IZH_SUBSTEPS) − 1` so the
+    /// downstream `w2` motor layer sees roughly the same `[-1, +1]` range
+    /// as the perceptron path.
+    /// Sprint 153: also threshold-encodes inputs into `last_pre_spike_ticks`
+    /// and records every post-neuron spike into `last_post_spike_ticks` so
+    /// the future STDP rule (S155) has the timing information it needs.
+    /// `tick` is the current simulation tick — caller threads through.
+    pub fn forward_izhikevich_with_state(
+        &mut self,
+        inputs: &[f32; BRAIN_INPUTS],
+        tick: u32,
+        lateral_alpha: f32,
+    ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
+        let h_n = self.hidden_n as usize;
+
+        // Sprint 153: pre-spike encoding. Any input crossing the threshold
+        // this tick stamps its `last_pre_spike_ticks` slot — the STDP rule
+        // measures `Δt = tick − last_pre_spike` against the post-spike time.
+        for j in 0..BRAIN_INPUTS {
+            if inputs[j] > SPIKE_ENCODE_THRESHOLD {
+                self.last_pre_spike_ticks[j] = tick;
+            }
+        }
+
+        // L1 matvec (same dot product as perceptron pre-activation) →
+        // injection current. Plain scalar loop here: Izhikevich is not the
+        // perf-critical path in S146 (Perceptron lineages dominate), and a
+        // scalar loop matches the GPU shader S147 will mirror.
+        let mut current = [0.0_f32; BRAIN_HIDDEN];
+        for i in 0..h_n {
+            let row = &self.w1[i];
+            let mut acc = 0.0_f32;
+            for j in 0..BRAIN_INPUTS {
+                acc += row[j] * inputs[j];
+            }
+            current[i] = acc + self.b1[i];
+        }
+
+        // Sprint 192: lateral inhibition on injection current. Mirror of
+        // GPU `brain_forward_izhikevich.wgsl`. With `α = 0` this is a
+        // no-op and the path stays byte-identical with pre-S192 behaviour.
+        // Only the active range [0, h_n) participates — dead-zone w1/b1
+        // are CPPN-materialised (non-zero) for post-mating children, so
+        // iterating BRAIN_HIDDEN here would mix CPPN garbage into the
+        // softplus pool. Same `tid < h_n` gating as the Perceptron path.
+        lateral_inhibition_in_place(&mut current, h_n, lateral_alpha);
+
+        // Sub-step Euler integration of the (v, u) ODE.
+        let dt = IZH_DT_PER_SUBSTEP_MS;
+        let mut spike_counts = [0_u32; BRAIN_HIDDEN];
+        for _ in 0..IZH_SUBSTEPS {
+            for i in 0..h_n {
+                let v = self.membrane[i];
+                let u = self.recovery[i];
+                let dv = 0.04 * v * v + 5.0 * v + 140.0 - u + current[i];
+                let du = IZH_A * (IZH_B * v - u);
+                let v_new = v + dv * dt;
+                let u_new = u + du * dt;
+                if v_new >= IZH_SPIKE_THRESHOLD {
+                    self.membrane[i] = IZH_C;
+                    self.recovery[i] = u_new + IZH_D;
+                    spike_counts[i] += 1;
+                    // Sprint 153: a post-spike happened this sub-step — the
+                    // resolution we record is the whole tick (sufficient for
+                    // STDP windows ≥ 1 tick).
+                    self.last_post_spike_ticks[i] = tick;
+                } else {
+                    self.membrane[i] = v_new;
+                    self.recovery[i] = u_new;
+                }
+            }
+        }
+
+        // Map spike count to hidden activation in [-1, +1].
+        let scale = 2.0 / IZH_SUBSTEPS as f32;
+        let mut hidden = [0.0_f32; BRAIN_HIDDEN];
+        for i in 0..h_n {
+            hidden[i] = (spike_counts[i] as f32) * scale - 1.0;
+        }
+
+        // L2 matvec + LayerNorm + tanh — identical shape to perceptron
+        // path so `w2`/`b2` evolved under perceptron can run with
+        // Izhikevich hidden. Sprint 189: same LayerNorm contract as the
+        // perceptron output layer (`Brain::forward_with_state`).
+        let mut pre_out = [0.0_f32; BRAIN_OUTPUTS];
+        for o in 0..BRAIN_OUTPUTS {
+            let row = &self.w2[o];
+            let mut acc = 0.0_f32;
+            for j in 0..h_n {
+                acc += row[j] * hidden[j];
+            }
+            pre_out[o] = acc + self.b2[o];
+        }
+        layer_norm_in_place(&mut pre_out, BRAIN_OUTPUTS);
+        let mut outputs = [0.0_f32; BRAIN_OUTPUTS];
+        for o in 0..BRAIN_OUTPUTS {
+            outputs[o] = tanh_fast_scalar(pre_out[o]);
+        }
+
+        (hidden, outputs)
     }
 
     /// Forward pass that also returns hidden activations (needed for Hebbian
     /// updates).
     ///
-    /// Matvec is SIMDified with `wide::f32x8`: full 8-lane chunks load
-    /// directly from weight rows, the trailing partial chunk uses a
-    /// zero-padded scratch lane. With `target-cpu=native` the inner mul_add
-    /// lowers to a single FMA. tanh activation is also vectorized via
-    /// `tanh_fast` over the active hidden range.
+    /// Matvec uses **Kahan compensated summation** in 8-lane SIMD parallel
+    /// across the dot-product, then a sequential Kahan horizontal reduce.
+    /// The compensation term bounds the per-dot-product error to O(ε)
+    /// regardless of summation order — that is what shrinks the CPU/GPU
+    /// brain-forward drift after the V8 RNG unification closed Brownian as
+    /// a divergence source. Trade-off: no FMA in the inner product (Kahan
+    /// requires separate mul + add to keep the compensation term valid),
+    /// but the dependency chain stays SIMD-pipelined.
+    ///
+    /// tanh activation is still vectorized via `tanh_fast` over the active
+    /// hidden range.
     // L1_TAIL/L2_TAIL branches are statically dead when BRAIN_INPUTS /
     // BRAIN_HIDDEN are multiples of 8, but kept defensive in case the
     // dimensions change. Clippy lints flag the dead branch as unreachable.
@@ -352,6 +761,7 @@ impl Brain {
     pub fn forward_with_state(
         &self,
         inputs: &[f32; BRAIN_INPUTS],
+        lateral_alpha: f32,
     ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
         const L1_FULL: usize = BRAIN_INPUTS / 8;
         const L1_TAIL: usize = BRAIN_INPUTS % 8;
@@ -373,22 +783,38 @@ impl Brain {
             input_lanes[L1_FULL] = f32x8::new(tail);
         }
 
-        // L1 matvec — load weight chunks directly (no per-row scratch).
+        // L1 matvec with Kahan compensated summation in each SIMD lane.
         let mut pre_hidden = [0.0_f32; BRAIN_HIDDEN];
         for i in 0..h_n {
             let row = &self.w1[i];
             let mut acc = f32x8::ZERO;
+            let mut comp = f32x8::ZERO;
             for k in 0..L1_FULL {
                 let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
-                acc = w.mul_add(input_lanes[k], acc);
+                kahan_step_simd(w * input_lanes[k], &mut acc, &mut comp);
             }
             if L1_TAIL > 0 {
                 let mut tail = [0.0_f32; 8];
                 tail[..L1_TAIL].copy_from_slice(&row[L1_FULL * 8..]);
-                acc = f32x8::new(tail).mul_add(input_lanes[L1_FULL], acc);
+                kahan_step_simd(
+                    f32x8::new(tail) * input_lanes[L1_FULL],
+                    &mut acc,
+                    &mut comp,
+                );
             }
-            pre_hidden[i] = self.b1[i] + acc.reduce_add();
+            pre_hidden[i] = self.b1[i] + kahan_reduce_lanes(acc);
         }
+
+        // Sprint 192: lateral inhibition before LayerNorm. Mirror of the
+        // GPU forward shader; strongly-active neurons inhibit weakly-active
+        // ones, amplifying init-jitter diversity so Hebbian updates stay
+        // per-neuron-distinct over many ticks.
+        lateral_inhibition_in_place(&mut pre_hidden, h_n, lateral_alpha);
+
+        // Sprint 189: LayerNorm over the active hidden range before tanh —
+        // breaks the recurrent-saturation feedback loop. Mirror of the GPU
+        // path in `shaders/brain_forward.wgsl`.
+        layer_norm_in_place(&mut pre_hidden, h_n);
 
         // Vectorized tanh in chunks of 8 over active hiddens; scalar tail.
         let mut hidden = [0.0_f32; BRAIN_HIDDEN];
@@ -400,7 +826,7 @@ impl Brain {
             hidden[start..start + 8].copy_from_slice(&activated);
         }
         for i in full_chunks * 8..h_n {
-            hidden[i] = pre_hidden[i].tanh();
+            hidden[i] = tanh_fast_scalar(pre_hidden[i]);
         }
 
         // Pack hidden into lanes for L2.
@@ -414,32 +840,52 @@ impl Brain {
             hidden_lanes[L2_FULL] = f32x8::new(tail);
         }
 
-        // L2 matvec; BRAIN_OUTPUTS is small, scalar tanh per output is fine.
-        let mut out = [0.0_f32; BRAIN_OUTPUTS];
-        for ((o, row), &bias) in out.iter_mut().zip(self.w2.iter()).zip(self.b2.iter()) {
+        // L2 matvec with Kahan compensated summation; BRAIN_OUTPUTS is small
+        // so we still do scalar tanh per output at the end.
+        let mut pre_out = [0.0_f32; BRAIN_OUTPUTS];
+        for ((o, row), &bias) in pre_out.iter_mut().zip(self.w2.iter()).zip(self.b2.iter()) {
             let mut acc = f32x8::ZERO;
+            let mut comp = f32x8::ZERO;
             for k in 0..L2_FULL {
                 let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
-                acc = w.mul_add(hidden_lanes[k], acc);
+                kahan_step_simd(w * hidden_lanes[k], &mut acc, &mut comp);
             }
             if L2_TAIL > 0 {
                 let mut tail = [0.0_f32; 8];
                 tail[..L2_TAIL].copy_from_slice(&row[L2_FULL * 8..]);
-                acc = f32x8::new(tail).mul_add(hidden_lanes[L2_FULL], acc);
+                kahan_step_simd(
+                    f32x8::new(tail) * hidden_lanes[L2_FULL],
+                    &mut acc,
+                    &mut comp,
+                );
             }
-            *o = (bias + acc.reduce_add()).tanh();
+            *o = bias + kahan_reduce_lanes(acc);
+        }
+        // Sprint 189: LayerNorm output preacts before tanh. Same parity
+        // contract as the L1 path above.
+        layer_norm_in_place(&mut pre_out, BRAIN_OUTPUTS);
+        let mut out = [0.0_f32; BRAIN_OUTPUTS];
+        for (o, &p) in out.iter_mut().zip(pre_out.iter()) {
+            *o = tanh_fast_scalar(p);
         }
         (hidden, out)
     }
 
-    /// Reward-modulated Hebbian update: `Δw = lr · reward · pre · post`.
+    /// Reward-modulated Hebbian update with Oja correction:
+    /// `Δw = lr · reward · post · (pre − post · w)`
+    /// `   = lr · reward · post · pre  −  lr · reward · post² · w`.
+    /// The first term is classic Hebb; the second pulls every weight
+    /// toward `pre / post`, giving a finite equilibrium without needing
+    /// the L2 cap to clip overshoots. Across hidden neurons the rule
+    /// promotes principal-component-like decorrelation (Oja 1982).
+    /// Biases keep classic Hebb (no `w` to regularise).
+    ///
     /// Pre/post activations come from a stored prior forward pass, so credit
     /// assignment is myopic (1-tick window). Reward fires on biologically
     /// meaningful events (eating, predation kills).
     ///
-    /// Updates iterate the full row width via `f32x8`. This is safe because
-    /// dead-zone activations and inputs are zero, so `lr · 0 · x = 0` leaves
-    /// those weights untouched.
+    /// Updates iterate the full row width via `f32x8`. Dead-zone neurons
+    /// (`hidden = 0`) self-cancel both terms (`Δw = 0`).
     #[allow(clippy::absurd_extreme_comparisons, clippy::out_of_bounds_indexing)]
     pub fn hebbian_update(
         &mut self,
@@ -457,14 +903,18 @@ impl Brain {
         let lr = learning_rate * reward;
         let h_n = self.hidden_n as usize;
 
-        // L1: w1[i][j] += lr · last_hidden[i] · last_inputs[j].
+        // L1: w1[i][j] += lr · post · pre − lr · post² · w1[i][j].
         for i in 0..h_n {
-            let scale = f32x8::splat(lr * last_hidden[i]);
+            let post = last_hidden[i];
+            let lr_post = f32x8::splat(lr * post);
+            let lr_post_sq = f32x8::splat(lr * post * post);
             let row = &mut self.w1[i];
             for k in 0..L1_FULL {
                 let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
                 let x = f32x8::new(last_inputs[k * 8..(k + 1) * 8].try_into().unwrap());
-                let updated = scale.mul_add(x, w).to_array();
+                // updated = w + lr_post * x - lr_post_sq * w
+                //         = w * (1 - lr_post_sq) + lr_post * x
+                let updated = (w - lr_post_sq * w + lr_post * x).to_array();
                 row[k * 8..(k + 1) * 8].copy_from_slice(&updated);
             }
             if L1_TAIL > 0 {
@@ -472,21 +922,24 @@ impl Brain {
                 let mut tail_x = [0.0_f32; 8];
                 tail_w[..L1_TAIL].copy_from_slice(&row[L1_FULL * 8..]);
                 tail_x[..L1_TAIL].copy_from_slice(&last_inputs[L1_FULL * 8..]);
-                let updated = scale
-                    .mul_add(f32x8::new(tail_x), f32x8::new(tail_w))
-                    .to_array();
+                let w = f32x8::new(tail_w);
+                let x = f32x8::new(tail_x);
+                let updated = (w - lr_post_sq * w + lr_post * x).to_array();
                 row[L1_FULL * 8..].copy_from_slice(&updated[..L1_TAIL]);
             }
-            self.b1[i] += lr * last_hidden[i];
+            self.b1[i] += lr * post;
         }
 
-        // L2: w2[o][j] += lr · last_outputs[o] · last_hidden[j].
+        // L2: w2[o][j] += lr · post · pre − lr · post² · w2[o][j],
+        // where post = last_outputs[o], pre = last_hidden[j].
         for (o, row) in self.w2.iter_mut().enumerate() {
-            let scale = f32x8::splat(lr * last_outputs[o]);
+            let post = last_outputs[o];
+            let lr_post = f32x8::splat(lr * post);
+            let lr_post_sq = f32x8::splat(lr * post * post);
             for k in 0..L2_FULL {
                 let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
                 let h = f32x8::new(last_hidden[k * 8..(k + 1) * 8].try_into().unwrap());
-                let updated = scale.mul_add(h, w).to_array();
+                let updated = (w - lr_post_sq * w + lr_post * h).to_array();
                 row[k * 8..(k + 1) * 8].copy_from_slice(&updated);
             }
             if L2_TAIL > 0 {
@@ -494,14 +947,194 @@ impl Brain {
                 let mut tail_h = [0.0_f32; 8];
                 tail_w[..L2_TAIL].copy_from_slice(&row[L2_FULL * 8..]);
                 tail_h[..L2_TAIL].copy_from_slice(&last_hidden[L2_FULL * 8..]);
-                let updated = scale
-                    .mul_add(f32x8::new(tail_h), f32x8::new(tail_w))
-                    .to_array();
+                let w = f32x8::new(tail_w);
+                let h = f32x8::new(tail_h);
+                let updated = (w - lr_post_sq * w + lr_post * h).to_array();
                 row[L2_FULL * 8..].copy_from_slice(&updated[..L2_TAIL]);
             }
         }
         for (b, &o) in self.b2.iter_mut().zip(last_outputs.iter()) {
             *b += lr * o;
+        }
+    }
+
+    /// Wave 3: per-tick eligibility-trace decay + accumulate. Runs every
+    /// tick after the brain forward pass; no weight changes happen here —
+    /// just trace bookkeeping. `decay = (1 − decay_per_sec · dt)`. Applied
+    /// `trace = decay · trace + pre · post`. When a reward event later
+    /// fires `hebbian_apply_reward`, the cell can credit motor outputs from
+    /// many ticks earlier (effective window ~ 1 / decay_per_sec). Iterates
+    /// only the active hidden range to leave dead-zone weights at 0.
+    pub fn hebbian_step(
+        &mut self,
+        last_inputs: &[f32; BRAIN_INPUTS],
+        last_hidden: &[f32; BRAIN_HIDDEN],
+        last_outputs: &[f32; BRAIN_OUTPUTS],
+        dt: f32,
+        decay_per_sec: f32,
+    ) {
+        let decay = (1.0 - decay_per_sec * dt).max(0.0);
+        let h_n = self.hidden_n as usize;
+        let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
+        for i in 0..h_n {
+            let post = last_hidden[i];
+            for j in 0..active_inputs {
+                self.trace_w1[i][j] = decay * self.trace_w1[i][j] + post * last_inputs[j];
+            }
+        }
+        for (o, row) in self.trace_w2.iter_mut().enumerate() {
+            let post = last_outputs[o];
+            for j in 0..h_n {
+                row[j] = decay * row[j] + post * last_hidden[j];
+            }
+        }
+    }
+
+    /// Wave 3: apply a reward event against the accumulated eligibility
+    /// trace. `Δw[i,j] = lr · reward · trace[i,j]`. Fires on eat / predation
+    /// / novelty events. Does not reset traces — they keep decaying tick by
+    /// tick, so a long reward streak reinforces the same recent motor
+    /// pattern multiple times. Bias terms ride on `last_hidden` /
+    /// `last_outputs` since traces only cover weights, not biases.
+    pub fn hebbian_apply_reward(
+        &mut self,
+        last_hidden: &[f32; BRAIN_HIDDEN],
+        last_outputs: &[f32; BRAIN_OUTPUTS],
+        reward: f32,
+        learning_rate: f32,
+    ) {
+        let lr = learning_rate * reward;
+        let h_n = self.hidden_n as usize;
+        let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
+        // Sprint 190: Oja correction — `−lr · post² · w` folded into the
+        // same loop. Mirror of `shaders/hebbian_apply_reward.wgsl`. The
+        // eligibility trace remains the classic `pre · post` accumulator
+        // (no Oja inside the trace step); regularisation is applied at
+        // weight-apply time, where the current `post` is known.
+        for i in 0..h_n {
+            let post = last_hidden[i];
+            let oja_coef = post * post;
+            for j in 0..active_inputs {
+                let w = self.w1[i][j];
+                self.w1[i][j] = w + lr * (self.trace_w1[i][j] - oja_coef * w);
+            }
+            self.b1[i] += lr * post;
+        }
+        for (o, row) in self.w2.iter_mut().enumerate() {
+            let post = last_outputs[o];
+            let oja_coef = post * post;
+            for j in 0..h_n {
+                let w = row[j];
+                row[j] = w + lr * (self.trace_w2[o][j] - oja_coef * w);
+            }
+            self.b2[o] += lr * post;
+        }
+    }
+
+    /// Sprint 154: STDP trace step. Decays `pre_trace` and `post_trace`
+    /// according to the cell's `stdp_tau_ticks`, then bumps any trace
+    /// slot whose corresponding spike-time array matches the current
+    /// `tick` (i.e., the neuron fired this tick). Single combined pass so
+    /// we walk each array once per tick.
+    pub fn stdp_step(&mut self, tick: u32, tau_ticks: f32) {
+        let decay = (-1.0_f32 / tau_ticks.max(MIN_STDP_TAU_TICKS)).exp();
+        for j in 0..BRAIN_INPUTS {
+            self.pre_trace[j] *= decay;
+            if self.last_pre_spike_ticks[j] == tick {
+                self.pre_trace[j] += 1.0;
+            }
+        }
+        for h in 0..BRAIN_HIDDEN {
+            self.post_trace[h] *= decay;
+            if self.last_post_spike_ticks[h] == tick {
+                self.post_trace[h] += 1.0;
+            }
+        }
+    }
+
+    /// Sprint 156: reward-modulated STDP — gates the S155 rule by an
+    /// external `reward` scalar (typically the per-tick value from the
+    /// S133 reward funnel). Reward 0 → no weight change; reward > 0
+    /// boosts the LTP/LTD magnitudes uniformly. Three-factor learning
+    /// in the simplest form (timing × pair × reward).
+    pub fn stdp_apply_rewarded(
+        &mut self,
+        tick: u32,
+        a_plus: f32,
+        a_minus: f32,
+        reward: f32,
+    ) {
+        if reward == 0.0 {
+            return;
+        }
+        self.stdp_apply(tick, a_plus * reward, a_minus * reward);
+    }
+
+    /// Sprint 155: classical pair-based STDP rule. Walks every spike that
+    /// happened this tick and updates the relevant `w1` synapses via
+    /// per-neuron traces:
+    /// - LTP: a post-spike at hidden neuron h reaches back via `pre_trace[i]`
+    ///   for every input i (large trace = pre fired recently → strengthen).
+    /// - LTD: a pre-spike at input i reaches forward via `post_trace[h]`
+    ///   for every hidden h (post fired recently → pre was late, weaken).
+    /// Iterates only `[0..hidden_n]` (S80 dead zone), so split-link grown
+    /// brains pay only for their active synapses. STDP only modifies `w1`
+    /// (input → hidden); `w2` keeps its rate-Hebbian path from S133.
+    pub fn stdp_apply(&mut self, tick: u32, a_plus: f32, a_minus: f32) {
+        let h_n = self.hidden_n as usize;
+        // LTP path: any hidden neuron that spiked this tick gets all of its
+        // input weights nudged up by `a_plus × pre_trace[i]`.
+        for h in 0..h_n {
+            if self.last_post_spike_ticks[h] != tick {
+                continue;
+            }
+            for j in 0..BRAIN_INPUTS {
+                self.w1[h][j] += a_plus * self.pre_trace[j];
+            }
+        }
+        // LTD path: any input that spiked this tick weakens its outgoing
+        // synapses by `a_minus × post_trace[h]` for each post neuron.
+        for j in 0..BRAIN_INPUTS {
+            if self.last_pre_spike_ticks[j] != tick {
+                continue;
+            }
+            for h in 0..h_n {
+                self.w1[h][j] -= a_minus * self.post_trace[h];
+            }
+        }
+    }
+
+    /// Sprint 138: row-wise L2 norm cap (synaptic scaling). For each `w1[i]`
+    /// and `w2[o]` row, if `||row||_2 > cap`, scale the row to `cap`. Bias
+    /// vectors are not touched. Mirrors `synaptic_scale.wgsl` for parity.
+    pub fn synaptic_scale(&mut self, cap: f32) {
+        let h_n = self.hidden_n as usize;
+        let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
+        let cap_sq = cap * cap;
+        for i in 0..h_n {
+            let mut sum_sq = 0.0_f32;
+            for j in 0..active_inputs {
+                sum_sq += self.w1[i][j] * self.w1[i][j];
+            }
+            if sum_sq > cap_sq {
+                let scale = cap / sum_sq.sqrt();
+                for j in 0..active_inputs {
+                    self.w1[i][j] *= scale;
+                }
+            }
+        }
+        for o in 0..BRAIN_OUTPUTS {
+            let row = &mut self.w2[o];
+            let mut sum_sq = 0.0_f32;
+            for j in 0..h_n {
+                sum_sq += row[j] * row[j];
+            }
+            if sum_sq > cap_sq {
+                let scale = cap / sum_sq.sqrt();
+                for j in 0..h_n {
+                    row[j] *= scale;
+                }
+            }
         }
     }
 

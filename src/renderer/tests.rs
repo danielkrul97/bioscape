@@ -3,6 +3,9 @@ use super::config::{
     CAMERA_OFFSET_DISTANCE, CAMERA_PITCH_INITIAL, CAMERA_PITCH_MAX, CAMERA_PITCH_MIN,
     CAMERA_SCALE_INITIAL,
 };
+use super::world_map::{food_multiplier, hazard_drain};
+use super::resources::WorldExtent;
+use super::world_map::food_target;
 use bioscape::{
     HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
 };

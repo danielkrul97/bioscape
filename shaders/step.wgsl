@@ -7,7 +7,6 @@
 // Bindings: 11 storage + 1 uniform = 12 total — at the per-pipeline limit
 // (`GpuContext` caps at 12). Adding a binding here forces a SoA refactor.
 
-const TAU: f32 = 6.28318530717958647692;
 
 struct StepParams {
     num_cells: u32,
@@ -35,12 +34,17 @@ struct StepParams {
     thermal_ref_temp: f32,
     thermal_diurnal_amp: f32,
     thermal_seasonal_amp: f32,
-    thermal_diurnal_phase: f32,
-    thermal_seasonal_phase: f32,
+    thermal_diurnal_sin: f32,
+    thermal_seasonal_sin: f32,
     thermal_log2_q10: f32,
-    pad_b0: u32,
-    pad_b1: u32,
-    pad_b2: u32,
+    // Wave 4 maze fields. `maze_active != 0` enables the collision_push pass
+    // after world_bounce. Voxel resolution is read from `maze_res_x/y`; the
+    // mask itself comes from binding 12 (row-major `vy * res_x + vx`,
+    // non-zero = occupied). `maze_active = 0` skips the entire block so
+    // non-maze runs stay byte-identical.
+    maze_active: u32,
+    maze_res_x: u32,
+    maze_res_y: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: StepParams;
@@ -53,8 +57,16 @@ struct StepParams {
 @group(0) @binding(7) var<storage, read_write> ages: array<u32>;
 @group(0) @binding(8) var<storage, read_write> cooldowns: array<u32>;
 @group(0) @binding(9) var<storage, read_write> energies: array<f32>;
-@group(0) @binding(10) var<storage, read> body_dims: array<f32>;
-@group(0) @binding(11) var<storage, read> aux: array<f32>;
+// body_dims is `array<vec4<f32>>` (length / width / height + 4-byte pad)
+// instead of three scalar slots — one 16B load replaces 3 separate scalar
+// loads per cell. aux is naturally `vec4` (spike / shell / vision / attack).
+@group(0) @binding(10) var<storage, read> body_dims: array<vec4<f32>>;
+@group(0) @binding(11) var<storage, read> aux: array<vec4<f32>>;
+// Wave 4: maze occupancy mask. One u32 per voxel, row-major
+// `vy * maze_res_x + vx`. Value 0 = passable, non-zero = wall. Allocated
+// at `MAZE_MASK_CAPACITY` u32s; only the first `maze_res_x * maze_res_y`
+// are read when `maze_active != 0`.
+@group(0) @binding(12) var<storage, read> maze_mask: array<u32>;
 
 @compute @workgroup_size(64)
 fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -85,13 +97,15 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     var ang_vel = angular_velocities[i];
     var pitch_vel = pitch_velocities[i];
     var energy = energies[i];
-    let body_l = body_dims[i * 3u + 0u];
-    let body_w = body_dims[i * 3u + 1u];
-    let body_h = body_dims[i * 3u + 2u];
-    let spike = aux[i * 4u + 0u];
-    let shell = aux[i * 4u + 1u];
-    let vision = aux[i * 4u + 2u];
-    let attack = aux[i * 4u + 3u];
+    let body = body_dims[i];
+    let body_l = body.x;
+    let body_w = body.y;
+    let body_h = body.z;
+    let aux_i = aux[i];
+    let spike = aux_i.x;
+    let shell = aux_i.y;
+    let vision = aux_i.z;
+    let attack = aux_i.w;
 
     pos = pos + vel * dt;
     heading = heading + ang_vel * dt;
@@ -124,8 +138,8 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
         var norm = (pos.z / params.world_half_z + 1.0) * 0.5;
         norm = clamp(norm, 0.0, 1.0);
         let base = params.thermal_bottom + (params.thermal_top - params.thermal_bottom) * norm;
-        let seasonal_offset = params.thermal_seasonal_amp * sin(TAU * params.thermal_seasonal_phase);
-        let diurnal_offset = params.thermal_diurnal_amp * norm * sin(TAU * params.thermal_diurnal_phase);
+        let seasonal_offset = params.thermal_seasonal_amp * params.thermal_seasonal_sin;
+        let diurnal_offset = params.thermal_diurnal_amp * norm * params.thermal_diurnal_sin;
         let temp = base + seasonal_offset + diurnal_offset;
         // `pow(q10, x) == exp2(x * log2(q10))`; CPU-side `thermal_log2_q10`
         // turns the per-cell pow into a single mul + exp2.
@@ -147,20 +161,113 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     energy = energy - attack_strength * params.attack_cost_per_sec * dt_eff;
 
     // Toroidal XY wrap (cylinder topology) + Z bounce. Mirror of CPU
-    // `Cell::apply_world_bounce`.
-    let wx = 2.0 * params.world_half_x;
-    let wy = 2.0 * params.world_half_y;
-    if (pos.x >= params.world_half_x || pos.x < -params.world_half_x) {
-        let p = pos.x + params.world_half_x;
-        pos.x = p - floor(p / wx) * wx - params.world_half_x;
-    }
-    if (pos.y >= params.world_half_y || pos.y < -params.world_half_y) {
-        let p = pos.y + params.world_half_y;
-        pos.y = p - floor(p / wy) * wy - params.world_half_y;
+    // `Cell::apply_world_bounce`. In maze mode (Wave 4), XY uses bounded
+    // walls instead — clamp + zero outward velocity (Cell::apply_world_bounce_bounded).
+    if (params.maze_active != 0u) {
+        if (pos.x > params.world_half_x) {
+            pos.x = params.world_half_x;
+            if (vel.x > 0.0) { vel.x = 0.0; }
+        } else if (pos.x < -params.world_half_x) {
+            pos.x = -params.world_half_x;
+            if (vel.x < 0.0) { vel.x = 0.0; }
+        }
+        if (pos.y > params.world_half_y) {
+            pos.y = params.world_half_y;
+            if (vel.y > 0.0) { vel.y = 0.0; }
+        } else if (pos.y < -params.world_half_y) {
+            pos.y = -params.world_half_y;
+            if (vel.y < 0.0) { vel.y = 0.0; }
+        }
+    } else {
+        let wx = 2.0 * params.world_half_x;
+        let wy = 2.0 * params.world_half_y;
+        if (pos.x >= params.world_half_x || pos.x < -params.world_half_x) {
+            let p = pos.x + params.world_half_x;
+            pos.x = p - floor(p / wx) * wx - params.world_half_x;
+        }
+        if (pos.y >= params.world_half_y || pos.y < -params.world_half_y) {
+            let p = pos.y + params.world_half_y;
+            pos.y = p - floor(p / wy) * wy - params.world_half_y;
+        }
     }
     if (is_3d && abs(pos.z) > params.world_half_z) {
         vel.z = -vel.z;
         pos.z = clamp(pos.z, -params.world_half_z, params.world_half_z);
+    }
+
+    // Wave 4 maze collision_push: mirror of `Cell::apply_obstacle_collision`.
+    // Sample 9 voxels around `pos` (xy 3×3 stencil), accumulate push out of
+    // any occupied one, apply to position, zero outward velocity component.
+    // Damage to `damage_accum` is NOT written here (binding budget) — CPU/GPU
+    // diverge in the brain's wall-bump signal but motion stays identical.
+    if (params.maze_active != 0u && params.maze_res_x > 0u && params.maze_res_y > 0u) {
+        let radius = max((body_l + body_w + body_h) / 3.0, 2.5);
+        let cs_x = (2.0 * params.world_half_x) / f32(params.maze_res_x);
+        let cs_y = (2.0 * params.world_half_y) / f32(params.maze_res_y);
+        let xi_f = floor((pos.x + params.world_half_x) / cs_x);
+        let yi_f = floor((pos.y + params.world_half_y) / cs_y);
+        let xi = i32(xi_f);
+        let yi = i32(yi_f);
+        let nx = i32(params.maze_res_x);
+        let ny = i32(params.maze_res_y);
+        var push_x: f32 = 0.0;
+        var push_y: f32 = 0.0;
+        for (var dvy: i32 = -1; dvy <= 1; dvy = dvy + 1) {
+            for (var dvx: i32 = -1; dvx <= 1; dvx = dvx + 1) {
+                let vx = xi + dvx;
+                let vy = yi + dvy;
+                if (vx < 0 || vx >= nx || vy < 0 || vy >= ny) {
+                    continue;
+                }
+                let idx = u32(vy) * params.maze_res_x + u32(vx);
+                if (maze_mask[idx] == 0u) {
+                    continue;
+                }
+                let cx = -params.world_half_x + (f32(vx) + 0.5) * cs_x;
+                let cy = -params.world_half_y + (f32(vy) + 0.5) * cs_y;
+                let half_x = cs_x * 0.5;
+                let half_y = cs_y * 0.5;
+                let closest_x = clamp(pos.x, cx - half_x, cx + half_x);
+                let closest_y = clamp(pos.y, cy - half_y, cy + half_y);
+                let diff_x = pos.x - closest_x;
+                let diff_y = pos.y - closest_y;
+                let d2 = diff_x * diff_x + diff_y * diff_y;
+                if (d2 >= radius * radius) {
+                    continue;
+                }
+                if (d2 < 1e-8) {
+                    let ax = half_x + radius - abs(pos.x - cx);
+                    let ay = half_y + radius - abs(pos.y - cy);
+                    if (ax < ay) {
+                        let s = select(-1.0, 1.0, pos.x >= cx);
+                        push_x = push_x + ax * s;
+                    } else {
+                        let s = select(-1.0, 1.0, pos.y >= cy);
+                        push_y = push_y + ay * s;
+                    }
+                } else {
+                    let inv_d = inverseSqrt(d2);
+                    let pen = radius - d2 * inv_d;
+                    push_x = push_x + diff_x * inv_d * pen;
+                    push_y = push_y + diff_y * inv_d * pen;
+                }
+            }
+        }
+        if (abs(push_x) > 1e-4 || abs(push_y) > 1e-4) {
+            pos.x = pos.x + push_x;
+            pos.y = pos.y + push_y;
+            let pmag2 = push_x * push_x + push_y * push_y;
+            if (pmag2 > 1e-8) {
+                let inv = inverseSqrt(pmag2);
+                let nxn = push_x * inv;
+                let nyn = push_y * inv;
+                let v_dot_n = vel.x * nxn + vel.y * nyn;
+                if (v_dot_n < 0.0) {
+                    vel.x = vel.x - v_dot_n * nxn;
+                    vel.y = vel.y - v_dot_n * nyn;
+                }
+            }
+        }
     }
 
     positions[i * 3u + 0u] = pos.x;

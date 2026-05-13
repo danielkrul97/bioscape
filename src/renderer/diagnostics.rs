@@ -64,6 +64,7 @@ pub(super) fn register_diagnostics(app: &mut App) {
         .register_diagnostic(Diagnostic::new(DIAG_EAT_FOOD).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_SMELL).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_PHEROMONE).with_suffix(" ms"))
+        .register_diagnostic(Diagnostic::new(DIAG_VIBRATION).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_GRID_REBUILD).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_SYNC_TRANSFORMS).with_suffix(" ms"))
         .register_diagnostic(Diagnostic::new(DIAG_TICKS_PER_FRAME).with_suffix(" ticks"))

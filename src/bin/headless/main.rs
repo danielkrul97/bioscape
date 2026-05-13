@@ -7,124 +7,203 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    EventCalendar,
-    ShockScheduleConfig, CYCLE_AMPLITUDE, GRID_CELL_SIZE,
+    EventCalendar, MazeDifficulty,
+    ShockScheduleConfig, CYCLE_AMPLITUDE,
     INITIAL_CELLS,
     MATING_RADIUS, MAX_POPULATION,
     N_PHEROMONE_CHANNELS,
-    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z, TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_SEED,
+    TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_SEED,
 };
-#[cfg(feature = "gpu")]
-use bioscape::gpu::{
-        BrainGpu, BrownianGpu, CellsGpu, CppnGpu, FieldGpu, GpuContext, GpuFullScratch,
-        HebbianGpu, MotorGpu, PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
-    };
+use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::env;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
 mod csv;
-mod world;
+use bioscape::sim as world;
+
+#[cfg(test)]
+mod world_tests;
 
 use csv::*;
 use world::*;
 
-fn main() {
-    let raw_args: Vec<String> = env::args().collect();
-    // Sprint 44: `--gpu` flag (filtered před positional parsingem). Bez
-    // `--features gpu` se flag tiše ignoruje.
-    // Sprint 51: `--gpu-full` flag — persistent brain weights + GPU Hebbian +
-    // GPU Brownian. Implies --gpu (brain forward na GPU).
-    let want_gpu_full = raw_args.iter().any(|a| a == "--gpu-full");
-    let want_gpu = want_gpu_full || raw_args.iter().any(|a| a == "--gpu");
-    // Sprint 48: `--save=PATH` / `--load=PATH` checkpoint flags. Form
-    // `--key=value` aby se PATH ne-leakoval do positional indexingu.
-    let save_path: Option<String> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--save=").map(|s| s.to_string()));
-    let load_path: Option<String> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--load=").map(|s| s.to_string()));
-    // Sprint 87 Hamilton sweep: `--share-frac=X` runtime override pro
-    // BOND_FOOD_SHARE_FRAC, `--kin` zapne kin filter (food share jen na
-    // partnery se stejným lineage_id).
-    let share_frac_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--share-frac=").and_then(|s| s.parse().ok()));
-    let kin_filter = raw_args.iter().any(|a| a == "--kin");
-    let pred_gain_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--pred-gain=").and_then(|s| s.parse().ok()));
-    let pred_drain_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--pred-drain=").and_then(|s| s.parse().ok()));
-    let food_mult_override: Option<f32> = raw_args
-        .iter()
-        .find_map(|a| a.strip_prefix("--food=").and_then(|s| s.parse().ok()));
-    // Sprint 109: `--shocks-mean-gens N` (space-separated) nebo
-    // `--shocks-mean-gens=N` (= form). Default 0 = no-op (empty kalendář).
-    // `consumed_value_idx` drží pozici následujícího raw arg pokud je flag
-    // space-separated; ten se musí vyfiltrovat z positional setu.
-    let mut shocks_mean_gens: u32 = 0;
-    let mut consumed_value_idx: Option<usize> = None;
-    for (i, a) in raw_args.iter().enumerate() {
-        if let Some(rest) = a.strip_prefix("--shocks-mean-gens") {
-            if let Some(eq_val) = rest.strip_prefix('=') {
-                if let Ok(v) = eq_val.parse::<u32>() {
-                    shocks_mean_gens = v;
-                }
-            } else if rest.is_empty() {
-                if let Some(next) = raw_args.get(i + 1) {
-                    if let Ok(v) = next.parse::<u32>() {
-                        shocks_mean_gens = v;
-                        consumed_value_idx = Some(i + 1);
-                    }
-                }
-            }
-            break;
+#[derive(Parser, Debug)]
+#[command(
+    name = "headless",
+    about = "Bioscape headless simulator — deterministic, GPU compute mandatory.",
+)]
+struct Cli {
+    /// RNG seed (deterministic; same seed → identical run).
+    #[arg(default_value_t = 0)]
+    seed: u64,
+
+    /// Number of generations to simulate.
+    #[arg(default_value_t = 500)]
+    max_gens: u64,
+
+    /// Output CSV path. Default: `run_seed{seed}.csv`.
+    out_path: Option<String>,
+
+    /// Map noise seed.
+    map_seed: Option<u64>,
+
+    /// Mating radius in world units.
+    mating_radius: Option<f32>,
+
+    /// Initial cell count.
+    initial_cells: Option<usize>,
+
+    /// Population cap.
+    max_population: Option<usize>,
+
+    /// Rayon thread count (default: std::thread::available_parallelism()).
+    threads: Option<usize>,
+
+    /// Save checkpoint to PATH at end of run.
+    #[arg(long, value_name = "PATH")]
+    save: Option<String>,
+
+    /// Load checkpoint from PATH instead of starting fresh.
+    #[arg(long, value_name = "PATH")]
+    load: Option<String>,
+
+    /// BOND_FOOD_SHARE_FRAC runtime override (Hamilton sweep).
+    #[arg(long, value_name = "FRAC")]
+    share_frac: Option<f32>,
+
+    /// Kin filter: bond food sharing restricted to same lineage_id.
+    #[arg(long)]
+    kin: bool,
+
+    /// Predation gain multiplier.
+    #[arg(long, value_name = "X")]
+    pred_gain: Option<f32>,
+
+    /// Predation drain multiplier.
+    #[arg(long, value_name = "X")]
+    pred_drain: Option<f32>,
+
+    /// Food spawn multiplier.
+    #[arg(long, value_name = "X")]
+    food: Option<f32>,
+
+    /// Mean generations between environmental shocks. 0 = empty calendar (default).
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    shocks_mean_gens: u32,
+
+    /// Maze difficulty (easy|medium|hard). Bare `--maze` defaults to medium.
+    #[arg(
+        long,
+        value_name = "DIFFICULTY",
+        num_args = 0..=1,
+        default_missing_value = "medium",
+    )]
+    maze: Option<String>,
+
+    /// Curriculum: `difficulty:gens,difficulty:gens,…` (final segment may omit
+    /// length = rest of run). Implies `--maze` from the first stage.
+    #[arg(long, value_name = "SPEC")]
+    maze_stages: Option<String>,
+
+    /// Sprint 159: fraction of initial population assigned `NeuronModel::
+    /// Izhikevich` at gen 0 (default 0 = all Perceptron). Used to bypass
+    /// the slow mutation-driven bootstrap so cross-seed validation can
+    /// observe Izhikevich niche dynamics from tick 1.
+    #[arg(long, value_name = "FRAC", default_value_t = 0.0)]
+    initial_izhikevich_frac: f32,
+}
+
+fn parse_maze_lenient(s: &str) -> MazeDifficulty {
+    match MazeDifficulty::parse(s) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "warning: unknown --maze value '{s}', using medium. Valid: easy|medium|hard"
+            );
+            MazeDifficulty::Medium
         }
     }
-    let args: Vec<String> = raw_args
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| !a.starts_with("--") && Some(*i) != consumed_value_idx)
-        .map(|(_, a)| a.clone())
-        .collect();
-    let seed: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let max_gens: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(500);
-    let out_path = args
-        .get(3)
-        .cloned()
+}
+
+fn parse_maze_stages(spec: &str) -> Vec<(MazeDifficulty, u64)> {
+    let mut out: Vec<(MazeDifficulty, u64)> = Vec::new();
+    let mut cum: u64 = 0;
+    let parts: Vec<&str> = spec.split(',').collect();
+    let last_idx = parts.len().saturating_sub(1);
+    for (i, p) in parts.iter().enumerate() {
+        let mut it = p.splitn(2, ':');
+        let diff_str = it.next().unwrap_or("");
+        let gens_str = it.next();
+        let diff = match MazeDifficulty::parse(diff_str) {
+            Some(d) => d,
+            None => {
+                eprintln!("warning: unknown stage difficulty '{diff_str}', skipping");
+                continue;
+            }
+        };
+        let end_gen = if i == last_idx && gens_str.is_none() {
+            u64::MAX
+        } else {
+            let n = gens_str.and_then(|s| s.parse::<u64>().ok()).unwrap_or(50);
+            cum = cum.saturating_add(n);
+            cum
+        };
+        out.push((diff, end_gen));
+    }
+    out
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let seed = cli.seed;
+    let max_gens = cli.max_gens;
+    let out_path = cli
+        .out_path
         .unwrap_or_else(|| format!("run_seed{}.csv", seed));
-    let map_seed: u64 = args
-        .get(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(WORLD_MAP_SEED);
-    let mating_radius: f32 = args
-        .get(5)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MATING_RADIUS);
-    // Sprint 43: positional override pro initial cells / max population /
-    // rayon thread count. Default zachovává pre-Sprint-43 chování.
-    let initial_cells: usize = args
-        .get(6)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(INITIAL_CELLS);
-    let max_population: usize = args
-        .get(7)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MAX_POPULATION);
-    let threads: usize = args
-        .get(8)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
+    let map_seed = cli.map_seed.unwrap_or(WORLD_MAP_SEED);
+    let mating_radius = cli.mating_radius.unwrap_or(MATING_RADIUS);
+    let initial_cells = cli.initial_cells.unwrap_or(INITIAL_CELLS);
+    let max_population = cli.max_population.unwrap_or(MAX_POPULATION);
+    let threads = cli.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
+
+    let shocks_mean_gens = cli.shocks_mean_gens;
+    let save_path = cli.save;
+    let load_path = cli.load;
+    let share_frac_override = cli.share_frac;
+    let kin_filter = cli.kin;
+    let pred_gain_override = cli.pred_gain;
+    let pred_drain_override = cli.pred_drain;
+    let food_mult_override = cli.food;
+    let maze_difficulty: Option<MazeDifficulty> = cli.maze.as_deref().map(parse_maze_lenient);
+    let maze_stages: Vec<(MazeDifficulty, u64)> = cli
+        .maze_stages
+        .as_deref()
+        .map(parse_maze_stages)
+        .unwrap_or_default();
+
+    if maze_difficulty.is_some() {
+        eprintln!(
+            "info: --maze (Wave 7): full GPU parity — step wall collision, FieldGpu masked diffusion, sensor_gather LOS + whisker raycast, and hebbian eligibility traces (per-tick decay+accumulate + on-event trace-based reward apply) all run on-device."
+        );
+    }
+    if !maze_stages.is_empty() {
+        eprintln!(
+            "info: --maze-stages — same caveat as --maze (see startup info)."
+        );
+    }
+    let initial_maze_difficulty = if !maze_stages.is_empty() {
+        Some(maze_stages[0].0)
+    } else {
+        maze_difficulty
+    };
 
     if threads > 0 {
         let _ = rayon::ThreadPoolBuilder::new()
@@ -167,29 +246,71 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("checkpoint: load failed ({e}); starting fresh");
-                World::new(
+                World::new_with_maze(
                     &mut rng,
                     map_seed,
                     mating_radius,
                     initial_cells,
                     max_population,
                     events.clone(),
+                    initial_maze_difficulty,
                 )
             }
         }
     } else {
-        World::new(
+        World::new_with_maze(
             &mut rng,
             map_seed,
             mating_radius,
             initial_cells,
             max_population,
             events,
+            initial_maze_difficulty,
         )
     };
+    if !maze_stages.is_empty() {
+        world.maze_curriculum = maze_stages.clone();
+        let stages_str: Vec<String> = maze_stages
+            .iter()
+            .map(|(d, end)| {
+                if *end == u64::MAX {
+                    format!("{}:rest", d.label())
+                } else {
+                    format!("{}→gen{}", d.label(), end)
+                }
+            })
+            .collect();
+        eprintln!("maze curriculum: {}", stages_str.join(", "));
+    }
+    if let Some(d) = initial_maze_difficulty {
+        if let Some(field) = world.obstacles.as_ref() {
+            eprintln!(
+                "maze: {} ({}×{} voxels, goal at [{:.0}, {:.0}])",
+                d.label(),
+                field.resolution[0],
+                field.resolution[1],
+                field.goal_position[0],
+                field.goal_position[1],
+            );
+        }
+    }
     // Sprint 87 Hamilton sweep: aplikuj CLI overrides AFTER World::new (i po
     // checkpoint load) — nikdy se neserializují, vždy z aktuálního CLI.
+    // Sprint 187: --share-frac now pins gen-0 altruism_share_frac uniformly
+    // (instead of overriding the obsolete `world.share_frac` global, which is
+    // now legacy unused). Mutation can drift afterwards; the pin only seeds
+    // the starting population so the Hamilton-sweep semantic ("start everyone
+    // at share rate X") survives the per-genome migration. world.share_frac
+    // is still set for back-compat with anything reading the field, even
+    // though the eat_food code no longer consults it.
     if let Some(sf) = share_frac_override {
+        let clamped = sf.clamp(
+            bioscape::MIN_ALTRUISM_SHARE_FRAC,
+            bioscape::MAX_ALTRUISM_SHARE_FRAC,
+        );
+        for cell in &mut world.cells {
+            cell.genome.altruism_share_frac = clamped;
+        }
         world.share_frac = sf;
     }
     world.kin_filter = kin_filter;
@@ -203,116 +324,47 @@ fn main() {
         world.food_factor_mult = v;
     }
 
-    #[cfg(feature = "gpu")]
-    if want_gpu_full {
+    // Sprint 159: pre-seed a fraction of the initial population as
+    // Izhikevich. Run BEFORE `init_gpu_full` so the GPU upload picks up
+    // the per-cell neuron_model assignments.
+    if cli.initial_izhikevich_frac > 0.0 {
+        let frac = cli.initial_izhikevich_frac.clamp(0.0, 1.0);
+        let target = (frac * world.cells.len() as f32).round() as usize;
+        for cell in world.cells.iter_mut().take(target) {
+            cell.genome.neuron_model = bioscape::NeuronModel::Izhikevich;
+        }
+        eprintln!(
+            "info: pre-seeded {} of {} cells as Izhikevich (frac={:.2})",
+            target,
+            world.cells.len(),
+            frac
+        );
+    }
+
+    {
         let cap = initial_cells.max(max_population).max(64);
-        // Sprint 59: FieldGpu sources capacity. Per-tick deposit count =
-        // foods (smell) + cells (pheromone). food_target může bumpnout přes
-        // density cycles (CYCLE_AMPLITUDE), s safety margin × 2.
         let field_sources_cap = (food_target(1.0 + CYCLE_AMPLITUDE) + max_population) * 2;
-        let init = || -> Result<GpuFullState, String> {
-            let ctx = GpuContext::new()?;
-            let cells_gpu = CellsGpu::with_context(&ctx, cap);
-            cells_gpu.upload_brains(world.cells.iter().map(|c| &c.genome.brain));
-            cells_gpu.upload_xoshiro_seeds(world.cells.iter().enumerate().map(|(slot, c)| {
-                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
-            }));
-            let brain = BrainGpu::with_context(&ctx, cap)?;
-            let hebbian = HebbianGpu::with_context(&ctx, cap)?;
-            let brownian = BrownianGpu::with_context(&ctx, cap)?;
-            // Sprint 59: smell + pheromone FieldGpu instances, sdílí GpuContext.
-            let smell = FieldGpu::with_context(
-                &ctx,
-                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
-                WORLD_HALF,
-                field_sources_cap,
-            )?;
-            let pheromone = FieldGpu::with_context(
-                &ctx,
-                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-                WORLD_HALF,
-                field_sources_cap,
-            )?;
-            // Sprint 60: spatial hashes pro sensor broad-phase. Sdílí
-            // GRID_CELL_SIZE konstantu s CPU SpatialGrid; xy world bounds
-            // pro toroidal bucket wrap.
-            let cell_hash = SpatialHashGpu::with_context(
-                &ctx,
-                cap,
-                GRID_CELL_SIZE,
-                [WORLD_HALF[0], WORLD_HALF[1]],
-            )?;
-            let food_capacity = field_sources_cap;
-            let food_hash = SpatialHashGpu::with_context(
-                &ctx,
-                food_capacity,
-                GRID_CELL_SIZE,
-                [WORLD_HALF[0], WORLD_HALF[1]],
-            )?;
-            let sensor = SensorGatherGpu::with_context(&ctx, cap, food_capacity)?;
-            let populate = PopulateInputsGpu::with_context(&ctx)?;
-            let motor = MotorGpu::with_context(&ctx, cap)?;
-            let step = StepGpu::with_context(&ctx, cap)?;
-            // GPU CPPN materialises child brain weights direct → cells.brain_weights_buf.
-            // Capacity = cap (worst case: all cells reproduce in one tick after a
-            // mass extinction; init upload is cap children too).
-            let cppn = CppnGpu::with_context(&ctx, cap);
-            // Sprint 62: turn_rate je per-cell genome konstanta. Upload na sim
-            // init; reproduce volá `upload_turn_rates` znovu (per-event sparse).
-            let turn_rates: Vec<f32> = world.cells.iter().map(|c| c.genome.turn_rate).collect();
-            cells_gpu.upload_turn_rates(&turn_rates);
-            Ok(GpuFullState {
-                cells: cells_gpu,
-                brain,
-                hebbian,
-                brownian,
-                smell,
-                pheromone,
-                cell_hash,
-                food_hash,
-                sensor,
-                populate,
-                motor,
-                step,
-                cppn,
-                scratch: GpuFullScratch::default(),
-            })
-        };
-        match init() {
-            Ok(state) => {
+        match world.init_gpu_full() {
+            Ok(()) => {
                 eprintln!(
                     "gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
-                world.gpu_full = Some(state);
             }
             Err(e) => {
-                eprintln!("gpu-full: init failed ({e}); fallback to CPU");
+                // Wave N: no CPU fallback. GPU is the only compute path —
+                // if init fails the run can't proceed.
+                eprintln!("gpu-full: init failed: {e}");
+                std::process::exit(1);
             }
         }
-    }
-    #[cfg(feature = "gpu")]
-    if want_gpu && !want_gpu_full && world.gpu_full.is_none() {
-        match BrainGpu::new(initial_cells.max(64)) {
-            Ok(g) => {
-                eprintln!("gpu: BrainGpu initialized (capacity {})", initial_cells.max(64));
-                world.gpu = Some(g);
-            }
-            Err(e) => {
-                eprintln!("gpu: init failed ({e}); falling back to CPU");
-            }
-        }
-    }
-    #[cfg(not(feature = "gpu"))]
-    if want_gpu {
-        eprintln!("gpu: --gpu / --gpu-full requested but binary built without --features gpu");
     }
 
     let file = std::fs::File::create(&out_path).expect("can't create output file");
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac,vib_emit_avg,vib_amp_avg,vib_grad_mag_avg,gain_mech_avg,gain_mech_dev,maze_active,maze_in_goal_frac,maze_unique_reach_frac,maze_first_reach_total,lr_avg,lr_std,decay_avg,decay_std,w_norm_avg,neural_spike_frac,izhikevich_frac,repro_avg,repro_std,birth_avg,birth_std,altruism_avg,altruism_std,cluster_bonus_avg,cluster_bonus_std,attack_gate_avg,attack_gate_std,size_ratio_avg,size_ratio_std,defense_avg,defense_std,rw_eatfood_avg,rw_novelty_avg,rw_predation_avg,rw_escape_avg,rw_damage_avg,rw_bondformed_avg,rw_mating_avg"
     )
     .unwrap();
     write_stats(&mut log, &world, 0.0).unwrap();
@@ -364,8 +416,11 @@ fn main() {
             };
             // GPU CPPN keeps child brains GPU-resident; sync to CPU before the
             // stats pass reads `Genome.brain` for diagnostic metrics.
-            #[cfg(feature = "gpu")]
             world.sync_brains_from_gpu();
+            // V7: the vibration field lives on the GPU in --gpu-full mode
+            // (sensor gather reads it inline). Pull it back to the CPU shadow
+            // so the per-gen CSV write samples real values, not zeros.
+            world.sync_vibration_from_gpu();
             write_stats(&mut log, &world, tps).unwrap();
             // Sprint 126: reset burst_accum aby každá generace měřila vlastní
             // tick-to-tick variance. Bez resetu by hodnoty monotonně rostly.
@@ -425,6 +480,8 @@ fn main() {
             world.coop_food_failed_gen = 0;
             world.coop_food_arrivals_sum_gen = 0;
             world.coop_food_events_gen = 0;
+            world.goal_zone_ticks_gen = 0;
+            world.goal_unique_reachers_gen.clear();
         }
         if world.cells.is_empty() {
             eprintln!("extinction at gen {}", world.clock.generation);

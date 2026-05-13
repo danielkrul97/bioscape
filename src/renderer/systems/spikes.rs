@@ -10,19 +10,28 @@ const SPIKE_THICKNESS_FRAC: f32 = 0.25;
 const SPIKE_VISIBLE_MIN: f32 = MIN_SPIKE_LENGTH + 0.05;
 
 /// Per-frame sync of spike transforms from owner cells. Hidden when:
-/// - owner cell despawned (also despawns the spike entity)
+/// - owner cell entity missing (rare with S195 pooling; we hide instead of
+///   despawning to keep the spike alive for the next time its owner gets
+///   recycled — but if the owner truly disappeared, hidden is the safe state)
+/// - owner cell entity is in the pool (`Visibility::Hidden`)
 /// - slot is inactive (slot >= spike_count)
 /// - length below threshold
 pub(crate) fn sync_spikes(
-    mut spikes: Query<(Entity, &SpikeEntity, &mut Transform, &mut Visibility)>,
-    cells: Query<&CellEntity>,
-    mut commands: Commands,
+    mut spikes: Query<(&SpikeEntity, &mut Transform, &mut Visibility)>,
+    cells: Query<(&CellEntity, &Visibility), Without<SpikeEntity>>,
 ) {
-    for (entity, spike, mut transform, mut vis) in &mut spikes {
-        let Ok(cell) = cells.get(spike.owner) else {
-            commands.entity(entity).despawn();
+    for (spike, mut transform, mut vis) in &mut spikes {
+        let Ok((cell, owner_vis)) = cells.get(spike.owner) else {
+            *vis = Visibility::Hidden;
             continue;
         };
+        // S195 pooling: if the owner cell is pooled (hidden), the spike
+        // tags along — without this the spike would render at the last
+        // tenant's pose, which floats around the scene at the old position.
+        if matches!(owner_vis, Visibility::Hidden) {
+            *vis = Visibility::Hidden;
+            continue;
+        }
         let cell = &cell.0;
         let slot_idx = spike.slot as usize;
         if slot_idx >= cell.phenotype.spike_count as usize {

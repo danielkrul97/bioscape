@@ -5,12 +5,14 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 use bioscape::{
-    Cell, Food, SmellField, WorldMap, CELL_RADIUS, CYCLE_AMPLITUDE,
-    INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z,
-    SMELL_GRID_RES, SMELL_GRID_RES_Z, SPIKE_SLOTS, WORLD_HALF, WORLD_MAP_BASE_RES,
-    WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED, reject_food_for_richness,
+    Cell, EventCalendar, Food, INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    ShockScheduleConfig, SmellField, SPIKE_SLOTS, WorldMap, WORLD_MAP_SEED, CELL_RADIUS,
+    CYCLE_AMPLITUDE, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z,
+    VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, WORLD_HALF, WORLD_MAP_BASE_RES,
+    WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z, reject_food_for_richness,
 };
-#[cfg(feature = "gpu")]
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use bioscape::gpu::{
     BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
     PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
@@ -21,12 +23,12 @@ use super::components::{CellEntity, FoodEntity, SpikeEntity, StatsRoot, StatsTex
 use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
-    AdhesionMaterials, CellMesh, CellSlotMap, FoodMaterial, FoodMesh,
-    OrbitCamera, PheromoneResource, SmellResource, SpikeMaterial, SpikeMesh, WorldExtent,
-    WorldMapResource,
+    AdhesionMaterials, CellMesh, CellSlotMap, EventCalendarResource, FoodMaterial, FoodMesh,
+    OrbitCamera, PheromoneResource, SimRng, SimWorld, SmellResource, SpikeMaterial, SpikeMesh,
+    VibrationResource, WorldExtent, WorldMapResource,
 };
-#[cfg(feature = "gpu")]
-use super::resources_gpu::{GpuBrainState, GpuFieldState, GpuFullPipeline};
+use super::sim_config::{SimConfig, CONFIG_FILENAME};
+use super::resources_gpu::GpuFullPipeline;
 use super::world_map::{food_target, world_map_image};
 
 pub(super) fn setup(
@@ -46,6 +48,82 @@ pub(super) fn setup(
         half_z: half[2],
     };
     commands.insert_resource(extent);
+
+    // Sprint 183 (post-S182 cleanup): load renderer overrides from
+    // `bioscape.json` in CWD. Missing/unparseable file → library
+    // defaults (identical to pre-S183 hardcoded behavior).
+    let config = SimConfig::load_or_default(std::path::Path::new(CONFIG_FILENAME));
+
+    // Sprint 184: build the event calendar from `config.seed` (not the
+    // literal `WORLD_MAP_SEED` as pre-S184) and feed it into the shared
+    // `World`. Without this the renderer's sim ran with an empty calendar
+    // — shocks never fired regardless of `BIOSCAPE_SHOCKS_MEAN_GENS`.
+    let shocks_mean_gens: u32 = std::env::var("BIOSCAPE_SHOCKS_MEAN_GENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let shock_cfg = if shocks_mean_gens > 0 {
+        ShockScheduleConfig {
+            mean_gens_between: shocks_mean_gens,
+            ..Default::default()
+        }
+    } else {
+        ShockScheduleConfig::default()
+    };
+    let event_calendar = EventCalendar::generate(config.seed, &shock_cfg, 1_000_000);
+    if shocks_mean_gens > 0 {
+        info!(
+            "shocks: mean_gens_between={} scheduled={} (seed={})",
+            shocks_mean_gens,
+            event_calendar.events.len(),
+            config.seed,
+        );
+    }
+
+    // Sprint 175-176-183: instantiate shared `bioscape::sim::World` from
+    // resolved config. GPU init runs alongside Bevy's RenderPlugin (2 wgpu
+    // instances; consolidation in 184+).
+    {
+        let mut sim_rng = StdRng::seed_from_u64(config.seed);
+        let mut world = bioscape::sim::World::new_with_maze(
+            &mut sim_rng,
+            config.resolved_map_seed(),
+            config.resolved_mating_radius(),
+            config.resolved_initial_cells(),
+            config.resolved_max_population(),
+            event_calendar.clone(),
+            config.resolved_maze(),
+        );
+        // Sprint 183: pre-seed Izhikevich fraction (mirror headless
+        // `--initial-izhikevich-frac` from S159).
+        let izh_frac = config.initial_izhikevich_frac.clamp(0.0, 1.0);
+        if izh_frac > 0.0 {
+            let target = (izh_frac * world.cells.len() as f32).round() as usize;
+            for cell in world.cells.iter_mut().take(target) {
+                cell.genome.neuron_model = bioscape::NeuronModel::Izhikevich;
+            }
+            info!(
+                "sim-world: pre-seeded {} of {} cells as Izhikevich (frac={:.2})",
+                target,
+                world.cells.len(),
+                izh_frac
+            );
+        }
+        match world.init_gpu_full() {
+            Ok(()) => {
+                info!(
+                    "sim-world: shared sim driver initialised ({} initial cells, seed={})",
+                    world.cells.len(),
+                    config.seed
+                );
+            }
+            Err(e) => {
+                panic!("sim-world: init_gpu_full failed ({e}); GPU mandatory");
+            }
+        }
+        commands.insert_resource(SimWorld(world));
+        commands.insert_resource(SimRng(sim_rng));
+    }
 
     // Sprint 36: Camera3d s orthographic projection — "scale" zoom feel bez
     // perspective void okolo scény. `IsDefaultUiCamera` marker říká
@@ -202,74 +280,14 @@ pub(super) fn setup(
         initial_cells.push(cell);
     }
 
-    // GPU compute init. Default = full pipeline (`GpuFullPipeline`, single-Wait
-    // readback). Init failure → CPU SIMD fallback (Resource None).
-    //
-    // Env var precedence:
-    //   `BIOSCAPE_GPU_FULL=0`  → opt-out, čistý CPU SIMD path
-    //   `BIOSCAPE_GPU_BRAIN=1` → legacy brain-only GPU (overrides GPU_FULL)
-    //   default                → GPU_FULL on
-    //
-    // Sprint 132 verdikt (CPU SIMD 5–10× faster) byl měřen na FRAGMENTED GPU
-    // path (`BIOSCAPE_GPU_BRAIN=1`) s per-system `Maintain::Wait` ~10 ms/tick.
-    // Single-Wait `download_full_batch_into` v gpu-full agreguje 9 readbacků
-    // do 1 polled barriera. Init fail je safety net pro adapters bez compute
-    // support.
-    #[cfg(feature = "gpu")]
-    let want_gpu_full =
-        !matches!(std::env::var("BIOSCAPE_GPU_FULL").as_deref(), Ok("0"));
-    #[cfg(feature = "gpu")]
-    let want_gpu_brain = std::env::var("BIOSCAPE_GPU_BRAIN").as_deref() == Ok("1");
-    #[cfg(feature = "gpu")]
-    if want_gpu_brain {
-        let cap = MAX_POPULATION + 64;
-        let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
-        let field_sources_cap = (initial_food_target + cap) * 2;
-        let world_half = extent.as_array();
-        let init = || -> Result<(GpuBrainState, GpuFieldState), String> {
-            let ctx = GpuContext::new()?;
-            let cells = CellsGpu::with_context(&ctx, cap);
-            cells.upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
-            cells.upload_xoshiro_seeds(initial_cells.iter().enumerate().map(|(slot, c)| {
-                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
-            }));
-            let brain = BrainGpu::with_context(&ctx, cap)?;
-            let hebbian = HebbianGpu::with_context(&ctx, cap)?;
-            let brownian = BrownianGpu::with_context(&ctx, cap)?;
-            let smell = FieldGpu::with_context(
-                &ctx,
-                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
-                world_half,
-                field_sources_cap,
-            )?;
-            let pheromone = FieldGpu::with_context(
-                &ctx,
-                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
-                world_half,
-                field_sources_cap,
-            )?;
-            Ok((
-                GpuBrainState { cells, brain, hebbian, brownian },
-                GpuFieldState { smell, pheromone },
-            ))
-        };
-        match init() {
-            Ok((brain_state, field_state)) => {
-                info!(
-                    "renderer-gpu: persistent brain weights + Hebbian + Field (opt-in via BIOSCAPE_GPU_BRAIN=1, cap {} cells, {} field sources)",
-                    cap, field_sources_cap
-                );
-                commands.insert_resource(brain_state);
-                commands.insert_resource(field_state);
-            }
-            Err(e) => {
-                warn!("renderer-gpu: init failed ({}); CPU compute path active", e);
-            }
-        }
-    } else if want_gpu_full {
-        // Full GPU pipeline (mirror headless `--gpu-full`): single-Wait readback,
-        // sensor + populate + brain + motor + step + brownian na GPU. Default
-        // path. Disable přes `BIOSCAPE_GPU_FULL=0` (forced CPU SIMD).
+    // Wave N: GPU full pipeline is mandatory. Legacy `BIOSCAPE_GPU_BRAIN=1`
+    // brain-only path is gone (it never matched gpu-full feature parity).
+    // `BIOSCAPE_GPU_FULL=0` opt-out is also gone — init failure now panics
+    // because there is no CPU compute fallback to fall through to.
+    {
+        // Full GPU pipeline (mirror headless --gpu-full): single-Wait
+        // readback, sensor + populate + brain + motor + step + brownian
+        // + collision + predate + food_spawn on GPU.
         let cap = MAX_POPULATION + 64;
         let initial_food_target = food_target(&extent, 1.0 + CYCLE_AMPLITUDE);
         let field_sources_cap = (initial_food_target + cap) * 2;
@@ -278,9 +296,10 @@ pub(super) fn setup(
             let ctx = GpuContext::new()?;
             let cells = CellsGpu::with_context(&ctx, cap);
             cells.upload_brains(initial_cells.iter().map(|c| &c.genome.brain));
-            cells.upload_xoshiro_seeds(initial_cells.iter().enumerate().map(|(slot, c)| {
-                c.lineage_id ^ (slot as u64).wrapping_mul(0x9E3779B97F4A7C15)
-            }));
+            // V7-unification: seed from `cell_id` (stable, unique per cell)
+            // so CPU `Cell.xoshiro_state` and GPU per-slot state expand from
+            // the same input and produce identical brownian streams.
+            cells.upload_xoshiro_seeds(initial_cells.iter().map(|c| c.cell_id));
             let turn_rates: Vec<f32> = initial_cells.iter().map(|c| c.genome.turn_rate).collect();
             cells.upload_turn_rates(&turn_rates);
             let brain = BrainGpu::with_context(&ctx, cap)?;
@@ -298,6 +317,28 @@ pub(super) fn setup(
                 world_half,
                 field_sources_cap,
             )?;
+            let pheromone_ch1 = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                world_half,
+                field_sources_cap,
+            )?;
+            let pheromone_ch2 = FieldGpu::with_context(
+                &ctx,
+                [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
+                world_half,
+                field_sources_cap,
+            )?;
+            let vibration = FieldGpu::with_context(
+                &ctx,
+                [
+                    bioscape::VIBRATION_GRID_RES,
+                    bioscape::VIBRATION_GRID_RES,
+                    bioscape::VIBRATION_GRID_RES_Z,
+                ],
+                world_half,
+                cap,
+            )?;
             let cell_hash = SpatialHashGpu::with_context(
                 &ctx,
                 cap,
@@ -314,6 +355,52 @@ pub(super) fn setup(
             let populate = PopulateInputsGpu::with_context(&ctx)?;
             let motor = MotorGpu::with_context(&ctx, cap)?;
             let step = StepGpu::with_context(&ctx, cap)?;
+            let predate = bioscape::gpu::PredateGpu::with_context(&ctx, cap)?;
+            // Wave J port: GPU food rejection sampling. K-attempts buffer sized
+            // for the worst-case dispatch (FOOD_SPAWN_RATE × MAX_SPAWN_ATTEMPTS).
+            // World map uploaded once at init; obstacle mask gets refreshed on
+            // each maze toggle in `input::toggle_maze_world`.
+            let food_spawn_cap =
+                bioscape::FOOD_SPAWN_RATE * bioscape::MAX_SPAWN_ATTEMPTS;
+            let world_map_size = (bioscape::WORLD_MAP_RES
+                * bioscape::WORLD_MAP_RES
+                * bioscape::WORLD_MAP_RES_Z) as u64;
+            let obstacle_mask_cap: u64 = 256 * 256 * 4;
+            let food_spawn = bioscape::gpu::FoodSpawnGpu::with_context(
+                &ctx,
+                food_spawn_cap,
+                world_map_size,
+                obstacle_mask_cap,
+            )?;
+            food_spawn.upload_world_map(world_map.field());
+            // GPU eat_food candidate selection. Capacity mirrors food_hash
+            // (field_sources_cap) so the on-device per-tick food array
+            // upload always fits.
+            let eat_food = bioscape::gpu::EatFoodGpu::with_context(
+                &ctx,
+                cap,
+                field_sources_cap,
+                world_map_size,
+            )?;
+            eat_food.upload_world_map(world_map.field());
+            let collision = bioscape::gpu::CollisionGpu::with_context(
+                &ctx,
+                cap,
+                bioscape::GRID_CELL_SIZE,
+                bioscape::CELL_RADIUS,
+                bioscape::COLLISION_RESTITUTION,
+                bioscape::gpu::AdhesionParams {
+                    strength: bioscape::ADHESION_STRENGTH,
+                    cross_type: bioscape::ADHESION_CROSS_TYPE,
+                    range_factor: bioscape::ADHESION_RANGE_FACTOR,
+                },
+                bioscape::gpu::BondParams {
+                    bonds_per_cell: bioscape::MAX_BONDS_PER_CELL as u32,
+                    break_factor: bioscape::BOND_BREAK_FACTOR,
+                },
+                bioscape::MAX_COLLISION_CONTACTS_PER_CELL,
+                [world_half[0], world_half[1]],
+            )?;
             let cppn = bioscape::gpu::CppnGpu::with_context(&ctx, cap);
             Ok(GpuFullPipeline {
                 cells,
@@ -322,12 +409,19 @@ pub(super) fn setup(
                 brownian,
                 smell,
                 pheromone,
+                pheromone_ch1,
+                pheromone_ch2,
+                vibration,
                 cell_hash,
                 food_hash,
                 sensor,
                 populate,
                 motor,
                 step,
+                collision,
+                predate,
+                food_spawn,
+                eat_food,
                 cppn,
                 scratch: bioscape::gpu::GpuFullScratch::default(),
             })
@@ -335,17 +429,15 @@ pub(super) fn setup(
         match init_full() {
             Ok(pipeline) => {
                 info!(
-                    "renderer-gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (default; disable s BIOSCAPE_GPU_FULL=0; cap {} cells, {} field sources)",
+                    "renderer-gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step + Collision + Predate + FoodSpawn (cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
                 commands.insert_resource(pipeline);
             }
             Err(e) => {
-                warn!("renderer-gpu-full: init failed ({}); CPU compute path active", e);
+                panic!("renderer-gpu-full: init failed ({e}); GPU is mandatory");
             }
         }
-    } else {
-        info!("renderer: CPU compute path (BIOSCAPE_GPU_FULL=0; SIMD brain + field, no GPU sync stall)");
     }
     commands.insert_resource(slot_map);
     let _ = initial_cells;
@@ -386,7 +478,13 @@ pub(super) fn setup(
             )
         }),
     });
+    commands.insert_resource(VibrationResource(SmellField::new(
+        [VIBRATION_GRID_RES, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z],
+        half,
+    )));
     commands.insert_resource(WorldMapResource(world_map));
+    commands.insert_resource(EventCalendarResource(event_calendar));
+    commands.insert_resource(config);
 }
 
 /// Cap virtual-time delta na 50 ms — limit catch-up FixedUpdate ticků (~4 při

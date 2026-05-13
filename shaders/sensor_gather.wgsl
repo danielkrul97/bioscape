@@ -1,15 +1,15 @@
 // Sprint 50: GPU mirror of World::brain_act sensor gather (headless). Per cell:
 //   - cell_hash query → nearest cell + neighbors_in_vision count
 //   - food_hash query → nearest food
-//   - sample 3D smell + pheromone gradients via finite difference
+//   - sample 3D smell + pheromone + vibration gradients via finite difference
 //
 // Consumes:
 //   SpatialHashGpu (cells)        — Sprint 45
 //   SpatialHashGpu (foods)        — separate instance
-//   FieldGpu × 2 (smell, pheromone) — Sprint 46, grids read as array<u32>
-//                                     and bitcast to f32.
+//   FieldGpu × 3 (smell, pheromone, vibration) — grids read as array<u32>
+//                                                and bitcast to f32.
 //
-// Output layout per cell (15 f32, stride 15 — Sprint 56 added z gradient slots):
+// Output layout per cell (19 f32, stride 19 — V7 added vibration grad+amp):
 //   [0..3]   nearest_food.dx,dy,dz   (0 if has_food == 0)
 //   [3]      has_food (0.0 / 1.0)
 //   [4..7]   nearest_cell.dx,dy,dz
@@ -17,6 +17,8 @@
 //   [8..11]  smell_grad.x, .y, .z
 //   [11..14] pheromone_grad.x, .y, .z
 //   [14]     neighbors_in_vision count, bitcast<f32>(u32)
+//   [15..18] vibration_grad.x, .y, .z
+//   [18]     vibration_amp (scalar sample at cell pos)
 
 const GRID_NX: i32 = 64;
 const GRID_NY: i32 = 32;
@@ -39,7 +41,12 @@ struct SensorParams {
     field_world_half_x: f32,
     field_world_half_y: f32,
     field_world_half_z: f32,
-    _pad0: u32,
+    // Wave 5 maze fields. `maze_active != 0` enables LOS raycast that
+    // filters food/cell candidates blocked by walls. Whisker raycast
+    // deferred (needs heading + pitch bindings, see binding 13 comment).
+    maze_active: u32,
+    maze_res_x: u32,
+    maze_res_y: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SensorParams;
@@ -54,6 +61,21 @@ struct SensorParams {
 @group(0) @binding(9) var<storage, read> smell_grid: array<u32>;
 @group(0) @binding(10) var<storage, read> pheromone_grid: array<u32>;
 @group(0) @binding(11) var<storage, read_write> output: array<f32>;
+@group(0) @binding(12) var<storage, read> vibration_grid: array<u32>;
+// Wave 5: maze occupancy mask (binding 13). Same format as
+// step.wgsl::maze_mask — one u32 per voxel, row-major
+// `vy * maze_res_x + vx`, value 0 = passable. Read by `raycast_blocked`
+// for LOS filtering and whisker raycast.
+@group(0) @binding(13) var<storage, read> maze_mask: array<u32>;
+// Wave 6: per-cell heading + pitch for whisker raycast direction.
+// Allocated by SensorGatherGpu, uploaded each dispatch_no_readback.
+@group(0) @binding(14) var<storage, read> headings: array<f32>;
+@group(0) @binding(15) var<storage, read> pitches: array<f32>;
+// Wave L: per-channel pheromone grids (ch1, ch2). Same resolution +
+// world_half as `pheromone_grid` (ch0). Gradients fed to brain inputs
+// 21..26 via populate_inputs.wgsl.
+@group(0) @binding(16) var<storage, read> pheromone_grid_ch1: array<u32>;
+@group(0) @binding(17) var<storage, read> pheromone_grid_ch2: array<u32>;
 
 // Toroidal minimum-image displacement (used for both x and y).
 fn min_image_xy(d: f32, half: f32) -> f32 {
@@ -61,6 +83,78 @@ fn min_image_xy(d: f32, half: f32) -> f32 {
     if (d > half) { return d - w; }
     if (d < -half) { return d + w; }
     return d;
+}
+
+// Wave 6: single-direction whisker raycast in xy. Mirrors one ray of
+// `ObstacleField::whisker_distances`. `dir` is a unit vector in world
+// frame (caller derives from heading/pitch). Returns normalized
+// free-distance in [0, 1] — 1.0 = clear within WHISKER_RANGE, 0.0 =
+// wall touching origin. ±z directions short-circuit to 1.0 since walls
+// span full z height; caller skips those rays.
+fn whisker_distance(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
+    if (abs(dir.x) < 1e-6 && abs(dir.y) < 1e-6) {
+        return 1.0;
+    }
+    let cs_x = (2.0 * params.world_half_x) / f32(params.maze_res_x);
+    let cs_y = (2.0 * params.world_half_y) / f32(params.maze_res_y);
+    let step = min(cs_x, cs_y) * 0.5;
+    let whisker_range: f32 = 90.0; // mirrors lib::WHISKER_RANGE
+    let n_steps = u32(ceil(whisker_range / step));
+    let nx = i32(params.maze_res_x);
+    let ny = i32(params.maze_res_y);
+    for (var k: u32 = 1u; k <= n_steps; k = k + 1u) {
+        let t = f32(k) * step;
+        let px = origin.x + dir.x * t;
+        let py = origin.y + dir.y * t;
+        let xi = i32(floor((px + params.world_half_x) / cs_x));
+        let yi = i32(floor((py + params.world_half_y) / cs_y));
+        if (xi < 0 || xi >= nx || yi < 0 || yi >= ny) {
+            return clamp(t / whisker_range, 0.0, 1.0);
+        }
+        let idx = u32(yi) * params.maze_res_x + u32(xi);
+        if (maze_mask[idx] != 0u) {
+            return clamp(t / whisker_range, 0.0, 1.0);
+        }
+    }
+    return 1.0;
+}
+
+// Wave 5: xy raycast against the maze obstacle mask. Mirror of
+// `ObstacleField::raycast_blocked` — uniform-step sampling at half-voxel
+// pitch. Returns true if any voxel between `origin` and `target` is
+// occupied. Caller MUST check `params.maze_active != 0u` first; this
+// helper assumes it.
+fn raycast_blocked(origin: vec3<f32>, tgt: vec3<f32>) -> bool {
+    let dx = tgt.x - origin.x;
+    let dy = tgt.y - origin.y;
+    let dist = sqrt(dx * dx + dy * dy);
+    if (dist < 1e-3) {
+        return false;
+    }
+    let nx = i32(params.maze_res_x);
+    let ny = i32(params.maze_res_y);
+    let cs_x = (2.0 * params.world_half_x) / f32(params.maze_res_x);
+    let cs_y = (2.0 * params.world_half_y) / f32(params.maze_res_y);
+    let step = min(cs_x, cs_y) * 0.5;
+    let n_steps = u32(ceil(dist / step));
+    if (n_steps <= 1u) {
+        return false;
+    }
+    for (var k: u32 = 1u; k < n_steps; k = k + 1u) {
+        let t = f32(k) * step / dist;
+        let px = origin.x + dx * t;
+        let py = origin.y + dy * t;
+        let xi = i32(floor((px + params.world_half_x) / cs_x));
+        let yi = i32(floor((py + params.world_half_y) / cs_y));
+        if (xi < 0 || xi >= nx || yi < 0 || yi >= ny) {
+            return true; // outside bounds = solid in maze mode
+        }
+        let idx = u32(yi) * params.maze_res_x + u32(xi);
+        if (maze_mask[idx] != 0u) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Bucket coordinates for a position. xy is wrapped to [-half, half) before
@@ -94,14 +188,20 @@ struct FieldConsts {
 struct FieldSample {
     smell: f32,
     pheromone: f32,
+    pheromone_ch1: f32,
+    pheromone_ch2: f32,
+    vibration: f32,
 };
 
-// Single-position sample of both grids. xy is toroidal (modulo wrap); z out
-// of range yields a zero pair (matches CPU SmellField sample-on-bounds).
-fn sample_both_at(pos: vec3<f32>, fc: FieldConsts) -> FieldSample {
+// Single-position sample of all five grids. xy is toroidal (modulo wrap); z
+// out of range yields a zero triple (matches CPU SmellField sample-on-bounds).
+// All fields share the same resolution + world_half (renderer/headless both
+// allocate them on the same FieldGpu shape), so one addressing pass serves
+// every read.
+fn sample_all_at(pos: vec3<f32>, fc: FieldConsts) -> FieldSample {
     let zi = i32(floor((pos.z + params.field_world_half_z) * fc.inv_cell_z));
     if (zi < 0 || zi >= fc.nz) {
-        return FieldSample(0.0, 0.0);
+        return FieldSample(0.0, 0.0, 0.0, 0.0, 0.0);
     }
     let xi_raw = i32(floor((pos.x + params.field_world_half_x) * fc.inv_cell_x));
     let yi_raw = i32(floor((pos.y + params.field_world_half_y) * fc.inv_cell_y));
@@ -111,6 +211,9 @@ fn sample_both_at(pos: vec3<f32>, fc: FieldConsts) -> FieldSample {
     return FieldSample(
         bitcast<f32>(smell_grid[idx]),
         bitcast<f32>(pheromone_grid[idx]),
+        bitcast<f32>(pheromone_grid_ch1[idx]),
+        bitcast<f32>(pheromone_grid_ch2[idx]),
+        bitcast<f32>(vibration_grid[idx]),
     );
 }
 
@@ -184,6 +287,13 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let dzf = pj.z - pos_i.z;
                     let d2 = dxf * dxf + dyf * dyf + dzf * dzf;
                     if (d2 <= vr2) {
+                        // Wave 5: LOS check — skip neighbors hidden by walls.
+                        // Mirror of CPU `bioscape::los_clear`. Only fires
+                        // when the maze is active to keep the no-maze path
+                        // identical.
+                        if (params.maze_active != 0u && raycast_blocked(pos_i, pj)) {
+                            continue;
+                        }
                         neighbors_count = neighbors_count + 1u;
                         if (d2 < best_cell_d2) {
                             best_cell_d2 = d2;
@@ -211,6 +321,10 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let dzf = pf.z - pos_i.z;
                         let d2 = dxf * dxf + dyf * dyf + dzf * dzf;
                         if (d2 <= vr2 && d2 < best_food_d2) {
+                            // Wave 5: LOS check — skip food blocked by walls.
+                            if (params.maze_active != 0u && raycast_blocked(pos_i, pf)) {
+                                continue;
+                            }
                             best_food_d2 = d2;
                             best_food_dx = dxf;
                             best_food_dy = dyf;
@@ -233,12 +347,16 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
         f32(params.field_res_z) / (2.0 * params.field_world_half_z),
     );
     let eps = params.field_eps;
-    let s_xp = sample_both_at(vec3<f32>(pos_i.x + eps, pos_i.y, pos_i.z), fc);
-    let s_xm = sample_both_at(vec3<f32>(pos_i.x - eps, pos_i.y, pos_i.z), fc);
-    let s_yp = sample_both_at(vec3<f32>(pos_i.x, pos_i.y + eps, pos_i.z), fc);
-    let s_ym = sample_both_at(vec3<f32>(pos_i.x, pos_i.y - eps, pos_i.z), fc);
-    let s_zp = sample_both_at(vec3<f32>(pos_i.x, pos_i.y, pos_i.z + eps), fc);
-    let s_zm = sample_both_at(vec3<f32>(pos_i.x, pos_i.y, pos_i.z - eps), fc);
+    let s_xp = sample_all_at(vec3<f32>(pos_i.x + eps, pos_i.y, pos_i.z), fc);
+    let s_xm = sample_all_at(vec3<f32>(pos_i.x - eps, pos_i.y, pos_i.z), fc);
+    let s_yp = sample_all_at(vec3<f32>(pos_i.x, pos_i.y + eps, pos_i.z), fc);
+    let s_ym = sample_all_at(vec3<f32>(pos_i.x, pos_i.y - eps, pos_i.z), fc);
+    let s_zp = sample_all_at(vec3<f32>(pos_i.x, pos_i.y, pos_i.z + eps), fc);
+    let s_zm = sample_all_at(vec3<f32>(pos_i.x, pos_i.y, pos_i.z - eps), fc);
+    // 7th sample at cell position for vibration amplitude (smell/pheromone use
+    // gradient only). Reuses the same addressing path — no extra divergence
+    // hit, just one extra grid read.
+    let s_center = sample_all_at(pos_i, fc);
     let inv_2eps = 0.5 / eps;
 
     let smell_grad = vec3<f32>(
@@ -251,8 +369,49 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
         (s_yp.pheromone - s_ym.pheromone) * inv_2eps,
         (s_zp.pheromone - s_zm.pheromone) * inv_2eps,
     );
+    let pheromone_grad_ch1 = vec3<f32>(
+        (s_xp.pheromone_ch1 - s_xm.pheromone_ch1) * inv_2eps,
+        (s_yp.pheromone_ch1 - s_ym.pheromone_ch1) * inv_2eps,
+        (s_zp.pheromone_ch1 - s_zm.pheromone_ch1) * inv_2eps,
+    );
+    let pheromone_grad_ch2 = vec3<f32>(
+        (s_xp.pheromone_ch2 - s_xm.pheromone_ch2) * inv_2eps,
+        (s_yp.pheromone_ch2 - s_ym.pheromone_ch2) * inv_2eps,
+        (s_zp.pheromone_ch2 - s_zm.pheromone_ch2) * inv_2eps,
+    );
+    let vibration_grad = vec3<f32>(
+        (s_xp.vibration - s_xm.vibration) * inv_2eps,
+        (s_yp.vibration - s_ym.vibration) * inv_2eps,
+        (s_zp.vibration - s_zm.vibration) * inv_2eps,
+    );
+    let vibration_amp = s_center.vibration;
 
-    let off = i * 15u;
+    // Wave 6: 6-direction whisker raycast in body frame. Mirror of
+    // `ObstacleField::whisker_distances` — uniform-step samples from cell
+    // position along [+forward, -forward, +right, -right, +up, -down],
+    // returns normalized free-distance in [0, 1] (1 = clear, 0 = wall at
+    // origin). Always writes (zeros when maze inactive) so the populate
+    // shader can copy unconditionally.
+    var whisker0: f32 = 1.0;
+    var whisker1: f32 = 1.0;
+    var whisker2: f32 = 1.0;
+    var whisker3: f32 = 1.0;
+    var whisker4: f32 = 1.0;
+    var whisker5: f32 = 1.0;
+    if (params.maze_active != 0u) {
+        let heading = headings[i];
+        let pitch = pitches[i];
+        let cp = cos(pitch);
+        let fwd = vec3<f32>(cos(heading) * cp, sin(heading) * cp, sin(pitch));
+        let right = vec3<f32>(-sin(heading), cos(heading), 0.0);
+        whisker0 = whisker_distance(pos_i, fwd);
+        whisker1 = whisker_distance(pos_i, vec3<f32>(-fwd.x, -fwd.y, -fwd.z));
+        whisker2 = whisker_distance(pos_i, right);
+        whisker3 = whisker_distance(pos_i, vec3<f32>(-right.x, -right.y, -right.z));
+        // ±z directions always clear (xy-only walls); skip raycast.
+    }
+
+    let off = i * 31u;
     output[off + 0u] = best_food_dx;
     output[off + 1u] = best_food_dy;
     output[off + 2u] = best_food_dz;
@@ -268,4 +427,22 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     output[off + 12u] = pheromone_grad.y;
     output[off + 13u] = pheromone_grad.z;
     output[off + 14u] = bitcast<f32>(neighbors_count);
+    output[off + 15u] = vibration_grad.x;
+    output[off + 16u] = vibration_grad.y;
+    output[off + 17u] = vibration_grad.z;
+    output[off + 18u] = vibration_amp;
+    output[off + 19u] = whisker0;
+    output[off + 20u] = whisker1;
+    output[off + 21u] = whisker2;
+    output[off + 22u] = whisker3;
+    output[off + 23u] = whisker4;
+    output[off + 24u] = whisker5;
+    // Wave L: ch1/ch2 pheromone gradients. populate_inputs maps these to
+    // brain inputs 21..26.
+    output[off + 25u] = pheromone_grad_ch1.x;
+    output[off + 26u] = pheromone_grad_ch1.y;
+    output[off + 27u] = pheromone_grad_ch1.z;
+    output[off + 28u] = pheromone_grad_ch2.x;
+    output[off + 29u] = pheromone_grad_ch2.y;
+    output[off + 30u] = pheromone_grad_ch2.z;
 }

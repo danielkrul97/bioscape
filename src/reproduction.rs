@@ -64,10 +64,12 @@ where
     matings
 }
 
-/// Sprint 40: vyrobí dítě z dvou rodičů (immutable refs — parent halving si
-/// dělá caller před voláním). Random direction pro startovní heading +
-/// crossover + mutate genomu, fresh phenotype z genomu (žádný Lamarckismus),
-/// brain stav reset (last_*=0). Energy = a.energy + b.energy (caller už halved).
+/// Sprint 40 + S187: vyrobí dítě z dvou rodičů (immutable refs — parent
+/// energy donation si dělá caller před voláním). Random direction pro
+/// startovní heading + crossover + mutate genomu, fresh phenotype z genomu
+/// (žádný Lamarckismus), brain stav reset (last_*=0).
+/// Energy = `parent_a.genome.birth_energy + parent_b.genome.birth_energy`
+/// (gene-encoded absolute donation, caller už subtractoval z parent.energy).
 /// Sprint 66: caller poskytuje `cell_id` (World-level monotonic counter).
 /// Sprint 70: vybere parent, do jehož bond clusteru se má spawn dítě. Priorita:
 /// 1. Parent s bondy + adhesion_type matchující childovu (= dítě se chytne
@@ -173,7 +175,7 @@ pub fn make_mating_child_no_brain(
         ],
         angular_velocity: 0.0,
         pitch_velocity: 0.0,
-        energy: parent_a.energy + parent_b.energy,
+        energy: parent_a.genome.birth_energy + parent_b.genome.birth_energy,
         heading: direction,
         pitch: 0.0,
         lineage_id: parent_a.lineage_id,
@@ -204,6 +206,14 @@ pub fn make_mating_child_no_brain(
             + rng.random_range(-CELL_STATE_INHERIT_NOISE..CELL_STATE_INHERIT_NOISE))
             .clamp(0.0, 1.0),
         last_best_food_d2: f32::MAX,
+        // Seed mirrors GPU `upload_xoshiro_seed_at(slot, cell.cell_id)` so
+        // the child's CPU and GPU brownian streams agree from tick 0.
+        xoshiro_state: Xoshiro128PlusPlus::from_cell_id(cell_id),
+        last_whisker_distances: [1.0; WHISKER_COUNT],
+        novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
+        novelty_head: 0,
+        under_attack_streak: 0,
+        escape_cooldown_ticks: 0,
         phenotype: child_phenotype,
         genome: child_genome,
     }
@@ -267,6 +277,7 @@ pub fn bond_velocity_delta(
     dist: f32,
     vel_i: [f32; 3],
     vel_j: [f32; 3],
+    dt: f32,
 ) -> ([f32; 3], bool) {
     let break_len = bond.rest_length * BOND_BREAK_FACTOR;
     if dist > break_len || dist <= f32::EPSILON {
@@ -291,6 +302,8 @@ pub fn bond_velocity_delta(
         + (vel_i[1] - vel_j[1]) * ny
         + (vel_i[2] - vel_j[2]) * nz;
     let damp = -bond.damping * v_rel_n;
-    let mag = spring + damp;
+    // Sprint 192: integrate Hookean force over the tick (`Δv = F · dt`).
+    // Pre-S192 returned mag directly → 60× too strong impulses.
+    let mag = (spring + damp) * dt;
     ([mag * nx, mag * ny, mag * nz], false)
 }

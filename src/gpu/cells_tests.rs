@@ -227,6 +227,7 @@ fn cells_gpu_download_brain_motor_batch_zero_returns_empty() {
 fn cells_gpu_download_full_batch_into_zero_clears_all_scratches() {
     let ctx = match try_ctx() { Some(c) => c, None => return };
     let cells = CellsGpu::with_context(&ctx, 8);
+    let mut inputs_out = vec![[0.0_f32; BRAIN_INPUTS]; 4];
     let mut hidden_out = vec![[0.0_f32; BRAIN_HIDDEN]; 4];
     let mut outputs_out = vec![[0.0_f32; BRAIN_OUTPUTS]; 4];
     let mut velocities_out = vec![[0.0_f32; 3]; 4];
@@ -238,6 +239,7 @@ fn cells_gpu_download_full_batch_into_zero_clears_all_scratches() {
     let mut energies_out = vec![1.0; 4];
     cells.download_full_batch_into(
         0,
+        &mut inputs_out,
         &mut hidden_out,
         &mut outputs_out,
         &mut velocities_out,
@@ -248,6 +250,7 @@ fn cells_gpu_download_full_batch_into_zero_clears_all_scratches() {
         &mut cooldowns_out,
         &mut energies_out,
     );
+    assert!(inputs_out.is_empty());
     assert!(hidden_out.is_empty());
     assert!(outputs_out.is_empty());
     assert!(velocities_out.is_empty());
@@ -285,6 +288,7 @@ fn cells_gpu_upload_positions_roundtrip_via_full_batch() {
     cells.upload_metadata(&energies, &headings, &pitches, &damages, &max_speeds, &eff_radii);
     cells.upload_angular_pitch(&angulars, &pitch_vels);
 
+    let mut inputs_out = Vec::new();
     let mut hidden_out = Vec::new();
     let mut outputs_out = Vec::new();
     let mut velocities_out = Vec::new();
@@ -296,6 +300,7 @@ fn cells_gpu_upload_positions_roundtrip_via_full_batch() {
     let mut energies_out = Vec::new();
     cells.download_full_batch_into(
         n,
+        &mut inputs_out,
         &mut hidden_out,
         &mut outputs_out,
         &mut velocities_out,
@@ -449,6 +454,7 @@ fn cells_gpu_upload_metadata_roundtrip_via_full_batch() {
     cells.upload_velocities(&velocities);
     cells.upload_age_cooldown(&ages, &cooldowns);
     cells.upload_angular_pitch(&angulars, &pitch_vels);
+    let mut inputs_out = Vec::new();
     let mut hidden_out = Vec::new();
     let mut outputs_out = Vec::new();
     let mut velocities_out = Vec::new();
@@ -460,6 +466,7 @@ fn cells_gpu_upload_metadata_roundtrip_via_full_batch() {
     let mut energies_out = Vec::new();
     cells.download_full_batch_into(
         n,
+        &mut inputs_out,
         &mut hidden_out,
         &mut outputs_out,
         &mut velocities_out,
@@ -561,6 +568,7 @@ fn cells_gpu_age_cooldown_roundtrip_via_full_batch() {
     );
     cells.upload_angular_pitch(&vec![0.0_f32; n], &vec![0.0_f32; n]);
 
+    let mut inputs_out = Vec::new();
     let mut hidden_out = Vec::new();
     let mut outputs_out = Vec::new();
     let mut velocities_out = Vec::new();
@@ -572,6 +580,7 @@ fn cells_gpu_age_cooldown_roundtrip_via_full_batch() {
     let mut energies_out = Vec::new();
     cells.download_full_batch_into(
         n,
+        &mut inputs_out,
         &mut hidden_out,
         &mut outputs_out,
         &mut velocities_out,
@@ -613,4 +622,78 @@ fn cells_gpu_epoch_initially_zero_and_unchanging_for_simple_uploads() {
     cells.upload_brains(brains.iter());
     cells.upload_velocities(&vec![[0.0_f32; 3]; 4]);
     assert_eq!(cells.epoch(), 0);
+}
+
+#[test]
+fn cells_gpu_reset_persistent_brain_state_at_zeros_only_target_slot() {
+    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let n = 4;
+    let cells = CellsGpu::with_context(&ctx, n);
+    // Seed last_hidden / last_outputs with non-zero data via upload_inputs
+    // round-trip (no public last_hidden upload API; we instead drive both
+    // buffers via the public upload paths so the test can inspect them).
+    // Easier path: write known patterns via the public buffer accessors +
+    // wgpu queue write_buffer.
+    let hidden_pattern: Vec<f32> = (0..n * BRAIN_HIDDEN).map(|i| (i + 1) as f32).collect();
+    let outputs_pattern: Vec<f32> = (0..n * BRAIN_OUTPUTS).map(|i| (i + 1) as f32 * 0.5).collect();
+    ctx.queue.write_buffer(
+        cells.last_hidden_buffer(),
+        0,
+        bytemuck::cast_slice(&hidden_pattern),
+    );
+    ctx.queue.write_buffer(
+        cells.last_outputs_buffer(),
+        0,
+        bytemuck::cast_slice(&outputs_pattern),
+    );
+
+    cells.reset_persistent_brain_state_at(1);
+
+    let (hidden_after, outputs_after) = cells.download_hidden_outputs(n);
+    // Slot 1 is fully zeroed.
+    assert!(hidden_after[1].iter().all(|&v| v == 0.0));
+    assert!(outputs_after[1].iter().all(|&v| v == 0.0));
+    // Adjacent slots untouched.
+    for slot in [0usize, 2, 3] {
+        for (k, &v) in hidden_after[slot].iter().enumerate() {
+            let expected = hidden_pattern[slot * BRAIN_HIDDEN + k];
+            assert_eq!(v, expected, "slot {} hidden[{}] altered", slot, k);
+        }
+        for (k, &v) in outputs_after[slot].iter().enumerate() {
+            let expected = outputs_pattern[slot * BRAIN_OUTPUTS + k];
+            assert_eq!(v, expected, "slot {} outputs[{}] altered", slot, k);
+        }
+    }
+}
+
+#[test]
+fn cells_gpu_swap_to_resets_destination_persistent_state() {
+    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let n = 4;
+    let cells = CellsGpu::with_context(&ctx, n);
+    let mut rng = StdRng::seed_from_u64(271);
+    let brains: Vec<Brain> = (0..n).map(|_| Brain::random(&mut rng)).collect();
+    cells.upload_brains(brains.iter());
+    let hidden_pattern: Vec<f32> = (0..n * BRAIN_HIDDEN).map(|i| (i + 1) as f32).collect();
+    ctx.queue.write_buffer(
+        cells.last_hidden_buffer(),
+        0,
+        bytemuck::cast_slice(&hidden_pattern),
+    );
+    // Simulate the die-and-swap pattern: cell at slot 1 dies, slot 3 moves
+    // into its place. dst=1 must end up holding slot-3's brain weights but
+    // zeroed Hebbian-state (no leftover from the dead cell at slot 1).
+    cells.swap_to(1, 3);
+    let new_at_1 = cells.download_brain_at(1);
+    assert!(brain_eq(&new_at_1, &brains[3]), "brain at slot 1 should be slot 3's");
+    let (hidden_after, _outputs_after) = cells.download_hidden_outputs(n);
+    assert!(
+        hidden_after[1].iter().all(|&v| v == 0.0),
+        "last_hidden[1] should be zeroed after swap_to (was: {:?})",
+        &hidden_after[1][..4]
+    );
+    // Slot 3 (now unused but its buffer state stays for next allocate) is
+    // not zeroed by swap_to; allocate-side reset handles that path.
+    let slot3_hidden_sum: f32 = hidden_after[3].iter().sum();
+    assert!(slot3_hidden_sum > 0.0, "swap_to should not zero src slot");
 }

@@ -14,6 +14,14 @@ pub fn dummy_brain() -> Brain {
         b1: [0.0; BRAIN_HIDDEN],
         w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
         b2: [0.0; BRAIN_OUTPUTS],
+        trace_w1: [[0.0; BRAIN_INPUTS]; BRAIN_HIDDEN],
+        trace_w2: [[0.0; BRAIN_HIDDEN]; BRAIN_OUTPUTS],
+        membrane: [IZH_V_REST; BRAIN_HIDDEN],
+        recovery: [0.0; BRAIN_HIDDEN],
+        last_pre_spike_ticks: [0; BRAIN_INPUTS],
+        last_post_spike_ticks: [0; BRAIN_HIDDEN],
+        pre_trace: [0.0; BRAIN_INPUTS],
+        post_trace: [0.0; BRAIN_HIDDEN],
     }
 }
 
@@ -38,6 +46,20 @@ pub fn dummy_genome() -> Genome {
         sensor_gains: [0.0; N_SENSOR_CATEGORIES],
         brain: dummy_brain(),
         cppn: default_cppn(),
+        learning_rate: LEARNING_RATE,
+        trace_decay_per_sec: HEBBIAN_TRACE_DECAY_PER_SEC,
+        neuron_model: NeuronModel::Perceptron,
+        stdp_a_plus: DEFAULT_STDP_A_PLUS,
+        stdp_a_minus: DEFAULT_STDP_A_MINUS,
+        stdp_tau_ticks: DEFAULT_STDP_TAU_TICKS,
+        reproduce_at_energy: REPRODUCE_THRESHOLD,
+        birth_energy: 50.0,
+        altruism_share_frac: BOND_FOOD_SHARE_FRAC,
+        cluster_share_bonus: BOND_FOOD_SHARE_CLUSTER_BONUS,
+        attack_gate: ATTACK_THRESHOLD,
+        predation_size_ratio: SIZE_RATIO_THRESHOLD,
+        defense_contribution: BOND_DEFENSE_FRAC,
+        reward_weights: REWARD_WEIGHT_DEFAULTS,
     }
 }
 
@@ -67,6 +89,19 @@ pub fn zero_cfg() -> MutationConfig {
         sigma_spike_orientation: 0.0,
         sigma_spike_complexity: 0.0,
         sigma_spike_length_secondary: 0.0,
+        sigma_learning_rate: 0.0,
+        sigma_trace_decay: 0.0,
+        model_flip_rate: 0.0,
+        sigma_stdp_a: 0.0,
+        sigma_stdp_tau: 0.0,
+        sigma_reproduce_at_energy: 0.0,
+        sigma_birth_energy: 0.0,
+        sigma_altruism_share_frac: 0.0,
+        sigma_cluster_share_bonus: 0.0,
+        sigma_attack_gate: 0.0,
+        sigma_predation_size_ratio: 0.0,
+        sigma_defense_contribution: 0.0,
+        sigma_reward_weights: [0.0; N_REWARD_KINDS],
     }
 }
 
@@ -109,6 +144,12 @@ pub fn base_cell() -> Cell {
         bonds: [None; MAX_BONDS_PER_CELL],
         cell_state: 0.5,
         last_best_food_d2: f32::MAX,
+        xoshiro_state: Xoshiro128PlusPlus::from_cell_id(0),
+        last_whisker_distances: [1.0; WHISKER_COUNT],
+        novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
+        novelty_head: 0,
+        under_attack_streak: 0,
+        escape_cooldown_ticks: 0,
         phenotype,
         genome,
     }

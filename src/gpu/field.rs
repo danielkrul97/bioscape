@@ -23,6 +23,13 @@ struct FieldParams {
     world_half_x: f32,
     world_half_y: f32,
     world_half_z: f32,
+    /// Wave 4: when non-zero, the diffuse shader treats voxels with
+    /// `mask[idx] != 0u` as Neumann zero-flux walls (mirror of CPU
+    /// `SmellField::step_masked`). Mask buffer is binding 4.
+    mask_active: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 pub struct FieldGpu {
@@ -35,6 +42,14 @@ pub struct FieldGpu {
     grid_b: wgpu::Buffer,
     params_buf: wgpu::Buffer,
     sources_buf: wgpu::Buffer,
+    /// Wave 4: per-voxel obstacle mask (binding 4). One u32 per voxel,
+    /// matching grid layout (`k * res_x * res_y + j * res_x + i`). Value 0
+    /// = passable, non-zero = wall. Sized = grid size; zeroed at
+    /// allocation so the no-maze path stays neutral.
+    mask_buf: wgpu::Buffer,
+    /// Wave 4: cached active-mask state. When `false`, the params'
+    /// `mask_active` flag is also 0 and shader skips the mask check.
+    mask_is_active: bool,
     grid_readback: wgpu::Buffer,
     bg_round_a: wgpu::BindGroup,
     bg_round_b: wgpu::BindGroup,
@@ -80,7 +95,13 @@ impl FieldGpu {
         world_half: [f32; 3],
         sources_capacity: usize,
     ) -> Result<Self, String> {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader_deposit = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("field_deposit"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/field_deposit.wgsl").into(),
+            ),
+        });
+        let shader_diffuse = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("field_diffuse"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("../../shaders/field_diffuse.wgsl").into(),
@@ -131,6 +152,16 @@ impl FieldGpu {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -140,18 +171,18 @@ impl FieldGpu {
             push_constant_ranges: &[],
         });
 
-        let make_pipe = |entry: &str, label: &str| {
+        let make_pipe = |module: &wgpu::ShaderModule, entry: &str, label: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
-                module: &shader,
+                module,
                 entry_point: Some(entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             })
         };
-        let pipeline_deposit = make_pipe("deposit", "field-deposit");
-        let pipeline_diffuse = make_pipe("diffuse", "field-diffuse");
+        let pipeline_deposit = make_pipe(&shader_deposit, "deposit", "field-deposit");
+        let pipeline_diffuse = make_pipe(&shader_diffuse, "diffuse", "field-diffuse");
 
         let grid_size_bytes =
             (resolution[0] * resolution[1] * resolution[2] * std::mem::size_of::<u32>()) as u64;
@@ -187,6 +218,16 @@ impl FieldGpu {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Wave 4: per-voxel obstacle mask buffer (binding 4). Same size as
+        // grid; zeroed initially so without an `upload_obstacle_mask` call
+        // the shader behaves identically to the pre-Wave-4 (no-mask) path.
+        let mask_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("field-mask"),
+            size: grid_size_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&mask_buf, 0, &vec![0u8; grid_size_bytes as usize]);
 
         let make_bg = |grid_in: &wgpu::Buffer, grid_out: &wgpu::Buffer, label: &str| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -208,6 +249,10 @@ impl FieldGpu {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: grid_out.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: mask_buf.as_entire_binding(),
                     },
                 ],
             })
@@ -232,6 +277,8 @@ impl FieldGpu {
             grid_b,
             params_buf,
             sources_buf,
+            mask_buf,
+            mask_is_active: false,
             grid_readback,
             bg_round_a,
             bg_round_b,
@@ -301,11 +348,33 @@ impl FieldGpu {
                         binding: 3,
                         resource: grid_out.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.mask_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
         self.bg_round_a = make_bg(&self.grid_a, &self.grid_b, "field-bg-round-a");
         self.bg_round_b = make_bg(&self.grid_b, &self.grid_a, "field-bg-round-b");
+    }
+
+    /// Wave 4: upload an obstacle mask sized to this field's grid (one bool
+    /// per voxel). Switches the diffuse shader to the masked path until
+    /// `clear_obstacle_mask` is called. The mask is zero-padded if shorter
+    /// than expected; oversize is rejected.
+    pub fn upload_obstacle_mask(&mut self, mask: &[bool]) {
+        let n = self.resolution[0] * self.resolution[1] * self.resolution[2];
+        debug_assert_eq!(mask.len(), n, "field mask len mismatch");
+        let packed: Vec<u32> = mask.iter().map(|&b| if b { 1 } else { 0 }).collect();
+        self.queue
+            .write_buffer(&self.mask_buf, 0, bytemuck::cast_slice(&packed));
+        self.mask_is_active = true;
+    }
+
+    /// Wave 4: deactivate the obstacle mask (homogeneous diffusion path).
+    pub fn clear_obstacle_mask(&mut self) {
+        self.mask_is_active = false;
     }
 
     /// 3D mirror of `SmellField::step`: 7-point Jacobi stencil with
@@ -334,6 +403,10 @@ impl FieldGpu {
             world_half_x: self.world_half[0],
             world_half_y: self.world_half[1],
             world_half_z: self.world_half[2],
+            mask_active: if self.mask_is_active { 1 } else { 0 },
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));

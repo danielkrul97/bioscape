@@ -29,7 +29,14 @@ impl GpuContext {
                 label: Some("bioscape-shared"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 12,
+                    // Wave 6 bumped 14 → 16: sensor_gather adds heading +
+                    // pitch bindings for whisker raycast (bindings 14, 15)
+                    // alongside the existing 12 + maze_mask binding 13.
+                    // Wave L bumped 16 → 20: ch1/ch2 pheromone grids
+                    // (bindings 16, 17) for multi-channel sensor gather.
+                    // 20 is the wgpu default for desktop adapters and
+                    // covers contemporary discrete GPUs comfortably.
+                    max_storage_buffers_per_shader_stage: 20,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -56,9 +63,13 @@ const W1_OFFSET: usize = 0;
 pub const B1_OFFSET: usize = BRAIN_HIDDEN * BRAIN_INPUTS;
 pub const W2_OFFSET: usize = B1_OFFSET + BRAIN_HIDDEN;
 pub const B2_OFFSET: usize = W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN;
+// Wave 2 (whiskers): BRAIN_INPUTS 78→84 (6 maze-whisker slots appended).
+// Offsets shift accordingly; the WGSL shader constants in
+// `brain_forward.wgsl`, `hebbian.wgsl`, `populate_inputs.wgsl` are kept in
+// lock-step with these values.
 const _: () = assert!(W1_OFFSET == 0);
-const _: () = assert!(B1_OFFSET == 3330);
-const _: () = assert!(W2_OFFSET == 3375);
-const _: () = assert!(B2_OFFSET == 4005);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4019);
+const _: () = assert!(B1_OFFSET == 3780);
+const _: () = assert!(W2_OFFSET == 3825);
+const _: () = assert!(B2_OFFSET == 4455);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4469);
 

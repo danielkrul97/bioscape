@@ -267,13 +267,20 @@ pub fn hazard_shock_multiplier(
         }
         let mask = match (event.center_xy, event.radius) {
             (Some(center), Some(radius)) if radius > 0.0 => {
-                let center3 = [center[0], center[1], pos[2]];
+                // V8: full 3D spherical falloff. The center sits on the world
+                // floor (`z = 0`) so the strongest hit lands at the bottom and
+                // surface cells feel only the outer skirt — matches the visual
+                // wireframe sphere drawn by `draw_hazard_pulse_gizmos`.
+                let center3 = [center[0], center[1], 0.0];
                 let d_vec = min_image_delta(center3, pos, world_half);
-                let dist_xy = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1]).sqrt();
-                if dist_xy >= radius {
+                let dist = (d_vec[0] * d_vec[0]
+                    + d_vec[1] * d_vec[1]
+                    + d_vec[2] * d_vec[2])
+                    .sqrt();
+                if dist >= radius {
                     0.0
                 } else {
-                    let t = (1.0 - dist_xy / radius).clamp(0.0, 1.0);
+                    let t = (1.0 - dist / radius).clamp(0.0, 1.0);
                     t * t * (3.0 - 2.0 * t)
                 }
             }

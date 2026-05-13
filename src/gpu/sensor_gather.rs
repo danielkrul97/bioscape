@@ -24,7 +24,12 @@ pub struct SensorParamsGpu {
     pub field_world_half_x: f32,
     pub field_world_half_y: f32,
     pub field_world_half_z: f32,
-    pub _pad0: u32,
+    /// Wave 5: maze fields (LOS raycast). `maze_active != 0` enables LOS
+    /// filtering of food/cell candidates against the obstacle mask at
+    /// binding 13.
+    pub maze_active: u32,
+    pub maze_res_x: u32,
+    pub maze_res_y: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -34,7 +39,17 @@ pub struct SensorRow {
     pub neighbors_in_vision: u32,
     pub smell_grad: [f32; 3],
     pub pheromone_grad: [f32; 3],
+    pub pheromone_grad_ch1: [f32; 3],
+    pub pheromone_grad_ch2: [f32; 3],
+    pub vibration_grad: [f32; 3],
+    pub vibration_amp: f32,
 }
+
+/// Output stride per cell in `sensor_gather.wgsl` — keep in lock-step with
+/// the shader's `let off = i * 31u;` block. V7 bumped 15 → 19 (+4 vibration);
+/// Wave 6 bumped 19 → 25 (+6 whisker raycast); Wave L bumped 25 → 31
+/// (+6 for ch1/ch2 pheromone gradients).
+pub const SENSOR_OUTPUT_STRIDE: usize = 31;
 
 pub struct SensorGatherGpu {
     device: Arc<wgpu::Device>,
@@ -48,6 +63,13 @@ pub struct SensorGatherGpu {
     eff_radii_buf: wgpu::Buffer,
     vision_radii_buf: wgpu::Buffer,
     food_positions_buf: wgpu::Buffer,
+    /// Wave 5: per-voxel maze occupancy mask (binding 13). Same packing as
+    /// `StepGpu::maze_mask_buf`. Pre-allocated at MAZE_MASK_CAPACITY u32s.
+    maze_mask_buf: wgpu::Buffer,
+    /// Wave 6: per-cell heading + pitch for whisker raycast direction
+    /// derivation (bindings 14, 15). Uploaded each `dispatch_no_readback`.
+    headings_buf: wgpu::Buffer,
+    pitches_buf: wgpu::Buffer,
     output_buf: wgpu::Buffer,
     output_rb: wgpu::Buffer,
     pos_packed: Vec<f32>,
@@ -87,7 +109,11 @@ impl SensorGatherGpu {
                 include_str!("../../shaders/sensor_gather.wgsl").into(),
             ),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..12)
+        // Wave 6: 14 → 16 bindings (bindings 14, 15 = headings, pitches
+        // read-only for whisker raycast direction).
+        // Wave L: 16 → 18 bindings (bindings 16, 17 = pheromone ch1/ch2
+        // grids read-only for multi-channel gradient sampling).
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..18)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -148,11 +174,22 @@ impl SensorGatherGpu {
         let eff_radii_buf = mk("sensor-eff", nc * f, stor_dst);
         let vision_radii_buf = mk("sensor-vision", nc * f, stor_dst);
         let food_positions_buf = mk("sensor-food-pos", nf * 3 * f, stor_dst);
-        // 15 floats per cell: nearest_food (3) + nearest_cell delta (3) +
-        // size (1) + neighbors_count (1) + smell_grad (3) + phero_grad (3) +
-        // padding to land on a vec4 boundary.
-        let output_buf = mk("sensor-output", nc * 15 * f, stor_src);
-        let output_rb = mk("sensor-output-rb", nc * 15 * f, read);
+        // Wave 5: maze mask buffer. Same MAZE_MASK_CAPACITY as StepGpu so
+        // the same packed mask payload feeds both shaders.
+        let maze_mask_buf = mk(
+            "sensor-maze-mask",
+            MAZE_MASK_CAPACITY as u64 * std::mem::size_of::<u32>() as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let headings_buf = mk("sensor-headings", nc * f, stor_dst);
+        let pitches_buf = mk("sensor-pitches", nc * f, stor_dst);
+        // V7: 19 floats per cell (was 15). Layout — nearest_food (3) +
+        // has_food (1) + nearest_cell delta (3) + radius (1) + smell_grad (3)
+        // + phero_grad (3) + neighbors_count (1, bitcast<u32>) + vibration_grad (3)
+        // + vibration_amp (1). Keep in sync with shader's `let off = i * 19u`.
+        let stride_bytes = (SENSOR_OUTPUT_STRIDE as u64) * f;
+        let output_buf = mk("sensor-output", nc * stride_bytes, stor_src);
+        let output_rb = mk("sensor-output-rb", nc * stride_bytes, read);
 
         Ok(Self {
             device,
@@ -166,6 +203,9 @@ impl SensorGatherGpu {
             eff_radii_buf,
             vision_radii_buf,
             food_positions_buf,
+            maze_mask_buf,
+            headings_buf,
+            pitches_buf,
             output_buf,
             output_rb,
             pos_packed: Vec::new(),
@@ -186,10 +226,28 @@ impl SensorGatherGpu {
         &self.vision_radii_buf
     }
 
+    /// Wave 5: upload the maze mask. Same packing as `StepGpu::upload_maze`.
+    /// `params.maze_active = 0` next dispatch makes the shader skip the LOS
+    /// check; the mask buffer contents are then irrelevant.
+    pub fn upload_maze(&self, mask: &[u32]) {
+        debug_assert!(
+            mask.len() <= MAZE_MASK_CAPACITY,
+            "sensor maze mask {} exceeds capacity {}",
+            mask.len(),
+            MAZE_MASK_CAPACITY
+        );
+        if mask.is_empty() {
+            return;
+        }
+        self.queue
+            .write_buffer(&self.maze_mask_buf, 0, bytemuck::cast_slice(mask));
+    }
+
     /// Variant of `compute()` that skips the `Vec<SensorRow>` readback —
     /// the sensor output stays in `output_buf` for the chained
     /// `PopulateInputsGpu` shader to consume. Saves a ~60 KB readback /
     /// device round-trip per tick.
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_no_readback(
         &mut self,
@@ -197,10 +255,15 @@ impl SensorGatherGpu {
         eff_radii: &[f32],
         vision_radii: &[f32],
         food_positions: &[[f32; 3]],
+        headings: &[f32],
+        pitches: &[f32],
         cell_hash: &SpatialHashGpu,
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        pheromone_ch1: &FieldGpu,
+        pheromone_ch2: &FieldGpu,
+        vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) {
         if positions.is_empty() {
@@ -215,10 +278,15 @@ impl SensorGatherGpu {
             eff_radii,
             vision_radii,
             food_positions,
+            headings,
+            pitches,
             cell_hash,
             food_hash,
             smell,
             pheromone,
+            pheromone_ch1,
+            pheromone_ch2,
+            vibration,
             params,
         );
         self.queue.submit(Some(encoder.finish()));
@@ -232,10 +300,15 @@ impl SensorGatherGpu {
         eff_radii: &[f32],
         vision_radii: &[f32],
         food_positions: &[[f32; 3]],
+        headings: &[f32],
+        pitches: &[f32],
         cell_hash: &SpatialHashGpu,
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        pheromone_ch1: &FieldGpu,
+        pheromone_ch2: &FieldGpu,
+        vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) {
         let n = positions.len();
@@ -268,6 +341,8 @@ impl SensorGatherGpu {
         self.queue.write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
         self.queue.write_buffer(&self.vision_radii_buf, 0, bytemuck::cast_slice(vision_radii));
         self.queue.write_buffer(&self.food_positions_buf, 0, bytemuck::cast_slice(&self.food_packed));
+        self.queue.write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
+        self.queue.write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sensor-bg"),
@@ -285,6 +360,12 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 9, resource: smell.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: self.headings_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: pheromone_ch1.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 17, resource: pheromone_ch2.current_grid_buffer().as_entire_binding() },
             ],
         });
 
@@ -307,10 +388,15 @@ impl SensorGatherGpu {
         eff_radii: &[f32],
         vision_radii: &[f32],
         food_positions: &[[f32; 3]],
+        headings: &[f32],
+        pitches: &[f32],
         cell_hash: &SpatialHashGpu,
         food_hash: &SpatialHashGpu,
         smell: &FieldGpu,
         pheromone: &FieldGpu,
+        pheromone_ch1: &FieldGpu,
+        pheromone_ch2: &FieldGpu,
+        vibration: &FieldGpu,
         params: SensorParamsGpu,
     ) -> Vec<SensorRow> {
         let n = positions.len();
@@ -344,6 +430,9 @@ impl SensorGatherGpu {
         self.queue.write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
         self.queue.write_buffer(&self.vision_radii_buf, 0, bytemuck::cast_slice(vision_radii));
         self.queue.write_buffer(&self.food_positions_buf, 0, bytemuck::cast_slice(&self.food_packed));
+        // Wave 6: per-cell heading + pitch for in-shader whisker raycast.
+        self.queue.write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
+        self.queue.write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sensor-bg"),
@@ -361,6 +450,12 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 9, resource: smell.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: self.headings_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: pheromone_ch1.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 17, resource: pheromone_ch2.current_grid_buffer().as_entire_binding() },
             ],
         });
 
@@ -376,7 +471,7 @@ impl SensorGatherGpu {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
         }
-        let bytes = (n as u64) * 15 * 4;
+        let bytes = (n as u64) * (SENSOR_OUTPUT_STRIDE as u64) * 4;
         encoder.copy_buffer_to_buffer(&self.output_buf, 0, &self.output_rb, 0, bytes);
         self.queue.submit(Some(encoder.finish()));
 
@@ -387,7 +482,7 @@ impl SensorGatherGpu {
         let f: &[f32] = bytemuck::cast_slice(&data);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let off = i * 15;
+            let off = i * SENSOR_OUTPUT_STRIDE;
             let has_food = f[off + 3] > 0.5;
             // `SensorRow` carries a signed min-image delta (toroidal-aware,
             // matches `BrainSensors.nearest_food/cell`). Reconstructing an
@@ -413,6 +508,10 @@ impl SensorGatherGpu {
                 neighbors_in_vision: count_bits,
                 smell_grad: [f[off + 8], f[off + 9], f[off + 10]],
                 pheromone_grad: [f[off + 11], f[off + 12], f[off + 13]],
+                pheromone_grad_ch1: [f[off + 25], f[off + 26], f[off + 27]],
+                pheromone_grad_ch2: [f[off + 28], f[off + 29], f[off + 30]],
+                vibration_grad: [f[off + 15], f[off + 16], f[off + 17]],
+                vibration_amp: f[off + 18],
             });
         }
         drop(data);

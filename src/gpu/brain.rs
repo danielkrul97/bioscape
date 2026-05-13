@@ -10,7 +10,7 @@ use super::*;
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 struct Params {
     num_cells: u32,
-    _pad0: u32,
+    lateral_inhibition_alpha: f32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -344,6 +344,7 @@ impl BrainGpu {
         brains: I,
         hiddens_out: &mut [[f32; BRAIN_HIDDEN]],
         outputs_out: &mut [[f32; BRAIN_OUTPUTS]],
+        lateral_alpha: f32,
     ) where
         I: IntoIterator<Item = &'a Brain>,
     {
@@ -387,6 +388,7 @@ impl BrainGpu {
 
         let params = Params {
             num_cells: n as u32,
+            lateral_inhibition_alpha: lateral_alpha,
             ..Params::default()
         };
         self.queue
@@ -465,14 +467,20 @@ impl BrainGpu {
     /// `last_hidden` + `last_outputs` as write-back). The point is **no
     /// weight upload** — they live on the device across ticks. `hidden_n`
     /// is uploaded each call into `BrainGpu.hidden_n_buf` (binding 5).
-    pub fn forward_persistent(&mut self, cells_gpu: &CellsGpu, n: usize, hidden_n: &[u32]) {
+    pub fn forward_persistent(
+        &mut self,
+        cells_gpu: &CellsGpu,
+        n: usize,
+        hidden_n: &[u32],
+        lateral_alpha: f32,
+    ) {
         if n == 0 {
             return;
         }
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("brain-encoder-persistent"),
         });
-        self.forward_persistent_into(&mut encoder, cells_gpu, n, hidden_n);
+        self.forward_persistent_into(&mut encoder, cells_gpu, n, hidden_n, lateral_alpha);
         self.queue.submit(Some(encoder.finish()));
     }
 
@@ -482,6 +490,7 @@ impl BrainGpu {
         cells_gpu: &CellsGpu,
         n: usize,
         hidden_n: &[u32],
+        lateral_alpha: f32,
     ) {
         if n == 0 {
             return;
@@ -489,6 +498,7 @@ impl BrainGpu {
         assert_eq!(hidden_n.len(), n, "hidden_n length must match cell count");
         let params = Params {
             num_cells: n as u32,
+            lateral_inhibition_alpha: lateral_alpha,
             ..Params::default()
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));

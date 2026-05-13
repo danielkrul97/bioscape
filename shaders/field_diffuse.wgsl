@@ -1,19 +1,15 @@
-// Sprint 46 + 56: GPU equivalent of lib::SmellField (3D). Ping-pong storage
-// (grid_a, grid_b); per-tick bind group swap selects "in" vs "out".
+// FieldGpu diffuse kernel: 7-point Jacobi stencil + multiplicative decay.
+// Split from deposit so `grid_in` / `grid_out` are plain `array<u32>` —
+// diffuse has no cross-thread contention (single writer per voxel), so the
+// pre-split `atomicLoad` / `atomicStore` calls were pure overhead.
 //
-// Two entry points:
-//   deposit — per source: atomic float add to grid_in[idx] via CAS loop
-//             (WGSL has no native atomic<f32>). xy modulo wrap (toroidal),
-//             z out-of-range → no-op.
-//   diffuse — per cell (i,j,k): 7-point Jacobi stencil + multiplicative decay.
-//             xy toroidal (cylinder), z bounded (Neumann zero-flux).
-//             Matches CPU SmellField::step (Sprint 53/54).
+// xy toroidal (cylinder), z bounded (Neumann zero-flux). Wave 4 masked path
+// treats `obstacle_mask[idx] != 0` voxels as zero-flux walls.
 //
-// Bind layout note: grids are declared atomic because deposit needs CAS.
-// Diffuse has no contention (single writer per cell) and would benefit from
-// non-atomic loads/stores, but that requires splitting into two modules with
-// distinct bind layouts. Single-file form here pays the atomic overhead in
-// diffuse as the trade-off.
+// Deposit lives in `field_deposit.wgsl` and shares the same bind group
+// layout — grid_in must stay `atomic` there for the CAS-based atomic float
+// add. Memory ordering between deposit and diffuse is enforced by the
+// dispatch boundary (separate compute pass on the host).
 
 struct Params {
     res_x: u32,
@@ -28,48 +24,22 @@ struct Params {
     world_half_x: f32,
     world_half_y: f32,
     world_half_z: f32,
+    // Wave 4: when non-zero, masked voxels become Neumann zero-flux walls.
+    mask_active: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> sources: array<vec4<f32>>;          // xyz + amount
-@group(0) @binding(2) var<storage, read_write> grid_in: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> grid_out: array<atomic<u32>>;
-
-@compute @workgroup_size(64)
-fn deposit(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.num_sources) {
-        return;
-    }
-    let s = sources[i];
-    let pos = s.xyz;
-    let amount = s.w;
-
-    let nx = i32(params.res_x);
-    let ny = i32(params.res_y);
-    let nz = i32(params.res_z);
-    let zi = i32(floor((pos.z + params.world_half_z) / params.cell_size_z));
-    if (zi < 0 || zi >= nz) {
-        return;
-    }
-    let xi_raw = i32(floor((pos.x + params.world_half_x) / params.cell_size_x));
-    let yi_raw = i32(floor((pos.y + params.world_half_y) / params.cell_size_y));
-    // Normalize for negative modulo (WGSL i32 % follows truncated division).
-    let xi = ((xi_raw % nx) + nx) % nx;
-    let yi = ((yi_raw % ny) + ny) % ny;
-    let idx = u32(zi * nx * ny + yi * nx + xi);
-
-    // Atomic float add via CAS — no native atomic<f32> in WGSL.
-    var old_bits: u32 = atomicLoad(&grid_in[idx]);
-    loop {
-        let new_bits: u32 = bitcast<u32>(bitcast<f32>(old_bits) + amount);
-        let res = atomicCompareExchangeWeak(&grid_in[idx], old_bits, new_bits);
-        if (res.exchanged) {
-            break;
-        }
-        old_bits = res.old_value;
-    }
-}
+// Sources binding is required by the shared bind group layout but unused
+// by diffuse (deposit owns it).
+@group(0) @binding(1) var<storage, read> sources_unused: array<vec4<f32>>;
+// grid_in is read-only by diffuse but the shared layout (with deposit's CAS)
+// makes it writable storage — declare `read_write` to match.
+@group(0) @binding(2) var<storage, read_write> grid_in: array<u32>;
+@group(0) @binding(3) var<storage, read_write> grid_out: array<u32>;
+@group(0) @binding(4) var<storage, read> obstacle_mask: array<u32>;
 
 @compute @workgroup_size(4, 4, 4)
 fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -84,28 +54,43 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let plane = nx * ny;
     let idx = k * plane + j * nx + i;
-    let center = bitcast<f32>(atomicLoad(&grid_in[idx]));
+    let masked = params.mask_active != 0u;
+    if (masked && obstacle_mask[idx] != 0u) {
+        grid_out[idx] = bitcast<u32>(0.0);
+        return;
+    }
+    let center = bitcast<f32>(grid_in[idx]);
 
     // Branchless toroidal wrap on xy.
     let i_left  = select(i - 1u, nx - 1u, i == 0u);
     let i_right = select(i + 1u, 0u,      i + 1u == nx);
     let j_up    = select(j - 1u, ny - 1u, j == 0u);
     let j_down  = select(j + 1u, 0u,      j + 1u == ny);
-
-    // Branchless Neumann zero-flux on z: at the boundary the ghost-cell index
-    // collapses to the boundary plane itself, so the loaded value equals
-    // `center`, matching the original `back = center` / `front = center`
-    // fallback. (E.g. k == 0 → k_back == 0 → load is grid_in[idx].)
+    // Branchless Neumann zero-flux on z.
     let k_back  = select(k - 1u, 0u,      k == 0u);
     let k_front = select(k + 1u, nz - 1u, k + 1u == nz);
 
-    let left  = bitcast<f32>(atomicLoad(&grid_in[k * plane + j * nx + i_left]));
-    let right = bitcast<f32>(atomicLoad(&grid_in[k * plane + j * nx + i_right]));
-    let up    = bitcast<f32>(atomicLoad(&grid_in[k * plane + j_up * nx + i]));
-    let down  = bitcast<f32>(atomicLoad(&grid_in[k * plane + j_down * nx + i]));
-    let back  = bitcast<f32>(atomicLoad(&grid_in[k_back * plane + j * nx + i]));
-    let front = bitcast<f32>(atomicLoad(&grid_in[k_front * plane + j * nx + i]));
+    let idx_left  = k * plane + j * nx + i_left;
+    let idx_right = k * plane + j * nx + i_right;
+    let idx_up    = k * plane + j_up * nx + i;
+    let idx_down  = k * plane + j_down * nx + i;
+    let idx_back  = k_back * plane + j * nx + i;
+    let idx_front = k_front * plane + j * nx + i;
+    var left  = bitcast<f32>(grid_in[idx_left]);
+    var right = bitcast<f32>(grid_in[idx_right]);
+    var up    = bitcast<f32>(grid_in[idx_up]);
+    var down  = bitcast<f32>(grid_in[idx_down]);
+    var back  = bitcast<f32>(grid_in[idx_back]);
+    var front = bitcast<f32>(grid_in[idx_front]);
+    if (masked) {
+        if (obstacle_mask[idx_left]  != 0u) { left  = center; }
+        if (obstacle_mask[idx_right] != 0u) { right = center; }
+        if (obstacle_mask[idx_up]    != 0u) { up    = center; }
+        if (obstacle_mask[idx_down]  != 0u) { down  = center; }
+        if (obstacle_mask[idx_back]  != 0u) { back  = center; }
+        if (obstacle_mask[idx_front] != 0u) { front = center; }
+    }
 
     let new_val = center + params.diffusion * (left + right + up + down + back + front - 6.0 * center);
-    atomicStore(&grid_out[idx], bitcast<u32>(new_val * params.decay));
+    grid_out[idx] = bitcast<u32>(new_val * params.decay);
 }

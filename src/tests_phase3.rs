@@ -745,7 +745,6 @@ fn brain_forward_outputs_in_tanh_range() {
 
 // ─── GPU paritní testy ──────────────────────────────────────────────────────
 
-#[cfg(feature = "gpu")]
 #[test]
 fn motor_gpu_zero_outputs_parity_with_cpu() {
     use crate::gpu::*;
@@ -791,7 +790,6 @@ fn motor_gpu_zero_outputs_parity_with_cpu() {
     }
 }
 
-#[cfg(feature = "gpu")]
 #[test]
 fn motor_gpu_small_batch_parity() {
     use crate::gpu::*;
@@ -837,7 +835,6 @@ fn motor_gpu_small_batch_parity() {
     }
 }
 
-#[cfg(feature = "gpu")]
 #[test]
 fn field_gpu_zero_sources_decays_only() {
     use crate::gpu::*;
@@ -861,7 +858,6 @@ fn field_gpu_zero_sources_decays_only() {
     }
 }
 
-#[cfg(feature = "gpu")]
 #[test]
 fn field_gpu_pure_decay_matches_analytic() {
     use crate::gpu::*;
@@ -883,7 +879,6 @@ fn field_gpu_pure_decay_matches_analytic() {
     assert_eq!(nonneg, grid.len(), "all values must be non-negative");
 }
 
-#[cfg(feature = "gpu")]
 #[test]
 fn hebbian_gpu_zero_reward_noop() {
     use crate::gpu::*;
@@ -923,7 +918,6 @@ fn hebbian_gpu_zero_reward_noop() {
     }
 }
 
-#[cfg(feature = "gpu")]
 #[test]
 fn brownian_gpu_zero_noise_preserves_velocity() {
     use crate::gpu::*;
@@ -943,7 +937,6 @@ fn brownian_gpu_zero_noise_preserves_velocity() {
     }
 }
 
-#[cfg(feature = "gpu")]
 #[test]
 fn sensor_gather_gpu_no_neighbors_when_alone() {
     use crate::gpu::*;
@@ -987,16 +980,21 @@ fn sensor_gather_gpu_no_neighbors_when_alone() {
         field_world_half_z: field_world_half[2],
         ..SensorParamsGpu::default()
     };
+    // Wave 6: sensor.compute now also takes per-cell heading + pitch for
+    // the in-shader whisker raycast. Tests don't care about whiskers, so
+    // upload zeros and let `params.maze_active = 0` skip the raycast block.
+    let test_headings = vec![0.0_f32; positions.len()];
+    let test_pitches = vec![0.0_f32; positions.len()];
     let rows = sensor.compute(
         &positions, &eff_radii, &vision_radii, &food_positions,
-        &cell_hash, &food_hash, &smell, &phero, params,
+        &test_headings, &test_pitches,
+        &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell, params,
     );
     assert_eq!(rows[0].neighbors_in_vision, 0, "alone cell has no neighbors");
     assert!(rows[0].nearest_cell.is_none());
     assert!(rows[0].nearest_food.is_none(), "food too far for vision");
 }
 
-#[cfg(feature = "gpu")]
 #[test]
 fn sensor_gather_gpu_food_in_vision_detected() {
     use crate::gpu::*;
@@ -1040,14 +1038,19 @@ fn sensor_gather_gpu_food_in_vision_detected() {
         field_world_half_z: field_world_half[2],
         ..SensorParamsGpu::default()
     };
+    // Wave 6: sensor.compute now also takes per-cell heading + pitch for
+    // the in-shader whisker raycast. Tests don't care about whiskers, so
+    // upload zeros and let `params.maze_active = 0` skip the raycast block.
+    let test_headings = vec![0.0_f32; positions.len()];
+    let test_pitches = vec![0.0_f32; positions.len()];
     let rows = sensor.compute(
         &positions, &eff_radii, &vision_radii, &food_positions,
-        &cell_hash, &food_hash, &smell, &phero, params,
+        &test_headings, &test_pitches,
+        &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell, params,
     );
     assert!(rows[0].nearest_food.is_some(), "food within vision radius missed");
 }
 
-#[cfg(feature = "gpu")]
 #[test]
 fn brain_forward_gpu_matches_cpu_small_batch() {
     use crate::gpu::*;
@@ -1065,9 +1068,15 @@ fn brain_forward_gpu_matches_cpu_small_batch() {
     };
     let mut h_gpu = vec![[0.0_f32; BRAIN_HIDDEN]; n];
     let mut o_gpu = vec![[0.0_f32; BRAIN_OUTPUTS]; n];
-    gpu.forward_batch(&inputs, &brains, &mut h_gpu, &mut o_gpu);
+    gpu.forward_batch(
+        &inputs,
+        &brains,
+        &mut h_gpu,
+        &mut o_gpu,
+        crate::LATERAL_INHIBITION_ALPHA,
+    );
     for i in 0..n {
-        let (_, o_cpu) = brains[i].forward_with_state(&inputs[i]);
+        let (_, o_cpu) = brains[i].forward_with_state(&inputs[i], crate::LATERAL_INHIBITION_ALPHA);
         for k in 0..BRAIN_OUTPUTS {
             let d = (o_cpu[k] - o_gpu[i][k]).abs();
             assert!(d < 1e-4, "i={i} k={k} cpu={} gpu={}", o_cpu[k], o_gpu[i][k]);

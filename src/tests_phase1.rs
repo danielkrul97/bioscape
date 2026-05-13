@@ -477,14 +477,21 @@ fn make_mating_child_inherits_lineage_from_a() {
 }
 
 #[test]
-fn make_mating_child_energy_is_sum_of_parents() {
+fn make_mating_child_energy_is_sum_of_parent_birth_energies() {
+    // Sprint 187: child energy comes from parents' gene-encoded
+    // `birth_energy` (absolute donation), not from a halve-and-give of
+    // parent.energy. Parent.energy is irrelevant to child birth amount
+    // (the caller is responsible for subtracting birth_energy from each
+    // parent before calling).
     let mut a = base_cell();
     let mut b = base_cell();
     a.energy = 60.0;
     b.energy = 80.0;
+    a.genome.birth_energy = 40.0;
+    b.genome.birth_energy = 30.0;
     let mut rng = StdRng::seed_from_u64(1);
     let child = make_mating_child(&a, &b, &mut rng, 0);
-    assert!((child.energy - 140.0).abs() < 1e-3);
+    assert!((child.energy - 70.0).abs() < 1e-3);
 }
 
 #[test]
@@ -554,7 +561,8 @@ fn bond_velocity_delta_breaks_at_zero_dist() {
         damping: BOND_DAMPING,
         age_ticks: 0,
     };
-    let (delta, broken) = bond_velocity_delta(&bond, [0.0; 3], 0.0, [0.0; 3], [0.0; 3]);
+    let (delta, broken) =
+        bond_velocity_delta(&bond, [0.0; 3], 0.0, [0.0; 3], [0.0; 3], 1.0 / 60.0);
     assert!(broken);
     assert_eq!(delta, [0.0; 3]);
 }
@@ -574,6 +582,7 @@ fn bond_velocity_delta_zero_force_at_rest_with_zero_velocities() {
         10.0,
         [0.0; 3],
         [0.0; 3],
+        1.0 / 60.0,
     );
     assert!(!broken);
     assert!(delta[0].abs() < 1e-6);
@@ -961,6 +970,9 @@ fn populate_brain_inputs_resets_damage_accum() {
         smell_grad: [0.0; 3],
         pheromone_grads: [[0.0; 3]; N_PHEROMONE_CHANNELS],
         temperature_local: THERMAL_REF_TEMP,
+        vibration_grad: [0.0; 3],
+        vibration_amp: 0.0,
+        whisker_distances: [1.0; WHISKER_COUNT],
     };
     let _ = populate_brain_inputs(&mut cell, &sensors, 50.0);
     assert_eq!(cell.damage_accum, 0.0);
@@ -976,6 +988,9 @@ fn populate_brain_inputs_writes_food_and_cell_deltas() {
         smell_grad: [0.0; 3],
         pheromone_grads: [[0.0; 3]; N_PHEROMONE_CHANNELS],
         temperature_local: THERMAL_REF_TEMP,
+        vibration_grad: [0.0; 3],
+        vibration_amp: 0.0,
+        whisker_distances: [1.0; WHISKER_COUNT],
     };
     let inputs = populate_brain_inputs(&mut cell, &sensors, 100.0);
     assert!((inputs[0] - 0.1).abs() < 1e-4);
@@ -998,6 +1013,9 @@ fn populate_brain_inputs_writes_multichannel_pheromone_gradients() {
         smell_grad: [0.0; 3],
         pheromone_grads: grads,
         temperature_local: THERMAL_REF_TEMP,
+        vibration_grad: [0.0; 3],
+        vibration_amp: 0.0,
+        whisker_distances: [1.0; WHISKER_COUNT],
     };
     let inputs = populate_brain_inputs(&mut cell, &sensors, 50.0);
     assert!(inputs[21].abs() > 0.0);

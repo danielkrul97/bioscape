@@ -25,6 +25,21 @@ pub struct BrainSensors {
     /// `populate_brain_inputs` normalizuje přes `tanh((T − REF) / 10)` →
     /// brain input [-1, 1] (Q10-aware škálování).
     pub temperature_local: f32,
+    /// Mechanosensory gradient at cell position. Source = motion-driven
+    /// `VibrationField` (separate from chemical fields). Slots [29..32] in
+    /// `populate_brain_inputs`, tanh-normalized with
+    /// `VIBRATION_NORMALIZATION_GAIN`.
+    pub vibration_grad: [f32; 3],
+    /// Local amplitude of the vibration field (= scalar sample at cell pos).
+    /// Slot [32]. Combined with `vibration_grad` the brain can locate +
+    /// gauge nearby movers.
+    pub vibration_amp: f32,
+    /// Whisker raycast distances against the maze obstacle field, in body
+    /// frame: [+forward, -forward, +right, -right, +up, -down]. Slots
+    /// [33..39] in `populate_brain_inputs`. 1.0 = clear within
+    /// `WHISKER_RANGE`, 0.0 = wall at origin. When no obstacle field is
+    /// active, the helper returns all-ones (no walls).
+    pub whisker_distances: [f32; WHISKER_COUNT],
 }
 
 /// Sprint 40: jediný source of truth pro brain inputs layout. Pre-refactor byl
@@ -43,7 +58,7 @@ pub fn populate_brain_inputs(
     // identity s pre-Sprint-32 trajektorií. Sprint 33+ vz != 0; hypot
     // ignoruje vz, ale rozdíl je sub-ULP. Sprint 41+ může přejít na 3D mag.
     let speed_norm = (cell.velocity[0].hypot(cell.velocity[1]) / max_speed).clamp(0.0, 1.0);
-    let energy_norm = (cell.energy / REPRODUCE_THRESHOLD).clamp(0.0, 1.5);
+    let energy_norm = (cell.energy / cell.genome.reproduce_at_energy).clamp(0.0, 1.5);
 
     let mut inputs = [0.0_f32; BRAIN_INPUTS];
     if let Some(delta) = sensors.nearest_food {
@@ -61,35 +76,51 @@ pub fn populate_brain_inputs(
     let _ = pos;
     inputs[4] = energy_norm;
     inputs[5] = speed_norm;
-    inputs[7] = (sensors.smell_grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
-    inputs[8] = (sensors.smell_grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
-    inputs[17] = (sensors.smell_grad[2] * SMELL_NORMALIZATION_GAIN).tanh();
+    inputs[7] = tanh_fast_scalar(sensors.smell_grad[0] * SMELL_NORMALIZATION_GAIN);
+    inputs[8] = tanh_fast_scalar(sensors.smell_grad[1] * SMELL_NORMALIZATION_GAIN);
+    inputs[17] = tanh_fast_scalar(sensors.smell_grad[2] * SMELL_NORMALIZATION_GAIN);
     let fwd = forward_vector(cell.heading, cell.pitch);
     inputs[9] = fwd[0];
     inputs[10] = fwd[1];
     inputs[18] = fwd[2];
-    inputs[11] = (sensors.pheromone_grads[0][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[12] = (sensors.pheromone_grads[0][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[19] = (sensors.pheromone_grads[0][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[13] = (sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
-    inputs[14] = (cell.damage_accum * DAMAGE_NORMALIZATION_GAIN).tanh();
+    inputs[11] = tanh_fast_scalar(sensors.pheromone_grads[0][0] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[12] = tanh_fast_scalar(sensors.pheromone_grads[0][1] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[19] = tanh_fast_scalar(sensors.pheromone_grads[0][2] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[13] = tanh_fast_scalar(sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT);
+    inputs[14] = tanh_fast_scalar(cell.damage_accum * DAMAGE_NORMALIZATION_GAIN);
     cell.damage_accum = 0.0;
     // Sprint 87: thermal awareness, slot 20. Q10-aware tanh normalizace —
     // (T - REF) / 10 dává tanh(±1.3) ≈ ±0.86 na endpoints [BOTTOM, TOP],
     // tanh(0) = 0 na ref. Diurnal/seasonal posuny mohou krátkodobě saturovat
     // k ±1, což je akceptovatelná oversaturace pro brain signal.
-    inputs[20] = ((sensors.temperature_local - THERMAL_REF_TEMP) / 10.0).tanh();
+    inputs[20] = tanh_fast_scalar((sensors.temperature_local - THERMAL_REF_TEMP) / 10.0);
     // Sprint 126: ch1, ch2 pheromone gradients. ch0 zachované na sloty 11/12/19.
-    inputs[21] = (sensors.pheromone_grads[1][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[22] = (sensors.pheromone_grads[1][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[23] = (sensors.pheromone_grads[1][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[24] = (sensors.pheromone_grads[2][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[25] = (sensors.pheromone_grads[2][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[26] = (sensors.pheromone_grads[2][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[21] = tanh_fast_scalar(sensors.pheromone_grads[1][0] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[22] = tanh_fast_scalar(sensors.pheromone_grads[1][1] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[23] = tanh_fast_scalar(sensors.pheromone_grads[1][2] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[24] = tanh_fast_scalar(sensors.pheromone_grads[2][0] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[25] = tanh_fast_scalar(sensors.pheromone_grads[2][1] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[26] = tanh_fast_scalar(sensors.pheromone_grads[2][2] * PHEROMONE_NORMALIZATION_GAIN);
     // Bond-mediated communication inbox (mean of partners' last_outputs[12..14]).
     // Computed pre-brain_act by `pool_bond_messages`. Solo cells: 0.
     for k in 0..N_BOND_MSG_CHANNELS {
         inputs[27 + k] = cell.bonded_inbox[k];
+    }
+    // Mechanosensory inputs — vibration gradient + amplitude. Slots
+    // [29..32] = grad_{x,y,z}, [32] = amp. tanh-normalized via
+    // `VIBRATION_NORMALIZATION_GAIN`; saturates on a single loud neighbor.
+    let vib_base = 27 + N_BOND_MSG_CHANNELS;
+    inputs[vib_base] = tanh_fast_scalar(sensors.vibration_grad[0] * VIBRATION_NORMALIZATION_GAIN);
+    inputs[vib_base + 1] = tanh_fast_scalar(sensors.vibration_grad[1] * VIBRATION_NORMALIZATION_GAIN);
+    inputs[vib_base + 2] = tanh_fast_scalar(sensors.vibration_grad[2] * VIBRATION_NORMALIZATION_GAIN);
+    inputs[vib_base + 3] = tanh_fast_scalar(sensors.vibration_amp * VIBRATION_NORMALIZATION_GAIN);
+    // Wave 2 whiskers — [33..39] (= vib_base + 4 .. vib_base + 4 + WHISKER_COUNT).
+    // Already in [0, 1] from the raycast helper; no extra normalization. Mapped
+    // to [-1, 1] via 2x-1 so "clear" reads as +1 (preferred direction signal)
+    // and "wall touching" as -1 (avoid).
+    let wh_base = vib_base + 4;
+    for k in 0..WHISKER_COUNT {
+        inputs[wh_base + k] = sensors.whisker_distances[k] * 2.0 - 1.0;
     }
     // Sprint 94: cluster-shared brain. Recurrent slots (21..52) čtou
     // `pooled_hidden` (mean self + bonded neighbors z předchozího ticku)
@@ -99,6 +130,19 @@ pub fn populate_brain_inputs(
     inputs[BRAIN_INPUTS_SENSORY..BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT]
         .copy_from_slice(&cell.pooled_hidden[..BRAIN_RECURRENT]);
     inputs
+}
+
+/// LOS check for the sensor gather closures. Returns true if the segment
+/// `origin → target` is unobstructed by maze walls (or if no obstacle field
+/// is active). Cells that fail the test must be excluded from
+/// `nearest_food` / `nearest_cell` / `neighbors_in_vision` candidates so the
+/// brain cannot see "through" walls.
+#[inline]
+pub fn los_clear(field: Option<&ObstacleField>, origin: [f32; 3], target: [f32; 3]) -> bool {
+    match field {
+        Some(f) => !f.raycast_blocked(origin, target),
+        None => true,
+    }
 }
 
 /// Per-tick drain coefficient for sensor specialization:
@@ -111,16 +155,18 @@ pub const SENSOR_GAIN_COST: f32 = 0.3;
 /// boosted (better detection, higher cost).
 pub const MIN_SENSOR_GAIN: f32 = 0.0;
 pub const MAX_SENSOR_GAIN: f32 = 2.0;
-/// Three sensor categories indexed into `Genome.sensor_gains`:
+/// Four sensor categories indexed into `Genome.sensor_gains`:
 /// 0 = Vision (food delta, cell delta, rel_size, density),
 /// 1 = Chemistry (smell + pheromone gradients),
-/// 2 = Defensive (damage signal, thermal_local). Proprio sensors (energy,
-/// speed, heading) are always-on and not gained — a cell still needs its
-/// own state even in a deep-specialist mode.
+/// 2 = Defensive (damage signal, thermal_local),
+/// 3 = Mechano (vibration gradient + amplitude — motion-driven field). Proprio
+/// sensors (energy, speed, heading) are always-on and not gained — a cell
+/// still needs its own state even in a deep-specialist mode.
 pub const SENSOR_CATEGORY_VISION: usize = 0;
 pub const SENSOR_CATEGORY_CHEMISTRY: usize = 1;
 pub const SENSOR_CATEGORY_DEFENSIVE: usize = 2;
-pub const N_SENSOR_CATEGORIES: usize = 3;
+pub const SENSOR_CATEGORY_MECHANO: usize = 3;
+pub const N_SENSOR_CATEGORIES: usize = 4;
 
 /// Map a brain input slot index to its sensor category, or `None` for
 /// proprio slots (not gained, not pooled). Used by `apply_sensor_gains`
@@ -136,6 +182,15 @@ pub fn sensor_slot_category(slot: usize) -> Option<usize> {
         7 | 8 | 11 | 12 | 17 | 19 => Some(SENSOR_CATEGORY_CHEMISTRY),
         // Damage (14) + thermal (20) → Defensive
         14 | 20 => Some(SENSOR_CATEGORY_DEFENSIVE),
+        // Vibration gradient + amplitude (29..32) → Mechano. Pooling over
+        // bonded partners is automatic via `pool_bonded_sensors` once these
+        // slots are categorized — that is how cells in a cluster share the
+        // mechanosensory channel.
+        29 | 30 | 31 | 32 => Some(SENSOR_CATEGORY_MECHANO),
+        // Wave 2 whiskers (33..39) → also Mechano (active touch is mechano-
+        // sensory). Pooled across bond network so a tissue can collectively
+        // map walls.
+        33 | 34 | 35 | 36 | 37 | 38 => Some(SENSOR_CATEGORY_MECHANO),
         // Energy (4), speed (5), heading (9,10,18) → proprio, no gain
         _ => None,
     }
@@ -256,4 +311,28 @@ where
         }
     }
     acc
+}
+
+/// Per-cell vibration emission rate — amplitude added to the field at
+/// `cell.position` each tick (caller multiplies by `dt`). Composed of two
+/// terms: linear speed normalized by the cell's own `max_speed`, and angular
+/// speed normalized by `turn_rate`. Both terms are clamped so a cell never
+/// emits unbounded amounts even if a numerical excursion temporarily exceeds
+/// its quoted maxima. Pure read — no side effects.
+///
+/// Single source of truth: headless `World::update_vibration`,
+/// `csv::write_stats`, and the renderer's `update_vibration_field` all call
+/// this so the emission formula stays in one place.
+#[inline]
+pub fn vibration_emit_for_cell(cell: &Cell) -> f32 {
+    let max_speed = cell.genome.max_speed.max(1e-3);
+    let turn_rate = cell.genome.turn_rate.max(1e-3);
+    let vx = cell.velocity[0];
+    let vy = cell.velocity[1];
+    let vz = cell.velocity[2];
+    let speed = (vx * vx + vy * vy + vz * vz).sqrt();
+    let speed_norm = (speed / max_speed).clamp(0.0, 1.0);
+    let rot_norm = ((cell.angular_velocity.abs() + cell.pitch_velocity.abs()) / turn_rate)
+        .clamp(0.0, 2.0);
+    VIBRATION_K_LINEAR * speed_norm + VIBRATION_K_ANGULAR * rot_norm
 }

@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Spustí cargo-flamegraph na headless `--gpu-full` pro perf profile per-tick hot
-# path. Defaultní smoke run je 5 generací (≤30 viz `feedback_perf_smoke_runs`).
+# Spustí cargo-flamegraph na headless pro perf profile per-tick hot path.
+# Defaultní smoke run je 5 generací (≤30 viz `feedback_perf_smoke_runs`).
 #
 # Build profile:  `release-debug` (thin LTO + 16 codegen units + debug symbols).
 # Stack unwinding: frame pointers (RUSTFLAGS="-C force-frame-pointers=yes")
 # místo DWARF — perf.data ~50× menší, post-processing v sekundách místo hodin.
 #
 # Lokální použití:
-#   ./scripts/profile.sh                          # 5 gen, seed 0, gpu-full
+#   ./scripts/profile.sh                          # 5 gen, seed 0
 #   ./scripts/profile.sh --gens 10                # 10 gen
-#   ./scripts/profile.sh --no-gpu-full            # CPU brain path
 #   ./scripts/profile.sh --compare HEAD~3         # before/after — 2 SVGs do data/profiling/
 #   ./scripts/profile.sh --label perf-baseline    # custom output suffix
 #
@@ -28,7 +27,6 @@ cd "$(dirname "$0")/.."
 
 GENS="${GENS:-5}"
 SEED="${SEED:-0}"
-GPU_FULL=1
 COMPARE_REF=""
 LABEL=""
 
@@ -36,7 +34,6 @@ while (( $# > 0 )); do
   case "$1" in
     --gens) GENS="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
-    --no-gpu-full) GPU_FULL=0; shift ;;
     --compare) COMPARE_REF="$2"; shift 2 ;;
     --label) LABEL="$2"; shift 2 ;;
     -h|--help)
@@ -74,15 +71,13 @@ mkdir -p "$OUT_DIR"
 # resolve Rust frames cleanly.
 run_flamegraph() {
   local out="$1"
-  local args=()
-  (( GPU_FULL == 1 )) && args+=("--gpu-full")
-  args+=("--no-progress" "$SEED" "$GENS")
-  echo ">>> profile $out  (gens=$GENS seed=$SEED gpu-full=$GPU_FULL)"
+  local args=("$SEED" "$GENS")
+  echo ">>> profile $out  (gens=$GENS seed=$SEED)"
   # Custom perf args: 99 Hz sampling + frame-pointer call-graph (kompaktní perf.data,
   # post-processing v sekundách). Nutné ve spojení s `force-frame-pointers=yes`
   # v RUSTFLAGS, jinak by stack walker neměl ramps.
   cargo flamegraph \
-    --profile release-debug --features gpu --bin headless \
+    --profile release-debug --bin headless \
     -c "record -F 99 --call-graph fp -g" \
     --output "$out" -- "${args[@]}"
   echo "<<< wrote $out"
@@ -122,12 +117,10 @@ codegen-units = 16
 debug = true
 TOML
     fi
-    args=()
-    (( GPU_FULL == 1 )) && args+=("--gpu-full")
-    args+=("--no-progress" "$SEED" "$GENS")
+    args=("$SEED" "$GENS")
     echo ">>> profile $REF_OUT_REL  (in worktree)"
     cargo flamegraph \
-      --profile release-debug --features gpu --bin headless \
+      --profile release-debug --bin headless \
       -c "record -F 99 --call-graph fp -g" \
       --output "$REF_OUT_ABS" -- "${args[@]}"
   )

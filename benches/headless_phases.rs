@@ -183,6 +183,9 @@ fn bench_populate_brain_inputs(c: &mut Criterion) {
         smell_grad: [0.1, -0.2, 0.05],
         pheromone_grads,
         temperature_local: 17.0,
+        vibration_grad: [0.0, 0.0, 0.0],
+        vibration_amp: 0.0,
+        whisker_distances: [1.0; bioscape::WHISKER_COUNT],
     };
     for n in [1000usize] {
         group.throughput(Throughput::Elements(n as u64));

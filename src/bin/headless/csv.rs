@@ -1,6 +1,6 @@
 //! CSV per-generation logging and analytics for headless harness.
 
-use super::world::{World, EDGE_FRAC_THRESHOLD};
+use bioscape::sim::{World, EDGE_FRAC_THRESHOLD};
 
 use bioscape::{
     Cell, EventCalendar, SpatialGrid, BRAIN_RECURRENT, GRID_CELL_SIZE,
@@ -32,9 +32,10 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         } else {
             0.0
         };
+        let maze_active: u8 = if world.obstacles.is_some() { 1 } else { 0 };
         return writeln!(
             w,
-            // 82 columns total. Layout:
+            // 86 columns total (82 base + 4 maze). Layout:
             //   gen, cells, 11×0(cell metrics), food, density,
             //   17×0(lineages..mean_y), 0(energy_avg), births, deaths, fertile_ticks,
             //   0(atk_emit), predation, 6×0(recurrent..noise),
@@ -42,8 +43,9 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   shock_active, shock_hazard_max, 0.000(climate), shock_food_factor,
             //   0(lineage_count), 0.000, 0.000, 3×0(spike),
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
-            //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000",
+            //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
+            //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -60,6 +62,8 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             world.coop_food_solved_gen,
             world.coop_food_failed_gen,
             coop_arrivals_avg,
+            maze_active,
+            world.goal_first_reach_tick.len() as u64,
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -157,6 +161,25 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let (gain_vis_m, gain_vis_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_VISION);
     let (gain_chem_m, gain_chem_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_CHEMISTRY);
     let (gain_def_m, gain_def_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_DEFENSIVE);
+    let (gain_mech_m, gain_mech_d) = gain_mean_dev(bioscape::SENSOR_CATEGORY_MECHANO);
+    // Vibration field stats — per-cell aggregates so the row reports what
+    // the brain actually saw this tick (sample + gradient at each cell's
+    // position), plus the population's mean emission rate.
+    let mut vib_emit_sum = 0.0_f64;
+    let mut vib_amp_sum = 0.0_f64;
+    let mut vib_grad_mag_sum = 0.0_f64;
+    for c in &world.cells {
+        let pos = c.position;
+        vib_emit_sum += bioscape::vibration_emit_for_cell(c) as f64;
+        vib_amp_sum += world.vibration.sample(pos) as f64;
+        let g = world
+            .vibration
+            .gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
+        vib_grad_mag_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
+    }
+    let vib_emit_m = if cell_count > 0 { vib_emit_sum / cell_count as f64 } else { 0.0 };
+    let vib_amp_m = if cell_count > 0 { vib_amp_sum / cell_count as f64 } else { 0.0 };
+    let vib_grad_mag_m = if cell_count > 0 { vib_grad_mag_sum / cell_count as f64 } else { 0.0 };
     // Sprint 107: speciation distance diagnostic. Sample N pairs random,
     // průměr compatibility_distance na CPPN. Indicator of population-wide
     // genetic divergence (vyšší = víc speciation).
@@ -467,9 +490,91 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     } else {
         0.0
     };
+    // Maze navigation metrics — all zero when `world.obstacles` is None,
+    // i.e. no `--maze` flag. `maze_in_goal_frac` is the per-tick fraction of
+    // the population inside the goal zone, averaged over the generation;
+    // `maze_unique_reach_frac` is distinct cells that touched the goal this
+    // gen / current pop; `maze_first_reach_total` is the cumulative count of
+    // cell_ids that have ever first-touched the goal across all generations.
+    let maze_active: u8 = if world.obstacles.is_some() { 1 } else { 0 };
+    let maze_in_goal_frac = if maze_active == 1 && n > 0 {
+        world.goal_zone_ticks_gen as f64 / (TICKS_PER_GENERATION as f64 * nf)
+    } else {
+        0.0
+    };
+    let maze_unique_reach_frac = if maze_active == 1 && n > 0 {
+        world.goal_unique_reachers_gen.len() as f64 / nf
+    } else {
+        0.0
+    };
+    let maze_first_reach_total = world.goal_first_reach_tick.len() as u64;
+    // Sprint 140: per-cell rate stats from Sprint 136/137 genome fields.
+    let (lr_avg, lr_std) = mean_std(world.cells.iter().map(|c| c.genome.learning_rate as f64));
+    let (decay_avg, decay_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.trace_decay_per_sec as f64));
+    // Sprint 187: per-cell reproduction threshold + birth donation (r/K
+    // niche tracking — two axes that should correlate negatively if pure
+    // r and K strategies emerge as distinct attractors).
+    let (repro_avg, repro_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.reproduce_at_energy as f64));
+    let (birth_avg, birth_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.birth_energy as f64));
+    // Sprint 187: per-cell altruism + cluster bonus. Polymorphism vs
+    // convergence in long runs answers the kin-selection question.
+    let (altruism_avg, altruism_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.altruism_share_frac as f64));
+    let (cluster_bonus_avg, cluster_bonus_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.cluster_share_bonus as f64));
+    // Sprint 187: per-cell aggression traits. attack_gate drift down = hawk
+    // pressure, drift up = dove. defense_contribution drift up = altruistic
+    // defense emerging (parallel to altruism_share_frac).
+    let (attack_gate_avg, attack_gate_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.attack_gate as f64));
+    let (size_ratio_avg, size_ratio_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.predation_size_ratio as f64));
+    let (defense_avg, defense_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.defense_contribution as f64));
+    // Sprint 187: per-cell reward weights (7 kinds). Means only — stds skipped
+    // for CSV compactness (variance can be inferred from per-tick events).
+    let mut rw_means = [0.0_f64; bioscape::N_REWARD_KINDS];
+    if n > 0 {
+        for c in world.cells.iter() {
+            for k in 0..bioscape::N_REWARD_KINDS {
+                rw_means[k] += c.genome.reward_weights[k] as f64;
+            }
+        }
+        for k in 0..bioscape::N_REWARD_KINDS {
+            rw_means[k] /= nf;
+        }
+    }
+    // Sprint 140: mean L2 norm across w1 rows of all cells. Synaptic
+    // scaling (S138) caps row norms at `W_NORM_CAP`; this metric tracks
+    // how close the population sits to the cap on average.
+    let w_norm_avg = w1_row_norm_avg(&world.cells);
+    // Sprint 142 SNN bridge: end-of-gen snapshot fraction of hidden
+    // activations close to tanh saturation (|h| > 0.8). Acts as a
+    // passive proxy for "spike events" without the per-tick GPU readback
+    // a true STDP path would need; informs whether the population is
+    // running in a saturated regime (high frac) or staying in the
+    // responsive zone (low frac).
+    let neural_spike_frac = saturation_frac(&world.cells);
+    // Sprint 149: fraction of population on the Izhikevich neuron model.
+    // Activates with `MutationConfig::model_flip_rate > 0` — pre-S149 runs
+    // produce 0.0 throughout. Tracking how this fraction evolves answers
+    // whether SNN cells carve a niche worth investing in.
+    let izhikevich_frac = if n > 0 {
+        let count = world
+            .cells
+            .iter()
+            .filter(|c| matches!(c.genome.neuron_model, bioscape::NeuronModel::Izhikevich))
+            .count();
+        count as f64 / nf
+    } else {
+        0.0
+    };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -571,7 +676,127 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         bonded_attack_eff,
         swarm_attack_frac,
         pack_attack_frac,
+        // Vibration / mechanosensory diagnostics. Emit is the population's
+        // mean motion-driven amplitude per tick; amp + grad_mag are sampled
+        // at each cell's position so they reflect what the brain actually
+        // read this tick.
+        vib_emit_m,
+        vib_amp_m,
+        vib_grad_mag_m,
+        gain_mech_m,
+        gain_mech_d,
+        maze_active,
+        maze_in_goal_frac,
+        maze_unique_reach_frac,
+        maze_first_reach_total,
+        // Sprint 140
+        lr_avg,
+        lr_std,
+        decay_avg,
+        decay_std,
+        w_norm_avg,
+        // Sprint 142
+        neural_spike_frac,
+        // Sprint 149
+        izhikevich_frac,
+        // Sprint 187
+        repro_avg,
+        repro_std,
+        birth_avg,
+        birth_std,
+        altruism_avg,
+        altruism_std,
+        cluster_bonus_avg,
+        cluster_bonus_std,
+        attack_gate_avg,
+        attack_gate_std,
+        size_ratio_avg,
+        size_ratio_std,
+        defense_avg,
+        defense_std,
+        rw_means[0], // EatFood
+        rw_means[1], // Novelty
+        rw_means[2], // Predation
+        rw_means[3], // EscapedAttack
+        rw_means[4], // Damage
+        rw_means[5], // BondFormed
+        rw_means[6], // MateSignalAccepted
     )
+}
+
+/// Sprint 140: shared mean/stddev reducer for the new per-cell genome
+/// rate columns. Returns `(0.0, 0.0)` for an empty iterator so the empty-
+/// population row stays well-formed.
+fn mean_std<I: IntoIterator<Item = f64>>(it: I) -> (f64, f64) {
+    let mut sum = 0.0_f64;
+    let mut sumsq = 0.0_f64;
+    let mut n = 0_u64;
+    for v in it {
+        sum += v;
+        sumsq += v * v;
+        n += 1;
+    }
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let nf = n as f64;
+    let mean = sum / nf;
+    let var = (sumsq / nf - mean * mean).max(0.0);
+    (mean, var.sqrt())
+}
+
+/// Sprint 142 SNN bridge: fraction of (cell, hidden_neuron) pairs whose
+/// final-tick `last_hidden` magnitude crossed the `0.8` saturation
+/// threshold. A passive proxy for "spike events" — high values indicate
+/// the population is running brains near tanh saturation, which is what a
+/// future Izhikevich + STDP path would explicitly model.
+fn saturation_frac(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    const THRESHOLD: f32 = 0.8;
+    let mut saturated = 0_u64;
+    let mut total = 0_u64;
+    for cell in cells {
+        let h_n = cell.genome.brain.hidden_n as usize;
+        for h in 0..h_n {
+            if cell.last_hidden[h].abs() > THRESHOLD {
+                saturated += 1;
+            }
+            total += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        saturated as f64 / total as f64
+    }
+}
+
+/// Sprint 140: mean L2 norm of `w1` rows across the population. Each
+/// cell contributes `BRAIN_HIDDEN` row norms; we average over `n_cells ×
+/// BRAIN_HIDDEN` samples. With the S138 synaptic scaling cap at
+/// `W_NORM_CAP = 8.0`, healthy populations sit at `1–4`; saturation toward
+/// the cap signals chronic Hebbian overgrowth.
+fn w1_row_norm_avg(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0_f64;
+    let mut count = 0_u64;
+    for cell in cells {
+        let h_n = cell.genome.brain.hidden_n as usize;
+        for row in cell.genome.brain.w1.iter().take(h_n) {
+            let sq: f64 = row.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+            sum += sq.sqrt();
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f64
+    }
 }
 
 /// Sprint 111: aktivní shock summary pro CSV. Vrací `(count, hazard_intensity_max)`,

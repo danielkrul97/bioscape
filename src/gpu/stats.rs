@@ -5,16 +5,23 @@ use wgpu::util::DeviceExt;
 
 use super::*;
 
-// GPU stats reduction (single-workgroup tree reduce). Currently exercised
-// only by tests — no production caller, see `cell_stats.wgsl` analysis.
+// GPU stats reduction. Two-pass design:
+//   pass 1 (`reduce_partial`): ceil(N/256) workgroups in parallel, each
+//     emits 5 partial sums into `partials_buf[wg_id * 5 + 0..5]`.
+//   pass 2 (`reduce_final`): one workgroup folds the partials → final 5
+//     sums in `output_buf[0..5]`.
+// Replaces the pre-S190 single-workgroup design that left ~95 % of the GPU
+// idle on large N.
+
+const WG_SIZE: u32 = 256;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 struct StatsParams {
     num_cells: u32,
+    num_partials: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -29,7 +36,8 @@ pub struct CellStats {
 pub struct StatsGpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    pipeline: wgpu::ComputePipeline,
+    pipeline_partial: wgpu::ComputePipeline,
+    pipeline_final: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
     params_buf: wgpu::Buffer,
@@ -37,6 +45,7 @@ pub struct StatsGpu {
     velocities_buf: wgpu::Buffer,
     energies_buf: wgpu::Buffer,
     output_buf: wgpu::Buffer,
+    partials_buf: wgpu::Buffer,
     output_readback: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pos_packed: Vec<f32>,
@@ -117,6 +126,16 @@ impl StatsGpu {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -124,11 +143,19 @@ impl StatsGpu {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("stats-pipeline"),
+        let pipeline_partial = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("stats-partial-pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: Some("reduce"),
+            entry_point: Some("reduce_partial"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let pipeline_final = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("stats-final-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("reduce_final"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
@@ -137,7 +164,7 @@ impl StatsGpu {
             contents: bytemuck::bytes_of(&StatsParams::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let (positions_buf, velocities_buf, energies_buf, output_buf, output_readback) =
+        let (positions_buf, velocities_buf, energies_buf, output_buf, partials_buf, output_readback) =
             Self::alloc_buffers(&device, capacity);
         let bind_group = Self::make_bind_group(
             &device,
@@ -147,11 +174,13 @@ impl StatsGpu {
             &velocities_buf,
             &energies_buf,
             &output_buf,
+            &partials_buf,
         );
         Ok(Self {
             device,
             queue,
-            pipeline,
+            pipeline_partial,
+            pipeline_final,
             bind_group_layout,
             capacity,
             params_buf,
@@ -159,6 +188,7 @@ impl StatsGpu {
             velocities_buf,
             energies_buf,
             output_buf,
+            partials_buf,
             output_readback,
             bind_group,
             pos_packed: Vec::new(),
@@ -169,10 +199,21 @@ impl StatsGpu {
     fn alloc_buffers(
         device: &wgpu::Device,
         capacity: usize,
-    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+    ) -> (
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+    ) {
         let pos_size = (capacity * 3 * std::mem::size_of::<f32>()) as u64;
         let energy_size = (capacity * std::mem::size_of::<f32>()) as u64;
         let output_size = (8 * std::mem::size_of::<f32>()) as u64;
+        // 5 partial sums per workgroup; ceil(capacity / WG_SIZE) workgroups
+        // worst case. Pad by +1 so we never underflow on edge sizes.
+        let max_wgs = capacity.div_ceil(WG_SIZE as usize).max(1) as u64;
+        let partials_size = max_wgs * 5 * std::mem::size_of::<f32>() as u64;
         let positions_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stats-positions"),
             size: pos_size,
@@ -197,13 +238,26 @@ impl StatsGpu {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stats-partials"),
+            size: partials_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let output_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stats-readback"),
             size: output_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        (positions_buf, velocities_buf, energies_buf, output_buf, output_readback)
+        (
+            positions_buf,
+            velocities_buf,
+            energies_buf,
+            output_buf,
+            partials_buf,
+            output_readback,
+        )
     }
 
     fn make_bind_group(
@@ -214,6 +268,7 @@ impl StatsGpu {
         velocities: &wgpu::Buffer,
         energies: &wgpu::Buffer,
         output: &wgpu::Buffer,
+        partials: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("stats-bg"),
@@ -239,6 +294,10 @@ impl StatsGpu {
                     binding: 4,
                     resource: output.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: partials.as_entire_binding(),
+                },
             ],
         })
     }
@@ -248,11 +307,12 @@ impl StatsGpu {
             return;
         }
         let new_cap = (self.capacity * 2).max(n);
-        let (p, v, e, o, or_) = Self::alloc_buffers(&self.device, new_cap);
+        let (p, v, e, o, par, or_) = Self::alloc_buffers(&self.device, new_cap);
         self.positions_buf = p;
         self.velocities_buf = v;
         self.energies_buf = e;
         self.output_buf = o;
+        self.partials_buf = par;
         self.output_readback = or_;
         self.bind_group = Self::make_bind_group(
             &self.device,
@@ -262,6 +322,7 @@ impl StatsGpu {
             &self.velocities_buf,
             &self.energies_buf,
             &self.output_buf,
+            &self.partials_buf,
         );
         self.capacity = new_cap;
     }
@@ -294,8 +355,10 @@ impl StatsGpu {
             self.vel_packed.extend_from_slice(v);
         }
 
+        let num_partials = n.div_ceil(WG_SIZE as usize) as u32;
         let params = StatsParams {
             num_cells: n as u32,
+            num_partials,
             ..StatsParams::default()
         };
         self.queue
@@ -320,10 +383,19 @@ impl StatsGpu {
             });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("stats-pass"),
+                label: Some("stats-partial-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(&self.pipeline_partial);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(num_partials, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("stats-final-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_final);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }

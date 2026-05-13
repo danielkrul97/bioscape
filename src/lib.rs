@@ -6,7 +6,6 @@
 use core::f32::consts::TAU;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "gpu")]
 pub mod gpu;
 
 pub mod params;
@@ -33,6 +32,9 @@ pub use chemistry::*;
 pub mod world_map;
 pub use world_map::*;
 
+pub mod obstacles;
+pub use obstacles::*;
+
 pub mod spatial;
 pub use spatial::*;
 
@@ -47,6 +49,11 @@ pub use physics_utils::*;
 
 pub mod sensors;
 pub use sensors::*;
+
+pub mod sim;
+
+pub mod xoshiro;
+pub use xoshiro::*;
 
 /// Sprint 121: jeden spike v multi-spike struktuře. `length` ∈ [MIN, MAX]
 /// (= dnešní spike_length), `azimuth_offset`/`elevation_offset` určují směr
@@ -132,6 +139,12 @@ pub const ADHESION_CROSS_TYPE: f32 = -0.3;
 /// Maximum spring bondů per cell. Sphere packing kissing 12, ale soft cells
 /// se realisticky drží ≤ 6 sousedů. Fixní array → no heap alloc.
 pub const MAX_BONDS_PER_CELL: usize = 6;
+/// Maximum per-cell in-contact partners the GPU collision shader records
+/// each tick. CPU side is unbounded (Vec<u64>) but the GPU buffer is fixed
+/// — overflow drops the extras (counter still tracks the true count). 32
+/// covers worst-case clusters comfortably without burning storage for
+/// near-empty rows.
+pub const MAX_COLLISION_CONTACTS_PER_CELL: u32 = 32;
 /// Tiků kontaktu (cells in collision range, mutual bond_signal active) než se
 /// vytvoří spring bond. Sprint 71 měl 30 (= 0.5 s při 60 Hz). Sprint 76:
 /// 30 → 10 (~0.17 s) — Sprint 75 smoke ukázal, že cells se speed 190 mají
@@ -139,32 +152,40 @@ pub const MAX_BONDS_PER_CELL: usize = 6;
 /// candidates. 10 ticks dovolí formaci i z krátkých but consenting contactů.
 /// Risk: nestabilní bondy formující se z náhodného mihem (mitigated tím,
 /// že bond_signal threshold zůstává 0.2).
-pub const BOND_FORM_TICKS: u32 = 5;
+pub const BOND_FORM_TICKS: u32 = 3;
 /// Tiků bez kontaktu po kterých contact_progress klesne na 0 (cleanup sparse
 /// FxHashMap). Krátký timeout — pár, který se rozejde, ztrácí "track" hned.
 pub const CONTACT_DECAY_TICKS: u32 = 5;
 /// Spring constant k (acceleration / displacement / mass). 4 dává natural
-/// freq ~ √4 / mass; pro mass=1 je perioda ~π s. Damping ji rychle utlumí.
+/// freq ~ √(k/m); pro mass=1 a k=240, perioda = 2π/√240 ≈ 0.41 s ≈ 24 ticks.
 /// Sprint 68: per-bond stiffness se ukládá do Bond struct při formaci jako
 /// průměr `genome.bond_stiffness` obou cells. BOND_STIFFNESS zůstává jen
 /// jako center pro initial draw v Genome::random.
-pub const BOND_STIFFNESS: f32 = 4.0;
+/// Sprint 192: 4 → 240 (60× scaling) aby Hookean force × dt = Δv zachovala
+/// pre-S192 effective behavior. Pre-S192 collision shader writoval `mag`
+/// jako Δv bez `dt` násobení, takže effective k byl 60× vyšší než hodnota
+/// v konstantě. Nový kód × `dt` (= 1/60) → konstanta musí ×60 aby clustery
+/// drželi se stejnou tuhostí.
+pub const BOND_STIFFNESS: f32 = 240.0;
 /// Sprint 68: per-cell `genome.bond_stiffness` rozsah. Široký rozsah aby
-/// selekce mohla zkoušet jak floppy (k≈0.5, slouží spíš jako adhesion bond)
-/// tak rigid (k≈16, snapne při menší deformaci).
-pub const MIN_BOND_STIFFNESS: f32 = 0.5;
-pub const MAX_BOND_STIFFNESS: f32 = 16.0;
+/// selekce mohla zkoušet jak floppy (k≈30, slouží spíš jako adhesion bond)
+/// tak rigid (k≈960, snapne při menší deformaci).
+/// Sprint 192: rozsah scaled 60× (z [0.5, 16] na [30, 960]).
+pub const MIN_BOND_STIFFNESS: f32 = 30.0;
+pub const MAX_BOND_STIFFNESS: f32 = 960.0;
 /// Damping podél spring axis pro relativní velocity. Bez damping by spring
 /// oscilace explodovala (Sprint 65 collision damping je 0.5; bond má jiný
-/// regime — drží spojené). 0.6 = critically damped pro typický mass.
+/// regime — drží spojené).
 /// Sprint 68: per-bond — ukládá se do Bond struct při formaci jako průměr
 /// `genome.bond_damping` obou cells. BOND_DAMPING zůstává jako initial
 /// draw center.
-pub const BOND_DAMPING: f32 = 0.6;
+/// Sprint 192: 0.6 → 36 (60× scaling) ze stejného důvodu jako stiffness.
+pub const BOND_DAMPING: f32 = 36.0;
 /// Sprint 68: per-cell `genome.bond_damping` rozsah. 0 = under-damped (springs
-/// kmitají), 2 = over-damped (rychle ztuhne). 0.6 ≈ critical pro typický mass.
+/// kmitají), MAX = over-damped (rychle ztuhne).
+/// Sprint 192: rozsah scaled 60× (z [0, 2] na [0, 120]).
 pub const MIN_BOND_DAMPING: f32 = 0.0;
-pub const MAX_BOND_DAMPING: f32 = 2.0;
+pub const MAX_BOND_DAMPING: f32 = 120.0;
 /// Bond se trhá při current_length > rest_length × factor. 3.0 = 200 % strain
 /// před break — víc tolerance kolizním impulse v dense clusterech (Sprint 132+
 /// jemný bump z 2.5 pro stabilnější struktury), naturální oscilace stále uvnitř
@@ -187,11 +208,11 @@ pub const BOND_FORM_THRESHOLD: f32 = 0.0;
 pub const BOND_BREAK_THRESHOLD: f32 = -1.0;
 /// Energy cost při formaci bondu (one-shot, paid by initiator). Ne-trivial,
 /// aby selekce váhala bonding vs free-roaming.
-pub const BOND_FORMATION_COST: f32 = 0.2;
+pub const BOND_FORMATION_COST: f32 = 0.05;
 /// Per-second cost udržování každého bondu (paid každý tick). Drobný — bond
 /// je výhoda (tissue stability), ale ne free. Tuned tak, aby cluster benefit
 /// rostl relativně k maintenance cost při low food periods.
-pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.04;
+pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.015;
 /// Sprint 78: food-share fraction per bond. Když bonded cell eats food
 /// (FOOD_VALUE energy), každý bonded partner dostane `FOOD_VALUE × FRAC`
 /// extra energy (free reward, no energy conservation — modeluje „tissue
@@ -200,19 +221,31 @@ pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.04;
 /// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál pro
 /// bonding — fitness payoff přímo přes food share.
 pub const BOND_FOOD_SHARE_FRAC: f32 = 2.5;
-/// Negative frequency-dependent selection na reprodukci. `reproduce_threshold`
-/// = REPRODUCE_THRESHOLD × (1 + α × lineage_freq), kde lineage_freq je
-/// fraction of population sharing daný lineage_id. α=0.5 → monoculture lineage
-/// (freq=1.0) potřebuje 1.5× energie na reprodukci, vzácné lineages baseline.
-/// Stabilizační síla proti diversity collapse bez hard caps.
-pub const LINEAGE_DIVERSITY_ALPHA: f32 = 0.5;
+/// Sprint 187: per-genome `altruism_share_frac` range. Wide span lets the
+/// initial population draw selfish (0..0.5) and altruist (2..3) phenotypes
+/// from gen 0 — kin selection / cheater dynamics emerge from selection
+/// rather than uniform forced cooperation.
+pub const MIN_ALTRUISM_SHARE_FRAC: f32 = 0.0;
+pub const MAX_ALTRUISM_SHARE_FRAC: f32 = 5.0;
+/// Negative frequency-dependent selection na reprodukci. Sprint 143:
+/// kvadratická penalty místo lineární — `threshold = REPRODUCE_THRESHOLD ×
+/// (1 + α × lineage_freq²)`. Quadratic exponent zaměřuje penalty na
+/// dominantní lineages (freq → 1.0 → 3.0× threshold) a nechává vzácné
+/// near-baseline (freq=0.1 → 1.02×). Pre-S143 měl α=0.5 + lineární — 150-gen
+/// validation ukázal collapse na 2 lineages od gen 30, takže penalty
+/// tightened: α 0.5 → 2.0 + lineární → kvadratická.
+pub const LINEAGE_DIVERSITY_ALPHA: f32 = 2.0;
 /// Sprint 87: cluster-size bonus pro food share fraction. Per-partner share =
 /// `FRAC × (1 + (n_bonds − 1) × BONUS) × donor_state`. Cells hluboko v tkáni
 /// (víc bondů) sdílí každému partnerovi vyšší podíl — empirie ze 300-gen
 /// runs ukázala kolaps tissue regimu (bond_active_frac → 0 do gen 200), takže
 /// linear bonus per added bond posiluje selekci pro velké clustery. n=1 →
 /// ×1.00, n=2 → ×1.15, n=6 (max) → ×1.75. Žádný cap (max je MAX_BONDS_PER_CELL=6).
-pub const BOND_FOOD_SHARE_CLUSTER_BONUS: f32 = 0.15;
+pub const BOND_FOOD_SHARE_CLUSTER_BONUS: f32 = 0.40;
+/// Sprint 187: per-genome `cluster_share_bonus` range. Per-partner share
+/// multiplier scales linearly with active bond count: `share × (1 + (n−1) × bonus)`.
+pub const MIN_CLUSTER_SHARE_BONUS: f32 = 0.0;
+pub const MAX_CLUSTER_SHARE_BONUS: f32 = 1.0;
 
 // ─── Sprint 80: bistabilní cell-state (epigenetic-like memory) ──────────────
 // Per-cell continuous scalar [0,1] s pozitivním feedbackem okolo 0.5 →
@@ -257,19 +290,54 @@ pub const CLUSTER_SPAWN_RADIUS: f32 = 8.0;
 /// bondování. 15 % per bond × cap 4 = max 60 % reduction (4-bond clusters
 /// jsou v podstatě immune krátce; predátor pořád dostane něco z 1- a 2-bond cells).
 pub const BOND_DEFENSE_FRAC: f32 = 0.15;
+/// Sprint 187: per-genome `defense_contribution` range. Donor-side trait:
+/// each cell donates defense to its bonded partners (victim's defense pool
+/// = sum of bonded partners' contributions, capped at `BOND_DEFENSE_CAP`).
+/// Parallel to `altruism_share_frac` (food donor) — defensive analog. High
+/// contribution helps cluster survive predation but offers no direct
+/// individual benefit; kin selection signal.
+pub const MIN_DEFENSE_CONTRIBUTION: f32 = 0.0;
+pub const MAX_DEFENSE_CONTRIBUTION: f32 = 0.5;
+
+/// Sprint 187: per-cell reward weights. Each lineage evolves its own
+/// dopamine-like sensitivity to different events. Order matches
+/// `RewardKind` enum: `[EatFood, Novelty, Predation, EscapedAttack, Damage,
+/// BondFormed, MateSignalAccepted]`. Defaults equal the pre-S187 globals so
+/// fresh checkpoints behave like the baseline at gen 0. `MAX = 2 × default`
+/// per slot — clamp prevents reward inflation runaway (selection can't push
+/// every weight to infinity, the saturation cap forces a trade-off across
+/// kinds).
+pub const N_REWARD_KINDS: usize = 7;
+pub const REWARD_WEIGHT_DEFAULTS: [f32; N_REWARD_KINDS] = [
+    1.0,                          // EatFood (was hardcoded 1.0 at push site)
+    NOVELTY_REWARD_MAGNITUDE,     // 0.05
+    PREDATION_REWARD_SCALE,       // 0.4
+    ESCAPE_REWARD_MAGNITUDE,      // 0.3
+    DAMAGE_REWARD_GAIN,           // 0.1
+    BOND_FORMED_REWARD_MAGNITUDE, // 0.6
+    MATING_REWARD_MAGNITUDE,      // 0.5
+];
+pub const REWARD_WEIGHT_MAX: [f32; N_REWARD_KINDS] = [
+    2.0, 0.1, 0.8, 0.6, 0.2, 1.2, 1.0,
+];
+pub const REWARD_WEIGHT_MIN: [f32; N_REWARD_KINDS] = [
+    0.0; N_REWARD_KINDS
+];
 /// Maximum bondů, které se počítají do defense multiplikátoru. Cap brání
 /// stacking abuse (cell s 6 bondy = 100% immune). 4 = sweet spot, kde
 /// střední cluster (3-4 bondy) má smysluplnou ochranu, ale solo cell jasně
 /// horší (jen 0.85× damage).
 pub const BOND_DEFENSE_CAP: u32 = 4;
 
-/// Sprint 69: multiplikátor predation gain + damage podle počtu kořistních
-/// bondů. Vrací hodnotu v [0.4, 1.0]. n_bonds=0 → 1.0 (no defense), n_bonds≥4
-/// → 1.0 - 0.15×4 = 0.4 (max defense). Linear in n_bonds.
+/// Sprint 69 + 187: multiplier on predation gain + damage for bonded victims.
+/// Returns a value in `[0.4, 1.0]`. Pre-S187 took `n_bonds` and used the
+/// uniform `BOND_DEFENSE_FRAC`. Post-S187 takes a precomputed
+/// `defense_pool` — the sum of bonded partners' `genome.defense_contribution`
+/// (already capped at `BOND_DEFENSE_CAP` partners by the caller). The floor
+/// (`0.4`) matches the pre-S187 maximum defense reduction.
 #[inline]
-pub fn bond_defense_factor(n_bonds: u32) -> f32 {
-    let capped = n_bonds.min(BOND_DEFENSE_CAP) as f32;
-    1.0 - BOND_DEFENSE_FRAC * capped
+pub fn bond_defense_factor(defense_pool: f32) -> f32 {
+    (1.0 - defense_pool).max(0.4)
 }
 
 

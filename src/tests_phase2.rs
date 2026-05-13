@@ -22,7 +22,10 @@ fn sensor_slot_category_proprio_returns_none() {
 
 #[test]
 fn sensor_slot_category_unknown_slot_returns_none() {
-    for slot in [21usize, 30, 50, 52, BRAIN_INPUTS - 1] {
+    // Bond inbox (27, 28), pheromone ch1/ch2 reserved (21..27), and recurrent
+    // slots (33..78) currently fall through to `None` — they are not gained.
+    // Slot 30 used to be in this list before V7; now it is mechano.
+    for slot in [21usize, 27, 28, 50, 52, BRAIN_INPUTS - 1] {
         assert_eq!(sensor_slot_category(slot), None);
     }
 }
@@ -268,10 +271,9 @@ fn spike_bonus_scales_with_spike_length() {
 
 #[test]
 fn brownian_zero_dt_is_noop() {
-    let mut rng = StdRng::seed_from_u64(0xE001);
     let mut c = base_cell();
     let v0 = c.velocity;
-    c.apply_brownian(&mut rng, 0.0_f32, 50.0);
+    c.apply_brownian(0.0_f32, 50.0);
     assert_eq!(c.velocity, v0);
 }
 
@@ -334,6 +336,19 @@ fn aggressive_cfg() -> MutationConfig {
         sigma_spike_orientation: 100.0,
         sigma_spike_complexity: 100.0,
         sigma_spike_length_secondary: 100.0,
+        sigma_learning_rate: 100.0,
+        sigma_trace_decay: 100.0,
+        model_flip_rate: 1.0,
+        sigma_stdp_a: 100.0,
+        sigma_stdp_tau: 100.0,
+        sigma_reproduce_at_energy: 100.0,
+        sigma_birth_energy: 100.0,
+        sigma_altruism_share_frac: 100.0,
+        sigma_cluster_share_bonus: 100.0,
+        sigma_attack_gate: 100.0,
+        sigma_predation_size_ratio: 100.0,
+        sigma_defense_contribution: 100.0,
+        sigma_reward_weights: [100.0; N_REWARD_KINDS],
     }
 }
 
@@ -554,8 +569,8 @@ fn crossover_sensor_gains_per_category() {
     let mut rng = StdRng::seed_from_u64(0xCC02);
     let mut a = dummy_genome();
     let mut b = dummy_genome();
-    a.sensor_gains = [0.0, 0.0, 0.0];
-    b.sensor_gains = [2.0, 2.0, 2.0];
+    a.sensor_gains = [0.0; N_SENSOR_CATEGORIES];
+    b.sensor_gains = [2.0; N_SENSOR_CATEGORIES];
     for _ in 0..200 {
         let c = Genome::crossover(&a, &b, &mut rng);
         for k in 0..N_SENSOR_CATEGORIES {

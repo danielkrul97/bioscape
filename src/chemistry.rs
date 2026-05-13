@@ -177,6 +177,68 @@ impl SmellField {
         std::mem::swap(&mut self.grid, &mut self.scratch);
     }
 
+    /// Maze-mode diffusion step. `mask[idx] == true` marks Neumann-boundary
+    /// (wall) voxels — they hold value 0 and any neighbor reading them in
+    /// the stencil substitutes the center cell's own value instead (zero
+    /// flux through walls). Scalar-only path; the SIMD fast path in `step`
+    /// is bypassed because mask checks vary per-voxel. Caller pays one
+    /// branch per voxel — acceptable since this only runs in maze mode.
+    pub fn step_masked(
+        &mut self,
+        diffusion: f32,
+        decay_per_sec: f32,
+        dt: f32,
+        mask: &[bool],
+    ) {
+        debug_assert_eq!(mask.len(), self.grid.len());
+        let nx = self.resolution[0];
+        let ny = self.resolution[1];
+        let nz = self.resolution[2];
+        let plane = nx * ny;
+        let decay = (1.0 - decay_per_sec * dt).max(0.0);
+        let grid = &self.grid;
+        self.scratch
+            .par_chunks_mut(plane)
+            .enumerate()
+            .for_each(|(k, scratch_plane)| {
+                let center_plane = k * plane;
+                let back_plane = if k > 0 { (k - 1) * plane } else { center_plane };
+                let front_plane = if k + 1 < nz {
+                    (k + 1) * plane
+                } else {
+                    center_plane
+                };
+                for j in 0..ny {
+                    let j_up = if j == 0 { ny - 1 } else { j - 1 };
+                    let j_down = if j + 1 == ny { 0 } else { j + 1 };
+                    for i in 0..nx {
+                        let idx = center_plane + j * nx + i;
+                        if mask[idx] {
+                            scratch_plane[j * nx + i] = 0.0;
+                            continue;
+                        }
+                        let i_left = if i == 0 { nx - 1 } else { i - 1 };
+                        let i_right = if i + 1 == nx { 0 } else { i + 1 };
+                        let center = grid[idx];
+                        let read = |neighbor_idx: usize| -> f32 {
+                            if mask[neighbor_idx] { center } else { grid[neighbor_idx] }
+                        };
+                        let left = read(center_plane + j * nx + i_left);
+                        let right = read(center_plane + j * nx + i_right);
+                        let up = read(center_plane + j_up * nx + i);
+                        let down = read(center_plane + j_down * nx + i);
+                        let back = read(back_plane + j * nx + i);
+                        let front = read(front_plane + j * nx + i);
+                        let new = center
+                            + diffusion
+                                * (left + right + up + down + back + front - 6.0 * center);
+                        scratch_plane[j * nx + i] = new * decay;
+                    }
+                }
+            });
+        std::mem::swap(&mut self.grid, &mut self.scratch);
+    }
+
     pub fn sample(&self, pos: [f32; 3]) -> f32 {
         self.idx_of(pos).map(|i| self.grid[i]).unwrap_or(0.0)
     }

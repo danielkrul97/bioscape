@@ -21,6 +21,17 @@ pub const EAT_RADIUS: f32 = 8.0;
 pub const MATING_RADIUS: f32 = 200.0;
 
 pub const DRAG_COEFFICIENT: f32 = 0.005;
+/// Sprint 188: hard cap on per-cell velocity magnitude expressed as a
+/// multiple of `genome.max_speed`. Bond spring forces are applied as
+/// per-tick impulses without a `dt` scale (see `shaders/collision.wgsl`
+/// + `world.rs::resolve_collisions` Phase 2), so an overstretched bond
+/// briefly drives `|v|` well past what drag can balance — observed at
+/// 3.6× `max_speed` in a real run. 1.5× preserves headroom for short
+/// transients (bond release, predation impulse) while keeping run-away
+/// out of the system. Applied AFTER all velocity-mutating phases so
+/// brain, motor, brownian, collision, bond, and step contributions are
+/// all bounded by the same envelope.
+pub const VELOCITY_CAP_FACTOR: f32 = 1.5;
 pub const ANGULAR_DRAG: f32 = 1.0;
 pub const ENERGY_COST_PER_V_SQ: f32 = 0.0008;
 pub const ANGULAR_ENERGY_COST: f32 = 0.05;
@@ -33,6 +44,23 @@ pub const FOOD_SPAWN_RATE: usize = 5;
 /// (40 % of pre baseline) — scarcer plants činí intra-cell predaci výnosnou
 /// strategií, jinak by herbivore + outrun zůstal dominantní attractor.
 pub const WORLD_UNITS_PER_FOOD: f32 = 6500.0;
+
+/// Sprint 193: food scarcity ramp. Multiplier applied to `food_target`
+/// alongside the seasonal cycle and FoodCrash shock. Starts at 1.0 in
+/// generation 0 and linearly drops to `SCARCITY_FLOOR` by
+/// `SCARCITY_RAMP_END_GEN`, then stays flat at the floor. Folded into
+/// `World::density_factor` at end-of-generation so checkpoint + CSV
+/// already track it.
+///
+/// Rationale: pre-S193 the 183-192 brain-stability stack guarantees the
+/// brain *can* do graded computation, but the population still survives
+/// on bonded-cluster food-share without using it. Halving plant density
+/// over the first 100 generations creates a monotonic energetic gradient
+/// that should reward smarter foraging policies without starving the
+/// population to extinction (floor = 50 % baseline = still positive
+/// energy budget for an efficient cell).
+pub const SCARCITY_RAMP_END_GEN: u64 = 100;
+pub const SCARCITY_FLOOR: f32 = 0.5;
 
 /// Sprint 38: gravitační zrychlení (sim units / sec²) působící na cells.
 /// Sprint 65: 5.0 → 0.0 (neutral buoyancy approximation). Pre-Sprint-65

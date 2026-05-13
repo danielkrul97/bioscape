@@ -67,12 +67,14 @@ fn count(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&counts[b], 1u);
 }
 
-// Two-phase workgroup-parallel exclusive scan over NUM_BUCKETS = 8192.
+// Three-phase workgroup-parallel exclusive scan over NUM_BUCKETS = 8192.
 // Phase 1: each thread serially scans its ELEMS_PER_THREAD slice, resetting
 //   counts to 0 along the way, and writes its slice total to `partial[tid]`.
-// Phase 2: thread 0 serially scans `partial[0..SCAN_WG]` (cheap at 256
-//   elements; replaces the dominant 8192-element serial loop the older
-//   single-thread kernel did, leaving the heavy lifting in Phases 1/3).
+// Phase 2: Hillis-Steele inclusive scan over `partial[0..SCAN_WG]` —
+//   log2(256) = 8 parallel steps instead of a 256-element serial loop in
+//   thread 0. Then convert inclusive → exclusive by subtracting each
+//   thread's own slice total. Saves the serial bottleneck at the cost of
+//   16 barriers + 8 register writes per thread.
 // Phase 3: each thread reads its block_offset = partial[tid] and writes
 //   block_offset + local[k] to offsets[base + k] for k in 0..ELEMS_PER_THREAD.
 // Host already dispatches (1, 1, 1) — workgroup_size(SCAN_WG) makes the
@@ -95,14 +97,24 @@ fn prefix_sum(@builtin(local_invocation_id) lid: vec3<u32>) {
     partial[tid] = sum;
     workgroupBarrier();
 
+    // Hillis-Steele inclusive scan: log2(SCAN_WG) parallel passes.
+    var stride: u32 = 1u;
+    loop {
+        if (stride >= SCAN_WG) { break; }
+        let val = select(0u, partial[tid - stride], tid >= stride);
+        workgroupBarrier();
+        partial[tid] = partial[tid] + val;
+        workgroupBarrier();
+        stride = stride * 2u;
+    }
+
+    // Snapshot total and inclusive value, then convert to exclusive in-place.
+    let total = partial[SCAN_WG - 1u];
+    let inclusive = partial[tid];
+    workgroupBarrier();
+    partial[tid] = inclusive - sum;
     if (tid == 0u) {
-        var s: u32 = 0u;
-        for (var k: u32 = 0u; k < SCAN_WG; k = k + 1u) {
-            let p = partial[k];
-            partial[k] = s;
-            s = s + p;
-        }
-        offsets[NUM_BUCKETS] = s;
+        offsets[NUM_BUCKETS] = total;
     }
     workgroupBarrier();
 

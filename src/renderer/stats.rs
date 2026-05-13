@@ -2,8 +2,8 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use rustc_hash::FxHashSet;
 
-use super::components::{CellEntity, Dying, EpochEnded, FoodEntity, GenerationEnded, StatsText};
-use super::resources::{Clock, FoodDensityFactor};
+use super::components::{EpochEnded, GenerationEnded, StatsText};
+use super::resources::{Clock, FoodDensityFactor, SimWorld};
 
 pub(super) fn log_clock_events(
     mut generation_ended: MessageReader<GenerationEnded>,
@@ -22,8 +22,7 @@ pub(super) fn update_stats_overlay(
     time: Res<Time<Virtual>>,
     density: Res<FoodDensityFactor>,
     diagnostics: Res<DiagnosticsStore>,
-    cells: Query<&CellEntity, Without<Dying>>,
-    foods: Query<(), With<FoodEntity>>,
+    sim_world: Res<SimWorld>,
     text: Single<&mut Text, With<StatsText>>,
     mut lineages_scratch: Local<FxHashSet<u64>>,
 ) {
@@ -50,21 +49,29 @@ pub(super) fn update_stats_overlay(
     let mut spk_sum = 0.0_f64;
     let mut spk_max = 0.0_f64;
     let mut e_sum = 0.0_f64;
-    // R-#15: per-frame Update system. Persistent Local set zachová capacity.
+    let mut vib_emit_sum = 0.0_f64;
+    let mut vib_amp_sum = 0.0_f64;
+    let mut vib_grad_sum = 0.0_f64;
+    let mut vib_samples = 0usize;
     lineages_scratch.clear();
     let lineages = &mut *lineages_scratch;
     let mut oldest_age: u64 = 0;
     let current_gen = clock.0.generation;
-    for c in &cells {
+    let world = &sim_world.0;
+    let vibration_field = &world.vibration;
+    // Stride-sample vibration (9 trilinear lookups per cell otherwise);
+    // overlay only displays averages, so a fraction of the population suffices.
+    const VIB_SAMPLE_STRIDE: usize = 16;
+    for (i, cell) in world.cells.iter().enumerate() {
         count += 1;
-        let s = c.0.genome.max_speed as f64;
-        let v = c.0.genome.vision_radius as f64;
-        let t = c.0.genome.turn_rate as f64;
-        let l = c.0.phenotype.body_length as f64;
-        let w = c.0.phenotype.body_width as f64;
+        let s = cell.genome.max_speed as f64;
+        let v = cell.genome.vision_radius as f64;
+        let t = cell.genome.turn_rate as f64;
+        let l = cell.phenotype.body_length as f64;
+        let w = cell.phenotype.body_width as f64;
         let aspect = if w > 1e-6 { l / w } else { 0.0 };
-        let spk = c.0.phenotype.primary_spike_length() as f64;
-        let e = c.0.energy as f64;
+        let spk = cell.phenotype.primary_spike_length() as f64;
+        let e = cell.energy as f64;
         spd_sum += s;
         spd_sumsq += s * s;
         vis_sum += v;
@@ -79,13 +86,21 @@ pub(super) fn update_stats_overlay(
             spk_max = spk;
         }
         e_sum += e;
-        lineages.insert(c.0.lineage_id);
-        let age = current_gen.saturating_sub(c.0.lineage_birth_gen);
+        vib_emit_sum += bioscape::vibration_emit_for_cell(cell) as f64;
+        if i % VIB_SAMPLE_STRIDE == 0 {
+            let pos = cell.position;
+            vib_amp_sum += vibration_field.sample(pos) as f64;
+            let g = vibration_field.gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
+            vib_grad_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
+            vib_samples += 1;
+        }
+        lineages.insert(cell.lineage_id);
+        let age = current_gen.saturating_sub(cell.lineage_birth_gen);
         if age > oldest_age {
             oldest_age = age;
         }
     }
-    let food_count = foods.iter().count();
+    let food_count = world.foods.len();
     let lineage_count = lineages.len();
 
     let (spd_avg, spd_dev, vis_avg, vis_dev, trn_avg, len_avg, wid_avg, asp_avg, asp_dev, spk_avg, e_avg) =
@@ -110,10 +125,30 @@ pub(super) fn update_stats_overlay(
                 e_sum / n,
             )
         };
+    let (vib_emit_avg, vib_amp_avg, vib_grad_avg) = if count == 0 {
+        (0.0, 0.0, 0.0)
+    } else {
+        let n = count as f64;
+        let vs = vib_samples.max(1) as f64;
+        (vib_emit_sum / n, vib_amp_sum / vs, vib_grad_sum / vs)
+    };
+
+    // Effective compute throughput. `flops_per_tick` is a static estimate
+    // from current pop (see `bioscape::sim::estimate_flops_per_tick`); the
+    // effective tick rate equals `FIXED_TIMESTEP_HZ × relative_speed` when
+    // the sim is keeping up, and 0 when paused.
+    let flops_per_tick = bioscape::sim::estimate_flops_per_tick(count as u64);
+    let effective_tps = if time.is_paused() {
+        0.0
+    } else {
+        bioscape::FIXED_TIMESTEP_HZ as f64 * time.relative_speed() as f64
+    };
+    let flops_per_sec = flops_per_tick as f64 * effective_tps;
+    let gflops = flops_per_sec / 1e9;
 
     let mut text = text.into_inner();
     text.0 = format!(
-        "tick     {}\ngen      {}\nepoch    {}\nspeed    {}\ncells    {}\nfood     {}\ndensity  {:.2}\nfps      {:.0}\nspd_avg  {:.1}\nspd_dev  {:.2}\nvis_avg  {:.1}\nvis_dev  {:.2}\ntrn_avg  {:.2}\nlen_avg  {:.2}\nwid_avg  {:.2}\nasp_avg  {:.2}\nasp_dev  {:.2}\nspk_avg  {:.2}\nspk_max  {:.2}\ne_avg    {:.1}\nlineages {}\noldest   {}",
+        "tick     {}\ngen      {}\nepoch    {}\nspeed    {}\ncells    {}\nfood     {}\ndensity  {:.2}\nfps      {:.0}\ngflops   {:.2}\nspd_avg  {:.1}\nspd_dev  {:.2}\nvis_avg  {:.1}\nvis_dev  {:.2}\ntrn_avg  {:.2}\nlen_avg  {:.2}\nwid_avg  {:.2}\nasp_avg  {:.2}\nasp_dev  {:.2}\nspk_avg  {:.2}\nspk_max  {:.2}\ne_avg    {:.1}\nlineages {}\noldest   {}\nvib_emit {:.3}\nvib_amp  {:.4}\nvib_grad {:.5}",
         clock.0.tick,
         clock.0.generation,
         clock.0.epoch,
@@ -122,6 +157,7 @@ pub(super) fn update_stats_overlay(
         food_count,
         density.0,
         fps,
+        gflops,
         spd_avg,
         spd_dev,
         vis_avg,
@@ -136,5 +172,8 @@ pub(super) fn update_stats_overlay(
         e_avg,
         lineage_count,
         oldest_age,
+        vib_emit_avg,
+        vib_amp_avg,
+        vib_grad_avg,
     );
 }

@@ -1,14 +1,14 @@
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bioscape::{
-    EventCalendar, FoodKind, SimClock, SmellField, SpatialGrid, WorldMap, INITIAL_CELLS,
+    EventCalendar, ObstacleField, SimClock, SmellField, WorldMap,
+    INITIAL_CELLS, N_PHEROMONE_CHANNELS,
 };
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::config::{
-    CAMERA_PITCH_INITIAL, CAMERA_SCALE_INITIAL, GRID_CELL_SIZE,
-};
+use super::config::{CAMERA_PITCH_INITIAL, CAMERA_SCALE_INITIAL};
 use super::material::BioMaterial;
 
 #[derive(Resource, Default)]
@@ -17,6 +17,21 @@ pub(super) struct TickCounter {
     pub(super) sim_ms_this_frame: f64,
     pub(super) tick_start: Option<Instant>,
 }
+
+/// Sprint 174: newtype wrapping shared `bioscape::sim::World`. Initialised
+/// at startup alongside renderer's existing `GpuFullPipeline`. Sprint 176
+/// adds the per-frame `sim_tick` system + `sync_simworld_to_cellentity`
+/// position copy; legacy renderer tick systems continue running in
+/// parallel until S177 removes them.
+#[derive(Resource)]
+pub(super) struct SimWorld(pub(super) bioscape::sim::World);
+
+/// Sprint 176: deterministic RNG for the renderer's `sim_tick`. Mirrors
+/// headless `StdRng::seed_from_u64(seed)` so the same seed reproduces
+/// the same trajectory across both binaries. Seeded with `WORLD_MAP_SEED`
+/// at startup — overridable via CLI in a future sprint.
+#[derive(Resource)]
+pub(super) struct SimRng(pub(super) rand::rngs::StdRng);
 
 #[derive(Resource, Debug, Clone, Copy)]
 pub(super) struct WorldExtent {
@@ -43,24 +58,6 @@ impl Default for FoodDensityFactor {
     }
 }
 
-#[derive(Resource)]
-pub(super) struct CellGrid(pub(super) SpatialGrid<Entity, f32>);
-
-impl Default for CellGrid {
-    fn default() -> Self {
-        Self(SpatialGrid::new(GRID_CELL_SIZE, bioscape::WORLD_HALF))
-    }
-}
-
-#[derive(Resource)]
-pub(super) struct FoodGrid(pub(super) SpatialGrid<Entity, FoodKind>);
-
-impl Default for FoodGrid {
-    fn default() -> Self {
-        Self(SpatialGrid::new(GRID_CELL_SIZE, bioscape::WORLD_HALF))
-    }
-}
-
 /// Persistent cell_id ↔ Entity ↔ position lookup. Build raz/tick v
 /// `rebuild_cell_entity_lookups` před brain_act fází; consume v
 /// resolve_cell_collisions, cell_eats_food, draw_bond_gizmos, pool_bonded_*.
@@ -76,6 +73,7 @@ pub(super) struct CellEntityLookups {
 }
 
 impl CellEntityLookups {
+    #[allow(dead_code)]
     pub(super) fn rebuild<'a>(
         &mut self,
         iter: impl Iterator<Item = (Entity, u64, [f32; 3])>,
@@ -127,6 +125,29 @@ pub(super) struct CellSlotMap {
     pub(super) entity_to_slot: FxHashMap<Entity, usize>,
 }
 
+/// S195 entity pool — recycles hidden cell entities + their spike children
+/// instead of despawning them on shrink. Sidesteps Bevy issue
+/// [#22065](https://github.com/bevyengine/bevy/issues/22065): every
+/// `Entity::despawn()` against an `ExtendedMaterial` user leaks an entry in
+/// `specialized_material_pipeline_cache`, and the cache grows forever — over
+/// long runs the render pass takes longer and longer to specialize.
+///
+/// On shrink we toggle `Visibility::Hidden` and stash the entity here. On
+/// grow we pop one and re-insert `CellEntity` + `MeshMaterial3d` + `Transform`
+/// + `Visibility::Visible`. Spike children stay alive across recycles —
+/// their `owner: Entity` still points to the same `Entity` id even after the
+/// underlying cell data changed, and `sync_spikes` reads fresh data from the
+/// `CellEntity` component each frame anyway.
+///
+/// Memory bound: pool size ≤ max_population (~1500 entities) so worst-case
+/// ECS footprint is ~9k entities (1500 cells × (1 + SPIKE_SLOTS=5 children))
+/// = ~few MB — bounded, not a leak.
+#[derive(Resource, Default)]
+pub(super) struct CellEntityPool {
+    pub(super) free_cells: Vec<Entity>,
+}
+
+#[allow(dead_code)]
 impl CellSlotMap {
     pub(super) fn allocate(&mut self, entity: Entity) -> usize {
         let slot = self.slot_to_entity.len();
@@ -229,6 +250,7 @@ impl OrbitCamera {
 }
 
 #[derive(Resource)]
+#[allow(dead_code)]
 pub(super) struct SmellResource(pub(super) SmellField);
 
 /// Sprint 126: multi-channel pheromone fields. Pole `[SmellField; N_PHEROMONE_CHANNELS]`
@@ -239,6 +261,12 @@ pub(super) struct PheromoneResource {
     pub(super) fields: [SmellField; bioscape::N_PHEROMONE_CHANNELS],
 }
 
+/// Motion-driven mechanosensory field. Reuses `SmellField` (3D scalar with
+/// diffusion + decay); deposit per cell happens in `update_vibration_field`.
+/// CPU-only — no GPU shader counterpart.
+#[derive(Resource)]
+pub(super) struct VibrationResource(pub(super) SmellField);
+
 /// Sprint 128: cooperative food packets. Vec uloženo přímo v Resource (žádná
 /// per-node Entity — coop food má jen pozici a stav, žádné rendering aspekty
 /// v této verzi).
@@ -247,6 +275,40 @@ pub(super) struct CoopFoodResource(pub(super) Vec<bioscape::CoopFood>);
 
 #[derive(Resource)]
 pub(super) struct WorldMapResource(pub(super) WorldMap);
+
+/// Maze world toggle. When `field` is `Some`, the renderer routes wall
+/// collision (`step_cells`), masked diffusion (smell/pheromone/vibration
+/// fields) and vision LOS (`cells_brain_act`) through the maze-aware code
+/// paths, and a set of `MazeWallEntity` boxes is rendered for the occupied
+/// voxels. Pressing `KeyL` flips this — toggling fully allocates or
+/// deallocates the obstacle field + per-grid masks. Diffusion masks are
+/// precomputed once at allocation; the mask resolutions match
+/// `SmellField` / pheromone / vibration grid sizes so per-tick lookup is a
+/// flat indexing op.
+#[derive(Resource, Default)]
+pub(super) struct MazeWorld {
+    pub(super) field: Option<ObstacleField>,
+    pub(super) smell_mask: Option<Vec<bool>>,
+    pub(super) pheromone_masks: [Option<Vec<bool>>; N_PHEROMONE_CHANNELS],
+    pub(super) vibration_mask: Option<Vec<bool>>,
+}
+
+impl MazeWorld {
+    pub(super) fn is_active(&self) -> bool {
+        self.field.is_some()
+    }
+}
+
+/// Wave 3: bundle `MazeWorld` + `CoopFoodResource` into one `SystemParam`
+/// so `cells_brain_act` can carry both without crossing Bevy's 16-param
+/// system cap. The two fields together replace the previous `coop_foods`
+/// param; net result is 15 params with maze access in scope.
+#[derive(SystemParam)]
+#[allow(dead_code)]
+pub(super) struct MazeAndCoop<'w> {
+    pub(super) maze: Res<'w, MazeWorld>,
+    pub(super) coop_foods: Res<'w, CoopFoodResource>,
+}
 
 #[derive(Resource, Clone)]
 pub(super) struct ScreencastConfig {
