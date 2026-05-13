@@ -25,6 +25,14 @@ const SPIKE_SLOTS: u32 = 5u;
 // Must match `lib.rs::COMPLEXITY_ATTACK_GAIN` — keep in sync manually.
 const COMPLEXITY_ATTACK_GAIN: f32 = 0.5;
 
+// Per-victim attacker ID slots. K = 8 is enough headroom to detect a
+// bonded pair when a victim is mobbed: pack metric needs ≥1 bonded
+// pair among the attackers, so as long as one such pair lands inside
+// the first K slots we count it as a pack. Higher K costs n * 4 B more
+// storage and proportionally longer pair scan on the CPU. K must match
+// `predate.rs::MAX_ATTACKERS_PER_VICTIM`.
+const MAX_ATTACKERS_PER_VICTIM: u32 = 8u;
+
 struct PredateParams {
     num_cells: u32,
     cell_size: f32,
@@ -82,6 +90,15 @@ fn bucket_coords_of(pos: vec3<f32>) -> vec3<i32> {
 // Single-element global counter incremented atomically per (i, j) attack hit.
 // Mirrors CPU `attack_events.len()` for `predation_events_gen` CSV column.
 @group(0) @binding(13) var<storage, read_write> event_count: array<atomic<u32>>;
+// Pack-hunting diagnostics. The shader doesn't know about bonds — it
+// writes per-attacker hit/gain totals and the first K attacker IDs per
+// victim, then the CPU does the bond-pair lookup to classify swarm vs
+// pack. Each buffer is reset to 0 per dispatch.
+@group(0) @binding(14) var<storage, read_write> attacker_event_count: array<atomic<u32>>;
+@group(0) @binding(15) var<storage, read_write> attacker_gain_sum: array<atomic<u32>>;
+@group(0) @binding(16) var<storage, read_write> victim_attacker_count: array<atomic<u32>>;
+// Layout: K slots per victim, IDs stored as `attacker_idx + 1` so 0 = empty.
+@group(0) @binding(17) var<storage, read_write> victim_attackers: array<atomic<u32>>;
 
 @compute @workgroup_size(64)
 fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -231,6 +248,14 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let d2 = dot(d, d);
                     if (d2 < pair_r2) {
                         atomicAdd(&event_count[0], 1u);
+                        atomicAdd(&attacker_event_count[i], 1u);
+                        let slot = atomicAdd(&victim_attacker_count[j], 1u);
+                        if (slot < MAX_ATTACKERS_PER_VICTIM) {
+                            atomicStore(
+                                &victim_attackers[j * MAX_ATTACKERS_PER_VICTIM + slot],
+                                i + 1u,
+                            );
+                        }
                         var gain = params.predation_gain;
                         if (spike_active > 0u && d2 > 0.0) {
                             let inv_d = inverseSqrt(d2);
@@ -293,5 +318,9 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             old_s = r.old_value;
         }
+        // `attacker_gain_sum[i]` is written only by attacker `i` (no other
+        // workgroup races for the same index), so a single atomicStore is
+        // enough — no CAS needed.
+        atomicStore(&attacker_gain_sum[i], bitcast<u32>(self_gain));
     }
 }

@@ -2574,11 +2574,12 @@ impl World {
     }
 
     /// Predation dispatch — computes herd_counts + per-pair energy/damage
-    /// deltas in a single GPU pass and applies them to cells. Pack-hunting
-    /// CSV diagnostics (`bonded_attacks_gen` etc.) stay zero because the
-    /// shader doesn't emit per-event tuples; only the global
-    /// `predation_events_gen` counter is tracked via predate.wgsl's atomic
-    /// `event_count` binding.
+    /// deltas in a single GPU pass and applies them to cells. Sprint 186
+    /// extends the shader with per-attacker and per-victim diagnostics
+    /// (`attacker_event_count`, `attacker_gain_sum`, `victim_attacker_count`,
+    /// first-K `victim_attackers`) so `bonded_attacks_gen`,
+    /// `solo_attacks_gen`, `swarm_attacks_gen`, `pack_attacks_gen` and
+    /// `attack_victims_gen` track real activity instead of staying at zero.
     fn predate(&mut self) {
         let n = self.cells.len();
         if n == 0 {
@@ -2646,6 +2647,71 @@ impl World {
             &gpu.cell_hash,
             params,
         );
+        // Sprint 186: pack-hunting diagnostics. `attacker_event_count[i]`
+        // and `attacker_gain_sum[i]` come from the GPU; bonded vs solo
+        // partition uses `cell.n_bonds() >= 1`. Per-victim swarm + pack
+        // detection scans the first `MAX_ATTACKERS_PER_VICTIM` recorded
+        // attackers and looks for a mutually-bonded pair.
+        let max_atk = crate::gpu::MAX_ATTACKERS_PER_VICTIM;
+        for (i, cell) in self.cells.iter().enumerate() {
+            let hits = result.attacker_event_count[i];
+            if hits == 0 {
+                continue;
+            }
+            let gain_sum = result.attacker_gain_sum[i] as f64;
+            if cell.n_bonds() >= 1 {
+                self.bonded_attacks_gen += hits as u64;
+                self.bonded_attack_gain_sum_gen += gain_sum;
+            } else {
+                self.solo_attacks_gen += hits as u64;
+                self.solo_attack_gain_sum_gen += gain_sum;
+            }
+        }
+        let n_cells = self.cells.len();
+        for j in 0..n_cells {
+            let cnt = result.victim_attacker_count[j];
+            if cnt == 0 {
+                continue;
+            }
+            self.attack_victims_gen += 1;
+            if cnt < 2 {
+                continue;
+            }
+            self.swarm_attacks_gen += 1;
+            let base = j * max_atk;
+            let mut attackers: [usize; crate::gpu::MAX_ATTACKERS_PER_VICTIM] =
+                [usize::MAX; crate::gpu::MAX_ATTACKERS_PER_VICTIM];
+            let mut n_attackers = 0usize;
+            for k in 0..max_atk {
+                let raw = result.victim_attackers[base + k];
+                if raw == 0 {
+                    continue;
+                }
+                let idx = (raw - 1) as usize;
+                if idx < n_cells {
+                    attackers[n_attackers] = idx;
+                    n_attackers += 1;
+                }
+            }
+            let mut is_pack = false;
+            'pair_search: for a in 0..n_attackers {
+                for b in (a + 1)..n_attackers {
+                    let ai = attackers[a];
+                    let bi = attackers[b];
+                    let bid = self.cells[bi].cell_id;
+                    if self.cells[ai].bonds.iter().any(|slot| {
+                        slot.map(|bond| bond.other_cell_id == bid).unwrap_or(false)
+                    }) {
+                        is_pack = true;
+                        break 'pair_search;
+                    }
+                }
+            }
+            if is_pack {
+                self.pack_attacks_gen += 1;
+            }
+        }
+
         // Sprint 134: attacker `Predation(+gain × scale)` + victim
         // `EscapedAttack(+magnitude)` once `under_attack_streak` clears
         // a damage-free tick. Push events through the per-tick accumulator
