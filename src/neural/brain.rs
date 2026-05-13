@@ -3,7 +3,7 @@ use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use wide::f32x8;
 
-use super::activation::tanh_fast_simd;
+use super::activation::{tanh_fast_scalar, tanh_fast_simd};
 use super::cppn::Cppn;
 use crate::*;
 
@@ -111,6 +111,41 @@ fn layer_norm_in_place(xs: &mut [f32], n: usize) {
     let inv_std = 1.0_f32 / (var_sum * inv_n + 1e-6_f32).sqrt();
     for x in &mut xs[..n] {
         *x = (*x - mean) * inv_std;
+    }
+}
+
+/// Sprint 192: numerically stable softplus mirroring the GPU helper in
+/// `brain_forward.wgsl`. The `min(x, 20)` clamp keeps `exp()` from
+/// blowing past f32 range; above 20 the function is indistinguishable
+/// from `x` itself in IEEE-754 anyway.
+#[inline]
+fn softplus_stable(x: f32) -> f32 {
+    let capped = x.min(20.0);
+    (1.0 + capped.exp()).ln()
+}
+
+/// Sprint 192: subtractive lateral inhibition on a preact vector. Each
+/// `xs[i]` (for `i < n`) is reduced by `α × mean_{j ≠ i}(softplus(xs[j]))`.
+/// Strongly-positive entries dominate the inhibition pool and force
+/// weakly-positive entries closer to zero — over many ticks this keeps
+/// the Hebbian update per-neuron-distinct, preventing the row-collapse
+/// that returns after S188-S191 alone (~6000 ticks observed).
+#[inline]
+fn lateral_inhibition_in_place(xs: &mut [f32], n: usize, alpha: f32) {
+    if alpha <= 0.0 || n < 2 {
+        return;
+    }
+    let mut sp_sum = 0.0_f32;
+    let mut sp_self = [0.0_f32; BRAIN_HIDDEN];
+    for i in 0..n {
+        let sp = softplus_stable(xs[i]);
+        sp_self[i] = sp;
+        sp_sum += sp;
+    }
+    let inv_others = 1.0_f32 / (n - 1) as f32;
+    for i in 0..n {
+        let others = sp_sum - sp_self[i];
+        xs[i] -= alpha * others * inv_others;
     }
 }
 
@@ -596,7 +631,7 @@ impl Brain {
     }
 
     pub fn forward(&self, inputs: &[f32; BRAIN_INPUTS]) -> [f32; BRAIN_OUTPUTS] {
-        self.forward_with_state(inputs).1
+        self.forward_with_state(inputs, LATERAL_INHIBITION_ALPHA).1
     }
 
     /// Sprint 146: Izhikevich forward. `pre_hidden = w1·inputs + b1`
@@ -614,6 +649,7 @@ impl Brain {
         &mut self,
         inputs: &[f32; BRAIN_INPUTS],
         tick: u32,
+        lateral_alpha: f32,
     ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
         let h_n = self.hidden_n as usize;
 
@@ -639,6 +675,15 @@ impl Brain {
             }
             current[i] = acc + self.b1[i];
         }
+
+        // Sprint 192: lateral inhibition on injection current. Mirror of
+        // GPU `brain_forward_izhikevich.wgsl`. With `α = 0` this is a
+        // no-op and the path stays byte-identical with pre-S192 behaviour.
+        // Only the active range [0, h_n) participates — dead-zone w1/b1
+        // are CPPN-materialised (non-zero) for post-mating children, so
+        // iterating BRAIN_HIDDEN here would mix CPPN garbage into the
+        // softplus pool. Same `tid < h_n` gating as the Perceptron path.
+        lateral_inhibition_in_place(&mut current, h_n, lateral_alpha);
 
         // Sub-step Euler integration of the (v, u) ODE.
         let dt = IZH_DT_PER_SUBSTEP_MS;
@@ -689,7 +734,7 @@ impl Brain {
         layer_norm_in_place(&mut pre_out, BRAIN_OUTPUTS);
         let mut outputs = [0.0_f32; BRAIN_OUTPUTS];
         for o in 0..BRAIN_OUTPUTS {
-            outputs[o] = pre_out[o].tanh();
+            outputs[o] = tanh_fast_scalar(pre_out[o]);
         }
 
         (hidden, outputs)
@@ -716,6 +761,7 @@ impl Brain {
     pub fn forward_with_state(
         &self,
         inputs: &[f32; BRAIN_INPUTS],
+        lateral_alpha: f32,
     ) -> ([f32; BRAIN_HIDDEN], [f32; BRAIN_OUTPUTS]) {
         const L1_FULL: usize = BRAIN_INPUTS / 8;
         const L1_TAIL: usize = BRAIN_INPUTS % 8;
@@ -759,6 +805,12 @@ impl Brain {
             pre_hidden[i] = self.b1[i] + kahan_reduce_lanes(acc);
         }
 
+        // Sprint 192: lateral inhibition before LayerNorm. Mirror of the
+        // GPU forward shader; strongly-active neurons inhibit weakly-active
+        // ones, amplifying init-jitter diversity so Hebbian updates stay
+        // per-neuron-distinct over many ticks.
+        lateral_inhibition_in_place(&mut pre_hidden, h_n, lateral_alpha);
+
         // Sprint 189: LayerNorm over the active hidden range before tanh —
         // breaks the recurrent-saturation feedback loop. Mirror of the GPU
         // path in `shaders/brain_forward.wgsl`.
@@ -774,7 +826,7 @@ impl Brain {
             hidden[start..start + 8].copy_from_slice(&activated);
         }
         for i in full_chunks * 8..h_n {
-            hidden[i] = pre_hidden[i].tanh();
+            hidden[i] = tanh_fast_scalar(pre_hidden[i]);
         }
 
         // Pack hidden into lanes for L2.
@@ -814,7 +866,7 @@ impl Brain {
         layer_norm_in_place(&mut pre_out, BRAIN_OUTPUTS);
         let mut out = [0.0_f32; BRAIN_OUTPUTS];
         for (o, &p) in out.iter_mut().zip(pre_out.iter()) {
-            *o = p.tanh();
+            *o = tanh_fast_scalar(p);
         }
         (hidden, out)
     }

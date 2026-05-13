@@ -561,7 +561,8 @@ fn bond_velocity_delta_breaks_at_zero_dist() {
         damping: BOND_DAMPING,
         age_ticks: 0,
     };
-    let (delta, broken) = bond_velocity_delta(&bond, [0.0; 3], 0.0, [0.0; 3], [0.0; 3]);
+    let (delta, broken) =
+        bond_velocity_delta(&bond, [0.0; 3], 0.0, [0.0; 3], [0.0; 3], 1.0 / 60.0);
     assert!(broken);
     assert_eq!(delta, [0.0; 3]);
 }
@@ -581,6 +582,7 @@ fn bond_velocity_delta_zero_force_at_rest_with_zero_velocities() {
         10.0,
         [0.0; 3],
         [0.0; 3],
+        1.0 / 60.0,
     );
     assert!(!broken);
     assert!(delta[0].abs() < 1e-6);

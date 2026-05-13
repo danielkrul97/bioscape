@@ -76,31 +76,31 @@ pub fn populate_brain_inputs(
     let _ = pos;
     inputs[4] = energy_norm;
     inputs[5] = speed_norm;
-    inputs[7] = (sensors.smell_grad[0] * SMELL_NORMALIZATION_GAIN).tanh();
-    inputs[8] = (sensors.smell_grad[1] * SMELL_NORMALIZATION_GAIN).tanh();
-    inputs[17] = (sensors.smell_grad[2] * SMELL_NORMALIZATION_GAIN).tanh();
+    inputs[7] = tanh_fast_scalar(sensors.smell_grad[0] * SMELL_NORMALIZATION_GAIN);
+    inputs[8] = tanh_fast_scalar(sensors.smell_grad[1] * SMELL_NORMALIZATION_GAIN);
+    inputs[17] = tanh_fast_scalar(sensors.smell_grad[2] * SMELL_NORMALIZATION_GAIN);
     let fwd = forward_vector(cell.heading, cell.pitch);
     inputs[9] = fwd[0];
     inputs[10] = fwd[1];
     inputs[18] = fwd[2];
-    inputs[11] = (sensors.pheromone_grads[0][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[12] = (sensors.pheromone_grads[0][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[19] = (sensors.pheromone_grads[0][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[13] = (sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT).tanh();
-    inputs[14] = (cell.damage_accum * DAMAGE_NORMALIZATION_GAIN).tanh();
+    inputs[11] = tanh_fast_scalar(sensors.pheromone_grads[0][0] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[12] = tanh_fast_scalar(sensors.pheromone_grads[0][1] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[19] = tanh_fast_scalar(sensors.pheromone_grads[0][2] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[13] = tanh_fast_scalar(sensors.neighbors_in_vision as f32 / DENSITY_NORM_COUNT);
+    inputs[14] = tanh_fast_scalar(cell.damage_accum * DAMAGE_NORMALIZATION_GAIN);
     cell.damage_accum = 0.0;
     // Sprint 87: thermal awareness, slot 20. Q10-aware tanh normalizace —
     // (T - REF) / 10 dává tanh(±1.3) ≈ ±0.86 na endpoints [BOTTOM, TOP],
     // tanh(0) = 0 na ref. Diurnal/seasonal posuny mohou krátkodobě saturovat
     // k ±1, což je akceptovatelná oversaturace pro brain signal.
-    inputs[20] = ((sensors.temperature_local - THERMAL_REF_TEMP) / 10.0).tanh();
+    inputs[20] = tanh_fast_scalar((sensors.temperature_local - THERMAL_REF_TEMP) / 10.0);
     // Sprint 126: ch1, ch2 pheromone gradients. ch0 zachované na sloty 11/12/19.
-    inputs[21] = (sensors.pheromone_grads[1][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[22] = (sensors.pheromone_grads[1][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[23] = (sensors.pheromone_grads[1][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[24] = (sensors.pheromone_grads[2][0] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[25] = (sensors.pheromone_grads[2][1] * PHEROMONE_NORMALIZATION_GAIN).tanh();
-    inputs[26] = (sensors.pheromone_grads[2][2] * PHEROMONE_NORMALIZATION_GAIN).tanh();
+    inputs[21] = tanh_fast_scalar(sensors.pheromone_grads[1][0] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[22] = tanh_fast_scalar(sensors.pheromone_grads[1][1] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[23] = tanh_fast_scalar(sensors.pheromone_grads[1][2] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[24] = tanh_fast_scalar(sensors.pheromone_grads[2][0] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[25] = tanh_fast_scalar(sensors.pheromone_grads[2][1] * PHEROMONE_NORMALIZATION_GAIN);
+    inputs[26] = tanh_fast_scalar(sensors.pheromone_grads[2][2] * PHEROMONE_NORMALIZATION_GAIN);
     // Bond-mediated communication inbox (mean of partners' last_outputs[12..14]).
     // Computed pre-brain_act by `pool_bond_messages`. Solo cells: 0.
     for k in 0..N_BOND_MSG_CHANNELS {
@@ -110,10 +110,10 @@ pub fn populate_brain_inputs(
     // [29..32] = grad_{x,y,z}, [32] = amp. tanh-normalized via
     // `VIBRATION_NORMALIZATION_GAIN`; saturates on a single loud neighbor.
     let vib_base = 27 + N_BOND_MSG_CHANNELS;
-    inputs[vib_base] = (sensors.vibration_grad[0] * VIBRATION_NORMALIZATION_GAIN).tanh();
-    inputs[vib_base + 1] = (sensors.vibration_grad[1] * VIBRATION_NORMALIZATION_GAIN).tanh();
-    inputs[vib_base + 2] = (sensors.vibration_grad[2] * VIBRATION_NORMALIZATION_GAIN).tanh();
-    inputs[vib_base + 3] = (sensors.vibration_amp * VIBRATION_NORMALIZATION_GAIN).tanh();
+    inputs[vib_base] = tanh_fast_scalar(sensors.vibration_grad[0] * VIBRATION_NORMALIZATION_GAIN);
+    inputs[vib_base + 1] = tanh_fast_scalar(sensors.vibration_grad[1] * VIBRATION_NORMALIZATION_GAIN);
+    inputs[vib_base + 2] = tanh_fast_scalar(sensors.vibration_grad[2] * VIBRATION_NORMALIZATION_GAIN);
+    inputs[vib_base + 3] = tanh_fast_scalar(sensors.vibration_amp * VIBRATION_NORMALIZATION_GAIN);
     // Wave 2 whiskers — [33..39] (= vib_base + 4 .. vib_base + 4 + WHISKER_COUNT).
     // Already in [0, 1] from the raycast helper; no extra normalization. Mapped
     // to [-1, 1] via 2x-1 so "clear" reads as +1 (preferred direction signal)

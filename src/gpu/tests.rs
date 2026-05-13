@@ -32,10 +32,16 @@ fn brain_forward_gpu_matches_cpu() {
 
     let mut h_gpu = vec![[0.0_f32; BRAIN_HIDDEN]; n];
     let mut o_gpu = vec![[0.0_f32; BRAIN_OUTPUTS]; n];
-    gpu.forward_batch(&inputs, &brains, &mut h_gpu, &mut o_gpu);
+    gpu.forward_batch(
+        &inputs,
+        &brains,
+        &mut h_gpu,
+        &mut o_gpu,
+        LATERAL_INHIBITION_ALPHA,
+    );
 
     for i in 0..n {
-        let (h_cpu, o_cpu) = brains[i].forward_with_state(&inputs[i]);
+        let (h_cpu, o_cpu) = brains[i].forward_with_state(&inputs[i], LATERAL_INHIBITION_ALPHA);
         for k in 0..BRAIN_HIDDEN {
             let diff = (h_cpu[k] - h_gpu[i][k]).abs();
             assert!(
@@ -1065,7 +1071,9 @@ fn collision_gpu_matches_cpu() {
             let vrz = velocities[i][2] - velocities[j][2];
             let v_rel_n = vrx * nx + vry * ny + vrz * nz;
             let damp = -damping * v_rel_n;
-            let mag = spring + damp;
+            // Sprint 192: integrate Hookean force over the tick — must match
+            // the shader's `(spring + damp) * params.dt` term.
+            let mag = (spring + damp) * (1.0 / crate::FIXED_TIMESTEP_HZ);
             cpu_vel_deltas[i][0] += mag * nx;
             cpu_vel_deltas[i][1] += mag * ny;
             cpu_vel_deltas[i][2] += mag * nz;
@@ -1343,7 +1351,7 @@ fn gpu_context_shared_across_subsystems() {
 
     let mut h = vec![[0.0_f32; BRAIN_HIDDEN]; n];
     let mut o = vec![[0.0_f32; BRAIN_OUTPUTS]; n];
-    brain_gpu.forward_batch(&inputs, &brains, &mut h, &mut o);
+    brain_gpu.forward_batch(&inputs, &brains, &mut h, &mut o, LATERAL_INHIBITION_ALPHA);
 
     let (offsets, sorted) = hash_gpu.rebuild(&positions);
     assert_eq!(offsets.len(), GPU_HASH_NUM_BUCKETS + 1);

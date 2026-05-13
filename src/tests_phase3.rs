@@ -1068,9 +1068,15 @@ fn brain_forward_gpu_matches_cpu_small_batch() {
     };
     let mut h_gpu = vec![[0.0_f32; BRAIN_HIDDEN]; n];
     let mut o_gpu = vec![[0.0_f32; BRAIN_OUTPUTS]; n];
-    gpu.forward_batch(&inputs, &brains, &mut h_gpu, &mut o_gpu);
+    gpu.forward_batch(
+        &inputs,
+        &brains,
+        &mut h_gpu,
+        &mut o_gpu,
+        crate::LATERAL_INHIBITION_ALPHA,
+    );
     for i in 0..n {
-        let (_, o_cpu) = brains[i].forward_with_state(&inputs[i]);
+        let (_, o_cpu) = brains[i].forward_with_state(&inputs[i], crate::LATERAL_INHIBITION_ALPHA);
         for k in 0..BRAIN_OUTPUTS {
             let d = (o_cpu[k] - o_gpu[i][k]).abs();
             assert!(d < 1e-4, "i={i} k={k} cpu={} gpu={}", o_cpu[k], o_gpu[i][k]);

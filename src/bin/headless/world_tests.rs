@@ -3,11 +3,11 @@ use super::*;
 use bioscape::{
     BOND_FORM_TICKS, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, EventCalendar, HAZARD_AMP,
     HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, MATING_RADIUS, N_PHEROMONE_CHANNELS,
-    REPRODUCE_THRESHOLD, ShockEvent, ShockKind, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_MAP_SEED,
-    WORLD_UNITS_PER_FOOD,
+    REPRODUCE_THRESHOLD, SCARCITY_FLOOR, SCARCITY_RAMP_END_GEN, ShockEvent, ShockKind,
+    SMELL_GRID_RES, SMELL_GRID_RES_Z, TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_FOOD_AMP,
+    WORLD_MAP_FOOD_FLOOR, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
-use bioscape::sim::{food_multiplier, food_target, hazard_drain};
+use bioscape::sim::{food_multiplier, food_target, hazard_drain, scarcity_factor};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::path::PathBuf;
@@ -95,6 +95,46 @@ fn food_target_doubles_with_factor_two() {
     let one = food_target(1.0);
     let two = food_target(2.0);
     assert!(two as i64 - (one as i64 * 2) <= 1);
+}
+
+#[test]
+fn scarcity_factor_at_gen_zero_is_one() {
+    assert!(approx_eq(scarcity_factor(0), 1.0, FLT_EPS));
+}
+
+#[test]
+fn scarcity_factor_at_ramp_end_hits_floor() {
+    assert!(approx_eq(
+        scarcity_factor(SCARCITY_RAMP_END_GEN),
+        SCARCITY_FLOOR,
+        FLT_EPS,
+    ));
+}
+
+#[test]
+fn scarcity_factor_after_ramp_stays_at_floor() {
+    assert!(approx_eq(
+        scarcity_factor(SCARCITY_RAMP_END_GEN * 10),
+        SCARCITY_FLOOR,
+        FLT_EPS,
+    ));
+}
+
+#[test]
+fn scarcity_factor_midway_is_linear() {
+    let mid = SCARCITY_RAMP_END_GEN / 2;
+    let expected = 1.0 + (SCARCITY_FLOOR - 1.0) * 0.5;
+    assert!(approx_eq(scarcity_factor(mid), expected, 1e-3));
+}
+
+#[test]
+fn scarcity_factor_is_monotonically_non_increasing() {
+    let mut prev = scarcity_factor(0);
+    for gen in 1..=SCARCITY_RAMP_END_GEN + 50 {
+        let next = scarcity_factor(gen);
+        assert!(next <= prev + FLT_EPS, "regression at gen {gen}: {prev} -> {next}");
+        prev = next;
+    }
 }
 
 #[test]
@@ -448,7 +488,8 @@ fn tick_density_factor_changes_over_full_generation() {
     }
     let phase = (1.0 / CYCLE_GEN_PERIOD as f32) * std::f32::consts::TAU;
     let seasonal = 1.0 + CYCLE_AMPLITUDE * phase.sin();
-    assert!(approx_eq(world.density_factor, seasonal, 1e-3));
+    let expected = seasonal * scarcity_factor(world.clock.generation);
+    assert!(approx_eq(world.density_factor, expected, 1e-3));
     assert_eq!(initial, 1.0);
 }
 

@@ -22,6 +22,15 @@ struct CollisionParams {
     bond_break_factor: f32,
     bonds_per_cell: u32,
     max_contacts_per_cell: u32,
+    /// Sprint 192: simulation timestep, used to convert Hookean bond force
+    /// into a velocity delta (`Δv = F × dt / m`). Pre-S192 the shader
+    /// applied `mag` directly as Δv, effectively running at 60× the spring
+    /// constant the genome encodes — `VELOCITY_CAP_FACTOR` (S188) was the
+    /// symptomatic workaround. Now correct: `dt = 1 / FIXED_TIMESTEP_HZ`.
+    dt: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -388,6 +397,10 @@ impl CollisionGpu {
             bond_break_factor: self.bonds.break_factor,
             bonds_per_cell: self.bonds.bonds_per_cell,
             max_contacts_per_cell: self.max_contacts_per_cell,
+            dt: 1.0 / crate::FIXED_TIMESTEP_HZ,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -559,6 +572,10 @@ impl CollisionGpu {
             bond_break_factor: self.bonds.break_factor,
             bonds_per_cell: self.bonds.bonds_per_cell,
             max_contacts_per_cell: self.max_contacts_per_cell,
+            dt: 1.0 / crate::FIXED_TIMESTEP_HZ,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));

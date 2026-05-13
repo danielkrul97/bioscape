@@ -28,6 +28,13 @@ struct CollisionParams {
     bond_break_factor: f32,
     bonds_per_cell: u32,
     max_contacts_per_cell: u32,
+    // Sprint 192: dt = 1 / FIXED_TIMESTEP_HZ. Multiplies Hookean bond force
+    // to convert it into a per-tick velocity delta (`Δv = F · dt`). Pre-S192
+    // omitted dt → bond impulses were 60× too strong.
+    dt: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: CollisionParams;
@@ -248,7 +255,9 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v_rel = vel_i - vel_j;
         let v_rel_n = dot(v_rel, n);
         let damp = -damping * v_rel_n;
-        let mag = spring + damp;
+        // Sprint 192: integrate Hookean force over the tick. Pre-S192 wrote
+        // `mag` directly to `vel_deltas` (effectively 60× too strong).
+        let mag = (spring + damp) * params.dt;
         vdx_acc = vdx_acc + mag * n.x;
         vdy_acc = vdy_acc + mag * n.y;
         vdz_acc = vdz_acc + mag * n.z;

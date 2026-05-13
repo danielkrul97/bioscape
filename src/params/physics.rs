@@ -45,6 +45,23 @@ pub const FOOD_SPAWN_RATE: usize = 5;
 /// strategií, jinak by herbivore + outrun zůstal dominantní attractor.
 pub const WORLD_UNITS_PER_FOOD: f32 = 6500.0;
 
+/// Sprint 193: food scarcity ramp. Multiplier applied to `food_target`
+/// alongside the seasonal cycle and FoodCrash shock. Starts at 1.0 in
+/// generation 0 and linearly drops to `SCARCITY_FLOOR` by
+/// `SCARCITY_RAMP_END_GEN`, then stays flat at the floor. Folded into
+/// `World::density_factor` at end-of-generation so checkpoint + CSV
+/// already track it.
+///
+/// Rationale: pre-S193 the 183-192 brain-stability stack guarantees the
+/// brain *can* do graded computation, but the population still survives
+/// on bonded-cluster food-share without using it. Halving plant density
+/// over the first 100 generations creates a monotonic energetic gradient
+/// that should reward smarter foraging policies without starving the
+/// population to extinction (floor = 50 % baseline = still positive
+/// energy budget for an efficient cell).
+pub const SCARCITY_RAMP_END_GEN: u64 = 100;
+pub const SCARCITY_FLOOR: f32 = 0.5;
+
 /// Sprint 38: gravitační zrychlení (sim units / sec²) působící na cells.
 /// Sprint 65: 5.0 → 0.0 (neutral buoyancy approximation). Pre-Sprint-65
 /// vytvářelo selekční tlak směrem k „seď na dně" — cells postupně

@@ -40,9 +40,10 @@ use crate::{
     PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
     PREDATION_REWARD_MAX, RewardAccumulator, RewardKind,
     ACTIVITY_EMA_ALPHA, DEFAULT_STDP_A_MINUS, DEFAULT_STDP_A_PLUS,
-    EXCITABILITY_DRIFT_PER_TICK, SCALING_PERIOD_TICKS, SHELL_COST_PER_SEC,
-    SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE, VELOCITY_CAP_FACTOR,
-    WEIGHT_DECAY_PER_TICK, W_NORM_CAP,
+    EXCITABILITY_DRIFT_PER_TICK, SCALING_PERIOD_TICKS, SCARCITY_FLOOR,
+    SCARCITY_RAMP_END_GEN, SHELL_COST_PER_SEC,
+    LATERAL_INHIBITION_ALPHA, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
+    VELOCITY_CAP_FACTOR, WEIGHT_DECAY_PER_TICK, W_NORM_CAP,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -958,7 +959,8 @@ impl World {
                 &self.events.events,
                 self.clock.generation,
             );
-            self.density_factor = seasonal * shock_mult;
+            let scarcity = scarcity_factor(self.clock.generation);
+            self.density_factor = seasonal * shock_mult * scarcity;
         }
 
         macro_rules! timed {
@@ -1431,7 +1433,12 @@ impl World {
 
         // Phase 6: GPU brain forward_persistent. Čte `last_inputs_buf` direct,
         // píše last_hidden + last_outputs storage buffers.
-        gpu.brain.forward_persistent(&gpu.cells, n, &gpu.scratch.hidden_ns);
+        gpu.brain.forward_persistent(
+            &gpu.cells,
+            n,
+            &gpu.scratch.hidden_ns,
+            LATERAL_INHIBITION_ALPHA,
+        );
         // Sprint 147: Izhikevich forward runs AFTER perceptron — cells whose
         // `neuron_models[i] == Izhikevich` overwrite the perceptron's
         // last_hidden / last_outputs with spike-rate outputs. Perceptron
@@ -1442,7 +1449,13 @@ impl World {
         // write are both visible to the trace step that follows.
         let tick_u32 = self.clock.tick as u32;
         gpu.stdp_encode_pre.dispatch(&gpu.cells, n, tick_u32);
-        gpu.izhikevich.dispatch(&gpu.cells, n, tick_u32);
+        gpu.izhikevich.dispatch(
+            &gpu.cells,
+            n,
+            tick_u32,
+            LATERAL_INHIBITION_ALPHA,
+            &gpu.scratch.hidden_ns,
+        );
         // Trace decay+accumulate based on both pre and post spike-times.
         gpu.stdp_step
             .dispatch(&gpu.cells, n, tick_u32, crate::DEFAULT_STDP_TAU_TICKS);
@@ -1730,6 +1743,7 @@ impl World {
                 self.cells.iter().map(|c| &c.genome.brain),
                 &mut hiddens,
                 &mut outputs,
+                LATERAL_INHIBITION_ALPHA,
             );
         }
 
@@ -1946,7 +1960,10 @@ impl World {
                     }
                     Some(inputs_scratch[idx])
                 });
-                let (hidden, outputs) = cell.genome.brain.forward_with_state(&pooled);
+                let (hidden, outputs) = cell
+                    .genome
+                    .brain
+                    .forward_with_state(&pooled, LATERAL_INHIBITION_ALPHA);
                 cell.last_inputs = pooled;
                 cell.last_hidden = hidden;
                 cell.last_outputs = outputs;
@@ -3504,6 +3521,19 @@ pub fn food_target(factor: f32) -> usize {
     let z_extent = 2.0 * WORLD_HALF[2];
     let z_factor = (z_extent / 4.0).max(1.0);
     ((area / WORLD_UNITS_PER_FOOD) * factor.max(0.0) * z_factor) as usize
+}
+
+/// Sprint 193: linearly ramp plant food density from 1.0 at generation 0
+/// down to `SCARCITY_FLOOR` at `SCARCITY_RAMP_END_GEN`, then hold the
+/// floor. The result is folded into `World::density_factor` once per
+/// generation alongside the seasonal cycle and FoodCrash shock — the
+/// `spawn_food` call site stays unchanged.
+pub fn scarcity_factor(generation: u64) -> f32 {
+    if SCARCITY_RAMP_END_GEN == 0 {
+        return SCARCITY_FLOOR;
+    }
+    let t = (generation as f32 / SCARCITY_RAMP_END_GEN as f32).min(1.0);
+    1.0 + (SCARCITY_FLOOR - 1.0) * t
 }
 
 /// Rough static FLOP estimate per simulation tick at the given population.

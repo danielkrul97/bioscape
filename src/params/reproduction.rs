@@ -170,6 +170,30 @@ pub const SCALING_PERIOD_TICKS: u64 = 1;
 /// inside the L2 envelope.
 pub const WEIGHT_DECAY_PER_TICK: f32 = 0.001;
 
+/// Sprint 192: lateral-inhibition strength α applied to the L1 hidden
+/// pre-activations in every forward pass. Per neuron we subtract
+/// `α × mean_{h' ≠ h}(softplus(pre[h']))` from `pre[h]`, then continue
+/// into LayerNorm + tanh. Cumulative effect:
+/// - stronger-activating neurons emit more inhibition onto others →
+///   weaker neurons get suppressed further;
+/// - within-cluster tie-breaking is amplified rather than averaged
+///   away, so the Hebbian update on tick `t+1` sees diverse hidden
+///   values (`Δw[h] = lr × hidden[h] × input` is now neuron-dependent),
+///   keeping `w1` rows from re-converging to a single pattern.
+///
+/// Init jitter (S191) seeded diversity at birth but the bipolar collapse
+/// re-emerged after thousands of ticks because LayerNorm preserves
+/// bimodality and Oja's correction term is insufficient on uniform
+/// post-activations. Lateral inhibition provides *permanent* decorrelation
+/// pressure in every forward pass.
+///
+/// `α = 0.3` is moderate — softplus of saturated preact ≈ preact itself,
+/// so a fully-active neighbour cluster of size 24 would shave ~0.3 ×
+/// mean(preact) off each member's preact. Tunable; values past `~0.7`
+/// risk driving the layer into uniform-zero (all neurons suppress each
+/// other to silence).
+pub const LATERAL_INHIBITION_ALPHA: f32 = 0.3;
+
 /// Sprint 139: signed-EMA blend factor for per-neuron activity tracking.
 /// `0.01` gives an effective window of ~100 ticks (~1.7 s @ 60 Hz) — long
 /// enough to filter motor-output bursts but short enough that selection

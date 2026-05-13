@@ -40,8 +40,22 @@ const WG_SIZE: u32 = 64u;
 struct Params {
     num_cells: u32,
     tick: u32,
-    _pad0: u32,
+    lateral_inhibition_alpha: f32,
     _pad1: u32,
+}
+
+// Numerically stable softplus (mirror of brain_forward.wgsl).
+fn softplus(x: f32) -> f32 {
+    let capped = min(x, 20.0);
+    return log(1.0 + exp(capped));
+}
+
+// Padé(3,2) tanh — mirror of CPU `tanh_fast_scalar` and the same helper
+// in `brain_forward.wgsl`. Used on the L2 output for CPU/GPU parity.
+fn tanh_fast(x: f32) -> f32 {
+    let cx = clamp(x, -3.0, 3.0);
+    let x2 = cx * cx;
+    return cx * (27.0 + x2) / (27.0 + 9.0 * x2);
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -53,6 +67,12 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> recovery: array<f32>;
 @group(0) @binding(7) var<storage, read> neuron_models: array<u32>;
 @group(0) @binding(8) var<storage, read_write> post_spike_times: array<u32>;
+// Per-cell active hidden count. Gates L1 matvec, lateral inhibition,
+// Izhikevich integration, and L2 matvec to `tid < h_n` so dead-zone
+// neurons (CPPN-materialised w1/b1/w2 are non-zero for them) don't
+// pollute outputs. Mirror of the Perceptron `brain_forward.wgsl` path,
+// which uses `hidden_n` for the same purpose.
+@group(0) @binding(9) var<storage, read> hidden_n_buf: array<u32>;
 
 // Workgroup-shared per-cell scratch — replaces the pre-S190 private-memory
 // `array<f32, 45>` per thread. On-chip, ~10-100× faster than private DRAM.
@@ -65,6 +85,12 @@ var<workgroup> hidden_shared: array<f32, BRAIN_HIDDEN>;
 var<workgroup> pre_out_shared: array<f32, BRAIN_OUTPUTS>;
 var<workgroup> norm_mean: f32;
 var<workgroup> norm_inv_std: f32;
+// Sprint 192: lateral inhibition softplus reduction. Lane 0 sums
+// `softplus(current)` across all active neurons; each neuron thread
+// then subtracts `α × (sum − self_sp) / (n_active − 1)` from its own
+// injection current. Same mechanism as `brain_forward.wgsl`, but here
+// the inhibition reshapes the input current to the Izhikevich ODE.
+var<workgroup> softplus_sum: f32;
 
 @compute @workgroup_size(64)
 fn forward_izhikevich(
@@ -80,6 +106,7 @@ fn forward_izhikevich(
         return;
     }
     let tid = lid.x;
+    let h_n = hidden_n_buf[cell];
 
     let w_off = cell * WEIGHTS_PER_CELL;
     let in_off = cell * BRAIN_INPUTS;
@@ -99,10 +126,19 @@ fn forward_izhikevich(
     if (tid2 < BRAIN_INPUTS) {
         in_shared[tid2] = inputs[in_off + tid2];
     }
+    // Pre-zero the dead-zone slot owned by this thread so a fall-through
+    // path below has consistent inputs to read. The active range gets
+    // overwritten by the matvec/integration that follows.
+    if (tid < BRAIN_HIDDEN && tid >= h_n) {
+        current_shared[tid] = 0.0;
+        hidden_shared[tid] = 0.0;
+    }
     workgroupBarrier();
 
-    // L1 matvec — thread `tid` owns neuron `h = tid` for tid < BRAIN_HIDDEN.
-    if (tid < BRAIN_HIDDEN) {
+    // L1 matvec — only active neurons. Dead-zone w1/b1 from CPPN init are
+    // non-zero so iterating the full BRAIN_HIDDEN here would inject garbage
+    // current; gate to `tid < h_n` (mirror of Perceptron `brain_forward.wgsl`).
+    if (tid < h_n) {
         let row_base = w1_base + tid * BRAIN_INPUTS;
         var acc: f32 = weights[b1_base + tid];
         for (var in_i: u32 = 0u; in_i < BRAIN_INPUTS; in_i = in_i + 1u) {
@@ -112,10 +148,37 @@ fn forward_izhikevich(
     }
     workgroupBarrier();
 
+    // Sprint 192: lateral inhibition on injection current. Lane 0 sums
+    // softplus over the active range only — dead-zone neurons no longer
+    // participate (matches the Perceptron path's `tid < h_n` gating).
+    // With `α = 0` (disabled genome) the loop is a no-op so pre-S192
+    // trajectories are byte-identical until an explicit alpha bump.
+    let alpha = params.lateral_inhibition_alpha;
+    if (alpha > 0.0 && h_n > 1u) {
+        if (tid == 0u) {
+            var sp: f32 = 0.0;
+            for (var h: u32 = 0u; h < h_n; h = h + 1u) {
+                sp = sp + softplus(current_shared[h]);
+            }
+            softplus_sum = sp;
+        }
+        workgroupBarrier();
+        if (tid < h_n) {
+            let others = softplus_sum - softplus(current_shared[tid]);
+            let inv_others = 1.0 / f32(h_n - 1u);
+            current_shared[tid] = current_shared[tid] - alpha * others * inv_others;
+        }
+        workgroupBarrier();
+    }
+
     // 32 Euler sub-steps integrating one neuron per active thread. (v, u)
     // and spike_count live in scalar registers across the whole 32-step
-    // loop — no `array` indexing in the hot path.
-    if (tid < BRAIN_HIDDEN) {
+    // loop — no `array` indexing in the hot path. Dead-zone neurons are
+    // gated out: their `hidden_shared`/`hidden` slots stay at 0 (set in
+    // the pre-barrier section), and `membrane`/`recovery` are left
+    // untouched so a future `add_neuron` mutation activates from the
+    // last persisted (v, u) — usually still at IZH_V_REST / 0.
+    if (tid < h_n) {
         var v: f32 = membrane[hid_off + tid];
         var u: f32 = recovery[hid_off + tid];
         var spike_count: u32 = 0u;
@@ -141,6 +204,11 @@ fn forward_izhikevich(
         let activation = f32(spike_count) * (2.0 / f32(IZH_SUBSTEPS)) - 1.0;
         hidden_shared[tid] = activation;
         hidden[hid_off + tid] = activation;
+    } else if (tid < BRAIN_HIDDEN) {
+        // Persist dead-zone hidden as zero (mirrors Perceptron and CPU
+        // `forward_izhikevich_with_state`, both of which leave the
+        // returned `hidden` slot at its zero init for `i >= h_n`).
+        hidden[hid_off + tid] = 0.0;
     }
     workgroupBarrier();
 
@@ -178,6 +246,6 @@ fn forward_izhikevich(
 
     if (tid < BRAIN_OUTPUTS) {
         let normed = (pre_out_shared[tid] - norm_mean) * norm_inv_std;
-        outputs[out_off + tid] = tanh(normed);
+        outputs[out_off + tid] = tanh_fast(normed);
     }
 }

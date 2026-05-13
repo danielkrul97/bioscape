@@ -2441,7 +2441,8 @@ fn bond_spring_pulls_when_stretched() {
     // Bond rest 5, current 10 (stretched) → cell i taženo k j.
     let bond = Bond { other_cell_id: 1, rest_length: 5.0, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
     let delta = [10.0, 0.0, 0.0];
-    let (v, broken) = bond_velocity_delta(&bond, delta, 10.0, [0.0; 3], [0.0; 3]);
+    let dt = 1.0 / 60.0;
+    let (v, broken) = bond_velocity_delta(&bond, delta, 10.0, [0.0; 3], [0.0; 3], dt);
     assert!(!broken);
     assert!(v[0] < 0.0, "stretched bond should pull i toward j, got {:?}", v);
 }
@@ -2451,7 +2452,8 @@ fn bond_spring_pushes_when_compressed() {
     // Bond rest 10, current 5 (compressed) → cell i tlačeno od j.
     let bond = Bond { other_cell_id: 1, rest_length: 10.0, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
     let delta = [5.0, 0.0, 0.0];
-    let (v, broken) = bond_velocity_delta(&bond, delta, 5.0, [0.0; 3], [0.0; 3]);
+    let dt = 1.0 / 60.0;
+    let (v, broken) = bond_velocity_delta(&bond, delta, 5.0, [0.0; 3], [0.0; 3], dt);
     assert!(!broken);
     assert!(v[0] > 0.0, "compressed bond should push i away, got {:?}", v);
 }
@@ -2467,6 +2469,7 @@ fn bond_breaks_past_break_factor() {
         stretched,
         [0.0; 3],
         [0.0; 3],
+        1.0 / 60.0,
     );
     assert!(broken, "bond should break past BOND_BREAK_FACTOR");
     assert_eq!(v, [0.0; 3]);
@@ -2480,7 +2483,8 @@ fn bond_damping_opposes_closing_velocity() {
     let delta = [5.0, 0.0, 0.0];
     let v_i = [-1.0, 0.0, 0.0];
     let v_j = [0.0, 0.0, 0.0];
-    let (dv, _) = bond_velocity_delta(&bond, delta, 5.0, v_i, v_j);
+    let dt = 1.0 / 60.0;
+    let (dv, _) = bond_velocity_delta(&bond, delta, 5.0, v_i, v_j, dt);
     assert!(dv[0] > 0.0, "damping should oppose closing motion, got {:?}", dv);
 }
 
@@ -3108,7 +3112,7 @@ fn izhikevich_quiescent_neuron_does_not_spike() {
     // hidden activation: -1 (no spikes mapped to the lower bound).
     let mut brain = dummy_brain();
     let inputs = [0.0_f32; BRAIN_INPUTS];
-    let (hidden, _) = brain.forward_izhikevich_with_state(&inputs, 0);
+    let (hidden, _) = brain.forward_izhikevich_with_state(&inputs, 0, 0.0);
     for (i, h) in hidden.iter().take(brain.hidden_n as usize).enumerate() {
         assert!(
             (*h + 1.0).abs() < 1e-5,
@@ -3143,7 +3147,7 @@ fn izhikevich_strong_input_drives_spiking_over_multiple_ticks() {
     let inputs = [0.0_f32; BRAIN_INPUTS];
     let mut total_spikes = 0_u32;
     for _ in 0..20 {
-        let (hidden, _) = brain.forward_izhikevich_with_state(&inputs, 0);
+        let (hidden, _) = brain.forward_izhikevich_with_state(&inputs, 0, 0.0);
         for h in hidden.iter().take(h_n) {
             // spike_count = (h + 1) × IZH_SUBSTEPS / 2; sum across neurons.
             let spikes = (((h + 1.0) * IZH_SUBSTEPS as f32 / 2.0).round()) as u32;
@@ -3283,9 +3287,79 @@ fn izhikevich_zero_input_outputs_finite_and_in_range() {
         brain.b2[o] = 0.5;
     }
     let inputs = [0.0_f32; BRAIN_INPUTS];
-    let (_, outputs) = brain.forward_izhikevich_with_state(&inputs, 0);
+    let (_, outputs) = brain.forward_izhikevich_with_state(&inputs, 0, 0.0);
     for (o, v) in outputs.iter().enumerate() {
         assert!(v.is_finite(), "output {} not finite: {}", o, v);
         assert!(v.abs() <= 1.0 + 1e-5, "output {} out of [-1, 1]: {}", o, v);
+    }
+}
+
+#[test]
+fn izhikevich_dead_zone_weights_do_not_affect_output() {
+    // Sprint 192 regression: `Brain::from_cppn` populates dead-zone w1/b1/w2
+    // (indices >= hidden_n) with non-zero values because the CPPN substrate
+    // function maps coordinates to weights without any awareness of the
+    // active range. The forward path must gate work to `0..hidden_n` so
+    // those CPPN-derived dead-zone weights stay inert. Pre-fix, CPU iterated
+    // BRAIN_HIDDEN for lateral inhibition (pulled softplus(garbage) into
+    // the inhibition pool) and GPU iterated BRAIN_HIDDEN throughout
+    // (dead-zone neurons spiked, their hidden activations fed L2).
+    let h_n = BRAIN_HIDDEN_DEFAULT;
+    assert!(h_n < BRAIN_HIDDEN, "dead zone must exist for this test");
+
+    let mut baseline = dummy_brain();
+    // Active range: a couple of inputs that drive a clear spike. Strong
+    // tonic b1 makes the active integration produce a non-trivial pattern.
+    for i in 0..h_n {
+        baseline.b1[i] = 12.0 + i as f32 * 0.5;
+        for o in 0..BRAIN_OUTPUTS {
+            baseline.w2[o][i] = 0.1 * (i as f32 + 1.0);
+            baseline.b2[o] = 0.2;
+        }
+    }
+    let mut polluted = baseline;
+    // Fill the dead zone with the kind of magnitudes `Brain::from_cppn`
+    // emits — non-zero, sometimes large enough to drive dead-zone Izhikevich
+    // neurons to fire if they were integrated.
+    for h in h_n..BRAIN_HIDDEN {
+        polluted.b1[h] = 18.0; // well over tonic-spike threshold
+        for j in 0..BRAIN_INPUTS {
+            polluted.w1[h][j] = 0.3;
+        }
+        for o in 0..BRAIN_OUTPUTS {
+            polluted.w2[o][h] = 0.7;
+        }
+    }
+
+    let inputs = [0.1_f32; BRAIN_INPUTS];
+    // Lateral inhibition on, so a regression that pulled dead-zone preacts
+    // into the softplus pool would also visibly change `hidden` here.
+    let lateral = 0.3_f32;
+    let (h_baseline, o_baseline) =
+        baseline.forward_izhikevich_with_state(&inputs, 0, lateral);
+    let (h_polluted, o_polluted) =
+        polluted.forward_izhikevich_with_state(&inputs, 0, lateral);
+
+    for i in 0..h_n {
+        let d = (h_baseline[i] - h_polluted[i]).abs();
+        assert!(
+            d < 1e-6,
+            "hidden[{}] drifted: baseline={} polluted={} diff={}",
+            i,
+            h_baseline[i],
+            h_polluted[i],
+            d
+        );
+    }
+    for o in 0..BRAIN_OUTPUTS {
+        let d = (o_baseline[o] - o_polluted[o]).abs();
+        assert!(
+            d < 1e-6,
+            "outputs[{}] drifted: baseline={} polluted={} diff={}",
+            o,
+            o_baseline[o],
+            o_polluted[o],
+            d
+        );
     }
 }

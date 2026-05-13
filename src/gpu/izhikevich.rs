@@ -10,7 +10,7 @@ use super::*;
 struct IzhikevichParams {
     num_cells: u32,
     tick: u32,
-    _pad0: u32,
+    lateral_inhibition_alpha: f32,
     _pad1: u32,
 }
 
@@ -24,6 +24,11 @@ pub struct IzhikevichGpu {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     params_buf: wgpu::Buffer,
+    /// Per-cell active hidden count. Uploaded each dispatch so the shader
+    /// can gate L1/lateral-inhibition/integration to `0..h_n` and leave
+    /// dead-zone slots at zero (matches the Perceptron path).
+    hidden_n_buf: wgpu::Buffer,
+    hidden_n_capacity: usize,
 }
 
 impl IzhikevichGpu {
@@ -46,9 +51,11 @@ impl IzhikevichGpu {
                 include_str!("../../shaders/brain_forward_izhikevich.wgsl").into(),
             ),
         });
-        // Sprint 164: 9 bindings — adds binding 8 for post_spike_times
-        // (rw). Bindings 3, 4, 5, 6, 8 are rw; 1, 2, 7 are ro; 0 is uniform.
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..9)
+        // Sprint 164: binding 8 for post_spike_times (rw).
+        // Sprint 192 fix: binding 9 for hidden_n (ro) — gates dead-zone
+        // neurons out of L1/lateral-inhibition/integration/L2.
+        // Bindings 3, 4, 5, 6, 8 are rw; 1, 2, 7, 9 are ro; 0 is uniform.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..10)
             .map(|i| {
                 let ty = match i {
                     0 => wgpu::BufferBindingType::Uniform,
@@ -89,26 +96,61 @@ impl IzhikevichGpu {
             contents: bytemuck::bytes_of(&IzhikevichParams::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let hidden_n_capacity: usize = 1;
+        let hidden_n_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("izhikevich-hidden-n"),
+            size: (hidden_n_capacity * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Self {
             device,
             queue,
             pipeline,
             bind_group_layout,
             params_buf,
+            hidden_n_buf,
+            hidden_n_capacity,
         })
     }
 
-    pub fn dispatch(&self, cells_gpu: &CellsGpu, n: usize, tick: u32) {
+    fn ensure_hidden_n_capacity(&mut self, n: usize) {
+        if n <= self.hidden_n_capacity {
+            return;
+        }
+        let new_cap = (self.hidden_n_capacity * 2).max(n);
+        self.hidden_n_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("izhikevich-hidden-n"),
+            size: (new_cap * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.hidden_n_capacity = new_cap;
+    }
+
+    pub fn dispatch(
+        &mut self,
+        cells_gpu: &CellsGpu,
+        n: usize,
+        tick: u32,
+        lateral_alpha: f32,
+        hidden_n: &[u32],
+    ) {
         if n == 0 {
             return;
         }
+        assert_eq!(hidden_n.len(), n, "hidden_n length must match cell count");
+        self.ensure_hidden_n_capacity(n);
         let params = IzhikevichParams {
             num_cells: n as u32,
             tick,
+            lateral_inhibition_alpha: lateral_alpha,
             ..IzhikevichParams::default()
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.hidden_n_buf, 0, bytemuck::cast_slice(hidden_n));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("izhikevich-bg"),
             layout: &self.bind_group_layout,
@@ -148,6 +190,10 @@ impl IzhikevichGpu {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: cells_gpu.post_spike_times_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.hidden_n_buf.as_entire_binding(),
                 },
             ],
         });

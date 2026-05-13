@@ -157,27 +157,35 @@ pub const BOND_FORM_TICKS: u32 = 3;
 /// FxHashMap). Krátký timeout — pár, který se rozejde, ztrácí "track" hned.
 pub const CONTACT_DECAY_TICKS: u32 = 5;
 /// Spring constant k (acceleration / displacement / mass). 4 dává natural
-/// freq ~ √4 / mass; pro mass=1 je perioda ~π s. Damping ji rychle utlumí.
+/// freq ~ √(k/m); pro mass=1 a k=240, perioda = 2π/√240 ≈ 0.41 s ≈ 24 ticks.
 /// Sprint 68: per-bond stiffness se ukládá do Bond struct při formaci jako
 /// průměr `genome.bond_stiffness` obou cells. BOND_STIFFNESS zůstává jen
 /// jako center pro initial draw v Genome::random.
-pub const BOND_STIFFNESS: f32 = 4.0;
+/// Sprint 192: 4 → 240 (60× scaling) aby Hookean force × dt = Δv zachovala
+/// pre-S192 effective behavior. Pre-S192 collision shader writoval `mag`
+/// jako Δv bez `dt` násobení, takže effective k byl 60× vyšší než hodnota
+/// v konstantě. Nový kód × `dt` (= 1/60) → konstanta musí ×60 aby clustery
+/// drželi se stejnou tuhostí.
+pub const BOND_STIFFNESS: f32 = 240.0;
 /// Sprint 68: per-cell `genome.bond_stiffness` rozsah. Široký rozsah aby
-/// selekce mohla zkoušet jak floppy (k≈0.5, slouží spíš jako adhesion bond)
-/// tak rigid (k≈16, snapne při menší deformaci).
-pub const MIN_BOND_STIFFNESS: f32 = 0.5;
-pub const MAX_BOND_STIFFNESS: f32 = 16.0;
+/// selekce mohla zkoušet jak floppy (k≈30, slouží spíš jako adhesion bond)
+/// tak rigid (k≈960, snapne při menší deformaci).
+/// Sprint 192: rozsah scaled 60× (z [0.5, 16] na [30, 960]).
+pub const MIN_BOND_STIFFNESS: f32 = 30.0;
+pub const MAX_BOND_STIFFNESS: f32 = 960.0;
 /// Damping podél spring axis pro relativní velocity. Bez damping by spring
 /// oscilace explodovala (Sprint 65 collision damping je 0.5; bond má jiný
-/// regime — drží spojené). 0.6 = critically damped pro typický mass.
+/// regime — drží spojené).
 /// Sprint 68: per-bond — ukládá se do Bond struct při formaci jako průměr
 /// `genome.bond_damping` obou cells. BOND_DAMPING zůstává jako initial
 /// draw center.
-pub const BOND_DAMPING: f32 = 0.6;
+/// Sprint 192: 0.6 → 36 (60× scaling) ze stejného důvodu jako stiffness.
+pub const BOND_DAMPING: f32 = 36.0;
 /// Sprint 68: per-cell `genome.bond_damping` rozsah. 0 = under-damped (springs
-/// kmitají), 2 = over-damped (rychle ztuhne). 0.6 ≈ critical pro typický mass.
+/// kmitají), MAX = over-damped (rychle ztuhne).
+/// Sprint 192: rozsah scaled 60× (z [0, 2] na [0, 120]).
 pub const MIN_BOND_DAMPING: f32 = 0.0;
-pub const MAX_BOND_DAMPING: f32 = 2.0;
+pub const MAX_BOND_DAMPING: f32 = 120.0;
 /// Bond se trhá při current_length > rest_length × factor. 3.0 = 200 % strain
 /// před break — víc tolerance kolizním impulse v dense clusterech (Sprint 132+
 /// jemný bump z 2.5 pro stabilnější struktury), naturální oscilace stále uvnitř

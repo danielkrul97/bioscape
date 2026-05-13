@@ -56,6 +56,15 @@ fn forward_vector(yaw: f32, pitch: f32) -> vec3<f32> {
     return vec3<f32>(cy * cp, sy * cp, sp);
 }
 
+// Padé(3,2) tanh — mirror of CPU `tanh_fast_scalar` and the same helper
+// in `brain_forward.wgsl`. CPU `populate_brain_inputs` uses the same
+// approximation on every sensor input, so this keeps GPU/CPU parity.
+fn tanh_fast(x: f32) -> f32 {
+    let cx = clamp(x, -3.0, 3.0);
+    let x2 = cx * cx;
+    return cx * (27.0 + x2) / (27.0 + 9.0 * x2);
+}
+
 @compute @workgroup_size(64)
 fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -126,33 +135,33 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Always-written sensory inputs.
     last_inputs[inputs_off + 4u]  = energy_norm;
     last_inputs[inputs_off + 5u]  = speed_norm;
-    last_inputs[inputs_off + 7u]  = tanh(smell_x * params.smell_norm_gain);
-    last_inputs[inputs_off + 8u]  = tanh(smell_y * params.smell_norm_gain);
-    last_inputs[inputs_off + 17u] = tanh(smell_z * params.smell_norm_gain);
+    last_inputs[inputs_off + 7u]  = tanh_fast(smell_x * params.smell_norm_gain);
+    last_inputs[inputs_off + 8u]  = tanh_fast(smell_y * params.smell_norm_gain);
+    last_inputs[inputs_off + 17u] = tanh_fast(smell_z * params.smell_norm_gain);
     let fwd = forward_vector(heading, pitch);
     last_inputs[inputs_off + 9u]  = fwd.x;
     last_inputs[inputs_off + 10u] = fwd.y;
     last_inputs[inputs_off + 18u] = fwd.z;
-    last_inputs[inputs_off + 11u] = tanh(phero_x * params.phero_norm_gain);
-    last_inputs[inputs_off + 12u] = tanh(phero_y * params.phero_norm_gain);
-    last_inputs[inputs_off + 19u] = tanh(phero_z * params.phero_norm_gain);
-    last_inputs[inputs_off + 13u] = tanh(neighbor_count / params.density_norm);
-    last_inputs[inputs_off + 14u] = tanh(damage * params.damage_norm_gain);
+    last_inputs[inputs_off + 11u] = tanh_fast(phero_x * params.phero_norm_gain);
+    last_inputs[inputs_off + 12u] = tanh_fast(phero_y * params.phero_norm_gain);
+    last_inputs[inputs_off + 19u] = tanh_fast(phero_z * params.phero_norm_gain);
+    last_inputs[inputs_off + 13u] = tanh_fast(neighbor_count / params.density_norm);
+    last_inputs[inputs_off + 14u] = tanh_fast(damage * params.damage_norm_gain);
 
     // Slot 20 is a legacy reserved gap.
     last_inputs[inputs_off + 20u] = 0.0;
     // Wave L: ch1/ch2 pheromone gradients from sensor_gather slots 25..30.
     // Most runs leave multi-channel pheromone unused (only ch0 is populated)
-    // → the whole 3-float chunk is zero and `tanh(0) = 0`, so we can skip
-    // 6 `tanh` calls when the chunk is all-zero. The branch is uniform within
+    // → the whole 3-float chunk is zero and `tanh_fast(0) = 0`, so we can skip
+    // 6 `tanh_fast` calls when the chunk is all-zero. The branch is uniform within
     // each warp whenever the simulation doesn't use ch1/ch2 pheromones.
     let p25 = sensor_output[sensor_off + 25u];
     let p26 = sensor_output[sensor_off + 26u];
     let p27 = sensor_output[sensor_off + 27u];
     if (p25 != 0.0 || p26 != 0.0 || p27 != 0.0) {
-        last_inputs[inputs_off + 21u] = tanh(p25 * params.phero_norm_gain);
-        last_inputs[inputs_off + 22u] = tanh(p26 * params.phero_norm_gain);
-        last_inputs[inputs_off + 23u] = tanh(p27 * params.phero_norm_gain);
+        last_inputs[inputs_off + 21u] = tanh_fast(p25 * params.phero_norm_gain);
+        last_inputs[inputs_off + 22u] = tanh_fast(p26 * params.phero_norm_gain);
+        last_inputs[inputs_off + 23u] = tanh_fast(p27 * params.phero_norm_gain);
     } else {
         last_inputs[inputs_off + 21u] = 0.0;
         last_inputs[inputs_off + 22u] = 0.0;
@@ -162,9 +171,9 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p29 = sensor_output[sensor_off + 29u];
     let p30 = sensor_output[sensor_off + 30u];
     if (p28 != 0.0 || p29 != 0.0 || p30 != 0.0) {
-        last_inputs[inputs_off + 24u] = tanh(p28 * params.phero_norm_gain);
-        last_inputs[inputs_off + 25u] = tanh(p29 * params.phero_norm_gain);
-        last_inputs[inputs_off + 26u] = tanh(p30 * params.phero_norm_gain);
+        last_inputs[inputs_off + 24u] = tanh_fast(p28 * params.phero_norm_gain);
+        last_inputs[inputs_off + 25u] = tanh_fast(p29 * params.phero_norm_gain);
+        last_inputs[inputs_off + 26u] = tanh_fast(p30 * params.phero_norm_gain);
     } else {
         last_inputs[inputs_off + 24u] = 0.0;
         last_inputs[inputs_off + 25u] = 0.0;
@@ -180,10 +189,10 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the vibration FieldGpu directly, mirroring smell/pheromone semantics
     // (tanh-normalize through the per-channel gain so saturation behaviour
     // matches `lib::populate_brain_inputs`).
-    last_inputs[inputs_off + 29u] = tanh(vib_grad_x * params.vibration_norm_gain);
-    last_inputs[inputs_off + 30u] = tanh(vib_grad_y * params.vibration_norm_gain);
-    last_inputs[inputs_off + 31u] = tanh(vib_grad_z * params.vibration_norm_gain);
-    last_inputs[inputs_off + 32u] = tanh(vib_amp    * params.vibration_norm_gain);
+    last_inputs[inputs_off + 29u] = tanh_fast(vib_grad_x * params.vibration_norm_gain);
+    last_inputs[inputs_off + 30u] = tanh_fast(vib_grad_y * params.vibration_norm_gain);
+    last_inputs[inputs_off + 31u] = tanh_fast(vib_grad_z * params.vibration_norm_gain);
+    last_inputs[inputs_off + 32u] = tanh_fast(vib_amp    * params.vibration_norm_gain);
 
     // Wave 6: whisker raycast slots 33..38. sensor_gather.wgsl writes
     // normalized free-distances at sensor_off + 19..25; map [0, 1] →

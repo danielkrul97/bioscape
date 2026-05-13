@@ -277,6 +277,7 @@ pub fn bond_velocity_delta(
     dist: f32,
     vel_i: [f32; 3],
     vel_j: [f32; 3],
+    dt: f32,
 ) -> ([f32; 3], bool) {
     let break_len = bond.rest_length * BOND_BREAK_FACTOR;
     if dist > break_len || dist <= f32::EPSILON {
@@ -301,6 +302,8 @@ pub fn bond_velocity_delta(
         + (vel_i[1] - vel_j[1]) * ny
         + (vel_i[2] - vel_j[2]) * nz;
     let damp = -bond.damping * v_rel_n;
-    let mag = spring + damp;
+    // Sprint 192: integrate Hookean force over the tick (`Δv = F · dt`).
+    // Pre-S192 returned mag directly → 60× too strong impulses.
+    let mag = (spring + damp) * dt;
     ([mag * nx, mag * ny, mag * nz], false)
 }

@@ -20,8 +20,10 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // Bond physics drift slower than body params: bond_active_frac runs
     // sub-percent in long smokes, so selection has a weak signal — larger
     // sigma would degenerate into random walk.
-    sigma_bond_stiffness: 0.3,
-    sigma_bond_damping: 0.05,
+    // Sprint 192: 60× scaled with BOND_STIFFNESS / BOND_DAMPING constants
+    // so drift-per-gen percentage is preserved.
+    sigma_bond_stiffness: 18.0,
+    sigma_bond_damping: 3.0,
     // Structural brain mutations: ~2 % rates land roughly one structural
     // change per cell every 30–50 gens, giving selection time to evaluate.
     add_neuron_rate: 0.02,
