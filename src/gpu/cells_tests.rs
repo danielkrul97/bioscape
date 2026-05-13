@@ -227,6 +227,7 @@ fn cells_gpu_download_brain_motor_batch_zero_returns_empty() {
 fn cells_gpu_download_full_batch_into_zero_clears_all_scratches() {
     let ctx = match try_ctx() { Some(c) => c, None => return };
     let cells = CellsGpu::with_context(&ctx, 8);
+    let mut inputs_out = vec![[0.0_f32; BRAIN_INPUTS]; 4];
     let mut hidden_out = vec![[0.0_f32; BRAIN_HIDDEN]; 4];
     let mut outputs_out = vec![[0.0_f32; BRAIN_OUTPUTS]; 4];
     let mut velocities_out = vec![[0.0_f32; 3]; 4];
@@ -238,6 +239,7 @@ fn cells_gpu_download_full_batch_into_zero_clears_all_scratches() {
     let mut energies_out = vec![1.0; 4];
     cells.download_full_batch_into(
         0,
+        &mut inputs_out,
         &mut hidden_out,
         &mut outputs_out,
         &mut velocities_out,
@@ -248,6 +250,7 @@ fn cells_gpu_download_full_batch_into_zero_clears_all_scratches() {
         &mut cooldowns_out,
         &mut energies_out,
     );
+    assert!(inputs_out.is_empty());
     assert!(hidden_out.is_empty());
     assert!(outputs_out.is_empty());
     assert!(velocities_out.is_empty());
@@ -285,6 +288,7 @@ fn cells_gpu_upload_positions_roundtrip_via_full_batch() {
     cells.upload_metadata(&energies, &headings, &pitches, &damages, &max_speeds, &eff_radii);
     cells.upload_angular_pitch(&angulars, &pitch_vels);
 
+    let mut inputs_out = Vec::new();
     let mut hidden_out = Vec::new();
     let mut outputs_out = Vec::new();
     let mut velocities_out = Vec::new();
@@ -296,6 +300,7 @@ fn cells_gpu_upload_positions_roundtrip_via_full_batch() {
     let mut energies_out = Vec::new();
     cells.download_full_batch_into(
         n,
+        &mut inputs_out,
         &mut hidden_out,
         &mut outputs_out,
         &mut velocities_out,
@@ -449,6 +454,7 @@ fn cells_gpu_upload_metadata_roundtrip_via_full_batch() {
     cells.upload_velocities(&velocities);
     cells.upload_age_cooldown(&ages, &cooldowns);
     cells.upload_angular_pitch(&angulars, &pitch_vels);
+    let mut inputs_out = Vec::new();
     let mut hidden_out = Vec::new();
     let mut outputs_out = Vec::new();
     let mut velocities_out = Vec::new();
@@ -460,6 +466,7 @@ fn cells_gpu_upload_metadata_roundtrip_via_full_batch() {
     let mut energies_out = Vec::new();
     cells.download_full_batch_into(
         n,
+        &mut inputs_out,
         &mut hidden_out,
         &mut outputs_out,
         &mut velocities_out,
@@ -561,6 +568,7 @@ fn cells_gpu_age_cooldown_roundtrip_via_full_batch() {
     );
     cells.upload_angular_pitch(&vec![0.0_f32; n], &vec![0.0_f32; n]);
 
+    let mut inputs_out = Vec::new();
     let mut hidden_out = Vec::new();
     let mut outputs_out = Vec::new();
     let mut velocities_out = Vec::new();
@@ -572,6 +580,7 @@ fn cells_gpu_age_cooldown_roundtrip_via_full_batch() {
     let mut energies_out = Vec::new();
     cells.download_full_batch_into(
         n,
+        &mut inputs_out,
         &mut hidden_out,
         &mut outputs_out,
         &mut velocities_out,

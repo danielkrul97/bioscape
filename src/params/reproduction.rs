@@ -1,5 +1,31 @@
 pub const REPRODUCE_THRESHOLD: f32 = 150.0;
+/// Sprint 187: per-genome range for `reproduce_at_energy`. Wide span across
+/// the legacy global so an initial population draws from both r-strategy
+/// (low threshold, many small offspring) and K-strategy (high threshold,
+/// fewer well-provisioned offspring) niches from gen 0.
+pub const MIN_REPRODUCE_AT_ENERGY: f32 = 80.0;
+pub const MAX_REPRODUCE_AT_ENERGY: f32 = 250.0;
+/// Sprint 187: per-genome maternal donation per offspring. Replaces the
+/// implicit halve-and-give semantic (pre-S187: each parent lost 0.5 × energy,
+/// child got the sum). Now each parent loses `birth_energy` (absolute, gene-
+/// encoded) and the child gets `parent_a.birth_energy + parent_b.birth_energy`.
+/// Decouples "when to reproduce" (`reproduce_at_energy`) from "how much to
+/// invest per offspring" (`birth_energy`) → full r/K spectrum becomes a
+/// 2D evolvable trade-off rather than a 1D timing decision.
+pub const MIN_BIRTH_ENERGY: f32 = 30.0;
+pub const MAX_BIRTH_ENERGY: f32 = 150.0;
+/// Energy that must remain in the parent after birth, so it does not
+/// collapse mid-mating. Enforces the invariant
+/// `reproduce_at_energy ≥ 2 × birth_energy + SAFETY_MARGIN` (each parent
+/// pays `birth_energy`, must keep at least `SAFETY_MARGIN`).
+pub const REPRODUCE_BIRTH_SAFETY_MARGIN: f32 = 20.0;
 pub const SIZE_RATIO_THRESHOLD: f32 = 1.3;
+/// Sprint 187: per-genome `predation_size_ratio` range. Attackers with low
+/// ratio prey on close-sized victims (risky); high-ratio attackers only
+/// target much smaller prey (cautious). Selection finds the optimum given
+/// the population's size distribution.
+pub const MIN_PREDATION_SIZE_RATIO: f32 = 1.0;
+pub const MAX_PREDATION_SIZE_RATIO: f32 = 2.5;
 /// Post-Hunter rebalance: cell-on-cell predace je teď jediný predační režim.
 /// Drain ×2 + gain ×1.5 oproti pre-Hunter baseline → defense matters → bonded
 /// clusters jsou viable strategy → arms race mezi predátorskými lineages a
@@ -11,6 +37,13 @@ pub const PREDATION_GAIN_PER_TICK: f32 = 2.25;
 /// kolize jen kolize — energy se nepřevádí. Mirroruje semantiku
 /// `MATING_PHEROMONE_THRESHOLD` (input → behaviorální gate).
 pub const ATTACK_THRESHOLD: f32 = 0.15;
+/// Sprint 187: per-genome `attack_gate` range. Attackers with low gate
+/// strike on any positive brain signal (always-on aggression); high-gate
+/// attackers need strong brain commitment before predating. Maps to a
+/// hawk/dove polymorphism — selection finds the optimum given prey
+/// density + bond defense + per-tick attack cost.
+pub const MIN_ATTACK_GATE: f32 = 0.0;
+pub const MAX_ATTACK_GATE: f32 = 1.0;
 /// Cena udržování attack módu: COST × max(0, output[6]) za sekundu, paid each
 /// tick i když k predaci nedojde. Energie protiváhy "claws out". Bez ceny by
 /// selekce favorizovala vždy-zapnutý attack output.
@@ -115,11 +148,27 @@ pub const MAX_TRACE_DECAY_PER_SEC: f32 = 5.0;
 /// healthy weight growth isn't clipped — only runaway accumulation is.
 pub const W_NORM_CAP: f32 = 8.0;
 
-/// Sprint 138: 600 ticks ≈ 10 s @ 60 Hz. Hebbian's trace eligibility
-/// window is ~2 s, so 10 s gives selection-driven weights a chance to
-/// settle between scaling passes; smaller periods would clip Hebbian
-/// gains before they're consolidated.
-pub const SCALING_PERIOD_TICKS: u64 = 600;
+/// Sprint 188: per-tick scaling. Previously 600 (≈ 10 s @ 60 Hz) —
+/// Hebbian growth between dispatches outpaced the cap (live cell
+/// snapshot at age=1353 showed `||w1[7]||_2 ≈ 70`, 8.7× over cap, after
+/// 753 ticks since last scaling). Running every tick keeps the L2
+/// envelope continuously enforced; the shader is `O(cells ×
+/// WEIGHTS_PER_CELL) ≈ 6 M ops` total per dispatch, far below per-tick
+/// budget. Combined with `WEIGHT_DECAY_PER_TICK` the pair self-
+/// stabilizes without scaling/Hebbian oscillating against the cap.
+pub const SCALING_PERIOD_TICKS: u64 = 1;
+
+/// Sprint 188: multiplicative weight decay applied every tick to all
+/// `w1` and `w2` entries (biases included for symmetry). Pre-S188 the
+/// Hebbian path had no decay — any non-zero reward grew weights toward
+/// `W_NORM_CAP`, and once at the cap `synaptic_scale` clipped excess
+/// only, producing the observed "1 dominant neuron drives all outputs"
+/// representational collapse. With decay, the Hebbian update reaches a
+/// stable equilibrium `w_eq ≈ Δ_per_tick / decay`. At `0.001` a single
+/// weight at `|w| = 2.0` decays by `~0.2 %` per tick; combined with
+/// Hebbian `Δ ≈ 0.001–0.005` per reward tick this yields `w_eq` well
+/// inside the L2 envelope.
+pub const WEIGHT_DECAY_PER_TICK: f32 = 0.001;
 
 /// Sprint 139: signed-EMA blend factor for per-neuron activity tracking.
 /// `0.01` gives an effective window of ~100 ticks (~1.7 s @ 60 Hz) — long

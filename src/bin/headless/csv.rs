@@ -45,7 +45,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
             //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
             //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -512,6 +512,41 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let (lr_avg, lr_std) = mean_std(world.cells.iter().map(|c| c.genome.learning_rate as f64));
     let (decay_avg, decay_std) =
         mean_std(world.cells.iter().map(|c| c.genome.trace_decay_per_sec as f64));
+    // Sprint 187: per-cell reproduction threshold + birth donation (r/K
+    // niche tracking — two axes that should correlate negatively if pure
+    // r and K strategies emerge as distinct attractors).
+    let (repro_avg, repro_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.reproduce_at_energy as f64));
+    let (birth_avg, birth_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.birth_energy as f64));
+    // Sprint 187: per-cell altruism + cluster bonus. Polymorphism vs
+    // convergence in long runs answers the kin-selection question.
+    let (altruism_avg, altruism_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.altruism_share_frac as f64));
+    let (cluster_bonus_avg, cluster_bonus_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.cluster_share_bonus as f64));
+    // Sprint 187: per-cell aggression traits. attack_gate drift down = hawk
+    // pressure, drift up = dove. defense_contribution drift up = altruistic
+    // defense emerging (parallel to altruism_share_frac).
+    let (attack_gate_avg, attack_gate_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.attack_gate as f64));
+    let (size_ratio_avg, size_ratio_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.predation_size_ratio as f64));
+    let (defense_avg, defense_std) =
+        mean_std(world.cells.iter().map(|c| c.genome.defense_contribution as f64));
+    // Sprint 187: per-cell reward weights (7 kinds). Means only — stds skipped
+    // for CSV compactness (variance can be inferred from per-tick events).
+    let mut rw_means = [0.0_f64; bioscape::N_REWARD_KINDS];
+    if n > 0 {
+        for c in world.cells.iter() {
+            for k in 0..bioscape::N_REWARD_KINDS {
+                rw_means[k] += c.genome.reward_weights[k] as f64;
+            }
+        }
+        for k in 0..bioscape::N_REWARD_KINDS {
+            rw_means[k] /= nf;
+        }
+    }
     // Sprint 140: mean L2 norm across w1 rows of all cells. Synaptic
     // scaling (S138) caps row norms at `W_NORM_CAP`; this metric tracks
     // how close the population sits to the cap on average.
@@ -539,7 +574,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -664,6 +699,28 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         neural_spike_frac,
         // Sprint 149
         izhikevich_frac,
+        // Sprint 187
+        repro_avg,
+        repro_std,
+        birth_avg,
+        birth_std,
+        altruism_avg,
+        altruism_std,
+        cluster_bonus_avg,
+        cluster_bonus_std,
+        attack_gate_avg,
+        attack_gate_std,
+        size_ratio_avg,
+        size_ratio_std,
+        defense_avg,
+        defense_std,
+        rw_means[0], // EatFood
+        rw_means[1], // Novelty
+        rw_means[2], // Predation
+        rw_means[3], // EscapedAttack
+        rw_means[4], // Damage
+        rw_means[5], // BondFormed
+        rw_means[6], // MateSignalAccepted
     )
 }
 

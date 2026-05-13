@@ -163,7 +163,12 @@ impl IzhikevichGpu {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
+            // Post-S190: 1 workgroup = 1 cell so the 64 threads can co-op
+            // on workgroup-shared inputs/current/hidden and keep each
+            // neuron's (v, u, spike_count) in scalar registers across
+            // the 32-step Euler loop. Pre-S190 was 1 thread = 1 cell with
+            // 5× private-memory arrays spilling to DRAM.
+            pass.dispatch_workgroups(n as u32, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
     }

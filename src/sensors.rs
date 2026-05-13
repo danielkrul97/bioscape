@@ -58,7 +58,7 @@ pub fn populate_brain_inputs(
     // identity s pre-Sprint-32 trajektorií. Sprint 33+ vz != 0; hypot
     // ignoruje vz, ale rozdíl je sub-ULP. Sprint 41+ může přejít na 3D mag.
     let speed_norm = (cell.velocity[0].hypot(cell.velocity[1]) / max_speed).clamp(0.0, 1.0);
-    let energy_norm = (cell.energy / REPRODUCE_THRESHOLD).clamp(0.0, 1.5);
+    let energy_norm = (cell.energy / cell.genome.reproduce_at_energy).clamp(0.0, 1.5);
 
     let mut inputs = [0.0_f32; BRAIN_INPUTS];
     if let Some(delta) = sensors.nearest_food {

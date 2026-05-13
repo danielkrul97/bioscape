@@ -213,6 +213,12 @@ pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.015;
 /// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál pro
 /// bonding — fitness payoff přímo přes food share.
 pub const BOND_FOOD_SHARE_FRAC: f32 = 2.5;
+/// Sprint 187: per-genome `altruism_share_frac` range. Wide span lets the
+/// initial population draw selfish (0..0.5) and altruist (2..3) phenotypes
+/// from gen 0 — kin selection / cheater dynamics emerge from selection
+/// rather than uniform forced cooperation.
+pub const MIN_ALTRUISM_SHARE_FRAC: f32 = 0.0;
+pub const MAX_ALTRUISM_SHARE_FRAC: f32 = 5.0;
 /// Negative frequency-dependent selection na reprodukci. Sprint 143:
 /// kvadratická penalty místo lineární — `threshold = REPRODUCE_THRESHOLD ×
 /// (1 + α × lineage_freq²)`. Quadratic exponent zaměřuje penalty na
@@ -228,6 +234,10 @@ pub const LINEAGE_DIVERSITY_ALPHA: f32 = 2.0;
 /// linear bonus per added bond posiluje selekci pro velké clustery. n=1 →
 /// ×1.00, n=2 → ×1.15, n=6 (max) → ×1.75. Žádný cap (max je MAX_BONDS_PER_CELL=6).
 pub const BOND_FOOD_SHARE_CLUSTER_BONUS: f32 = 0.40;
+/// Sprint 187: per-genome `cluster_share_bonus` range. Per-partner share
+/// multiplier scales linearly with active bond count: `share × (1 + (n−1) × bonus)`.
+pub const MIN_CLUSTER_SHARE_BONUS: f32 = 0.0;
+pub const MAX_CLUSTER_SHARE_BONUS: f32 = 1.0;
 
 // ─── Sprint 80: bistabilní cell-state (epigenetic-like memory) ──────────────
 // Per-cell continuous scalar [0,1] s pozitivním feedbackem okolo 0.5 →
@@ -272,19 +282,54 @@ pub const CLUSTER_SPAWN_RADIUS: f32 = 8.0;
 /// bondování. 15 % per bond × cap 4 = max 60 % reduction (4-bond clusters
 /// jsou v podstatě immune krátce; predátor pořád dostane něco z 1- a 2-bond cells).
 pub const BOND_DEFENSE_FRAC: f32 = 0.15;
+/// Sprint 187: per-genome `defense_contribution` range. Donor-side trait:
+/// each cell donates defense to its bonded partners (victim's defense pool
+/// = sum of bonded partners' contributions, capped at `BOND_DEFENSE_CAP`).
+/// Parallel to `altruism_share_frac` (food donor) — defensive analog. High
+/// contribution helps cluster survive predation but offers no direct
+/// individual benefit; kin selection signal.
+pub const MIN_DEFENSE_CONTRIBUTION: f32 = 0.0;
+pub const MAX_DEFENSE_CONTRIBUTION: f32 = 0.5;
+
+/// Sprint 187: per-cell reward weights. Each lineage evolves its own
+/// dopamine-like sensitivity to different events. Order matches
+/// `RewardKind` enum: `[EatFood, Novelty, Predation, EscapedAttack, Damage,
+/// BondFormed, MateSignalAccepted]`. Defaults equal the pre-S187 globals so
+/// fresh checkpoints behave like the baseline at gen 0. `MAX = 2 × default`
+/// per slot — clamp prevents reward inflation runaway (selection can't push
+/// every weight to infinity, the saturation cap forces a trade-off across
+/// kinds).
+pub const N_REWARD_KINDS: usize = 7;
+pub const REWARD_WEIGHT_DEFAULTS: [f32; N_REWARD_KINDS] = [
+    1.0,                          // EatFood (was hardcoded 1.0 at push site)
+    NOVELTY_REWARD_MAGNITUDE,     // 0.05
+    PREDATION_REWARD_SCALE,       // 0.4
+    ESCAPE_REWARD_MAGNITUDE,      // 0.3
+    DAMAGE_REWARD_GAIN,           // 0.1
+    BOND_FORMED_REWARD_MAGNITUDE, // 0.6
+    MATING_REWARD_MAGNITUDE,      // 0.5
+];
+pub const REWARD_WEIGHT_MAX: [f32; N_REWARD_KINDS] = [
+    2.0, 0.1, 0.8, 0.6, 0.2, 1.2, 1.0,
+];
+pub const REWARD_WEIGHT_MIN: [f32; N_REWARD_KINDS] = [
+    0.0; N_REWARD_KINDS
+];
 /// Maximum bondů, které se počítají do defense multiplikátoru. Cap brání
 /// stacking abuse (cell s 6 bondy = 100% immune). 4 = sweet spot, kde
 /// střední cluster (3-4 bondy) má smysluplnou ochranu, ale solo cell jasně
 /// horší (jen 0.85× damage).
 pub const BOND_DEFENSE_CAP: u32 = 4;
 
-/// Sprint 69: multiplikátor predation gain + damage podle počtu kořistních
-/// bondů. Vrací hodnotu v [0.4, 1.0]. n_bonds=0 → 1.0 (no defense), n_bonds≥4
-/// → 1.0 - 0.15×4 = 0.4 (max defense). Linear in n_bonds.
+/// Sprint 69 + 187: multiplier on predation gain + damage for bonded victims.
+/// Returns a value in `[0.4, 1.0]`. Pre-S187 took `n_bonds` and used the
+/// uniform `BOND_DEFENSE_FRAC`. Post-S187 takes a precomputed
+/// `defense_pool` — the sum of bonded partners' `genome.defense_contribution`
+/// (already capped at `BOND_DEFENSE_CAP` partners by the caller). The floor
+/// (`0.4`) matches the pre-S187 maximum defense reduction.
 #[inline]
-pub fn bond_defense_factor(n_bonds: u32) -> f32 {
-    let capped = n_bonds.min(BOND_DEFENSE_CAP) as f32;
-    1.0 - BOND_DEFENSE_FRAC * capped
+pub fn bond_defense_factor(defense_pool: f32) -> f32 {
+    (1.0 - defense_pool).max(0.4)
 }
 
 

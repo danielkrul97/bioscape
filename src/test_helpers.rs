@@ -52,6 +52,14 @@ pub fn dummy_genome() -> Genome {
         stdp_a_plus: DEFAULT_STDP_A_PLUS,
         stdp_a_minus: DEFAULT_STDP_A_MINUS,
         stdp_tau_ticks: DEFAULT_STDP_TAU_TICKS,
+        reproduce_at_energy: REPRODUCE_THRESHOLD,
+        birth_energy: 50.0,
+        altruism_share_frac: BOND_FOOD_SHARE_FRAC,
+        cluster_share_bonus: BOND_FOOD_SHARE_CLUSTER_BONUS,
+        attack_gate: ATTACK_THRESHOLD,
+        predation_size_ratio: SIZE_RATIO_THRESHOLD,
+        defense_contribution: BOND_DEFENSE_FRAC,
+        reward_weights: REWARD_WEIGHT_DEFAULTS,
     }
 }
 
@@ -86,6 +94,14 @@ pub fn zero_cfg() -> MutationConfig {
         model_flip_rate: 0.0,
         sigma_stdp_a: 0.0,
         sigma_stdp_tau: 0.0,
+        sigma_reproduce_at_energy: 0.0,
+        sigma_birth_energy: 0.0,
+        sigma_altruism_share_frac: 0.0,
+        sigma_cluster_share_bonus: 0.0,
+        sigma_attack_gate: 0.0,
+        sigma_predation_size_ratio: 0.0,
+        sigma_defense_contribution: 0.0,
+        sigma_reward_weights: [0.0; N_REWARD_KINDS],
     }
 }
 

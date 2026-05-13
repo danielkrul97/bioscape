@@ -21,6 +21,17 @@ pub const EAT_RADIUS: f32 = 8.0;
 pub const MATING_RADIUS: f32 = 200.0;
 
 pub const DRAG_COEFFICIENT: f32 = 0.005;
+/// Sprint 188: hard cap on per-cell velocity magnitude expressed as a
+/// multiple of `genome.max_speed`. Bond spring forces are applied as
+/// per-tick impulses without a `dt` scale (see `shaders/collision.wgsl`
+/// + `world.rs::resolve_collisions` Phase 2), so an overstretched bond
+/// briefly drives `|v|` well past what drag can balance — observed at
+/// 3.6× `max_speed` in a real run. 1.5× preserves headroom for short
+/// transients (bond release, predation impulse) while keeping run-away
+/// out of the system. Applied AFTER all velocity-mutating phases so
+/// brain, motor, brownian, collision, bond, and step contributions are
+/// all bounded by the same envelope.
+pub const VELOCITY_CAP_FACTOR: f32 = 1.5;
 pub const ANGULAR_DRAG: f32 = 1.0;
 pub const ENERGY_COST_PER_V_SQ: f32 = 0.0008;
 pub const ANGULAR_ENERGY_COST: f32 = 0.05;

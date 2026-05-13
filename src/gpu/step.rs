@@ -48,11 +48,11 @@ pub struct StepParamsGpu {
     /// seasonal (per-generation, uniform shift).
     pub thermal_diurnal_amp: f32,
     pub thermal_seasonal_amp: f32,
-    /// Phase fraction `(tick mod period) / period` in `[0, 1)` — the caller
-    /// precomputes this so the shader doesn't lose precision casting `u64`
-    /// directly to `f32` on long runs.
-    pub thermal_diurnal_phase: f32,
-    pub thermal_seasonal_phase: f32,
+    /// `sin(TAU * phase)` precomputed on CPU. Both phases are uniform across
+    /// all cells in a tick, so the shader doesn't need to recompute the same
+    /// `sin` N× per dispatch.
+    pub thermal_diurnal_sin: f32,
+    pub thermal_seasonal_sin: f32,
     /// `log2(thermal_q10)` precomputed on CPU. Lets the shader replace
     /// `pow(q10, x)` with `exp2(x * thermal_log2_q10)` (one log2 saved per cell
     /// per tick). Callers must keep this in sync with `thermal_q10`.
@@ -212,7 +212,9 @@ impl StepGpu {
         let age_buf = mk("step-age", n * f, stor_dst_src);
         let cooldown_buf = mk("step-cooldown", n * f, stor_dst_src);
         let energy_buf = mk("step-energy", n * f, stor_dst_src);
-        let body_dims_buf = mk("step-body-dims", n * 3 * f, stor_dst);
+        // body_dims uses 16B-per-cell layout (vec4 with trailing pad) so the
+        // shader can read all three axes in one storage load.
+        let body_dims_buf = mk("step-body-dims", n * 4 * f, stor_dst);
         let aux_buf = mk("step-aux", n * 4 * f, stor_dst);
         // Wave 4: maze mask buffer. MAZE_MASK_CAPACITY u32s holds the
         // largest expected ObstacleField (Hard mode 65×37 = 2405 voxels at
@@ -352,7 +354,15 @@ impl StepGpu {
         self.queue.write_buffer(&self.age_buf, 0, bytemuck::cast_slice(ages));
         self.queue.write_buffer(&self.cooldown_buf, 0, bytemuck::cast_slice(cooldowns));
         self.queue.write_buffer(&self.energy_buf, 0, bytemuck::cast_slice(energies));
-        self.queue.write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(body_dims));
+        // Pad [f32; 3] → [f32; 4] so the shader can use `array<vec4<f32>>`
+        // (WGSL storage stride for vec3 is 16B too — explicit pad keeps the
+        // host data structure unchanged while letting the shader do one load).
+        let body_dims_padded: Vec<[f32; 4]> = body_dims
+            .iter()
+            .map(|d| [d[0], d[1], d[2], 0.0])
+            .collect();
+        self.queue
+            .write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(&body_dims_padded));
         self.queue.write_buffer(&self.aux_buf, 0, bytemuck::cast_slice(aux));
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

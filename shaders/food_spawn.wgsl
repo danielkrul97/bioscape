@@ -166,17 +166,16 @@ fn food_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cs = params.cell_size;
     let r_cells = i32(ceil(search_r / cs));
     let center = bucket_coords_of(pos);
-    var blocked: bool = false;
+    // RNG state is persisted on every exit path so blocked / valid attempts
+    // both advance the stream — return early on the first conflicting cell
+    // instead of propagating a `blocked` flag through four nested loops.
     for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-        if (blocked) { break; }
         let bz = clamp(center.z + dz, 0, GRID_NZ - 1);
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
-            if (blocked) { break; }
             var by = center.y + dy;
             if (by < 0) { by = by + GRID_NY; }
             else if (by >= GRID_NY) { by = by - GRID_NY; }
             for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
-                if (blocked) { break; }
                 var bx = center.x + dx;
                 if (bx < 0) { bx = bx + GRID_NX; }
                 else if (bx >= GRID_NX) { bx = bx - GRID_NX; }
@@ -201,15 +200,13 @@ fn food_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
                         pos.z - cp.z,
                     );
                     if (dot(d, d) < exclusion2) {
-                        blocked = true;
-                        break;
+                        xoshiro_state[i] = s;
+                        return;
                     }
                 }
             }
         }
     }
     xoshiro_state[i] = s;
-    if (!blocked) {
-        valid_mask[i] = 1u;
-    }
+    valid_mask[i] = 1u;
 }

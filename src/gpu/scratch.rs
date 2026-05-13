@@ -4,7 +4,7 @@
 //! does zero allocations except when a population spike forces a capacity
 //! grow.
 
-use crate::{BRAIN_HIDDEN, BRAIN_OUTPUTS, N_BOND_MSG_CHANNELS};
+use crate::{BRAIN_HIDDEN, BRAIN_INPUTS, BRAIN_OUTPUTS, N_BOND_MSG_CHANNELS};
 
 #[derive(Default)]
 pub struct GpuFullScratch {
@@ -28,6 +28,11 @@ pub struct GpuFullScratch {
     pub hidden_ns: Vec<u32>,
     pub bonded_inboxes: Vec<[f32; N_BOND_MSG_CHANNELS]>,
     // Readback scratch — `CellsGpu::download_full_batch_into` zapisuje do těchto.
+    /// Sprint 188: GPU now mirrors `last_inputs_buf` back to the CPU so
+    /// `Cell.last_inputs` reflects what the brain actually saw this tick
+    /// (pre-S188 it was frozen at spawn-time zeros — see the GPU pipeline
+    /// in `world.rs` Phase 5 → 10).
+    pub dl_inputs: Vec<[f32; BRAIN_INPUTS]>,
     pub dl_hiddens: Vec<[f32; BRAIN_HIDDEN]>,
     pub dl_outputs: Vec<[f32; BRAIN_OUTPUTS]>,
     pub dl_velocities: Vec<[f32; 3]>,
@@ -50,6 +55,12 @@ pub struct GpuFullScratch {
     pub lt_body_dims: Vec<[f32; 3]>,
     pub lt_carnivore: Vec<f32>,
     pub lt_attack_signals: Vec<f32>,
+    /// Sprint 187: per-cell aggression genome traits and aggregated defense
+    /// pool — refilled from `cell.genome.*` and bonded-partner walk every
+    /// predate dispatch.
+    pub lt_attack_gates: Vec<f32>,
+    pub lt_predation_size_ratios: Vec<f32>,
+    pub lt_defense_pool: Vec<f32>,
     pub lt_adhesion_types: Vec<u32>,
     pub lt_spike_counts: Vec<u32>,
     pub lt_spikes_packed: Vec<[f32; 4]>,

@@ -37,9 +37,12 @@ struct PredateParams {
     num_cells: u32,
     cell_size: f32,
     cell_radius_const: f32,
-    size_ratio_threshold: f32,
+    // Sprint 187: per-cell `attack_gates` + `predation_size_ratios` replace
+    // the pre-S187 uniform thresholds. `defense_floor` clamps the per-victim
+    // defense multiplier so a saturated pool can't invert the sign.
+    defense_floor: f32,
     herd_radius_sq: f32,
-    attack_threshold: f32,
+    _pad_attack_threshold: f32,
     predation_gain: f32,
     predation_drain: f32,
     spike_dot_threshold: f32,
@@ -83,22 +86,66 @@ fn bucket_coords_of(pos: vec3<f32>) -> vec3<i32> {
 @group(0) @binding(6) var<storage, read> hash_offsets: array<u32>;
 @group(0) @binding(7) var<storage, read> hash_sorted: array<u32>;
 @group(0) @binding(8) var<storage, read_write> herd_counts: array<u32>;
-@group(0) @binding(9) var<storage, read_write> energy_delta: array<atomic<u32>>;
+// Per-attacker accumulated self_gain (single writer per `i` — only thread
+// `i` writes to `energy_gain[i]`, so `atomicStore` is enough). CPU derives
+// `energy_delta[i] = energy_gain[i] - damage_delta[i]` after readback.
+@group(0) @binding(9) var<storage, read_write> energy_gain: array<atomic<u32>>;
+// Per-victim accumulated drain (multi-writer — every attacker that hits
+// `j` adds `predation_drain`). Still needs CAS for the float-add.
 @group(0) @binding(10) var<storage, read_write> damage_delta: array<atomic<u32>>;
 @group(0) @binding(11) var<storage, read> spike_counts: array<u32>;
 @group(0) @binding(12) var<storage, read> pitches: array<f32>;
-// Single-element global counter incremented atomically per (i, j) attack hit.
-// Mirrors CPU `attack_events.len()` for `predation_events_gen` CSV column.
-@group(0) @binding(13) var<storage, read_write> event_count: array<atomic<u32>>;
 // Pack-hunting diagnostics. The shader doesn't know about bonds — it
 // writes per-attacker hit/gain totals and the first K attacker IDs per
 // victim, then the CPU does the bond-pair lookup to classify swarm vs
 // pack. Each buffer is reset to 0 per dispatch.
-@group(0) @binding(14) var<storage, read_write> attacker_event_count: array<atomic<u32>>;
-@group(0) @binding(15) var<storage, read_write> attacker_gain_sum: array<atomic<u32>>;
-@group(0) @binding(16) var<storage, read_write> victim_attacker_count: array<atomic<u32>>;
+//
+// `total_events` (CPU `attack_events.len()` / `predation_events_gen`) is
+// derived host-side as `sum(attacker_event_count)` — the dedicated single-slot
+// atomic counter pre-S188 serialized every (i,j) hit through one cache line.
+@group(0) @binding(13) var<storage, read_write> attacker_event_count: array<atomic<u32>>;
+@group(0) @binding(14) var<storage, read_write> attacker_gain_sum: array<atomic<u32>>;
+@group(0) @binding(15) var<storage, read_write> victim_attacker_count: array<atomic<u32>>;
 // Layout: K slots per victim, IDs stored as `attacker_idx + 1` so 0 = empty.
-@group(0) @binding(17) var<storage, read_write> victim_attackers: array<atomic<u32>>;
+@group(0) @binding(16) var<storage, read_write> victim_attackers: array<atomic<u32>>;
+// Per-bucket minimum eff_radius. Populated by `bucket_min_radius`, consumed
+// by `attack` for the size-ratio whole-bucket prefilter. Empty buckets get
+// a large sentinel so they always fail the guard (and so get skipped).
+@group(0) @binding(17) var<storage, read_write> min_radius_per_bucket: array<f32>;
+// Sprint 187: per-cell aggression genome traits.
+@group(0) @binding(18) var<storage, read> attack_gates: array<f32>;
+@group(0) @binding(19) var<storage, read> predation_size_ratios: array<f32>;
+// Per-victim summed defense from bonded partners' `defense_contribution`,
+// CPU-aggregated each tick (similar pattern to bonded_inbox).
+@group(0) @binding(20) var<storage, read> defense_pool: array<f32>;
+
+// Per-bucket min(eff_radii) reduction. One thread per bucket walks
+// `hash_sorted[hash_offsets[b]..hash_offsets[b+1]]` and writes the smallest
+// `eff_radii[j]` it sees. `attack` uses this for a fast pre-filter:
+// `r_i < size_ratio_threshold * bucket_min` → no cell in the bucket can be
+// preyed on, skip the whole bucket walk. Empty buckets emit `1.0e30` so the
+// guard rejects them.
+const NUM_BUCKETS: u32 = 8192u; // GRID_NX * GRID_NY * GRID_NZ
+
+@compute @workgroup_size(64)
+fn bucket_min_radius(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= NUM_BUCKETS) {
+        return;
+    }
+    let start = hash_offsets[b];
+    let end = hash_offsets[b + 1u];
+    if (start == end) {
+        min_radius_per_bucket[b] = 1.0e30;
+        return;
+    }
+    var m: f32 = 1.0e30;
+    for (var k = start; k < end; k = k + 1u) {
+        let j = hash_sorted[k];
+        m = min(m, eff_radii[j]);
+    }
+    min_radius_per_bucket[b] = m;
+}
 
 @compute @workgroup_size(64)
 fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -162,9 +209,10 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let attack_strength = max(attack_signals[i], 0.0);
-    if (attack_strength <= params.attack_threshold) {
+    if (attack_strength <= attack_gates[i]) {
         return;
     }
+    let size_ratio_i = predation_size_ratios[i];
     let pos_i = vec3<f32>(
         positions[i * 3u + 0u],
         positions[i * 3u + 1u],
@@ -222,6 +270,13 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (bx < 0) { bx = bx + GRID_NX; }
                 else if (bx >= GRID_NX) { bx = bx - GRID_NX; }
                 let b = u32(bx + by * GRID_NX + bz * GRID_NX * GRID_NY);
+                // Whole-bucket size-ratio prefilter: if this attacker can't
+                // even prey on the smallest cell in the bucket, the entire
+                // bucket walk is wasted. Saves both the hash_offsets fetch
+                // chain and every per-pair load for large attackers.
+                if (r_i < size_ratio_i * min_radius_per_bucket[b]) {
+                    continue;
+                }
                 let start = hash_offsets[b];
                 let end = hash_offsets[b + 1u];
                 for (var k = start; k < end; k = k + 1u) {
@@ -230,7 +285,7 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                         continue;
                     }
                     let r_j = eff_radii[j];
-                    if (r_i < params.size_ratio_threshold * r_j) {
+                    if (r_i < size_ratio_i * r_j) {
                         continue;
                     }
                     let pair_r = crc_r_i + crc * r_j;
@@ -247,7 +302,6 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                     );
                     let d2 = dot(d, d);
                     if (d2 < pair_r2) {
-                        atomicAdd(&event_count[0], 1u);
                         atomicAdd(&attacker_event_count[i], 1u);
                         let slot = atomicAdd(&victim_attacker_count[j], 1u);
                         if (slot < MAX_ATTACKERS_PER_VICTIM) {
@@ -274,26 +328,25 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                         }
                         let n_neigh = f32(herd_counts[j]);
                         let dilution = 1.0 / (1.0 + params.dilution_k * n_neigh);
-                        gain = gain * dilution;
+                        // Sprint 187: bonded victims get a defense multiplier
+                        // reducing both attacker gain and victim drain. The
+                        // floor (`defense_floor`) bounds maximum protection
+                        // so kin-defense can't make any cluster immune.
+                        let def_factor = max(1.0 - defense_pool[j], params.defense_floor);
+                        gain = gain * dilution * def_factor;
+                        let applied_drain = params.predation_drain * def_factor;
                         self_gain = self_gain + gain;
 
-                        // Float atomic add via CAS: old → bitcast<f32>, modify,
-                        // bitcast back to u32, swap. Naga rejects passing the
-                        // storage pointer to a helper, so each site is inlined.
-                        var old_e: u32 = atomicLoad(&energy_delta[j]);
-                        loop {
-                            let new_e: u32 =
-                                bitcast<u32>(bitcast<f32>(old_e) - params.predation_drain);
-                            let r = atomicCompareExchangeWeak(&energy_delta[j], old_e, new_e);
-                            if (r.exchanged) {
-                                break;
-                            }
-                            old_e = r.old_value;
-                        }
+                        // Single CAS float-add: only `damage_delta[j]` is
+                        // touched per pair-hit. `energy_delta` on the CPU is
+                        // derived as `energy_gain[i] - damage_delta[i]`, so
+                        // we don't need a parallel `energy_delta[j] -= drain`
+                        // CAS — that pre-S188 path doubled the atomic
+                        // contention on mobbed victims for no semantic gain.
                         var old_d: u32 = atomicLoad(&damage_delta[j]);
                         loop {
                             let new_d: u32 =
-                                bitcast<u32>(bitcast<f32>(old_d) + params.predation_drain);
+                                bitcast<u32>(bitcast<f32>(old_d) + applied_drain);
                             let r = atomicCompareExchangeWeak(&damage_delta[j], old_d, new_d);
                             if (r.exchanged) {
                                 break;
@@ -306,21 +359,11 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Self-gain still goes through an atomic — cell `i` can simultaneously
-    // be a victim of another attacker writing to energy_delta[i].
+    // Self-gain: thread `i` is the only writer to `energy_gain[i]`, so a
+    // plain atomicStore is enough — no CAS needed. (Drain from other
+    // attackers lands in `damage_delta[i]`, kept on its own buffer.)
     if (self_gain != 0.0) {
-        var old_s: u32 = atomicLoad(&energy_delta[i]);
-        loop {
-            let new_s: u32 = bitcast<u32>(bitcast<f32>(old_s) + self_gain);
-            let r = atomicCompareExchangeWeak(&energy_delta[i], old_s, new_s);
-            if (r.exchanged) {
-                break;
-            }
-            old_s = r.old_value;
-        }
-        // `attacker_gain_sum[i]` is written only by attacker `i` (no other
-        // workgroup races for the same index), so a single atomicStore is
-        // enough — no CAS needed.
+        atomicStore(&energy_gain[i], bitcast<u32>(self_gain));
         atomicStore(&attacker_gain_sum[i], bitcast<u32>(self_gain));
     }
 }

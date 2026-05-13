@@ -16,6 +16,15 @@
 // dead-zone weights are zero (enforced CPU-side), so inactive neurons
 // contribute nothing. `hidden_n` only gates which tanh path the activation
 // takes — see `tanh_fast` below.
+//
+// Sprint 189: LayerNorm before tanh. Pre-activations (`w·x + b`) are
+// normalized to mean=0 / std=1 over the active range (L1: [0, h_n),
+// L2: [0, BRAIN_OUTPUTS)) before passing through tanh. This breaks the
+// recurrent-saturation feedback loop where saturated hidden activations
+// (±1) fed back as recurrent inputs and saturated the next-tick preact.
+// Math: `normed = (pre - mean) / sqrt(var + eps)`; the tanh that follows
+// only saturates on |normed| > ~2.3, which (since std=1) is a tail event
+// not the typical case.
 
 const BRAIN_INPUTS: u32 = 84u;       // Wave 2: 27 + 2 bond inbox + 4 vibration + 6 whisker + 45 recurrent
 const BRAIN_HIDDEN: u32 = 45u;
@@ -72,31 +81,55 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
         in_local[i] = inputs[i_off + i];
     }
 
-    // V8: Kahan compensated summation in the dot-product. Bounds error to
-    // O(ε) per dot regardless of float-add order, which (combined with the
-    // unified brownian RNG stream) keeps CPU `Brain::forward_with_state`
-    // and this shader within a tight ULP envelope per tick. The bias is
-    // applied AFTER the compensated sum so it does not pollute the running
-    // compensation term.
+    // Plain dot-product sum. Pre-S190 used Kahan compensated summation
+    // (4 FLOPs/iter vs 1) to keep the parity test's 1e-4 tolerance — but
+    // CPU `Brain::forward_with_state` uses plain summation too, so the only
+    // CPU↔GPU drift left to chase was tanh-implementation noise. Plain sum
+    // here stays within parity bounds in practice and saves ~3× FLOPs on the
+    // hottest kernel.
+    //
+    // Two-pass per layer: (1) compute pre-activations; (2) layer-norm over
+    // the active range, then tanh. Inactive (`h ≥ h_n`) slots stay at zero
+    // and are excluded from mean / variance to avoid biasing the norm.
     let w1_base = w_off + W1_OFFSET;
     let b1_base = w_off + B1_OFFSET;
-    var hid: array<f32, BRAIN_HIDDEN>;
+
+    // Pass 1: L1 pre-activations.
+    var pre_hid: array<f32, BRAIN_HIDDEN>;
     for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
         let row_base = w1_base + h * BRAIN_INPUTS;
-        var sum: f32 = 0.0;
-        var c: f32 = 0.0;
+        var sum: f32 = weights[b1_base + h];
         for (var i: u32 = 0u; i < BRAIN_INPUTS; i = i + 1u) {
-            let y = weights[row_base + i] * in_local[i] - c;
-            let t = sum + y;
-            c = (t - sum) - y;
-            sum = t;
+            sum = sum + weights[row_base + i] * in_local[i];
         }
-        sum = sum + weights[b1_base + h];
+        pre_hid[h] = sum;
+    }
+
+    // LayerNorm stats over the active range [0, h_n).
+    var sum_h: f32 = 0.0;
+    for (var h: u32 = 0u; h < h_n; h = h + 1u) {
+        sum_h = sum_h + pre_hid[h];
+    }
+    let inv_hn = 1.0 / max(f32(h_n), 1.0);
+    let mean_h = sum_h * inv_hn;
+    var var_h_sum: f32 = 0.0;
+    for (var h: u32 = 0u; h < h_n; h = h + 1u) {
+        let d = pre_hid[h] - mean_h;
+        var_h_sum = var_h_sum + d * d;
+    }
+    let inv_std_h = inverseSqrt(var_h_sum * inv_hn + 1e-6);
+
+    // Pass 2: apply normalization + tanh. Dead-zone stays at zero.
+    var hid: array<f32, BRAIN_HIDDEN>;
+    for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
         var act: f32;
-        if (h < chunk_end) {
-            act = tanh_fast(sum);
-        } else if (h < h_n) {
-            act = tanh(sum);
+        if (h < h_n) {
+            let normed = (pre_hid[h] - mean_h) * inv_std_h;
+            if (h < chunk_end) {
+                act = tanh_fast(normed);
+            } else {
+                act = tanh(normed);
+            }
         } else {
             act = 0.0;
         }
@@ -104,19 +137,32 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
         hidden[h_off + h] = act;
     }
 
+    // L2: same two-pass treatment over the fixed BRAIN_OUTPUTS range.
     let w2_base = w_off + W2_OFFSET;
     let b2_base = w_off + B2_OFFSET;
+    var pre_out: array<f32, BRAIN_OUTPUTS>;
     for (var o: u32 = 0u; o < BRAIN_OUTPUTS; o = o + 1u) {
         let row_base = w2_base + o * BRAIN_HIDDEN;
-        var sum: f32 = 0.0;
-        var c: f32 = 0.0;
+        var sum: f32 = weights[b2_base + o];
         for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
-            let y = weights[row_base + h] * hid[h] - c;
-            let t = sum + y;
-            c = (t - sum) - y;
-            sum = t;
+            sum = sum + weights[row_base + h] * hid[h];
         }
-        sum = sum + weights[b2_base + o];
-        outputs[o_off + o] = tanh(sum);
+        pre_out[o] = sum;
+    }
+    var sum_o: f32 = 0.0;
+    for (var o: u32 = 0u; o < BRAIN_OUTPUTS; o = o + 1u) {
+        sum_o = sum_o + pre_out[o];
+    }
+    let inv_on = 1.0 / f32(BRAIN_OUTPUTS);
+    let mean_o = sum_o * inv_on;
+    var var_o_sum: f32 = 0.0;
+    for (var o: u32 = 0u; o < BRAIN_OUTPUTS; o = o + 1u) {
+        let d = pre_out[o] - mean_o;
+        var_o_sum = var_o_sum + d * d;
+    }
+    let inv_std_o = inverseSqrt(var_o_sum * inv_on + 1e-6);
+    for (var o: u32 = 0u; o < BRAIN_OUTPUTS; o = o + 1u) {
+        let normed = (pre_out[o] - mean_o) * inv_std_o;
+        outputs[o_off + o] = tanh(normed);
     }
 }

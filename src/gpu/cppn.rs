@@ -55,6 +55,12 @@ fn activation_code(a: ActivationFn) -> u32 {
 /// skipping the per-child `upload_brain_at` round-trip the CPU path would
 /// otherwise need. One dispatch covers all children produced in one
 /// reproduction phase.
+/// CSR offsets per cell: `CPPN_MAX_NODES + 1` u32 slots. `link_offsets[id]`
+/// = inclusive start index in the cell's `cppn_links` slice; `link_offsets[id + 1]`
+/// = end. Lets the shader walk only links incoming to a given node instead of
+/// scanning all 256 slots per node × per layer pass.
+const CPPN_LINK_OFFSETS_PER_CELL: usize = CPPN_MAX_NODES + 1;
+
 pub struct CppnGpu {
     #[allow(dead_code)]
     device: Arc<wgpu::Device>,
@@ -66,6 +72,7 @@ pub struct CppnGpu {
     meta_buf: wgpu::Buffer,
     nodes_buf: wgpu::Buffer,
     links_buf: wgpu::Buffer,
+    link_offsets_buf: wgpu::Buffer,
     slots_buf: wgpu::Buffer,
     cached_bg: Option<wgpu::BindGroup>,
     cached_cells_epoch: u64,
@@ -74,7 +81,9 @@ pub struct CppnGpu {
     meta_scratch: Vec<[u32; 4]>,
     nodes_scratch: Vec<CppnNodePacked>,
     links_scratch: Vec<CppnLinkPacked>,
+    link_offsets_scratch: Vec<u32>,
     slots_scratch: Vec<u32>,
+    sort_scratch: Vec<CppnLinkPacked>,
 }
 
 impl CppnGpu {
@@ -94,7 +103,7 @@ impl CppnGpu {
                 include_str!("../../shaders/cppn_from_cppn.wgsl").into(),
             ),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..6)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..7)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -149,10 +158,12 @@ impl CppnGpu {
         let meta_size = cap * 16; // vec4<u32>
         let nodes_size = cap * (CPPN_MAX_NODES as u64) * 16; // CppnNode = 16 bytes
         let links_size = cap * (CPPN_MAX_LINKS as u64) * 16; // CppnLink = 16 bytes
+        let link_offsets_size = cap * (CPPN_LINK_OFFSETS_PER_CELL as u64) * 4;
         let slots_size = cap * 4;
         let meta_buf = mk("cppn-meta", meta_size);
         let nodes_buf = mk("cppn-nodes", nodes_size);
         let links_buf = mk("cppn-links", links_size);
+        let link_offsets_buf = mk("cppn-link-offsets", link_offsets_size);
         let slots_buf = mk("cppn-slots", slots_size);
 
         Self {
@@ -165,13 +176,16 @@ impl CppnGpu {
             meta_buf,
             nodes_buf,
             links_buf,
+            link_offsets_buf,
             slots_buf,
             cached_bg: None,
             cached_cells_epoch: 0,
             meta_scratch: Vec::with_capacity(capacity),
             nodes_scratch: Vec::with_capacity(capacity * CPPN_MAX_NODES),
             links_scratch: Vec::with_capacity(capacity * CPPN_MAX_LINKS),
+            link_offsets_scratch: Vec::with_capacity(capacity * CPPN_LINK_OFFSETS_PER_CELL),
             slots_scratch: Vec::with_capacity(capacity),
+            sort_scratch: Vec::with_capacity(CPPN_MAX_LINKS),
         }
     }
 
@@ -183,6 +197,7 @@ impl CppnGpu {
         self.meta_scratch.clear();
         self.nodes_scratch.clear();
         self.links_scratch.clear();
+        self.link_offsets_scratch.clear();
         self.slots_scratch.clear();
         for &(slot, cppn) in children {
             self.slots_scratch.push(slot as u32);
@@ -203,20 +218,41 @@ impl CppnGpu {
                     };
                 }
             }
-            let link_start = self.links_scratch.len();
-            self.links_scratch
-                .resize(link_start + CPPN_MAX_LINKS, CppnLinkPacked::default());
-            for (i, slot_link) in cppn.links.iter().enumerate() {
+            // CSR pack: collect valid links, sort by `to_id`, then write a
+            // sorted run + per-target offsets so the shader walks only the
+            // incoming-edge slice for each node instead of all 256 slots.
+            self.sort_scratch.clear();
+            for slot_link in cppn.links.iter().take(cppn.num_links as usize) {
                 if let Some(l) = slot_link {
-                    self.links_scratch[link_start + i] = CppnLinkPacked {
+                    self.sort_scratch.push(CppnLinkPacked {
                         from_id: l.from,
                         to_id: l.to,
                         weight: l.weight,
                         // `enabled = 0` makes the shader skip the link, so
                         // disabled links don't need pre-filtering.
                         enabled: if l.enabled { 1 } else { 0 },
-                    };
+                    });
                 }
+            }
+            self.sort_scratch.sort_by_key(|l| l.to_id);
+            let link_start = self.links_scratch.len();
+            self.links_scratch
+                .resize(link_start + CPPN_MAX_LINKS, CppnLinkPacked::default());
+            for (i, l) in self.sort_scratch.iter().enumerate() {
+                self.links_scratch[link_start + i] = *l;
+            }
+            // Build per-target counts in offsets[id + 1], then prefix-sum.
+            let offsets_start = self.link_offsets_scratch.len();
+            self.link_offsets_scratch
+                .resize(offsets_start + CPPN_LINK_OFFSETS_PER_CELL, 0u32);
+            for l in &self.sort_scratch {
+                if (l.to_id as usize) < CPPN_MAX_NODES {
+                    self.link_offsets_scratch[offsets_start + l.to_id as usize + 1] += 1;
+                }
+            }
+            for i in 1..CPPN_LINK_OFFSETS_PER_CELL {
+                self.link_offsets_scratch[offsets_start + i] +=
+                    self.link_offsets_scratch[offsets_start + i - 1];
             }
         }
     }
@@ -238,6 +274,10 @@ impl CppnGpu {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: cells.brain_weights_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.link_offsets_buf.as_entire_binding(),
                 },
             ],
         }));
@@ -271,6 +311,11 @@ impl CppnGpu {
             .write_buffer(&self.nodes_buf, 0, bytemuck::cast_slice(&self.nodes_scratch));
         self.queue
             .write_buffer(&self.links_buf, 0, bytemuck::cast_slice(&self.links_scratch));
+        self.queue.write_buffer(
+            &self.link_offsets_buf,
+            0,
+            bytemuck::cast_slice(&self.link_offsets_scratch),
+        );
         self.queue
             .write_buffer(&self.slots_buf, 0, bytemuck::cast_slice(&self.slots_scratch));
 

@@ -125,6 +125,28 @@ pub(super) struct CellSlotMap {
     pub(super) entity_to_slot: FxHashMap<Entity, usize>,
 }
 
+/// S195 entity pool — recycles hidden cell entities + their spike children
+/// instead of despawning them on shrink. Sidesteps Bevy issue
+/// [#22065](https://github.com/bevyengine/bevy/issues/22065): every
+/// `Entity::despawn()` against an `ExtendedMaterial` user leaks an entry in
+/// `specialized_material_pipeline_cache`, and the cache grows forever — over
+/// long runs the render pass takes longer and longer to specialize.
+///
+/// On shrink we toggle `Visibility::Hidden` and stash the entity here. On
+/// grow we pop one and re-insert `CellEntity` + `MeshMaterial3d` + `Transform`
+/// + `Visibility::Visible`. Spike children stay alive across recycles —
+/// their `owner: Entity` still points to the same `Entity` id even after the
+/// underlying cell data changed, and `sync_spikes` reads fresh data from the
+/// `CellEntity` component each frame anyway.
+///
+/// Memory bound: pool size ≤ max_population (~1500 entities) so worst-case
+/// ECS footprint is ~9k entities (1500 cells × (1 + SPIKE_SLOTS=5 children))
+/// = ~few MB — bounded, not a leak.
+#[derive(Resource, Default)]
+pub(super) struct CellEntityPool {
+    pub(super) free_cells: Vec<Entity>,
+}
+
 #[allow(dead_code)]
 impl CellSlotMap {
     pub(super) fn allocate(&mut self, entity: Entity) -> usize {

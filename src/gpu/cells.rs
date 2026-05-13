@@ -55,6 +55,12 @@ pub struct CellsGpu {
     /// Sprint 137: per-cell eligibility-trace decay (1/s), read by
     /// `hebbian_step.wgsl`. Same init/upload story as `learning_rates_buf`.
     trace_decays_buf: wgpu::Buffer,
+    /// Sprint 187: per-cell `genome.reproduce_at_energy`, read by
+    /// `populate_inputs.wgsl` for the energy-fullness brain input (slot 4).
+    /// Initialised at allocation to the pre-S187 global `REPRODUCE_THRESHOLD`;
+    /// uploaded from genome every reproduce phase so newborns track their
+    /// per-cell threshold from tick 0.
+    reproduce_at_energies_buf: wgpu::Buffer,
     /// Sprint 145: per-cell, per-hidden-neuron Izhikevich membrane
     /// potential `v`. Layout: `[capacity × BRAIN_HIDDEN]` f32, row-major
     /// (cell i hidden h at index `i * BRAIN_HIDDEN + h`). Initialised at
@@ -120,6 +126,7 @@ pub struct CellsGpu {
     age_rb: wgpu::Buffer,
     cooldown_rb: wgpu::Buffer,
     energy_rb: wgpu::Buffer,
+    last_inputs_rb: wgpu::Buffer,
     last_hidden_rb: wgpu::Buffer,
     last_outputs_rb: wgpu::Buffer,
     velocities_rb: wgpu::Buffer,
@@ -198,6 +205,14 @@ impl CellsGpu {
             &trace_decays_buf,
             0,
             bytemuck::cast_slice(&default_decay_fill),
+        );
+        let reproduce_at_energies_buf =
+            mk("cells-reproduce-at-energies", n * f, stor_dst_src);
+        let default_repro_fill = vec![REPRODUCE_THRESHOLD; capacity];
+        queue.write_buffer(
+            &reproduce_at_energies_buf,
+            0,
+            bytemuck::cast_slice(&default_repro_fill),
         );
         // Sprint 145: Izhikevich (v, u) buffers, sized like `last_hidden`.
         // Initial fill at resting potential / zero recovery so any cell
@@ -292,6 +307,7 @@ impl CellsGpu {
         let age_rb = mk("cells-age-rb", n * 4, read);
         let cooldown_rb = mk("cells-cooldown-rb", n * 4, read);
         let energy_rb = mk("cells-energy-rb", n * f, read);
+        let last_inputs_rb = mk("cells-inputs-rb", n * (BRAIN_INPUTS as u64) * f, read);
         let last_hidden_rb = mk("cells-hidden-rb", n * (BRAIN_HIDDEN as u64) * f, read);
         let last_outputs_rb = mk("cells-outputs-rb", n * (BRAIN_OUTPUTS as u64) * f, read);
         let velocities_rb = mk("cells-velocities-rb", n * 3 * f, read);
@@ -326,6 +342,7 @@ impl CellsGpu {
             rewards_buf,
             learning_rates_buf,
             trace_decays_buf,
+            reproduce_at_energies_buf,
             membrane_buf,
             recovery_buf,
             neuron_models_buf,
@@ -354,6 +371,7 @@ impl CellsGpu {
             age_rb,
             cooldown_rb,
             energy_rb,
+            last_inputs_rb,
             last_hidden_rb,
             last_outputs_rb,
             velocities_rb,
@@ -392,6 +410,7 @@ impl CellsGpu {
     pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
     pub fn learning_rates_buffer(&self) -> &wgpu::Buffer { &self.learning_rates_buf }
     pub fn trace_decays_buffer(&self) -> &wgpu::Buffer { &self.trace_decays_buf }
+    pub fn reproduce_at_energies_buffer(&self) -> &wgpu::Buffer { &self.reproduce_at_energies_buf }
     pub fn membrane_buffer(&self) -> &wgpu::Buffer { &self.membrane_buf }
     pub fn recovery_buffer(&self) -> &wgpu::Buffer { &self.recovery_buf }
     pub fn neuron_models_buffer(&self) -> &wgpu::Buffer { &self.neuron_models_buf }
@@ -446,13 +465,19 @@ impl CellsGpu {
     }
 
     /// Combined batch readback after the brain_act + step pipeline. Single
-    /// `Wait` barrier covers all 9 buffers; results are written into the
+    /// `Wait` barrier covers all 10 buffers; results are written into the
     /// caller-provided scratch slots (clear + extend pattern) so a stable
     /// capacity yields zero allocations per tick.
+    ///
+    /// `inputs_out` carries the per-cell `last_inputs` array straight from
+    /// the GPU `populate_inputs` shader — pre-S188 this stayed GPU-only,
+    /// leaving the CPU mirror frozen at spawn-time zeros and the inspector
+    /// brain panel showing a lie. Same `Wait` barrier as the rest.
     #[allow(clippy::too_many_arguments)]
     pub fn download_full_batch_into(
         &self,
         n: usize,
+        inputs_out: &mut Vec<[f32; BRAIN_INPUTS]>,
         hidden_out: &mut Vec<[f32; BRAIN_HIDDEN]>,
         outputs_out: &mut Vec<[f32; BRAIN_OUTPUTS]>,
         velocities_out: &mut Vec<[f32; 3]>,
@@ -464,6 +489,7 @@ impl CellsGpu {
         energies_out: &mut Vec<f32>,
     ) {
         if n == 0 {
+            inputs_out.clear();
             hidden_out.clear();
             outputs_out.clear();
             velocities_out.clear();
@@ -482,6 +508,7 @@ impl CellsGpu {
         self.queue.submit(Some(encoder.finish()));
         self.download_full_read_into(
             n,
+            inputs_out,
             hidden_out,
             outputs_out,
             velocities_out,
@@ -503,6 +530,7 @@ impl CellsGpu {
             return;
         }
         assert!(n <= self.capacity);
+        let i_bytes = (n * BRAIN_INPUTS * 4) as u64;
         let h_bytes = (n * BRAIN_HIDDEN * 4) as u64;
         let o_bytes = (n * BRAIN_OUTPUTS * 4) as u64;
         let v_bytes = (n * 3 * 4) as u64;
@@ -512,6 +540,7 @@ impl CellsGpu {
         let age_bytes = (n * 4) as u64;
         let cd_bytes = (n * 4) as u64;
         let e_bytes = (n * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.last_inputs_buf, 0, &self.last_inputs_rb, 0, i_bytes);
         encoder.copy_buffer_to_buffer(&self.last_hidden_buf, 0, &self.last_hidden_rb, 0, h_bytes);
         encoder.copy_buffer_to_buffer(&self.last_outputs_buf, 0, &self.last_outputs_rb, 0, o_bytes);
         encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_rb, 0, v_bytes);
@@ -529,6 +558,7 @@ impl CellsGpu {
     pub fn download_full_read_into(
         &self,
         n: usize,
+        inputs_out: &mut Vec<[f32; BRAIN_INPUTS]>,
         hidden_out: &mut Vec<[f32; BRAIN_HIDDEN]>,
         outputs_out: &mut Vec<[f32; BRAIN_OUTPUTS]>,
         velocities_out: &mut Vec<[f32; 3]>,
@@ -539,6 +569,7 @@ impl CellsGpu {
         cooldowns_out: &mut Vec<u32>,
         energies_out: &mut Vec<f32>,
     ) {
+        inputs_out.clear();
         hidden_out.clear();
         outputs_out.clear();
         velocities_out.clear();
@@ -552,6 +583,7 @@ impl CellsGpu {
             return;
         }
         assert!(n <= self.capacity);
+        let i_bytes = (n * BRAIN_INPUTS * 4) as u64;
         let h_bytes = (n * BRAIN_HIDDEN * 4) as u64;
         let o_bytes = (n * BRAIN_OUTPUTS * 4) as u64;
         let v_bytes = (n * 3 * 4) as u64;
@@ -561,6 +593,7 @@ impl CellsGpu {
         let age_bytes = (n * 4) as u64;
         let cd_bytes = (n * 4) as u64;
         let e_bytes = (n * 4) as u64;
+        let i_s = self.last_inputs_rb.slice(0..i_bytes);
         let h_s = self.last_hidden_rb.slice(0..h_bytes);
         let o_s = self.last_outputs_rb.slice(0..o_bytes);
         let v_s = self.velocities_rb.slice(0..v_bytes);
@@ -570,10 +603,11 @@ impl CellsGpu {
         let age_s = self.age_rb.slice(0..age_bytes);
         let cd_s = self.cooldown_rb.slice(0..cd_bytes);
         let e_s = self.energy_rb.slice(0..e_bytes);
-        for s in [&h_s, &o_s, &v_s, &a_s, &p_s, &pos_s, &age_s, &cd_s, &e_s] {
+        for s in [&i_s, &h_s, &o_s, &v_s, &a_s, &p_s, &pos_s, &age_s, &cd_s, &e_s] {
             s.map_async(wgpu::MapMode::Read, |_| {});
         }
         self.device.poll(wgpu::Maintain::Wait);
+        let i_data = i_s.get_mapped_range();
         let h_data = h_s.get_mapped_range();
         let o_data = o_s.get_mapped_range();
         let v_data = v_s.get_mapped_range();
@@ -583,6 +617,7 @@ impl CellsGpu {
         let age_data = age_s.get_mapped_range();
         let cd_data = cd_s.get_mapped_range();
         let e_data = e_s.get_mapped_range();
+        let i_f: &[f32] = bytemuck::cast_slice(&i_data);
         let h_f: &[f32] = bytemuck::cast_slice(&h_data);
         let o_f: &[f32] = bytemuck::cast_slice(&o_data);
         let v_f: &[f32] = bytemuck::cast_slice(&v_data);
@@ -594,6 +629,8 @@ impl CellsGpu {
         let e_f: &[f32] = bytemuck::cast_slice(&e_data);
         // Reinterpret flat readback slices as arrays of fixed-size chunks; one
         // memcpy per output Vec instead of per-element pushes.
+        let inputs_chunks: &[[f32; BRAIN_INPUTS]] = bytemuck::cast_slice(i_f);
+        inputs_out.extend_from_slice(&inputs_chunks[..n]);
         let hidden_chunks: &[[f32; BRAIN_HIDDEN]] = bytemuck::cast_slice(h_f);
         hidden_out.extend_from_slice(&hidden_chunks[..n]);
         let outputs_chunks: &[[f32; BRAIN_OUTPUTS]] = bytemuck::cast_slice(o_f);
@@ -607,8 +644,9 @@ impl CellsGpu {
         ages_out.extend_from_slice(&age_u[..n]);
         cooldowns_out.extend_from_slice(&cd_u[..n]);
         energies_out.extend_from_slice(&e_f[..n]);
-        drop(h_data); drop(o_data); drop(v_data); drop(a_data); drop(p_data);
+        drop(i_data); drop(h_data); drop(o_data); drop(v_data); drop(a_data); drop(p_data);
         drop(pos_data); drop(age_data); drop(cd_data); drop(e_data);
+        self.last_inputs_rb.unmap();
         self.last_hidden_rb.unmap();
         self.last_outputs_rb.unmap();
         self.velocities_rb.unmap();
@@ -915,6 +953,28 @@ impl CellsGpu {
     pub fn upload_trace_decays(&self, decays: &[f32]) {
         self.queue
             .write_buffer(&self.trace_decays_buf, 0, bytemuck::cast_slice(decays));
+    }
+
+    /// Sprint 187: full-population upload of per-cell `genome.reproduce_at_energy`.
+    /// Mirrors the `upload_learning_rates` cadence — once per reproduce phase
+    /// so newborn slots track their per-cell threshold before the next
+    /// `populate_inputs` dispatch reads the value.
+    pub fn upload_reproduce_at_energies(&self, thresholds: &[f32]) {
+        self.queue.write_buffer(
+            &self.reproduce_at_energies_buf,
+            0,
+            bytemuck::cast_slice(thresholds),
+        );
+    }
+
+    pub fn upload_reproduce_at_energy_at(&self, slot: usize, value: f32) {
+        assert!(slot < self.capacity);
+        let f = std::mem::size_of::<f32>() as u64;
+        self.queue.write_buffer(
+            &self.reproduce_at_energies_buf,
+            slot as u64 * f,
+            bytemuck::bytes_of(&value),
+        );
     }
 
     /// Sprint 137: write the rates for a single slot. Used by post-swap_to

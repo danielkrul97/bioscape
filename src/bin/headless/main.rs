@@ -296,7 +296,21 @@ fn main() {
     }
     // Sprint 87 Hamilton sweep: aplikuj CLI overrides AFTER World::new (i po
     // checkpoint load) — nikdy se neserializují, vždy z aktuálního CLI.
+    // Sprint 187: --share-frac now pins gen-0 altruism_share_frac uniformly
+    // (instead of overriding the obsolete `world.share_frac` global, which is
+    // now legacy unused). Mutation can drift afterwards; the pin only seeds
+    // the starting population so the Hamilton-sweep semantic ("start everyone
+    // at share rate X") survives the per-genome migration. world.share_frac
+    // is still set for back-compat with anything reading the field, even
+    // though the eat_food code no longer consults it.
     if let Some(sf) = share_frac_override {
+        let clamped = sf.clamp(
+            bioscape::MIN_ALTRUISM_SHARE_FRAC,
+            bioscape::MAX_ALTRUISM_SHARE_FRAC,
+        );
+        for cell in &mut world.cells {
+            cell.genome.altruism_share_frac = clamped;
+        }
         world.share_frac = sf;
     }
     world.kin_filter = kin_filter;
@@ -350,7 +364,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac,vib_emit_avg,vib_amp_avg,vib_grad_mag_avg,gain_mech_avg,gain_mech_dev,maze_active,maze_in_goal_frac,maze_unique_reach_frac,maze_first_reach_total,lr_avg,lr_std,decay_avg,decay_std,w_norm_avg,neural_spike_frac,izhikevich_frac"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac,vib_emit_avg,vib_amp_avg,vib_grad_mag_avg,gain_mech_avg,gain_mech_dev,maze_active,maze_in_goal_frac,maze_unique_reach_frac,maze_first_reach_total,lr_avg,lr_std,decay_avg,decay_std,w_norm_avg,neural_spike_frac,izhikevich_frac,repro_avg,repro_std,birth_avg,birth_std,altruism_avg,altruism_std,cluster_bonus_avg,cluster_bonus_std,attack_gate_avg,attack_gate_std,size_ratio_avg,size_ratio_std,defense_avg,defense_std,rw_eatfood_avg,rw_novelty_avg,rw_predation_avg,rw_escape_avg,rw_damage_avg,rw_bondformed_avg,rw_mating_avg"
     )
     .unwrap();
     write_stats(&mut log, &world, 0.0).unwrap();

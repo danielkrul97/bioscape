@@ -83,6 +83,14 @@ pub struct CollisionGpu {
     contact_partners_rb: wgpu::Buffer,
     pos_packed: Vec<f32>,
     vel_packed: Vec<f32>,
+    /// Content cache for stable uploads. Caller passes new slices every tick;
+    /// when bytes match the last upload, skip the `queue.write_buffer` —
+    /// `eff_radii` / `max_axes` change only on `apply_morph` and population
+    /// edits, so most ticks are cache hits. ~30 µs/tick saved per skipped
+    /// upload, with the comparison itself well under 1 µs at 1.5k cells.
+    cached_eff_radii: Vec<f32>,
+    cached_max_axes: Vec<f32>,
+    cached_adhesion_types: Vec<u32>,
 }
 
 impl CollisionGpu {
@@ -267,9 +275,18 @@ impl CollisionGpu {
             contact_partners_rb,
             pos_packed: Vec::new(),
             vel_packed: Vec::new(),
+            cached_eff_radii: Vec::new(),
+            cached_max_axes: Vec::new(),
+            cached_adhesion_types: Vec::new(),
         })
     }
 
+    /// Convenience wrapper — owns the encoder + submit + readback in one call.
+    /// Used by tests and any callsite that doesn't need to share an encoder
+    /// with neighboring dispatches. For the hot `--gpu-full` path, callers
+    /// (see `World::resolve_collisions_gpu_pass1`) compose
+    /// `dispatch_into` + `queue.submit` + `await_result` themselves and merge
+    /// the cell-hash dispatch into the same encoder.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
@@ -285,6 +302,58 @@ impl CollisionGpu {
         cell_hash: &SpatialHashGpu,
     ) -> CollisionResult {
         let n = positions.len();
+        if n == 0 {
+            return CollisionResult {
+                position_deltas: Vec::new(),
+                velocity_deltas: Vec::new(),
+                contact_count: Vec::new(),
+                contact_partners: Vec::new(),
+            };
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("collision-encoder"),
+            });
+        self.dispatch_into(
+            &mut encoder,
+            positions,
+            velocities,
+            eff_radii,
+            max_axes,
+            adhesion_types,
+            bond_partner_idx,
+            bond_rest,
+            bond_stiffness,
+            bond_damping,
+            cell_hash,
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.await_result(n)
+    }
+
+    /// Phase 1 of the split pipeline — uploads, dispatch, copy-to-readback,
+    /// all encoded into the caller-owned `encoder`. Caller must `queue.submit`
+    /// the encoder and then call [`await_result`] to map + read the data.
+    /// Stable uploads (`eff_radii`, `max_axes`, `adhesion_types`) are
+    /// content-cached: skipped when the new slice is byte-identical to the
+    /// last upload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_into(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        positions: &[[f32; 3]],
+        velocities: &[[f32; 3]],
+        eff_radii: &[f32],
+        max_axes: &[f32],
+        adhesion_types: &[u32],
+        bond_partner_idx: &[i32],
+        bond_rest: &[f32],
+        bond_stiffness: &[f32],
+        bond_damping: &[f32],
+        cell_hash: &SpatialHashGpu,
+    ) {
+        let n = positions.len();
         assert!(n <= self.capacity, "collision capacity overflow");
         assert_eq!(velocities.len(), n, "velocities length mismatch");
         assert_eq!(adhesion_types.len(), n, "adhesion_types length mismatch");
@@ -294,12 +363,7 @@ impl CollisionGpu {
         assert_eq!(bond_stiffness.len(), bonds_total, "bond_stiffness length mismatch");
         assert_eq!(bond_damping.len(), bonds_total, "bond_damping length mismatch");
         if n == 0 {
-            return CollisionResult {
-                position_deltas: Vec::new(),
-                velocity_deltas: Vec::new(),
-                contact_count: Vec::new(),
-                contact_partners: Vec::new(),
-            };
+            return;
         }
         self.pos_packed.clear();
         self.pos_packed.reserve(n * 3);
@@ -337,15 +401,30 @@ impl CollisionGpu {
             0,
             bytemuck::cast_slice(&self.vel_packed),
         );
-        self.queue
-            .write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
-        self.queue
-            .write_buffer(&self.max_axes_buf, 0, bytemuck::cast_slice(max_axes));
-        self.queue.write_buffer(
-            &self.adhesion_types_buf,
-            0,
-            bytemuck::cast_slice(adhesion_types),
-        );
+        // Content-cached stable uploads — `eff_radii` / `max_axes` change on
+        // `apply_morph` (rare), `adhesion_types` only on mutation. Comparing
+        // the slice is ~1 µs at 1.5k cells, vs ~30 µs for `queue.write_buffer`.
+        if self.cached_eff_radii != eff_radii {
+            self.queue
+                .write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
+            self.cached_eff_radii.clear();
+            self.cached_eff_radii.extend_from_slice(eff_radii);
+        }
+        if self.cached_max_axes != max_axes {
+            self.queue
+                .write_buffer(&self.max_axes_buf, 0, bytemuck::cast_slice(max_axes));
+            self.cached_max_axes.clear();
+            self.cached_max_axes.extend_from_slice(max_axes);
+        }
+        if self.cached_adhesion_types != adhesion_types {
+            self.queue.write_buffer(
+                &self.adhesion_types_buf,
+                0,
+                bytemuck::cast_slice(adhesion_types),
+            );
+            self.cached_adhesion_types.clear();
+            self.cached_adhesion_types.extend_from_slice(adhesion_types);
+        }
         self.queue.write_buffer(
             &self.bond_partner_idx_buf,
             0,
@@ -395,9 +474,6 @@ impl CollisionGpu {
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("collision-encoder"),
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("collision-pass"),
@@ -426,8 +502,186 @@ impl CollisionGpu {
             0,
             partners_bytes,
         );
-        self.queue.submit(Some(encoder.finish()));
+    }
 
+    /// Variant of [`dispatch_into`] that reads `positions` / `velocities`
+    /// directly from the persistent `CellsGpu` buffers instead of uploading
+    /// them from CPU slices. After `run_brain_act` finishes (and the
+    /// post-step `download_full_batch_into` sync), those two buffers hold
+    /// the same values the CPU mirror has, and no CPU phase between
+    /// `step` and `resolve_collisions` mutates them — so re-uploading is
+    /// pure waste.
+    ///
+    /// `eff_radii` is still passed as a slice and uploaded through the
+    /// internal cached buffer: `apply_morph` can change a cell's
+    /// `phenotype.effective_radius()` between `brain_act` (which uploaded
+    /// the previous-tick eff_radii to `cells.eff_radius_buf`) and this
+    /// dispatch, so binding `cells.eff_radius_buffer()` directly would
+    /// feed stale values to the pair_r threshold.
+    /// `max_axes` / `adhesion_types` follow the same S191 content-cache
+    /// path — most ticks skip the upload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_into_cells(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        cells_gpu: &CellsGpu,
+        n: usize,
+        eff_radii: &[f32],
+        max_axes: &[f32],
+        adhesion_types: &[u32],
+        bond_partner_idx: &[i32],
+        bond_rest: &[f32],
+        bond_stiffness: &[f32],
+        bond_damping: &[f32],
+        cell_hash: &SpatialHashGpu,
+    ) {
+        assert!(n <= self.capacity, "collision capacity overflow");
+        assert_eq!(eff_radii.len(), n, "eff_radii length mismatch");
+        assert_eq!(adhesion_types.len(), n, "adhesion_types length mismatch");
+        let bonds_total = n * self.bonds.bonds_per_cell as usize;
+        assert_eq!(bond_partner_idx.len(), bonds_total, "bond_partner_idx length mismatch");
+        assert_eq!(bond_rest.len(), bonds_total, "bond_rest length mismatch");
+        assert_eq!(bond_stiffness.len(), bonds_total, "bond_stiffness length mismatch");
+        assert_eq!(bond_damping.len(), bonds_total, "bond_damping length mismatch");
+        if n == 0 {
+            return;
+        }
+        let params = CollisionParams {
+            num_cells: n as u32,
+            cell_size: self.cell_size,
+            cell_radius_const: self.cell_radius_const,
+            collision_restitution: self.collision_restitution,
+            world_half_x: self.world_half_xy[0],
+            world_half_y: self.world_half_xy[1],
+            adhesion_strength: self.adhesion.strength,
+            adhesion_cross_type: self.adhesion.cross_type,
+            adhesion_range_factor: self.adhesion.range_factor,
+            bond_break_factor: self.bonds.break_factor,
+            bonds_per_cell: self.bonds.bonds_per_cell,
+            max_contacts_per_cell: self.max_contacts_per_cell,
+        };
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        // Content-cached stable uploads — same logic as `dispatch_into`.
+        if self.cached_eff_radii != eff_radii {
+            self.queue
+                .write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
+            self.cached_eff_radii.clear();
+            self.cached_eff_radii.extend_from_slice(eff_radii);
+        }
+        if self.cached_max_axes != max_axes {
+            self.queue
+                .write_buffer(&self.max_axes_buf, 0, bytemuck::cast_slice(max_axes));
+            self.cached_max_axes.clear();
+            self.cached_max_axes.extend_from_slice(max_axes);
+        }
+        if self.cached_adhesion_types != adhesion_types {
+            self.queue.write_buffer(
+                &self.adhesion_types_buf,
+                0,
+                bytemuck::cast_slice(adhesion_types),
+            );
+            self.cached_adhesion_types.clear();
+            self.cached_adhesion_types.extend_from_slice(adhesion_types);
+        }
+        self.queue.write_buffer(
+            &self.bond_partner_idx_buf,
+            0,
+            bytemuck::cast_slice(bond_partner_idx),
+        );
+        self.queue
+            .write_buffer(&self.bond_rest_buf, 0, bytemuck::cast_slice(bond_rest));
+        self.queue.write_buffer(
+            &self.bond_stiffness_buf,
+            0,
+            bytemuck::cast_slice(bond_stiffness),
+        );
+        self.queue.write_buffer(
+            &self.bond_damping_buf,
+            0,
+            bytemuck::cast_slice(bond_damping),
+        );
+        let zero_count = vec![0u8; (n * 4) as usize];
+        self.queue
+            .write_buffer(&self.contact_count_buf, 0, &zero_count);
+        let contacts_total = n * self.max_contacts_per_cell as usize;
+        let zero_partners = vec![0u8; contacts_total * 4];
+        self.queue
+            .write_buffer(&self.contact_partners_buf, 0, &zero_partners);
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("collision-bg-cells"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                // Positions / velocities come from persistent `CellsGpu`
+                // buffers — no per-tick upload. `eff_radii` stays on the
+                // internal cached buffer because `apply_morph` runs between
+                // `brain_act` (which last uploaded `cells.eff_radius_buf`)
+                // and this dispatch and may mutate a cell's effective
+                // radius — binding the cells buffer would feed stale values.
+                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.position_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.eff_radii_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.max_axes_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cell_hash.offsets_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cell_hash.sorted_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.deltas_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: cells_gpu.velocities_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.vel_deltas_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.adhesion_types_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: self.bond_partner_idx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.bond_rest_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: self.bond_stiffness_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.bond_damping_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: self.contact_count_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.contact_partners_buf.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("collision-pass-cells"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
+        }
+        let bytes = (n as u64) * 3 * 4;
+        let count_bytes = (n as u64) * 4;
+        let partners_bytes = (n as u64) * (self.max_contacts_per_cell as u64) * 4;
+        encoder.copy_buffer_to_buffer(&self.deltas_buf, 0, &self.deltas_rb, 0, bytes);
+        encoder.copy_buffer_to_buffer(&self.vel_deltas_buf, 0, &self.vel_deltas_rb, 0, bytes);
+        encoder.copy_buffer_to_buffer(
+            &self.contact_count_buf,
+            0,
+            &self.contact_count_rb,
+            0,
+            count_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.contact_partners_buf,
+            0,
+            &self.contact_partners_rb,
+            0,
+            partners_bytes,
+        );
+    }
+
+    /// Phase 2 — poll + map + extract. Caller must have submitted the
+    /// encoder from [`dispatch_into`] before calling this.
+    pub fn await_result(&self, n: usize) -> CollisionResult {
+        if n == 0 {
+            return CollisionResult {
+                position_deltas: Vec::new(),
+                velocity_deltas: Vec::new(),
+                contact_count: Vec::new(),
+                contact_partners: Vec::new(),
+            };
+        }
+        let bytes = (n as u64) * 3 * 4;
+        let count_bytes = (n as u64) * 4;
+        let partners_bytes = (n as u64) * (self.max_contacts_per_cell as u64) * 4;
         let pos_slice = self.deltas_rb.slice(0..bytes);
         let vel_slice = self.vel_deltas_rb.slice(0..bytes);
         let count_slice = self.contact_count_rb.slice(0..count_bytes);

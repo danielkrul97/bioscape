@@ -477,14 +477,21 @@ fn make_mating_child_inherits_lineage_from_a() {
 }
 
 #[test]
-fn make_mating_child_energy_is_sum_of_parents() {
+fn make_mating_child_energy_is_sum_of_parent_birth_energies() {
+    // Sprint 187: child energy comes from parents' gene-encoded
+    // `birth_energy` (absolute donation), not from a halve-and-give of
+    // parent.energy. Parent.energy is irrelevant to child birth amount
+    // (the caller is responsible for subtracting birth_energy from each
+    // parent before calling).
     let mut a = base_cell();
     let mut b = base_cell();
     a.energy = 60.0;
     b.energy = 80.0;
+    a.genome.birth_energy = 40.0;
+    b.genome.birth_energy = 30.0;
     let mut rng = StdRng::seed_from_u64(1);
     let child = make_mating_child(&a, &b, &mut rng, 0);
-    assert!((child.energy - 140.0).abs() < 1e-3);
+    assert!((child.energy - 70.0).abs() < 1e-3);
 }
 
 #[test]

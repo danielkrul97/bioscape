@@ -27,9 +27,9 @@ struct Params {
     phero_norm_gain: f32,
     damage_norm_gain: f32,
     density_norm: f32,
-    reproduce_threshold: f32,
     vibration_norm_gain: f32,    // V7: tanh gain on slots 29..32
     _pad0: u32,
+    _pad1: u32,                  // S187: was reproduce_threshold (now per-cell)
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -45,6 +45,8 @@ struct Params {
 @group(0) @binding(10) var<storage, read> last_hidden: array<f32>;           // n × hidden
 @group(0) @binding(11) var<storage, read_write> last_inputs: array<f32>;     // n × inputs
 @group(0) @binding(12) var<storage, read> bonded_inbox: array<f32>;          // n × N_BOND_MSG_CHANNELS
+// Sprint 187: per-cell reproduce threshold (was a uniform Params field).
+@group(0) @binding(13) var<storage, read> reproduce_at_energies: array<f32>; // n
 
 fn forward_vector(yaw: f32, pitch: f32) -> vec3<f32> {
     let cy = cos(yaw);
@@ -101,7 +103,7 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let speed_xy = sqrt(vx * vx + vy * vy);
     let speed_norm = clamp(speed_xy / max_speed, 0.0, 1.0);
-    let energy_norm = clamp(energy / params.reproduce_threshold, 0.0, 1.5);
+    let energy_norm = clamp(energy / max(reproduce_at_energies[i], 1e-3), 0.0, 1.5);
 
     // No init loop: every slot below is written exactly once. Conditional
     // slots use `select` to fold the absent-target case into the same write.
@@ -139,21 +141,35 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Slot 20 is a legacy reserved gap.
     last_inputs[inputs_off + 20u] = 0.0;
-    // Wave L: ch1/ch2 pheromone gradients come from sensor_gather slots
-    // 25..30 (added alongside the existing ch0 grad at 11..13). Same
-    // tanh×PHEROMONE_NORMALIZATION_GAIN saturation as ch0.
-    last_inputs[inputs_off + 21u] =
-        tanh(sensor_output[sensor_off + 25u] * params.phero_norm_gain);
-    last_inputs[inputs_off + 22u] =
-        tanh(sensor_output[sensor_off + 26u] * params.phero_norm_gain);
-    last_inputs[inputs_off + 23u] =
-        tanh(sensor_output[sensor_off + 27u] * params.phero_norm_gain);
-    last_inputs[inputs_off + 24u] =
-        tanh(sensor_output[sensor_off + 28u] * params.phero_norm_gain);
-    last_inputs[inputs_off + 25u] =
-        tanh(sensor_output[sensor_off + 29u] * params.phero_norm_gain);
-    last_inputs[inputs_off + 26u] =
-        tanh(sensor_output[sensor_off + 30u] * params.phero_norm_gain);
+    // Wave L: ch1/ch2 pheromone gradients from sensor_gather slots 25..30.
+    // Most runs leave multi-channel pheromone unused (only ch0 is populated)
+    // → the whole 3-float chunk is zero and `tanh(0) = 0`, so we can skip
+    // 6 `tanh` calls when the chunk is all-zero. The branch is uniform within
+    // each warp whenever the simulation doesn't use ch1/ch2 pheromones.
+    let p25 = sensor_output[sensor_off + 25u];
+    let p26 = sensor_output[sensor_off + 26u];
+    let p27 = sensor_output[sensor_off + 27u];
+    if (p25 != 0.0 || p26 != 0.0 || p27 != 0.0) {
+        last_inputs[inputs_off + 21u] = tanh(p25 * params.phero_norm_gain);
+        last_inputs[inputs_off + 22u] = tanh(p26 * params.phero_norm_gain);
+        last_inputs[inputs_off + 23u] = tanh(p27 * params.phero_norm_gain);
+    } else {
+        last_inputs[inputs_off + 21u] = 0.0;
+        last_inputs[inputs_off + 22u] = 0.0;
+        last_inputs[inputs_off + 23u] = 0.0;
+    }
+    let p28 = sensor_output[sensor_off + 28u];
+    let p29 = sensor_output[sensor_off + 29u];
+    let p30 = sensor_output[sensor_off + 30u];
+    if (p28 != 0.0 || p29 != 0.0 || p30 != 0.0) {
+        last_inputs[inputs_off + 24u] = tanh(p28 * params.phero_norm_gain);
+        last_inputs[inputs_off + 25u] = tanh(p29 * params.phero_norm_gain);
+        last_inputs[inputs_off + 26u] = tanh(p30 * params.phero_norm_gain);
+    } else {
+        last_inputs[inputs_off + 24u] = 0.0;
+        last_inputs[inputs_off + 25u] = 0.0;
+        last_inputs[inputs_off + 26u] = 0.0;
+    }
     // Bond-mediated communication inbox: slots 27..29 (N_BOND_MSG_CHANNELS=2).
     // CPU pre-tick aggregates partner messages into bonded_inbox buffer.
     let inbox_off = i * 2u;
@@ -185,8 +201,27 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Recurrent state: copy last_hidden[..BRAIN_RECURRENT] into
     // inputs[INPUTS_SENSORY..]. Overwrites slots 27..71, no pre-zero needed.
+    //
+    // Manual 4-wide unroll: gives naga a clean window of 4 adjacent loads +
+    // 4 adjacent stores so it can emit 128-bit memory ops where the hardware
+    // supports them. Full `array<vec4<f32>>` packing would require padding
+    // `last_hidden` from BRAIN_HIDDEN=45 to 48 across every plasticity shader,
+    // so we settle for the unroll-only path here.
     let recurrent = min(params.brain_recurrent, params.brain_hidden);
-    for (var k: u32 = 0u; k < recurrent; k = k + 1u) {
-        last_inputs[inputs_off + params.brain_inputs_sensory + k] = last_hidden[hidden_off + k];
+    let chunks = recurrent / 4u;
+    let out_base = inputs_off + params.brain_inputs_sensory;
+    for (var c: u32 = 0u; c < chunks; c = c + 1u) {
+        let k = c * 4u;
+        let h0 = last_hidden[hidden_off + k];
+        let h1 = last_hidden[hidden_off + k + 1u];
+        let h2 = last_hidden[hidden_off + k + 2u];
+        let h3 = last_hidden[hidden_off + k + 3u];
+        last_inputs[out_base + k]      = h0;
+        last_inputs[out_base + k + 1u] = h1;
+        last_inputs[out_base + k + 2u] = h2;
+        last_inputs[out_base + k + 3u] = h3;
+    }
+    for (var k: u32 = chunks * 4u; k < recurrent; k = k + 1u) {
+        last_inputs[out_base + k] = last_hidden[hidden_off + k];
     }
 }

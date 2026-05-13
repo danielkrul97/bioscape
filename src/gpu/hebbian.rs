@@ -306,7 +306,9 @@ impl HebbianGpu {
             });
             pass.set_pipeline(&self.pipeline_step);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
+            // Post-S189: 1 workgroup = 1 cell so threads can cooperatively
+            // cache `last_inputs` / `last_hidden` in workgroup-shared memory.
+            pass.dispatch_workgroups(n as u32, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
     }

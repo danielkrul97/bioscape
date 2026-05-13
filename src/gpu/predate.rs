@@ -15,9 +15,14 @@ pub struct PredateParamsGpu {
     pub num_cells: u32,
     pub cell_size: f32,
     pub cell_radius_const: f32,
-    pub size_ratio_threshold: f32,
+    /// Sprint 187: floor for the defense multiplier (was implicit `0.4` from
+    /// `BOND_DEFENSE_FRAC × BOND_DEFENSE_CAP` cap). Per-genome defense pool
+    /// can sum past `1.0`, so the shader needs an explicit clamp.
+    pub defense_floor: f32,
     pub herd_radius_sq: f32,
-    pub attack_threshold: f32,
+    /// Sprint 187: was `attack_threshold` global; now per-cell via
+    /// `attack_gates_buf` — slot kept as pad for back-compat layout.
+    pub _pad_attack_threshold: f32,
     pub predation_gain: f32,
     pub predation_drain: f32,
     pub spike_dot_threshold: f32,
@@ -62,6 +67,7 @@ pub struct PredateResult {
 pub struct PredateGpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    pipeline_bucket_min: wgpu::ComputePipeline,
     pipeline_herd: wgpu::ComputePipeline,
     pipeline_attack: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -74,23 +80,33 @@ pub struct PredateGpu {
     spikes_packed_buf: wgpu::Buffer,
     attack_buf: wgpu::Buffer,
     herd_buf: wgpu::Buffer,
-    energy_delta_buf: wgpu::Buffer,
+    energy_gain_buf: wgpu::Buffer,
     damage_delta_buf: wgpu::Buffer,
     /// Per-cell active spike count (`u32`).
     spike_counts_buf: wgpu::Buffer,
     /// Per-cell pitch (rad) — multi-spike needs the full 3D forward
     /// direction (yaw + azim, pitch + elev).
     pitches_buf: wgpu::Buffer,
-    /// Single-element atomic counter for total attack hits this dispatch.
-    event_count_buf: wgpu::Buffer,
     attacker_event_count_buf: wgpu::Buffer,
     attacker_gain_sum_buf: wgpu::Buffer,
     victim_attacker_count_buf: wgpu::Buffer,
     victim_attackers_buf: wgpu::Buffer,
+    /// NUM_BUCKETS × f32 — per-bucket minimum eff_radius used by the attack
+    /// kernel's whole-bucket size-ratio prefilter. Recomputed each tick by
+    /// the `bucket_min_radius` kernel right after the spatial hash rebuild.
+    bucket_min_radius_buf: wgpu::Buffer,
+    /// Sprint 187: per-cell attacker gate (replaces uniform attack_threshold).
+    attack_gates_buf: wgpu::Buffer,
+    /// Sprint 187: per-cell attacker size-ratio threshold (replaces uniform).
+    predation_size_ratios_buf: wgpu::Buffer,
+    /// Sprint 187: per-cell victim defense pool — CPU-aggregated sum of
+    /// bonded partners' `genome.defense_contribution` (capped at
+    /// `BOND_DEFENSE_CAP` partners). Shader applies
+    /// `max(1.0 − defense_pool[j], defense_floor)` to drain + gain.
+    defense_pool_buf: wgpu::Buffer,
     herd_rb: wgpu::Buffer,
-    energy_rb: wgpu::Buffer,
+    energy_gain_rb: wgpu::Buffer,
     damage_rb: wgpu::Buffer,
-    event_count_rb: wgpu::Buffer,
     attacker_event_count_rb: wgpu::Buffer,
     attacker_gain_sum_rb: wgpu::Buffer,
     victim_attacker_count_rb: wgpu::Buffer,
@@ -118,15 +134,18 @@ impl PredateGpu {
             label: Some("predate"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/predate.wgsl").into()),
         });
-        // 18 bindings: 1 uniform + 17 storage. Read-only: 1..=7 (positions
-        // through hash_sorted), 11..=12 (spike_counts, pitches). Read_write:
-        // 8 (herd_counts), 9..=10 (energy/damage atomic), 13 (event_count),
-        // 14..=17 (Sprint 186 per-attacker / per-victim diagnostics).
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..18)
+        // 21 bindings (S187 added 3 per-cell aggression buffers): 1 uniform +
+        // 20 storage. Read-only: 1..=7, 11..=12, 18..=20 (per-cell aggression).
+        // Read_write: 8 (herd_counts), 9..=10 (energy/damage atomic), 13..=16
+        // (Sprint 186 diagnostics), 17 (bucket min radius).
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..21)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
-                } else if (1..=7).contains(&i) || (11..=12).contains(&i) {
+                } else if (1..=7).contains(&i)
+                    || (11..=12).contains(&i)
+                    || (18..=20).contains(&i)
+                {
                     wgpu::BufferBindingType::Storage { read_only: true }
                 } else {
                     wgpu::BufferBindingType::Storage { read_only: false }
@@ -151,6 +170,14 @@ impl PredateGpu {
             label: Some("predate-pl"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
+        });
+        let pipeline_bucket_min = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("predate-bucket-min-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("bucket_min_radius"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
         });
         let pipeline_herd = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("predate-herd-pipeline"),
@@ -195,11 +222,14 @@ impl PredateGpu {
         let spikes_packed_buf = mk("predate-spikes-packed", n * spike_slots * 4 * f, stor_dst);
         let attack_buf = mk("predate-attack", n * f, stor_dst);
         let herd_buf = mk("predate-herd", n * f, stor_dst_src);
-        let energy_delta_buf = mk("predate-energy-delta", n * f, stor_dst_src);
+        let energy_gain_buf = mk("predate-energy-gain", n * f, stor_dst_src);
         let damage_delta_buf = mk("predate-damage-delta", n * f, stor_dst_src);
         let spike_counts_buf = mk("predate-spike-counts", n * f, stor_dst);
         let pitches_buf = mk("predate-pitches", n * f, stor_dst);
-        let event_count_buf = mk("predate-event-count", f, stor_dst_src);
+        let attack_gates_buf = mk("predate-attack-gates", n * f, stor_dst);
+        let predation_size_ratios_buf =
+            mk("predate-predation-size-ratios", n * f, stor_dst);
+        let defense_pool_buf = mk("predate-defense-pool", n * f, stor_dst);
         let attacker_event_count_buf =
             mk("predate-attacker-event-count", n * f, stor_dst_src);
         let attacker_gain_sum_buf =
@@ -211,10 +241,17 @@ impl PredateGpu {
             n * MAX_ATTACKERS_PER_VICTIM as u64 * f,
             stor_dst_src,
         );
+        // NUM_BUCKETS = GRID_NX * GRID_NY * GRID_NZ = 64 * 32 * 4 = 8192.
+        // Keep in sync with the const in `predate.wgsl` / `spatial_hash.wgsl`.
+        const NUM_BUCKETS: u64 = 8192;
+        let bucket_min_radius_buf = mk(
+            "predate-bucket-min-radius",
+            NUM_BUCKETS * f,
+            stor_dst,
+        );
         let herd_rb = mk("predate-herd-rb", n * f, read);
-        let energy_rb = mk("predate-energy-rb", n * f, read);
+        let energy_gain_rb = mk("predate-energy-gain-rb", n * f, read);
         let damage_rb = mk("predate-damage-rb", n * f, read);
-        let event_count_rb = mk("predate-event-count-rb", f, read);
         let attacker_event_count_rb =
             mk("predate-attacker-event-count-rb", n * f, read);
         let attacker_gain_sum_rb =
@@ -230,6 +267,7 @@ impl PredateGpu {
         Ok(Self {
             device,
             queue,
+            pipeline_bucket_min,
             pipeline_herd,
             pipeline_attack,
             bind_group_layout,
@@ -241,19 +279,21 @@ impl PredateGpu {
             spikes_packed_buf,
             attack_buf,
             herd_buf,
-            energy_delta_buf,
+            energy_gain_buf,
             damage_delta_buf,
             spike_counts_buf,
             pitches_buf,
-            event_count_buf,
             attacker_event_count_buf,
             attacker_gain_sum_buf,
             victim_attacker_count_buf,
             victim_attackers_buf,
+            bucket_min_radius_buf,
+            attack_gates_buf,
+            predation_size_ratios_buf,
+            defense_pool_buf,
             herd_rb,
-            energy_rb,
+            energy_gain_rb,
             damage_rb,
-            event_count_rb,
             attacker_event_count_rb,
             attacker_gain_sum_rb,
             victim_attacker_count_rb,
@@ -266,6 +306,10 @@ impl PredateGpu {
     /// `[length, azimuth_offset, elevation_offset, complexity]`;
     /// `spike_counts[i]` marks how many slots are active (the rest stay
     /// zero-initialized); `pitches[i]` provides the 3D forward direction.
+    /// Sprint 187: `attack_gates[i]` and `predation_size_ratios[i]` are
+    /// per-attacker (replace pre-S187 uniform Params fields); `defense_pool[j]`
+    /// is per-victim sum of bonded partners' `defense_contribution` (CPU
+    /// aggregated each tick).
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
@@ -276,6 +320,9 @@ impl PredateGpu {
         spikes_packed: &[[f32; 4]],
         spike_counts: &[u32],
         attack_signals: &[f32],
+        attack_gates: &[f32],
+        predation_size_ratios: &[f32],
+        defense_pool: &[f32],
         cell_hash: &SpatialHashGpu,
         params: PredateParamsGpu,
     ) -> PredateResult {
@@ -284,6 +331,9 @@ impl PredateGpu {
         assert_eq!(pitches.len(), n);
         assert_eq!(spike_counts.len(), n);
         assert_eq!(spikes_packed.len(), n * SPIKE_SLOTS);
+        assert_eq!(attack_gates.len(), n);
+        assert_eq!(predation_size_ratios.len(), n);
+        assert_eq!(defense_pool.len(), n);
         if n == 0 {
             return PredateResult {
                 herd_counts: Vec::new(),
@@ -309,7 +359,7 @@ impl PredateGpu {
         // start from clean slate per dispatch).
         let zero_bytes = vec![0u8; (n * 4) as usize];
         self.queue.write_buffer(&self.herd_buf, 0, &zero_bytes);
-        self.queue.write_buffer(&self.energy_delta_buf, 0, &zero_bytes);
+        self.queue.write_buffer(&self.energy_gain_buf, 0, &zero_bytes);
         self.queue.write_buffer(&self.damage_delta_buf, 0, &zero_bytes);
         // Sprint 186: per-attacker / per-victim diagnostics zero-init.
         self.queue
@@ -321,10 +371,6 @@ impl PredateGpu {
         let victim_attackers_zero = vec![0u8; n * MAX_ATTACKERS_PER_VICTIM * 4];
         self.queue
             .write_buffer(&self.victim_attackers_buf, 0, &victim_attackers_zero);
-        // Event counter is a single u32 — separate zero write (don't reuse
-        // the per-cell `zero_bytes` since `n` can be 0+).
-        self.queue
-            .write_buffer(&self.event_count_buf, 0, &[0u8, 0, 0, 0]);
 
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -348,6 +394,21 @@ impl PredateGpu {
         );
         self.queue
             .write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
+        self.queue.write_buffer(
+            &self.attack_gates_buf,
+            0,
+            bytemuck::cast_slice(attack_gates),
+        );
+        self.queue.write_buffer(
+            &self.predation_size_ratios_buf,
+            0,
+            bytemuck::cast_slice(predation_size_ratios),
+        );
+        self.queue.write_buffer(
+            &self.defense_pool_buf,
+            0,
+            bytemuck::cast_slice(defense_pool),
+        );
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("predate-bg"),
@@ -362,15 +423,18 @@ impl PredateGpu {
                 wgpu::BindGroupEntry { binding: 6, resource: cell_hash.offsets_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: cell_hash.sorted_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: self.herd_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.energy_delta_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.energy_gain_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: self.damage_delta_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.spike_counts_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: self.pitches_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.event_count_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.attacker_event_count_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: self.attacker_gain_sum_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: self.victim_attacker_count_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 17, resource: self.victim_attackers_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.attacker_event_count_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: self.attacker_gain_sum_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.victim_attacker_count_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: self.victim_attackers_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 17, resource: self.bucket_min_radius_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 18, resource: self.attack_gates_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 19, resource: self.predation_size_ratios_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 20, resource: self.defense_pool_buf.as_entire_binding() },
             ],
         });
 
@@ -378,6 +442,17 @@ impl PredateGpu {
             label: Some("predate-encoder"),
         });
         let workgroups = ((n as u32) + 63) / 64;
+        // NUM_BUCKETS = 8192 → 128 workgroups of 64 threads each.
+        const NUM_BUCKETS_WG: u32 = 8192 / 64;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("predate-bucket-min-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_bucket_min);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(NUM_BUCKETS_WG, 1, 1);
+        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("predate-herd-pass"),
@@ -399,9 +474,8 @@ impl PredateGpu {
         let bytes = (n as u64) * 4;
         let victim_attackers_bytes = bytes * MAX_ATTACKERS_PER_VICTIM as u64;
         encoder.copy_buffer_to_buffer(&self.herd_buf, 0, &self.herd_rb, 0, bytes);
-        encoder.copy_buffer_to_buffer(&self.energy_delta_buf, 0, &self.energy_rb, 0, bytes);
+        encoder.copy_buffer_to_buffer(&self.energy_gain_buf, 0, &self.energy_gain_rb, 0, bytes);
         encoder.copy_buffer_to_buffer(&self.damage_delta_buf, 0, &self.damage_rb, 0, bytes);
-        encoder.copy_buffer_to_buffer(&self.event_count_buf, 0, &self.event_count_rb, 0, 4);
         encoder.copy_buffer_to_buffer(
             &self.attacker_event_count_buf,
             0,
@@ -433,9 +507,8 @@ impl PredateGpu {
         self.queue.submit(Some(encoder.finish()));
 
         let h = self.herd_rb.slice(0..bytes);
-        let e = self.energy_rb.slice(0..bytes);
+        let e = self.energy_gain_rb.slice(0..bytes);
         let d = self.damage_rb.slice(0..bytes);
-        let ec = self.event_count_rb.slice(0..4);
         let aec = self.attacker_event_count_rb.slice(0..bytes);
         let ags = self.attacker_gain_sum_rb.slice(0..bytes);
         let vac = self.victim_attacker_count_rb.slice(0..bytes);
@@ -443,34 +516,41 @@ impl PredateGpu {
         h.map_async(wgpu::MapMode::Read, |_| {});
         e.map_async(wgpu::MapMode::Read, |_| {});
         d.map_async(wgpu::MapMode::Read, |_| {});
-        ec.map_async(wgpu::MapMode::Read, |_| {});
         aec.map_async(wgpu::MapMode::Read, |_| {});
         ags.map_async(wgpu::MapMode::Read, |_| {});
         vac.map_async(wgpu::MapMode::Read, |_| {});
         va.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
 
-        let event_count: u32 = {
-            let mapped = ec.get_mapped_range();
-            let arr: [u8; 4] = mapped[..4].try_into().expect("4-byte counter");
-            u32::from_ne_bytes(arr)
-        };
+        let attacker_event_count: Vec<u32> =
+            bytemuck::cast_slice::<u8, u32>(&aec.get_mapped_range()).to_vec();
+        let total_events: u32 = attacker_event_count.iter().sum();
+        // GPU now writes only the per-attacker self_gain (`energy_gain`) and
+        // per-victim drain (`damage_delta`). Net per-cell `energy_delta` is
+        // derived host-side so the shader can skip its second CAS smyčka.
+        let energy_gain: Vec<f32> =
+            bytemuck::cast_slice::<u8, f32>(&e.get_mapped_range()).to_vec();
+        let damage_delta: Vec<f32> =
+            bytemuck::cast_slice::<u8, f32>(&d.get_mapped_range()).to_vec();
+        let energy_delta: Vec<f32> = energy_gain
+            .iter()
+            .zip(damage_delta.iter())
+            .map(|(g, d)| g - d)
+            .collect();
         let res = PredateResult {
             herd_counts: bytemuck::cast_slice::<u8, u32>(&h.get_mapped_range()).to_vec(),
-            energy_delta: bytemuck::cast_slice::<u8, f32>(&e.get_mapped_range()).to_vec(),
-            damage_delta: bytemuck::cast_slice::<u8, f32>(&d.get_mapped_range()).to_vec(),
-            total_events: event_count,
-            attacker_event_count: bytemuck::cast_slice::<u8, u32>(&aec.get_mapped_range())
-                .to_vec(),
+            energy_delta,
+            damage_delta,
+            total_events,
+            attacker_event_count,
             attacker_gain_sum: bytemuck::cast_slice::<u8, f32>(&ags.get_mapped_range()).to_vec(),
             victim_attacker_count: bytemuck::cast_slice::<u8, u32>(&vac.get_mapped_range())
                 .to_vec(),
             victim_attackers: bytemuck::cast_slice::<u8, u32>(&va.get_mapped_range()).to_vec(),
         };
         self.herd_rb.unmap();
-        self.energy_rb.unmap();
+        self.energy_gain_rb.unmap();
         self.damage_rb.unmap();
-        self.event_count_rb.unmap();
         self.attacker_event_count_rb.unmap();
         self.attacker_gain_sum_rb.unmap();
         self.victim_attacker_count_rb.unmap();

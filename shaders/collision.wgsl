@@ -182,14 +182,14 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let adhesion_range = pair_r * params.adhesion_range_factor;
                         let adhesion_range2 = adhesion_range * adhesion_range;
                         if (d2 < adhesion_range2) {
-                            let dist = sqrt(d2);
+                            let inv_d = inverseSqrt(d2);
+                            let dist = d2 * inv_d;
                             let falloff = (adhesion_range - dist) / (adhesion_range - pair_r);
                             var coeff: f32 = params.adhesion_strength;
                             if (adhesion_types[j] != type_i) {
                                 coeff = coeff * params.adhesion_cross_type;
                             }
                             let mag = -coeff * falloff;
-                            let inv_d = 1.0 / dist;
                             vdx_acc = vdx_acc + mag * d.x * inv_d;
                             vdy_acc = vdy_acc + mag * d.y * inv_d;
                             vdz_acc = vdz_acc + mag * d.z * inv_d;

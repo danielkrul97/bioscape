@@ -52,18 +52,17 @@ pub(super) fn update_stats_overlay(
     let mut vib_emit_sum = 0.0_f64;
     let mut vib_amp_sum = 0.0_f64;
     let mut vib_grad_sum = 0.0_f64;
-    // Sprint 183+: stats aggregated from `SimWorld.0.cells` (canonical
-    // since S177); legacy `CellEntity` query is no longer reliable —
-    // entity lifecycle sync (S177 scope-cut) keeps only the initial 200
-    // entities. Vibration field samples from `SimWorld.0.vibration`
-    // (CPU shadow); `sim_tick` system syncs it periodically from GPU.
+    let mut vib_samples = 0usize;
     lineages_scratch.clear();
     let lineages = &mut *lineages_scratch;
     let mut oldest_age: u64 = 0;
     let current_gen = clock.0.generation;
     let world = &sim_world.0;
     let vibration_field = &world.vibration;
-    for cell in &world.cells {
+    // Stride-sample vibration (9 trilinear lookups per cell otherwise);
+    // overlay only displays averages, so a fraction of the population suffices.
+    const VIB_SAMPLE_STRIDE: usize = 16;
+    for (i, cell) in world.cells.iter().enumerate() {
         count += 1;
         let s = cell.genome.max_speed as f64;
         let v = cell.genome.vision_radius as f64;
@@ -87,11 +86,14 @@ pub(super) fn update_stats_overlay(
             spk_max = spk;
         }
         e_sum += e;
-        let pos = cell.position;
         vib_emit_sum += bioscape::vibration_emit_for_cell(cell) as f64;
-        vib_amp_sum += vibration_field.sample(pos) as f64;
-        let g = vibration_field.gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
-        vib_grad_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
+        if i % VIB_SAMPLE_STRIDE == 0 {
+            let pos = cell.position;
+            vib_amp_sum += vibration_field.sample(pos) as f64;
+            let g = vibration_field.gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
+            vib_grad_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
+            vib_samples += 1;
+        }
         lineages.insert(cell.lineage_id);
         let age = current_gen.saturating_sub(cell.lineage_birth_gen);
         if age > oldest_age {
@@ -127,12 +129,26 @@ pub(super) fn update_stats_overlay(
         (0.0, 0.0, 0.0)
     } else {
         let n = count as f64;
-        (vib_emit_sum / n, vib_amp_sum / n, vib_grad_sum / n)
+        let vs = vib_samples.max(1) as f64;
+        (vib_emit_sum / n, vib_amp_sum / vs, vib_grad_sum / vs)
     };
+
+    // Effective compute throughput. `flops_per_tick` is a static estimate
+    // from current pop (see `bioscape::sim::estimate_flops_per_tick`); the
+    // effective tick rate equals `FIXED_TIMESTEP_HZ × relative_speed` when
+    // the sim is keeping up, and 0 when paused.
+    let flops_per_tick = bioscape::sim::estimate_flops_per_tick(count as u64);
+    let effective_tps = if time.is_paused() {
+        0.0
+    } else {
+        bioscape::FIXED_TIMESTEP_HZ as f64 * time.relative_speed() as f64
+    };
+    let flops_per_sec = flops_per_tick as f64 * effective_tps;
+    let gflops = flops_per_sec / 1e9;
 
     let mut text = text.into_inner();
     text.0 = format!(
-        "tick     {}\ngen      {}\nepoch    {}\nspeed    {}\ncells    {}\nfood     {}\ndensity  {:.2}\nfps      {:.0}\nspd_avg  {:.1}\nspd_dev  {:.2}\nvis_avg  {:.1}\nvis_dev  {:.2}\ntrn_avg  {:.2}\nlen_avg  {:.2}\nwid_avg  {:.2}\nasp_avg  {:.2}\nasp_dev  {:.2}\nspk_avg  {:.2}\nspk_max  {:.2}\ne_avg    {:.1}\nlineages {}\noldest   {}\nvib_emit {:.3}\nvib_amp  {:.4}\nvib_grad {:.5}",
+        "tick     {}\ngen      {}\nepoch    {}\nspeed    {}\ncells    {}\nfood     {}\ndensity  {:.2}\nfps      {:.0}\ngflops   {:.2}\nspd_avg  {:.1}\nspd_dev  {:.2}\nvis_avg  {:.1}\nvis_dev  {:.2}\ntrn_avg  {:.2}\nlen_avg  {:.2}\nwid_avg  {:.2}\nasp_avg  {:.2}\nasp_dev  {:.2}\nspk_avg  {:.2}\nspk_max  {:.2}\ne_avg    {:.1}\nlineages {}\noldest   {}\nvib_emit {:.3}\nvib_amp  {:.4}\nvib_grad {:.5}",
         clock.0.tick,
         clock.0.generation,
         clock.0.epoch,
@@ -141,6 +157,7 @@ pub(super) fn update_stats_overlay(
         food_count,
         density.0,
         fps,
+        gflops,
         spd_avg,
         spd_dev,
         vis_avg,

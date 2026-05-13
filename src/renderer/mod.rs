@@ -12,6 +12,7 @@ mod diagnostics;
 mod gizmos;
 mod godmode;
 mod input;
+mod inspector;
 mod material;
 mod resources;
 mod resources_gpu;
@@ -75,6 +76,10 @@ pub fn run() {
     // (asset by se loadnul ale shader by se nezkompiloval).
     app.add_plugins(MaterialPlugin::<BioMaterial>::default());
 
+    // Sprint 187: Cell inspector — picking + gizmo outline + egui dialog
+    // + JSON export. Pulls in `EguiPlugin` automatically.
+    app.add_plugins(inspector::InspectorPlugin);
+
     // FrameTimeDiagnosticsPlugin runs unconditionally so the stats overlay
     // can show FPS — its overhead is just a few timestamps per frame. The
     // verbose log spam and custom per-system diagnostics stay behind `--diag`.
@@ -105,6 +110,7 @@ pub fn run() {
             GENERATIONS_PER_EPOCH,
         )))
         .init_resource::<CellEntityLookups>()
+        .init_resource::<CellEntityPool>()
         .init_resource::<FoodDensityFactor>()
         .init_resource::<NextCellId>()
         .init_resource::<ContactProgress>()

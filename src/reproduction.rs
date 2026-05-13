@@ -64,10 +64,12 @@ where
     matings
 }
 
-/// Sprint 40: vyrobí dítě z dvou rodičů (immutable refs — parent halving si
-/// dělá caller před voláním). Random direction pro startovní heading +
-/// crossover + mutate genomu, fresh phenotype z genomu (žádný Lamarckismus),
-/// brain stav reset (last_*=0). Energy = a.energy + b.energy (caller už halved).
+/// Sprint 40 + S187: vyrobí dítě z dvou rodičů (immutable refs — parent
+/// energy donation si dělá caller před voláním). Random direction pro
+/// startovní heading + crossover + mutate genomu, fresh phenotype z genomu
+/// (žádný Lamarckismus), brain stav reset (last_*=0).
+/// Energy = `parent_a.genome.birth_energy + parent_b.genome.birth_energy`
+/// (gene-encoded absolute donation, caller už subtractoval z parent.energy).
 /// Sprint 66: caller poskytuje `cell_id` (World-level monotonic counter).
 /// Sprint 70: vybere parent, do jehož bond clusteru se má spawn dítě. Priorita:
 /// 1. Parent s bondy + adhesion_type matchující childovu (= dítě se chytne
@@ -173,7 +175,7 @@ pub fn make_mating_child_no_brain(
         ],
         angular_velocity: 0.0,
         pitch_velocity: 0.0,
-        energy: parent_a.energy + parent_b.energy,
+        energy: parent_a.genome.birth_energy + parent_b.genome.birth_energy,
         heading: direction,
         pitch: 0.0,
         lineage_id: parent_a.lineage_id,

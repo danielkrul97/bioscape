@@ -1,10 +1,28 @@
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use wide::f32x8;
 
 use super::activation::tanh_fast_simd;
 use super::cppn::Cppn;
 use crate::*;
+
+/// Sprint 191: amplitude of the per-(row, weight) gaussian perturbation
+/// added on top of CPPN-derived weights in `Brain::from_cppn`. The CPPN
+/// substrate maps nearby (hidden) coordinates to nearly identical weight
+/// rows; without an explicit symmetry break Hebbian + Oja amplify only
+/// the variance the substrate already carries, leaving ~22 of 25 hidden
+/// neurons converged onto identical responses (observed in a real cell
+/// dump). `0.05` is small enough that the CPPN-encoded structure stays
+/// dominant at gen-0 but large enough that no two rows are bit-equal,
+/// giving the learning rules something to amplify.
+const INIT_JITTER_SIGMA: f32 = 0.05;
+/// Sprint 191: fixed RNG seed for the init jitter so `Brain::from_cppn`
+/// remains a pure function of its `Cppn` argument (same CPPN → same
+/// Brain across runs / lineages / replays). The variance per row comes
+/// from advancing the RNG stream as we walk `(h, i)` pairs, not from a
+/// CPPN-derived seed.
+const INIT_JITTER_SEED: u64 = 0xb13c_a591_91d3_9a17;
 
 /// Sprint 144: per-cell neuron compute model. `Perceptron` is the pre-S144
 /// rate-coded tanh path (default); `Izhikevich` switches the hidden layer
@@ -67,6 +85,33 @@ fn kahan_reduce_lanes(acc: f32x8) -> f32 {
         sum = t;
     }
     sum
+}
+
+/// Sprint 189: LayerNorm — mean-centre + unit-variance the first `n` slots
+/// of `xs` in place. Mirror of the GPU forward shader (`shaders/
+/// brain_forward.wgsl`); CPU and GPU must produce bit-close results so
+/// the parity tests stay green. Inactive slots (`i ≥ n`) are untouched
+/// and excluded from the mean / variance estimate.
+#[inline]
+fn layer_norm_in_place(xs: &mut [f32], n: usize) {
+    if n == 0 {
+        return;
+    }
+    let inv_n = 1.0_f32 / n as f32;
+    let mut sum = 0.0_f32;
+    for &x in &xs[..n] {
+        sum += x;
+    }
+    let mean = sum * inv_n;
+    let mut var_sum = 0.0_f32;
+    for &x in &xs[..n] {
+        let d = x - mean;
+        var_sum += d * d;
+    }
+    let inv_std = 1.0_f32 / (var_sum * inv_n + 1e-6_f32).sqrt();
+    for x in &mut xs[..n] {
+        *x = (*x - mean) * inv_std;
+    }
 }
 
 impl Brain {
@@ -219,6 +264,25 @@ impl Brain {
                 b2[o + k] = out[k][0] * 0.5;
             }
             o += 8;
+        }
+
+        // Sprint 191: symmetry-breaking jitter. Walks (h, i) in fixed order
+        // so the RNG draws are deterministic — the function stays pure in
+        // its `Cppn` argument. Per-row stream advance means different rows
+        // get different perturbation patterns, which is what Oja's rule
+        // needs as a starting point to drive decorrelation.
+        let mut rng = StdRng::seed_from_u64(INIT_JITTER_SEED);
+        for h in 0..BRAIN_HIDDEN {
+            for i in 0..BRAIN_INPUTS {
+                w1[h][i] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
+            }
+            b1[h] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
+        }
+        for o in 0..BRAIN_OUTPUTS {
+            for h in 0..BRAIN_HIDDEN {
+                w2[o][h] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
+            }
+            b2[o] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
         }
 
         Brain {
@@ -609,16 +673,23 @@ impl Brain {
             hidden[i] = (spike_counts[i] as f32) * scale - 1.0;
         }
 
-        // L2 matvec + tanh — identical shape to perceptron path so
-        // `w2`/`b2` evolved under perceptron can run with Izhikevich hidden.
-        let mut outputs = [0.0_f32; BRAIN_OUTPUTS];
+        // L2 matvec + LayerNorm + tanh — identical shape to perceptron
+        // path so `w2`/`b2` evolved under perceptron can run with
+        // Izhikevich hidden. Sprint 189: same LayerNorm contract as the
+        // perceptron output layer (`Brain::forward_with_state`).
+        let mut pre_out = [0.0_f32; BRAIN_OUTPUTS];
         for o in 0..BRAIN_OUTPUTS {
             let row = &self.w2[o];
             let mut acc = 0.0_f32;
             for j in 0..h_n {
                 acc += row[j] * hidden[j];
             }
-            outputs[o] = (acc + self.b2[o]).tanh();
+            pre_out[o] = acc + self.b2[o];
+        }
+        layer_norm_in_place(&mut pre_out, BRAIN_OUTPUTS);
+        let mut outputs = [0.0_f32; BRAIN_OUTPUTS];
+        for o in 0..BRAIN_OUTPUTS {
+            outputs[o] = pre_out[o].tanh();
         }
 
         (hidden, outputs)
@@ -688,6 +759,11 @@ impl Brain {
             pre_hidden[i] = self.b1[i] + kahan_reduce_lanes(acc);
         }
 
+        // Sprint 189: LayerNorm over the active hidden range before tanh —
+        // breaks the recurrent-saturation feedback loop. Mirror of the GPU
+        // path in `shaders/brain_forward.wgsl`.
+        layer_norm_in_place(&mut pre_hidden, h_n);
+
         // Vectorized tanh in chunks of 8 over active hiddens; scalar tail.
         let mut hidden = [0.0_f32; BRAIN_HIDDEN];
         let full_chunks = h_n / 8;
@@ -714,8 +790,8 @@ impl Brain {
 
         // L2 matvec with Kahan compensated summation; BRAIN_OUTPUTS is small
         // so we still do scalar tanh per output at the end.
-        let mut out = [0.0_f32; BRAIN_OUTPUTS];
-        for ((o, row), &bias) in out.iter_mut().zip(self.w2.iter()).zip(self.b2.iter()) {
+        let mut pre_out = [0.0_f32; BRAIN_OUTPUTS];
+        for ((o, row), &bias) in pre_out.iter_mut().zip(self.w2.iter()).zip(self.b2.iter()) {
             let mut acc = f32x8::ZERO;
             let mut comp = f32x8::ZERO;
             for k in 0..L2_FULL {
@@ -731,19 +807,33 @@ impl Brain {
                     &mut comp,
                 );
             }
-            *o = (bias + kahan_reduce_lanes(acc)).tanh();
+            *o = bias + kahan_reduce_lanes(acc);
+        }
+        // Sprint 189: LayerNorm output preacts before tanh. Same parity
+        // contract as the L1 path above.
+        layer_norm_in_place(&mut pre_out, BRAIN_OUTPUTS);
+        let mut out = [0.0_f32; BRAIN_OUTPUTS];
+        for (o, &p) in out.iter_mut().zip(pre_out.iter()) {
+            *o = p.tanh();
         }
         (hidden, out)
     }
 
-    /// Reward-modulated Hebbian update: `Δw = lr · reward · pre · post`.
+    /// Reward-modulated Hebbian update with Oja correction:
+    /// `Δw = lr · reward · post · (pre − post · w)`
+    /// `   = lr · reward · post · pre  −  lr · reward · post² · w`.
+    /// The first term is classic Hebb; the second pulls every weight
+    /// toward `pre / post`, giving a finite equilibrium without needing
+    /// the L2 cap to clip overshoots. Across hidden neurons the rule
+    /// promotes principal-component-like decorrelation (Oja 1982).
+    /// Biases keep classic Hebb (no `w` to regularise).
+    ///
     /// Pre/post activations come from a stored prior forward pass, so credit
     /// assignment is myopic (1-tick window). Reward fires on biologically
     /// meaningful events (eating, predation kills).
     ///
-    /// Updates iterate the full row width via `f32x8`. This is safe because
-    /// dead-zone activations and inputs are zero, so `lr · 0 · x = 0` leaves
-    /// those weights untouched.
+    /// Updates iterate the full row width via `f32x8`. Dead-zone neurons
+    /// (`hidden = 0`) self-cancel both terms (`Δw = 0`).
     #[allow(clippy::absurd_extreme_comparisons, clippy::out_of_bounds_indexing)]
     pub fn hebbian_update(
         &mut self,
@@ -761,14 +851,18 @@ impl Brain {
         let lr = learning_rate * reward;
         let h_n = self.hidden_n as usize;
 
-        // L1: w1[i][j] += lr · last_hidden[i] · last_inputs[j].
+        // L1: w1[i][j] += lr · post · pre − lr · post² · w1[i][j].
         for i in 0..h_n {
-            let scale = f32x8::splat(lr * last_hidden[i]);
+            let post = last_hidden[i];
+            let lr_post = f32x8::splat(lr * post);
+            let lr_post_sq = f32x8::splat(lr * post * post);
             let row = &mut self.w1[i];
             for k in 0..L1_FULL {
                 let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
                 let x = f32x8::new(last_inputs[k * 8..(k + 1) * 8].try_into().unwrap());
-                let updated = scale.mul_add(x, w).to_array();
+                // updated = w + lr_post * x - lr_post_sq * w
+                //         = w * (1 - lr_post_sq) + lr_post * x
+                let updated = (w - lr_post_sq * w + lr_post * x).to_array();
                 row[k * 8..(k + 1) * 8].copy_from_slice(&updated);
             }
             if L1_TAIL > 0 {
@@ -776,21 +870,24 @@ impl Brain {
                 let mut tail_x = [0.0_f32; 8];
                 tail_w[..L1_TAIL].copy_from_slice(&row[L1_FULL * 8..]);
                 tail_x[..L1_TAIL].copy_from_slice(&last_inputs[L1_FULL * 8..]);
-                let updated = scale
-                    .mul_add(f32x8::new(tail_x), f32x8::new(tail_w))
-                    .to_array();
+                let w = f32x8::new(tail_w);
+                let x = f32x8::new(tail_x);
+                let updated = (w - lr_post_sq * w + lr_post * x).to_array();
                 row[L1_FULL * 8..].copy_from_slice(&updated[..L1_TAIL]);
             }
-            self.b1[i] += lr * last_hidden[i];
+            self.b1[i] += lr * post;
         }
 
-        // L2: w2[o][j] += lr · last_outputs[o] · last_hidden[j].
+        // L2: w2[o][j] += lr · post · pre − lr · post² · w2[o][j],
+        // where post = last_outputs[o], pre = last_hidden[j].
         for (o, row) in self.w2.iter_mut().enumerate() {
-            let scale = f32x8::splat(lr * last_outputs[o]);
+            let post = last_outputs[o];
+            let lr_post = f32x8::splat(lr * post);
+            let lr_post_sq = f32x8::splat(lr * post * post);
             for k in 0..L2_FULL {
                 let w = f32x8::new(row[k * 8..(k + 1) * 8].try_into().unwrap());
                 let h = f32x8::new(last_hidden[k * 8..(k + 1) * 8].try_into().unwrap());
-                let updated = scale.mul_add(h, w).to_array();
+                let updated = (w - lr_post_sq * w + lr_post * h).to_array();
                 row[k * 8..(k + 1) * 8].copy_from_slice(&updated);
             }
             if L2_TAIL > 0 {
@@ -798,9 +895,9 @@ impl Brain {
                 let mut tail_h = [0.0_f32; 8];
                 tail_w[..L2_TAIL].copy_from_slice(&row[L2_FULL * 8..]);
                 tail_h[..L2_TAIL].copy_from_slice(&last_hidden[L2_FULL * 8..]);
-                let updated = scale
-                    .mul_add(f32x8::new(tail_h), f32x8::new(tail_w))
-                    .to_array();
+                let w = f32x8::new(tail_w);
+                let h = f32x8::new(tail_h);
+                let updated = (w - lr_post_sq * w + lr_post * h).to_array();
                 row[L2_FULL * 8..].copy_from_slice(&updated[..L2_TAIL]);
             }
         }
@@ -857,17 +954,28 @@ impl Brain {
         let lr = learning_rate * reward;
         let h_n = self.hidden_n as usize;
         let active_inputs = BRAIN_INPUTS_SENSORY + h_n;
+        // Sprint 190: Oja correction — `−lr · post² · w` folded into the
+        // same loop. Mirror of `shaders/hebbian_apply_reward.wgsl`. The
+        // eligibility trace remains the classic `pre · post` accumulator
+        // (no Oja inside the trace step); regularisation is applied at
+        // weight-apply time, where the current `post` is known.
         for i in 0..h_n {
+            let post = last_hidden[i];
+            let oja_coef = post * post;
             for j in 0..active_inputs {
-                self.w1[i][j] += lr * self.trace_w1[i][j];
+                let w = self.w1[i][j];
+                self.w1[i][j] = w + lr * (self.trace_w1[i][j] - oja_coef * w);
             }
-            self.b1[i] += lr * last_hidden[i];
+            self.b1[i] += lr * post;
         }
         for (o, row) in self.w2.iter_mut().enumerate() {
+            let post = last_outputs[o];
+            let oja_coef = post * post;
             for j in 0..h_n {
-                row[j] += lr * self.trace_w2[o][j];
+                let w = row[j];
+                row[j] = w + lr * (self.trace_w2[o][j] - oja_coef * w);
             }
-            self.b2[o] += lr * last_outputs[o];
+            self.b2[o] += lr * post;
         }
     }
 

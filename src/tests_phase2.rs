@@ -341,6 +341,14 @@ fn aggressive_cfg() -> MutationConfig {
         model_flip_rate: 1.0,
         sigma_stdp_a: 100.0,
         sigma_stdp_tau: 100.0,
+        sigma_reproduce_at_energy: 100.0,
+        sigma_birth_energy: 100.0,
+        sigma_altruism_share_frac: 100.0,
+        sigma_cluster_share_bonus: 100.0,
+        sigma_attack_gate: 100.0,
+        sigma_predation_size_ratio: 100.0,
+        sigma_defense_contribution: 100.0,
+        sigma_reward_weights: [100.0; N_REWARD_KINDS],
     }
 }
 

@@ -39,16 +39,12 @@ fn stdp_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hid_off = cell * BRAIN_HIDDEN;
     for (var j: u32 = 0u; j < BRAIN_INPUTS; j = j + 1u) {
         let idx = in_off + j;
-        pre_trace[idx] = pre_trace[idx] * decay;
-        if (pre_spike_times[idx] == tick) {
-            pre_trace[idx] = pre_trace[idx] + 1.0;
-        }
+        let bump = select(0.0, 1.0, pre_spike_times[idx] == tick);
+        pre_trace[idx] = pre_trace[idx] * decay + bump;
     }
     for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
         let idx = hid_off + h;
-        post_trace[idx] = post_trace[idx] * decay;
-        if (post_spike_times[idx] == tick) {
-            post_trace[idx] = post_trace[idx] + 1.0;
-        }
+        let bump = select(0.0, 1.0, post_spike_times[idx] == tick);
+        post_trace[idx] = post_trace[idx] * decay + bump;
     }
 }

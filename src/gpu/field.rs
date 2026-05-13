@@ -95,7 +95,13 @@ impl FieldGpu {
         world_half: [f32; 3],
         sources_capacity: usize,
     ) -> Result<Self, String> {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader_deposit = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("field_deposit"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../shaders/field_deposit.wgsl").into(),
+            ),
+        });
+        let shader_diffuse = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("field_diffuse"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("../../shaders/field_diffuse.wgsl").into(),
@@ -165,18 +171,18 @@ impl FieldGpu {
             push_constant_ranges: &[],
         });
 
-        let make_pipe = |entry: &str, label: &str| {
+        let make_pipe = |module: &wgpu::ShaderModule, entry: &str, label: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
-                module: &shader,
+                module,
                 entry_point: Some(entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             })
         };
-        let pipeline_deposit = make_pipe("deposit", "field-deposit");
-        let pipeline_diffuse = make_pipe("diffuse", "field-diffuse");
+        let pipeline_deposit = make_pipe(&shader_deposit, "deposit", "field-deposit");
+        let pipeline_diffuse = make_pipe(&shader_diffuse, "diffuse", "field-diffuse");
 
         let grid_size_bytes =
             (resolution[0] * resolution[1] * resolution[2] * std::mem::size_of::<u32>()) as u64;

@@ -63,6 +63,39 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // reward modulation once the integration is wired through CPU/GPU.
     sigma_stdp_a: 0.0,
     sigma_stdp_tau: 0.0,
+    // Sprint 187: ~2 % of [80, 250] range per gen. Slow enough that selection
+    // narrows around an r/K optimum instead of drifting into the clamps.
+    sigma_reproduce_at_energy: 4.0,
+    // ~1.7 % of [30, 150] per gen. Slower than reproduce_at drift so the two
+    // r/K axes co-evolve rather than one outrunning the other.
+    sigma_birth_energy: 2.0,
+    // ~2 % of [0, 5] per gen. Faster than reproduce_at because the kin
+    // selection signal is indirect (via cluster survival) and needs more
+    // exploration per generation to find local fitness gradients.
+    sigma_altruism_share_frac: 0.1,
+    // ~2 % of [0, 1] per gen.
+    sigma_cluster_share_bonus: 0.02,
+    // ~5 % of [0, 1] per gen — wider than other plasticity genes because
+    // hawk/dove dynamics are bistable, evolution needs more exploration to
+    // find local optima at all.
+    sigma_attack_gate: 0.05,
+    // ~3 % of [1, 2.5] range per gen.
+    sigma_predation_size_ratio: 0.05,
+    // ~6 % of [0, 0.5] per gen — defense is donor-side public good, signal
+    // is indirect (kin survival), so sigma is higher to outrun drift toward
+    // the cheater fixed point.
+    sigma_defense_contribution: 0.03,
+    // ~2 % of MAX per kind per gen. Per-slot so different reward kinds can
+    // drift at independent rates if a future sprint wants asymmetric tuning.
+    sigma_reward_weights: [
+        0.04,   // EatFood (MAX 2.0)
+        0.002,  // Novelty (MAX 0.1)
+        0.016,  // Predation (MAX 0.8)
+        0.012,  // EscapedAttack (MAX 0.6)
+        0.004,  // Damage (MAX 0.2)
+        0.024,  // BondFormed (MAX 1.2)
+        0.020,  // MateSignalAccepted (MAX 1.0)
+    ],
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -135,6 +168,31 @@ pub struct MutationConfig {
     pub sigma_stdp_a: f32,
     /// Sprint 148: gaussian sigma for `stdp_tau_ticks`.
     pub sigma_stdp_tau: f32,
+    /// Sprint 187: gaussian sigma for `reproduce_at_energy`. Zero = no drift,
+    /// no RNG draw — preserves the pre-S187 baseline byte-identically until
+    /// the field is activated.
+    pub sigma_reproduce_at_energy: f32,
+    /// Sprint 187: gaussian sigma for `birth_energy` (maternal donation per
+    /// offspring). Same `> 0` short-circuit as the sister field — zero skips
+    /// the RNG draw, so a population pinned to the pre-S187 effective
+    /// behavior stays RNG-stable.
+    pub sigma_birth_energy: f32,
+    /// Sprint 187: gaussian sigma for `altruism_share_frac` (donor's
+    /// per-partner share rate). Zero = no drift, no RNG draw.
+    pub sigma_altruism_share_frac: f32,
+    /// Sprint 187: gaussian sigma for `cluster_share_bonus` (per-bond
+    /// share amplifier).
+    pub sigma_cluster_share_bonus: f32,
+    /// Sprint 187: gaussian sigma for `attack_gate`.
+    pub sigma_attack_gate: f32,
+    /// Sprint 187: gaussian sigma for `predation_size_ratio`.
+    pub sigma_predation_size_ratio: f32,
+    /// Sprint 187: gaussian sigma for `defense_contribution`.
+    pub sigma_defense_contribution: f32,
+    /// Sprint 187: per-slot gaussian sigma for `reward_weights`. Zero per
+    /// slot = no drift on that kind (RNG draw skipped, byte-identical with
+    /// pre-S187 baseline for that index).
+    pub sigma_reward_weights: [f32; N_REWARD_KINDS],
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -218,6 +276,67 @@ pub struct Genome {
     /// Sprint 148: per-cell STDP temporal window (ticks).
     #[serde(default = "default_stdp_tau_ticks")]
     pub stdp_tau_ticks: f32,
+    /// Sprint 187: per-cell reproduction energy threshold. Replaces the
+    /// global `REPRODUCE_THRESHOLD` so r-strategy (low threshold, many small
+    /// offspring) and K-strategy (high threshold, fewer well-provisioned)
+    /// niches can emerge from selection rather than human tuning. Used both
+    /// for the fertile-check (CPU `collect_fertile`) and brain-input
+    /// normalization (`populate_inputs.wgsl`).
+    #[serde(default = "default_reproduce_at_energy")]
+    pub reproduce_at_energy: f32,
+    /// Sprint 187: per-cell maternal donation per offspring. Replaces the
+    /// implicit halve-and-give reproduction semantic. Each parent subtracts
+    /// `birth_energy` from their own pool; child energy = sum of both
+    /// parents' `birth_energy`. Decouples timing of reproduction
+    /// (`reproduce_at_energy`) from per-offspring investment so full r/K
+    /// trade-offs emerge. Invariant clamp:
+    /// `birth_energy ≤ (reproduce_at_energy − SAFETY_MARGIN) / 2`.
+    #[serde(default = "default_birth_energy")]
+    pub birth_energy: f32,
+    /// Sprint 187: per-cell altruism. Donor's share fraction when bonded
+    /// cells eat food — `value × altruism_share_frac × donor_state × cluster_mult`
+    /// goes to each bonded partner (free public-good, no conservation, see
+    /// Sprint 78 design). Pre-S187 was a uniform global forcing all cells
+    /// altruistic; per-genome lets selfish / altruist polymorphism emerge,
+    /// answering the core kin-selection question: does indirect selection
+    /// favour the altruist phenotype when its kin benefits?
+    #[serde(default = "default_altruism_share_frac")]
+    pub altruism_share_frac: f32,
+    /// Sprint 187: per-genome cluster-size bonus on share fraction. Donor
+    /// with `n_bonds` distributes `altruism_share_frac × (1 + (n − 1) × bonus)`
+    /// to each partner. High bonus rewards deep tissue (cells with many
+    /// bonds amplify per-partner share); zero collapses to flat share.
+    #[serde(default = "default_cluster_share_bonus")]
+    pub cluster_share_bonus: f32,
+    /// Sprint 187: per-genome attack gating threshold. Replaces global
+    /// `ATTACK_THRESHOLD`. Brain `last_outputs[6]` must exceed `attack_gate`
+    /// for predation-on-contact to fire. Low gate = trigger-happy attacker,
+    /// high gate = deliberate / cautious. Hawk/dove polymorphism axis.
+    #[serde(default = "default_attack_gate")]
+    pub attack_gate: f32,
+    /// Sprint 187: per-genome size-ratio threshold for predation. Replaces
+    /// global `SIZE_RATIO_THRESHOLD`. Attacker only predates when
+    /// `r_attacker ≥ predation_size_ratio × r_victim`. Low ratio = risky
+    /// close-sized fights; high = only-much-smaller prey (safe but rare).
+    #[serde(default = "default_predation_size_ratio")]
+    pub predation_size_ratio: f32,
+    /// Sprint 187: per-genome donor-side defense contribution. Each cell
+    /// donates this value to bonded partners' defense pool; victim's
+    /// effective drain/gain multiplier is
+    /// `max(1.0 − sum(partner.defense_contribution capped at CAP), 0.4)`.
+    /// Free public-good for cluster — kin selection signal (parallel to
+    /// `altruism_share_frac`, defensive instead of nutritional).
+    #[serde(default = "default_defense_contribution")]
+    pub defense_contribution: f32,
+    /// Sprint 187: per-genome reward sensitivity weights. Multiplies the
+    /// magnitude of each `RewardKind` event before the eligibility-trace
+    /// integration. Models "dopamine-like" inter-lineage variation in
+    /// motivational salience — pre-S187 every cell valued events identically
+    /// (hand-tuned globals). Order matches `RewardKind` enum (`[EatFood,
+    /// Novelty, Predation, EscapedAttack, Damage, BondFormed,
+    /// MateSignalAccepted]`).
+    #[serde(default = "default_reward_weights")]
+    pub reward_weights: [f32; N_REWARD_KINDS],
 }
 
 pub fn default_cppn() -> Cppn {
@@ -273,7 +392,51 @@ pub fn default_stdp_tau_ticks() -> f32 {
     DEFAULT_STDP_TAU_TICKS
 }
 
+pub fn default_reproduce_at_energy() -> f32 {
+    REPRODUCE_THRESHOLD
+}
+
+pub fn default_birth_energy() -> f32 {
+    50.0
+}
+
+pub fn default_altruism_share_frac() -> f32 {
+    BOND_FOOD_SHARE_FRAC
+}
+
+pub fn default_cluster_share_bonus() -> f32 {
+    BOND_FOOD_SHARE_CLUSTER_BONUS
+}
+
+pub fn default_attack_gate() -> f32 {
+    ATTACK_THRESHOLD
+}
+
+pub fn default_predation_size_ratio() -> f32 {
+    SIZE_RATIO_THRESHOLD
+}
+
+pub fn default_defense_contribution() -> f32 {
+    BOND_DEFENSE_FRAC
+}
+
+pub fn default_reward_weights() -> [f32; N_REWARD_KINDS] {
+    REWARD_WEIGHT_DEFAULTS
+}
+
 impl Genome {
+    /// Sprint 187: enforce `birth_energy ≤ (reproduce_at_energy − margin) / 2`
+    /// so a reproducing parent always retains at least `SAFETY_MARGIN` energy.
+    /// Applied as a post-construction clamp wherever a new genome is built
+    /// (random, mutate, crossover) — keeps RNG sequences pre-S187-stable
+    /// because no extra draws happen, just an arithmetic min().
+    fn clamp_birth_energy(mut self) -> Self {
+        let cap = ((self.reproduce_at_energy - REPRODUCE_BIRTH_SAFETY_MARGIN) * 0.5)
+            .max(MIN_BIRTH_ENERGY);
+        self.birth_energy = self.birth_energy.min(cap);
+        self
+    }
+
     pub fn random(rng: &mut impl Rng) -> Self {
         // Isotropic body at gen 0 — mutations can create asymmetry only when
         // selection rewards it; no ellipsoid prior is baked in.
@@ -333,7 +496,44 @@ impl Genome {
             stdp_a_plus: DEFAULT_STDP_A_PLUS,
             stdp_a_minus: DEFAULT_STDP_A_MINUS,
             stdp_tau_ticks: DEFAULT_STDP_TAU_TICKS,
+            // Sprint 187: wide draw centered on the legacy global so an initial
+            // population spans both r and K niches. Selection narrows around
+            // whichever side the food/predation balance favours.
+            reproduce_at_energy: rng.random_range(120.0..180.0),
+            // Narrow draw so the invariant clamp rarely fires at gen 0
+            // (max birth at reproduce_at_energy = 120 is (120−20)/2 = 50;
+            // the upper bound 70 is reached only when reproduce_at_energy ≥ 160).
+            birth_energy: rng.random_range(40.0..70.0),
+            // Wide draw across [0, 3] so the initial population mixes selfish
+            // and altruist phenotypes. Convergence to a single attractor in
+            // long runs is the signal that kin selection found an optimum;
+            // sustained polymorphism is the signal of negative frequency-
+            // dependent selection (cheater-vs-altruist balance).
+            altruism_share_frac: rng.random_range(0.0..3.0),
+            cluster_share_bonus: rng.random_range(0.0..0.5),
+            // Gen-0 attackers span trigger-happy (0.05) to deliberate (0.4).
+            // Wider than ATTACK_THRESHOLD=0.15 baseline so hawk/dove split
+            // is possible from gen 0.
+            attack_gate: rng.random_range(0.05..0.4),
+            // Span risky (1.1) to cautious (1.6), centered near the
+            // pre-S187 1.3 global.
+            predation_size_ratio: rng.random_range(1.1..1.6),
+            // Centered around pre-S187 0.15. Wide enough that defectors
+            // (≈0.05) and strong defenders (≈0.25) both exist at gen 0.
+            defense_contribution: rng.random_range(0.05..0.25),
+            // Per-slot uniform [0.5 × default, 1.5 × default]. Narrow start
+            // around the pre-S187 globals so gen 0 dynamics match baseline;
+            // sigma drift over generations expands the polymorphism.
+            reward_weights: {
+                let mut w = [0.0_f32; N_REWARD_KINDS];
+                for k in 0..N_REWARD_KINDS {
+                    let d = REWARD_WEIGHT_DEFAULTS[k];
+                    w[k] = rng.random_range(0.5 * d..(1.5 * d).max(0.5 * d + 1e-6));
+                }
+                w
+            },
         }
+        .clamp_birth_energy()
     }
 
     pub fn mutate(&self, rng: &mut impl Rng, cfg: &MutationConfig) -> Self {
@@ -507,7 +707,60 @@ impl Genome {
             } else {
                 self.stdp_tau_ticks
             },
+            reproduce_at_energy: if cfg.sigma_reproduce_at_energy > 0.0 {
+                (self.reproduce_at_energy + gaussian(rng) * cfg.sigma_reproduce_at_energy)
+                    .clamp(MIN_REPRODUCE_AT_ENERGY, MAX_REPRODUCE_AT_ENERGY)
+            } else {
+                self.reproduce_at_energy
+            },
+            birth_energy: if cfg.sigma_birth_energy > 0.0 {
+                (self.birth_energy + gaussian(rng) * cfg.sigma_birth_energy)
+                    .clamp(MIN_BIRTH_ENERGY, MAX_BIRTH_ENERGY)
+            } else {
+                self.birth_energy
+            },
+            altruism_share_frac: if cfg.sigma_altruism_share_frac > 0.0 {
+                (self.altruism_share_frac + gaussian(rng) * cfg.sigma_altruism_share_frac)
+                    .clamp(MIN_ALTRUISM_SHARE_FRAC, MAX_ALTRUISM_SHARE_FRAC)
+            } else {
+                self.altruism_share_frac
+            },
+            cluster_share_bonus: if cfg.sigma_cluster_share_bonus > 0.0 {
+                (self.cluster_share_bonus + gaussian(rng) * cfg.sigma_cluster_share_bonus)
+                    .clamp(MIN_CLUSTER_SHARE_BONUS, MAX_CLUSTER_SHARE_BONUS)
+            } else {
+                self.cluster_share_bonus
+            },
+            attack_gate: if cfg.sigma_attack_gate > 0.0 {
+                (self.attack_gate + gaussian(rng) * cfg.sigma_attack_gate)
+                    .clamp(MIN_ATTACK_GATE, MAX_ATTACK_GATE)
+            } else {
+                self.attack_gate
+            },
+            predation_size_ratio: if cfg.sigma_predation_size_ratio > 0.0 {
+                (self.predation_size_ratio + gaussian(rng) * cfg.sigma_predation_size_ratio)
+                    .clamp(MIN_PREDATION_SIZE_RATIO, MAX_PREDATION_SIZE_RATIO)
+            } else {
+                self.predation_size_ratio
+            },
+            defense_contribution: if cfg.sigma_defense_contribution > 0.0 {
+                (self.defense_contribution + gaussian(rng) * cfg.sigma_defense_contribution)
+                    .clamp(MIN_DEFENSE_CONTRIBUTION, MAX_DEFENSE_CONTRIBUTION)
+            } else {
+                self.defense_contribution
+            },
+            reward_weights: {
+                let mut w = self.reward_weights;
+                for k in 0..N_REWARD_KINDS {
+                    if cfg.sigma_reward_weights[k] > 0.0 {
+                        w[k] = (w[k] + gaussian(rng) * cfg.sigma_reward_weights[k])
+                            .clamp(REWARD_WEIGHT_MIN[k], REWARD_WEIGHT_MAX[k]);
+                    }
+                }
+                w
+            },
         }
+        .clamp_birth_energy()
     }
 
     /// Per-gene uniform crossover. Each scalar gene picks 50/50 from one
@@ -661,7 +914,70 @@ impl Genome {
             } else {
                 b.stdp_tau_ticks
             },
+            reproduce_at_energy: if a.reproduce_at_energy == b.reproduce_at_energy {
+                a.reproduce_at_energy
+            } else if rng.random::<bool>() {
+                a.reproduce_at_energy
+            } else {
+                b.reproduce_at_energy
+            },
+            birth_energy: if a.birth_energy == b.birth_energy {
+                a.birth_energy
+            } else if rng.random::<bool>() {
+                a.birth_energy
+            } else {
+                b.birth_energy
+            },
+            altruism_share_frac: if a.altruism_share_frac == b.altruism_share_frac {
+                a.altruism_share_frac
+            } else if rng.random::<bool>() {
+                a.altruism_share_frac
+            } else {
+                b.altruism_share_frac
+            },
+            cluster_share_bonus: if a.cluster_share_bonus == b.cluster_share_bonus {
+                a.cluster_share_bonus
+            } else if rng.random::<bool>() {
+                a.cluster_share_bonus
+            } else {
+                b.cluster_share_bonus
+            },
+            attack_gate: if a.attack_gate == b.attack_gate {
+                a.attack_gate
+            } else if rng.random::<bool>() {
+                a.attack_gate
+            } else {
+                b.attack_gate
+            },
+            predation_size_ratio: if a.predation_size_ratio == b.predation_size_ratio {
+                a.predation_size_ratio
+            } else if rng.random::<bool>() {
+                a.predation_size_ratio
+            } else {
+                b.predation_size_ratio
+            },
+            defense_contribution: if a.defense_contribution == b.defense_contribution {
+                a.defense_contribution
+            } else if rng.random::<bool>() {
+                a.defense_contribution
+            } else {
+                b.defense_contribution
+            },
+            reward_weights: {
+                let mut w = [0.0_f32; N_REWARD_KINDS];
+                for k in 0..N_REWARD_KINDS {
+                    w[k] = if a.reward_weights[k] == b.reward_weights[k] {
+                        a.reward_weights[k]
+                    } else if rng.random::<bool>() {
+                        a.reward_weights[k]
+                    } else {
+                        b.reward_weights[k]
+                    };
+                }
+                w
+            },
         }
+        .clamp_birth_energy()
     }
 }
 

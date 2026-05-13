@@ -74,6 +74,12 @@ struct CppnLink {
 @group(0) @binding(3) var<storage, read> cppn_links: array<CppnLink>;
 @group(0) @binding(4) var<storage, read> child_slots: array<u32>;
 @group(0) @binding(5) var<storage, read_write> brain_weights: array<f32>;
+// CSR per-target offsets — `link_offsets[cell * (CPPN_MAX_NODES+1) + to_id]`
+// is the start index in `cppn_links` for links ending at `to_id`. Lets us
+// walk only the incoming-edge slice instead of all CPPN_MAX_LINKS slots.
+@group(0) @binding(6) var<storage, read> link_offsets: array<u32>;
+
+const CPPN_LINK_OFFSETS_PER_CELL: u32 = 65u; // CPPN_MAX_NODES + 1
 
 // 1D substrate coords (mirror of `neural::cppn::substrate_*_coords`).
 fn substrate_input(slot: u32) -> vec3<f32> {
@@ -125,9 +131,9 @@ fn activate(act: u32, x: f32) -> f32 {
 fn cppn_forward(cell_idx: u32, inputs: array<f32, 7>) -> vec2<f32> {
     let node_base = cell_idx * CPPN_MAX_NODES;
     let link_base = cell_idx * CPPN_MAX_LINKS;
+    let offsets_base = cell_idx * CPPN_LINK_OFFSETS_PER_CELL;
     let cell_meta = cppn_meta[cell_idx];
     let num_nodes = cell_meta.x;
-    let num_links = cell_meta.y;
 
     var activations: array<f32, 64>;
     for (var k: u32 = 0u; k < CPPN_MAX_NODES; k = k + 1u) {
@@ -154,9 +160,12 @@ fn cppn_forward(cell_idx: u32, inputs: array<f32, 7>) -> vec2<f32> {
                 continue;
             }
             var sum: f32 = n.bias;
-            for (var j: u32 = 0u; j < num_links; j = j + 1u) {
+            // CSR walk: only links incoming to `n.id` instead of all 256.
+            let link_start = link_offsets[offsets_base + n.id];
+            let link_end = link_offsets[offsets_base + n.id + 1u];
+            for (var j: u32 = link_start; j < link_end; j = j + 1u) {
                 let l = cppn_links[link_base + j];
-                if (l.enabled == 0u || l.to_id != n.id) {
+                if (l.enabled == 0u) {
                     continue;
                 }
                 sum = sum + l.weight * activations[l.from_id];

@@ -1,6 +1,6 @@
 {
   "seed": 25689,
-  "initial_izhikevich_frac": 0.5,
+  "initial_izhikevich_frac": 0,
   "maze": null,
-  "max_population": 1500
+  "max_population": 1000
 }

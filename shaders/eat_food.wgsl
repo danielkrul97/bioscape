@@ -165,22 +165,21 @@ fn eat_food(@builtin(global_invocation_id) gid: vec3<u32>) {
     let search_r = eat_f * max_axis;
     let r_cells = i32(ceil(search_r / params.cell_size));
     let center = bucket_coords_of(pos);
-    var found: bool = false;
 
+    // First match wins → write result + return directly. Earlier revisions
+    // used an `if (found) break` chain across four nested loops; the boolean
+    // propagation kept divergent lanes alive until the outermost loop exit.
     for (var dz: i32 = -r_cells; dz <= r_cells; dz = dz + 1) {
-        if (found) { break; }
         let bz_raw = center.z + dz;
         if (bz_raw < 0 || bz_raw >= GRID_NZ) {
             continue;
         }
         let bz = bz_raw;
         for (var dy: i32 = -r_cells; dy <= r_cells; dy = dy + 1) {
-            if (found) { break; }
             var by = center.y + dy;
             if (by < 0) { by = by + GRID_NY; }
             else if (by >= GRID_NY) { by = by - GRID_NY; }
             for (var dx: i32 = -r_cells; dx <= r_cells; dx = dx + 1) {
-                if (found) { break; }
                 var bx = center.x + dx;
                 if (bx < 0) { bx = bx + GRID_NX; }
                 else if (bx >= GRID_NX) { bx = bx - GRID_NX; }
@@ -188,7 +187,6 @@ fn eat_food(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let start = hash_offsets[b];
                 let end = hash_offsets[b + 1u];
                 for (var k = start; k < end; k = k + 1u) {
-                    if (found) { break; }
                     let f = hash_sorted[k];
                     if (f >= params.num_foods) {
                         continue;
@@ -233,7 +231,7 @@ fn eat_food(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let value = food_base_value(kind) * multiplier * value_factor * eff;
                     out_food_idx[i] = f;
                     out_value[i] = value;
-                    found = true;
+                    return;
                 }
             }
         }
