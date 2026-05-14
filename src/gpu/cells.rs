@@ -43,6 +43,11 @@ pub struct CellsGpu {
     /// b1/b2 slots stay at zero (biases ride on activations at reward time).
     /// Initialized to zero so first step starts clean.
     brain_traces_buf: wgpu::Buffer,
+    /// Sprint 195: per-cell whisker spring-damper state — 12 f32 per cell,
+    /// layout `[deflection0..6, velocity0..6]`. Persistent across ticks,
+    /// mutated in place by `sensor_gather.wgsl`. Zeroed on allocation and on
+    /// every slot recycle (`reset_persistent_brain_state_at`).
+    whisker_state_buf: wgpu::Buffer,
     velocities_buf: wgpu::Buffer,
     xoshiro_state_buf: wgpu::Buffer,
     rewards_buf: wgpu::Buffer,
@@ -181,6 +186,11 @@ impl CellsGpu {
             0,
             &vec![0u8; (n * (BRAIN_WEIGHTS_PER_CELL as u64) * f) as usize],
         );
+        // Sprint 195: whisker spring-damper state, 12 f32 per cell
+        // (deflection ×6, velocity ×6). Zeroed so the first sensor_gather
+        // dispatch starts every whisker at rest (deflection 0 = straight).
+        let whisker_state_buf = mk("cells-whisker-state", n * 12 * f, stor_dst_src);
+        queue.write_buffer(&whisker_state_buf, 0, &vec![0u8; (n * 12 * f) as usize]);
         let velocities_buf = mk("cells-velocities", n * 3 * f, stor_dst_src);
         let xoshiro_state_buf = mk("cells-xoshiro", n * 4 * 4, stor_dst_src);
         let rewards_buf = mk(
@@ -337,6 +347,7 @@ impl CellsGpu {
             last_outputs_buf,
             brain_weights_buf,
             brain_traces_buf,
+            whisker_state_buf,
             velocities_buf,
             xoshiro_state_buf,
             rewards_buf,
@@ -405,6 +416,8 @@ impl CellsGpu {
     pub fn brain_weights_buffer(&self) -> &wgpu::Buffer { &self.brain_weights_buf }
     /// Wave 7: per-cell eligibility-trace buffer (parallel to brain weights).
     pub fn brain_traces_buffer(&self) -> &wgpu::Buffer { &self.brain_traces_buf }
+    /// Sprint 195: per-cell whisker spring-damper state (12 f32/cell).
+    pub fn whisker_state_buffer(&self) -> &wgpu::Buffer { &self.whisker_state_buf }
     pub fn velocities_buffer(&self) -> &wgpu::Buffer { &self.velocities_buf }
     pub fn xoshiro_state_buffer(&self) -> &wgpu::Buffer { &self.xoshiro_state_buf }
     pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
@@ -1091,6 +1104,14 @@ impl CellsGpu {
             &self.post_trace_buf,
             (slot * hidden_bytes) as u64,
             &zeros[..hidden_bytes],
+        );
+        // Sprint 195: clear the whisker spring-damper state so a recycled
+        // slot doesn't inherit the previous occupant's ringing whiskers.
+        let whisker_bytes = 12 * f;
+        self.queue.write_buffer(
+            &self.whisker_state_buf,
+            (slot * whisker_bytes) as u64,
+            &zeros[..whisker_bytes],
         );
     }
 

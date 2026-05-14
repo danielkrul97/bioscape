@@ -9,10 +9,12 @@
 // `spikes_packed` per cell = 5 × vec4 (length, azim, elev, complexity);
 // `spike_counts[i]` u32 marks how many slots are active.
 //
-// Atomic float-add is implemented via a CAS loop over `atomicCompareExchangeWeak`
-// with `bitcast` between u32 / f32 storage. Naga rejects passing storage
-// pointers into functions, so the CAS is inlined at each call site rather
-// than factored into a helper.
+// Per-victim drain accumulates into `damage_delta` via fixed-point integer
+// `atomicAdd`. Integer add is associative, so the per-victim sum is identical
+// regardless of attacker race order — unlike a CAS-based atomic float add,
+// where FP non-associativity made the result non-deterministic. The host
+// decodes the fixed-point value back to f32 on readback.
+const DAMAGE_FIXED_SCALE: f32 = 1048576.0;
 
 const GRID_NX: i32 = 64;
 const GRID_NY: i32 = 32;
@@ -230,23 +232,24 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
     // These depend only on the attacker's pose and spike geometry, not on
     // the victim — without the hoist, every (i, j) pair recomputes 4 trig
     // calls per spike inside the bucket walk.
+    //
+    // Branchless compaction: inactive spike slots (spk.x ≤ 0) get
+    // factor = 0 so they contribute nothing to the bonus accumulator
+    // downstream. Avoids the divergent `continue` that broke warp
+    // coherence between attackers with different spike counts.
     var spike_dir: array<vec3<f32>, SPIKE_SLOTS>;
     var spike_factor: array<f32, SPIKE_SLOTS>;
-    var spike_active: u32 = 0u;
     for (var s: u32 = 0u; s < n_spikes; s = s + 1u) {
         let spk = spikes_packed[spikes_base + s];
-        if (spk.x <= 0.0) {
-            continue;
-        }
+        let active_mask = step(1e-4, spk.x);
         let yaw_s = yaw_i + spk.y;
         let pit_s = pitch_i + spk.z;
         let cos_p = cos(pit_s);
-        spike_dir[spike_active] =
+        spike_dir[s] =
             vec3<f32>(cos(yaw_s) * cos_p, sin(yaw_s) * cos_p, sin(pit_s));
         let cmplx = clamp(spk.w, 0.0, 1.0);
-        spike_factor[spike_active] =
-            spk.x * (1.0 + COMPLEXITY_ATTACK_GAIN * cmplx) * params.spike_bonus;
-        spike_active = spike_active + 1u;
+        spike_factor[s] =
+            active_mask * spk.x * (1.0 + COMPLEXITY_ATTACK_GAIN * cmplx) * params.spike_bonus;
     }
 
     // Size-ratio threshold guarantees r_j ≤ r_i, so 2·CELL_RADIUS·r_i is
@@ -311,18 +314,19 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                             );
                         }
                         var gain = params.predation_gain;
-                        if (spike_active > 0u && d2 > 0.0) {
+                        if (n_spikes > 0u && d2 > 0.0) {
                             let inv_d = inverseSqrt(d2);
                             // d = pos_i - pj, so the unit vector toward the
                             // victim is -d * inv_d.
                             let to_target =
                                 vec3<f32>(-d.x * inv_d, -d.y * inv_d, -d.z * inv_d);
                             var spike_bonus: f32 = 0.0;
-                            for (var s: u32 = 0u; s < spike_active; s = s + 1u) {
+                            for (var s: u32 = 0u; s < n_spikes; s = s + 1u) {
                                 let cos_a = dot(spike_dir[s], to_target);
-                                if (cos_a >= params.spike_dot_threshold) {
-                                    spike_bonus = spike_bonus + spike_factor[s];
-                                }
+                                // Branchless dot-threshold mask — inactive
+                                // slots already have factor = 0.
+                                let aim_mask = step(params.spike_dot_threshold, cos_a);
+                                spike_bonus = spike_bonus + aim_mask * spike_factor[s];
                             }
                             gain = gain + params.predation_gain * spike_bonus;
                         }
@@ -337,22 +341,15 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let applied_drain = params.predation_drain * def_factor;
                         self_gain = self_gain + gain;
 
-                        // Single CAS float-add: only `damage_delta[j]` is
-                        // touched per pair-hit. `energy_delta` on the CPU is
-                        // derived as `energy_gain[i] - damage_delta[i]`, so
-                        // we don't need a parallel `energy_delta[j] -= drain`
-                        // CAS — that pre-S188 path doubled the atomic
-                        // contention on mobbed victims for no semantic gain.
-                        var old_d: u32 = atomicLoad(&damage_delta[j]);
-                        loop {
-                            let new_d: u32 =
-                                bitcast<u32>(bitcast<f32>(old_d) + applied_drain);
-                            let r = atomicCompareExchangeWeak(&damage_delta[j], old_d, new_d);
-                            if (r.exchanged) {
-                                break;
-                            }
-                            old_d = r.old_value;
-                        }
+                        // Deterministic fixed-point accumulation: only
+                        // `damage_delta[j]` is touched per pair-hit.
+                        // `energy_delta` on the CPU is derived as
+                        // `energy_gain[i] - damage_delta[i]` after decoding
+                        // the fixed-point value.
+                        atomicAdd(
+                            &damage_delta[j],
+                            u32(max(applied_drain, 0.0) * DAMAGE_FIXED_SCALE),
+                        );
                     }
                 }
             }

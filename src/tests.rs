@@ -866,7 +866,10 @@ fn apply_energy_costs_thermal_stress_quadratic() {
 
 #[test]
 fn populate_brain_inputs_writes_temperature_slot() {
-    // Sprint 87: slot 20 = tanh((temp - REF) / 10).
+    // Sprint 87: slot 20 = tanh_fast_scalar((temp - REF) / 10). Expected
+    // values derive from the same fast-tanh approximation the implementation
+    // uses (sensors.rs) so the test tracks both the formula and the THERMAL
+    // constants instead of hardcoding a std-`tanh` literal.
     let mut cell = base_cell();
     let sensors = BrainSensors {
         nearest_food: None,
@@ -887,10 +890,10 @@ fn populate_brain_inputs_writes_temperature_slot() {
         ..sensors
     };
     let inputs_top = populate_brain_inputs(&mut cell, &sensors_top, 50.0);
-    // tanh(13/10) = tanh(1.3) ≈ 0.86
+    let expect_top = tanh_fast_scalar((THERMAL_TOP - THERMAL_REF_TEMP) / 10.0);
     assert!(
-        (inputs_top[20] - 1.3_f32.tanh()).abs() < 1e-4,
-        "TOP got {}",
+        (inputs_top[20] - expect_top).abs() < 1e-4,
+        "TOP got {}, expected {expect_top}",
         inputs_top[20]
     );
     // Test bottom temp.
@@ -899,9 +902,10 @@ fn populate_brain_inputs_writes_temperature_slot() {
         ..sensors
     };
     let inputs_bot = populate_brain_inputs(&mut cell, &sensors_bot, 50.0);
+    let expect_bot = tanh_fast_scalar((THERMAL_BOTTOM - THERMAL_REF_TEMP) / 10.0);
     assert!(
-        (inputs_bot[20] - (-1.3_f32).tanh()).abs() < 1e-4,
-        "BOTTOM got {}",
+        (inputs_bot[20] - expect_bot).abs() < 1e-4,
+        "BOTTOM got {}, expected {expect_bot}",
         inputs_bot[20]
     );
 }
@@ -1023,6 +1027,8 @@ fn base_cell() -> Cell {
         last_best_food_d2: f32::MAX,
         xoshiro_state: crate::Xoshiro128PlusPlus::from_cell_id(0),
         last_whisker_distances: [1.0; WHISKER_COUNT],
+        whisker_deflection: [0.0; WHISKER_COUNT],
+        whisker_deflection_vel: [0.0; WHISKER_COUNT],
         novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
         novelty_head: 0,
         under_attack_streak: 0,

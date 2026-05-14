@@ -146,6 +146,8 @@ pub fn base_cell() -> Cell {
         last_best_food_d2: f32::MAX,
         xoshiro_state: Xoshiro128PlusPlus::from_cell_id(0),
         last_whisker_distances: [1.0; WHISKER_COUNT],
+        whisker_deflection: [0.0; WHISKER_COUNT],
+        whisker_deflection_vel: [0.0; WHISKER_COUNT],
         novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
         novelty_head: 0,
         under_attack_streak: 0,
@@ -153,4 +155,18 @@ pub fn base_cell() -> Cell {
         phenotype,
         genome,
     }
+}
+
+/// Per-cell whisker spring-damper state buffer (12 f32/cell) — the test-side
+/// mirror of `CellsGpu::whisker_state_buf`. Sensor-gather tests that run with
+/// `maze_active = 0` still need binding 18 populated for the bind group.
+pub fn whisker_state_buf(device: &wgpu::Device, n: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test-whisker-state"),
+        size: (n * 12 * std::mem::size_of::<f32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
 }

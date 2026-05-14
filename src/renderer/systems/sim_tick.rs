@@ -21,12 +21,9 @@ pub(crate) fn sim_tick(
 ) {
     let rng = &mut sim_rng.0;
     let gen_ended = sim_world.0.tick(rng);
-    // Sprint 183+: keep the CPU vibration shadow current so the stats
-    // overlay can sample it without per-frame GPU readback. `tick` is
-    // 60 Hz so this download adds ~few ms/tick — acceptable for renderer
-    // diagnostics. Headless skips this because it samples vibration only
-    // at gen-end (`sync_vibration_from_gpu` directly).
-    sim_world.0.sync_vibration_from_gpu();
+    // The CPU vibration shadow is refreshed lazily by `update_stats_overlay`
+    // (its only consumer) — a per-tick GPU grid readback here meant a full
+    // `Wait` barrier spent feeding a throttled debug HUD.
 
     // Parity with headless `main.rs` post-tick cleanup: at the boundary
     // of a finished generation, reset the per-gen counters that the

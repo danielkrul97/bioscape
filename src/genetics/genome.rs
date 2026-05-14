@@ -296,18 +296,21 @@ pub struct Genome {
     #[serde(default = "default_birth_energy")]
     pub birth_energy: f32,
     /// Sprint 187: per-cell altruism. Donor's share fraction when bonded
-    /// cells eat food — `value × altruism_share_frac × donor_state × cluster_mult`
-    /// goes to each bonded partner (free public-good, no conservation, see
-    /// Sprint 78 design). Pre-S187 was a uniform global forcing all cells
-    /// altruistic; per-genome lets selfish / altruist polymorphism emerge,
-    /// answering the core kin-selection question: does indirect selection
-    /// favour the altruist phenotype when its kin benefits?
+    /// cells eat food — the donor distributes a pool `value ×
+    /// altruism_share_frac × donor_state` split evenly across its bonded
+    /// partners (Sprint 193 `bonded_food_share`; pre-S193 each partner got the
+    /// full pool times a super-linear cluster bonus). Pre-S187 was a uniform
+    /// global forcing all cells altruistic; per-genome lets selfish / altruist
+    /// polymorphism emerge, answering the core kin-selection question: does
+    /// indirect selection favour the altruist phenotype when its kin benefits?
     #[serde(default = "default_altruism_share_frac")]
     pub altruism_share_frac: f32,
-    /// Sprint 187: per-genome cluster-size bonus on share fraction. Donor
-    /// with `n_bonds` distributes `altruism_share_frac × (1 + (n − 1) × bonus)`
-    /// to each partner. High bonus rewards deep tissue (cells with many
-    /// bonds amplify per-partner share); zero collapses to flat share.
+    /// Sprint 187: per-genome cluster-size bonus on share fraction.
+    /// Sprint 193: VESTIGIAL — the food-share formula is now conservative +
+    /// sub-linear (`bonded_food_share`) and no longer reads this trait. Kept
+    /// for genome-schema / CSV (`cluster_bonus_avg`) stability; still mutated
+    /// and crossed over but has no phenotypic effect. Full removal is
+    /// follow-up cleanup.
     #[serde(default = "default_cluster_share_bonus")]
     pub cluster_share_bonus: f32,
     /// Sprint 187: per-genome attack gating threshold. Replaces global

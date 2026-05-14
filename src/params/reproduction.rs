@@ -148,6 +148,23 @@ pub const MAX_TRACE_DECAY_PER_SEC: f32 = 5.0;
 /// healthy weight growth isn't clipped — only runaway accumulation is.
 pub const W_NORM_CAP: f32 = 8.0;
 
+/// Lower companion to `W_NORM_CAP` — minimum L2 norm an active `w1` / `w2`
+/// row may hold. `synaptic_scale` clamps every active row into
+/// `[W_NORM_FLOOR, W_NORM_CAP]` after the per-tick decay.
+///
+/// Why: `WEIGHT_DECAY_PER_TICK` assumes every cell gets a steady Hebbian
+/// reward stream to balance it (`w_eq ≈ Δ_hebbian / decay`). A long-lived
+/// cell that settles into a reward-sparse niche has `Δ_hebbian → 0`, so its
+/// rows decay multiplicatively toward zero — a 100-gen run showed founder
+/// cells at age ~48 k ticks with `w1` fully annihilated (row norms ~1e-19),
+/// brain output frozen to a single constant. Multiplicative decay preserves
+/// *direction* (uniform scaling), so a floor rescues the magnitude without
+/// inventing a direction: a floored row keeps its evolved / Hebbian-learnt
+/// orientation, just at a minimally-responsive scale. `0.5` keeps `w·input`
+/// meaningful against the `~0.6` bias range without distorting healthy rows
+/// (evolved cells sit at 3–8).
+pub const W_NORM_FLOOR: f32 = 0.5;
+
 /// Sprint 188: per-tick scaling. Previously 600 (≈ 10 s @ 60 Hz) —
 /// Hebbian growth between dispatches outpaced the cap (live cell
 /// snapshot at age=1353 showed `||w1[7]||_2 ≈ 70`, 8.7× over cap, after
@@ -169,6 +186,45 @@ pub const SCALING_PERIOD_TICKS: u64 = 1;
 /// Hebbian `Δ ≈ 0.001–0.005` per reward tick this yields `w_eq` well
 /// inside the L2 envelope.
 pub const WEIGHT_DECAY_PER_TICK: f32 = 0.001;
+
+/// Gram-Schmidt decorrelation rate (per-tick-equivalent). In the
+/// synaptic-scaling pass each active `w1` / `w2` row is partially
+/// orthogonalised against the lower-indexed rows (modified Gram-Schmidt),
+/// then renormalised to its pre-GS L2 norm. The GS pass actually fires once
+/// per `GS_PERIOD_TICKS` with the per-application strength scaled up by that
+/// factor, so this constant reads as a rate-per-tick independent of how the
+/// pass is throttled.
+///
+/// Why: S192's lateral inhibition fails to hold off the rank-1 weight
+/// collapse — measured on a real cell dump, 96 % of its effect is common-
+/// mode and deleted by the very next LayerNorm, and the surviving 4 % is a
+/// pointwise activation rescale, not a weight-space decorrelator. Per-neuron
+/// Oja is *not* a decorrelator either (it drives every neuron to the *same*
+/// principal component). This adds the explicit deflation term that was
+/// missing — the only operation that acts directly on the collapsed
+/// dimension (weight directions). `0.0` = disabled (byte-identical to the
+/// pre-GS pipeline).
+///
+/// Tuning: a 50-gen run at `0.05` broke the collapse decisively (w1 pairwise
+/// |cos| 1.000 → 0.001, distinct motor outputs 2/14 → 14/14) but drove the
+/// layer to *full* orthogonality every tick — that overrides Hebbian
+/// directional learning of `w1` entirely, and reproduction fell off as the
+/// (now decoupled) mating-pheromone output stopped riding the collapsed
+/// always-on value. `0.01` is the gentler retry: enough deflation to keep
+/// effective rank well above 1, little enough that Hebbian + selection still
+/// shape the weight directions.
+pub const GRAM_SCHMIDT_STRENGTH: f32 = 0.01;
+
+/// How often the Gram-Schmidt pass actually runs, in ticks. The
+/// cap/decay/floor part of `synaptic_scale` still runs every tick
+/// (`SCALING_PERIOD_TICKS`); only the `O(hidden_n²)` GS pass is throttled —
+/// it was the dominant cost (a 100-gen run dropped to 41 ticks/s with GS
+/// every tick, vs ~95 without). Decorrelation is cumulative, so firing it
+/// once per `GS_PERIOD_TICKS` with the per-application strength scaled up by
+/// the same factor keeps the time-averaged rate at `GRAM_SCHMIDT_STRENGTH`.
+/// On off-ticks the caller passes `gs_strength = 0`, which the shader
+/// branches past entirely.
+pub const GS_PERIOD_TICKS: u64 = 10;
 
 /// Sprint 192: lateral-inhibition strength α applied to the L1 hidden
 /// pre-activations in every forward pass. Per neuron we subtract

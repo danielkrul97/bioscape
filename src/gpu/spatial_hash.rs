@@ -31,6 +31,7 @@ pub struct SpatialHashGpu {
     pipeline_count: wgpu::ComputePipeline,
     pipeline_prefix: wgpu::ComputePipeline,
     pipeline_scatter: wgpu::ComputePipeline,
+    pipeline_sort: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     capacity: usize,
     cell_size: f32,
@@ -162,6 +163,7 @@ impl SpatialHashGpu {
         let pipeline_count = make_pipe("count", "hash-count");
         let pipeline_prefix = make_pipe("prefix_sum", "hash-prefix");
         let pipeline_scatter = make_pipe("scatter", "hash-scatter");
+        let pipeline_sort = make_pipe("sort_buckets", "hash-sort");
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("hash-params"),
@@ -187,6 +189,7 @@ impl SpatialHashGpu {
             pipeline_count,
             pipeline_prefix,
             pipeline_scatter,
+            pipeline_sort,
             bind_group_layout,
             capacity,
             cell_size,
@@ -396,6 +399,15 @@ impl SpatialHashGpu {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-sort-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_sort);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups((GPU_HASH_NUM_BUCKETS as u32 + 63) / 64, 1, 1);
+        }
 
         let offsets_bytes = ((GPU_HASH_NUM_BUCKETS + 1) * 4) as u64;
         let sorted_bytes = (n * 4) as u64;
@@ -501,6 +513,15 @@ impl SpatialHashGpu {
             pass.set_pipeline(&self.pipeline_scatter);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hash-sort-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_sort);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups((GPU_HASH_NUM_BUCKETS as u32 + 63) / 64, 1, 1);
         }
     }
 

@@ -6,8 +6,13 @@ use wgpu::util::DeviceExt;
 use crate::*;
 use super::*;
 
-// GPU predate — runs the herd_count and attack compute passes; atomic
-// float CAS handles the multi-attacker → victim energy/damage accumulation.
+// GPU predate — runs the herd_count and attack compute passes. Multi-attacker
+// → victim drain accumulates into `damage_delta` as fixed-point integers
+// (`atomicAdd`, associative → deterministic); the host decodes it back below.
+
+/// Fixed-point scale for `damage_delta` — must match `DAMAGE_FIXED_SCALE`
+/// in `shaders/predate.wgsl`.
+const DAMAGE_FIXED_SCALE: f32 = 1048576.0;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -530,8 +535,10 @@ impl PredateGpu {
         // derived host-side so the shader can skip its second CAS smyčka.
         let energy_gain: Vec<f32> =
             bytemuck::cast_slice::<u8, f32>(&e.get_mapped_range()).to_vec();
-        let damage_delta: Vec<f32> =
-            bytemuck::cast_slice::<u8, f32>(&d.get_mapped_range()).to_vec();
+        let damage_delta: Vec<f32> = bytemuck::cast_slice::<u8, u32>(&d.get_mapped_range())
+            .iter()
+            .map(|&fixed| fixed as f32 / DAMAGE_FIXED_SCALE)
+            .collect();
         let energy_delta: Vec<f32> = energy_gain
             .iter()
             .zip(damage_delta.iter())

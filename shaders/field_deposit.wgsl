@@ -1,7 +1,15 @@
 // Source deposit kernel for FieldGpu. Mirror of `lib::SmellField::deposit`.
-// Splits from the diffuse path so this is the only place that needs atomic
-// types on `grid_in` — the diffuse shader treats the same buffer as plain
-// `array<u32>` and saves 6× `atomicLoad` per voxel per pass.
+//
+// Determinism: sources accumulate into a fixed-point integer buffer via
+// `atomicAdd`. Integer add is associative, so the per-voxel sum is identical
+// regardless of the order threads land — unlike the previous CAS-based
+// atomic *float* add, where FP non-associativity + race-ordered CAS made the
+// grid (and every sensory gradient derived from it) non-deterministic.
+// `field_diffuse` decodes this buffer and folds it into the f32 grid.
+
+// Fixed-point scale: `amount * SCALE` truncated to u32. 2^20 keeps ~6
+// decimal digits of precision with headroom against per-voxel overflow.
+const DEPOSIT_FIXED_SCALE: f32 = 1048576.0;
 
 struct Params {
     res_x: u32,
@@ -24,12 +32,14 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> sources: array<vec4<f32>>;          // xyz + amount
-@group(0) @binding(2) var<storage, read_write> grid_in: array<atomic<u32>>;
-// Bindings 3 + 4 are unused by deposit but declared so the layout matches
-// the shared `field-bgl` (diffuse pipeline needs both). Naga prunes unused
+// Bindings 2, 3, 4 are unused by deposit but declared so the layout matches
+// the shared `field-bgl` (diffuse pipeline needs them). Naga prunes unused
 // storage buffers from the SPIR-V so there's no runtime overhead.
+@group(0) @binding(2) var<storage, read_write> grid_in_unused: array<u32>;
 @group(0) @binding(3) var<storage, read_write> grid_out_unused: array<u32>;
 @group(0) @binding(4) var<storage, read> obstacle_mask_unused: array<u32>;
+// Fixed-point deposit accumulator (binding 5). Zeroed by the host each step.
+@group(0) @binding(5) var<storage, read_write> deposit_accum: array<atomic<u32>>;
 
 @compute @workgroup_size(64)
 fn deposit(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -55,14 +65,7 @@ fn deposit(@builtin(global_invocation_id) gid: vec3<u32>) {
     let yi = ((yi_raw % ny) + ny) % ny;
     let idx = u32(zi * nx * ny + yi * nx + xi);
 
-    // Atomic float add via CAS — no native atomic<f32> in WGSL.
-    var old_bits: u32 = atomicLoad(&grid_in[idx]);
-    loop {
-        let new_bits: u32 = bitcast<u32>(bitcast<f32>(old_bits) + amount);
-        let res = atomicCompareExchangeWeak(&grid_in[idx], old_bits, new_bits);
-        if (res.exchanged) {
-            break;
-        }
-        old_bits = res.old_value;
-    }
+    // Deterministic accumulation: integer atomicAdd is associative, so the
+    // per-voxel sum does not depend on thread race order.
+    atomicAdd(&deposit_accum[idx], u32(max(amount, 0.0) * DEPOSIT_FIXED_SCALE));
 }

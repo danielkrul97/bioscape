@@ -19,7 +19,9 @@ struct StdpParams {
 struct StdpStepParams {
     num_cells: u32,
     tick: u32,
-    tau_ticks: f32,
+    /// `exp(-1 / max(1, tau_ticks))`, precomputed on the CPU so the shader
+    /// doesn't repeat the `exp` on every cell every tick.
+    decay: f32,
     _pad0: u32,
 }
 
@@ -211,10 +213,11 @@ impl StdpStepGpu {
         if n == 0 {
             return;
         }
+        let tau = tau_ticks.max(1.0);
         let params = StdpStepParams {
             num_cells: n as u32,
             tick,
-            tau_ticks,
+            decay: (-1.0 / tau).exp(),
             ..StdpStepParams::default()
         };
         self.queue

@@ -235,13 +235,13 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (d2 <= 1e-20) {
             continue;
         }
-        let dist = sqrt(d2);
+        let inv_d = inverseSqrt(d2);
+        let dist = d2 * inv_d;
         let rest = bond_rest[bond_idx];
         let break_len = rest * params.bond_break_factor;
         if (dist > break_len) {
             continue;
         }
-        let inv_d = 1.0 / dist;
         let n = d * inv_d;
         let extension = dist - rest;
         let stiffness = bond_stiffness[bond_idx];

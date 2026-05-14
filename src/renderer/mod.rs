@@ -95,6 +95,7 @@ pub fn run() {
     // schedule diverge from the headless run for any non-default seed.
 
     app.init_resource::<gizmos::ShowVibration>()
+        .init_resource::<ShowWhiskers>()
         .init_resource::<TickCounter>()
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`.
         // Sprint 88: white → ocean blue. Match s DistanceFog color tak aby
@@ -172,6 +173,7 @@ pub fn run() {
                 screencast_capture,
             ),
         )
+        .add_systems(Update, (toggle_whiskers, draw_whiskers))
         // God-mode pipeline runs before camera input so RMB orbit suppression
         // takes effect on the same tick as the press. Order inside the chain:
         // handle button hits first, then run the RMB state machine, then close

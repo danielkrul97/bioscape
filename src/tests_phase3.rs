@@ -985,10 +985,12 @@ fn sensor_gather_gpu_no_neighbors_when_alone() {
     // upload zeros and let `params.maze_active = 0` skip the raycast block.
     let test_headings = vec![0.0_f32; positions.len()];
     let test_pitches = vec![0.0_f32; positions.len()];
+    let test_whisker_state = crate::test_helpers::whisker_state_buf(&ctx.device, n);
     let rows = sensor.compute(
         &positions, &eff_radii, &vision_radii, &food_positions,
         &test_headings, &test_pitches,
-        &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell, params,
+        &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell,
+        &test_whisker_state, params,
     );
     assert_eq!(rows[0].neighbors_in_vision, 0, "alone cell has no neighbors");
     assert!(rows[0].nearest_cell.is_none());
@@ -1043,12 +1045,202 @@ fn sensor_gather_gpu_food_in_vision_detected() {
     // upload zeros and let `params.maze_active = 0` skip the raycast block.
     let test_headings = vec![0.0_f32; positions.len()];
     let test_pitches = vec![0.0_f32; positions.len()];
+    let test_whisker_state = crate::test_helpers::whisker_state_buf(&ctx.device, n);
     let rows = sensor.compute(
         &positions, &eff_radii, &vision_radii, &food_positions,
         &test_headings, &test_pitches,
-        &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell, params,
+        &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell,
+        &test_whisker_state, params,
     );
     assert!(rows[0].nearest_food.is_some(), "food within vision radius missed");
+}
+
+/// Sprint 195: the whisker spring-damper must produce bit-comparable results
+/// on the CPU (`whisker_step`) and the GPU (`sensor_gather.wgsl`). All cells
+/// face `heading = 0`, `pitch = 0` so the six whisker rays are exact world
+/// axes — the underlying raycast is then bit-identical CPU/GPU, isolating
+/// this test to the spring-damper + transduction-noise arithmetic.
+#[test]
+fn whisker_spring_damper_gpu_matches_cpu() {
+    use crate::gpu::*;
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
+    };
+
+    let field = ObstacleField::new_maze(WORLD_HALF, 195, MazeDifficulty::Medium);
+    let packed = field.packed_for_gpu();
+    let maze_res_x = field.resolution[0] as u32;
+    let maze_res_y = field.resolution[1] as u32;
+
+    // Fixed 4×2 grid of cells spanning the maze interior — varied positions
+    // so whiskers see walls at varied distances (ringing), all heading 0.
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    for &x in &[-700.0_f32, -350.0, 0.0, 350.0] {
+        for &y in &[-250.0_f32, 250.0] {
+            positions.push([x, y, 0.0]);
+        }
+    }
+    let n = positions.len();
+    let nf = 1_usize;
+    let headings = vec![0.0_f32; n];
+    let pitches = vec![0.0_f32; n];
+    let eff_radii = vec![1.0_f32; n];
+    let vision_radii = vec![30.0_f32; n];
+    let food_positions = vec![[900.0_f32, 500.0, 0.0]];
+
+    let cell_size = 64.0_f32;
+    let world_half_xy = [WORLD_HALF[0], WORLD_HALF[1]];
+    let field_resolution = [8usize, 8, 4];
+    let field_world_half = [WORLD_HALF[0], WORLD_HALF[1], 20.0];
+
+    let mut cell_hash =
+        SpatialHashGpu::with_context(&ctx, n, cell_size, world_half_xy).unwrap();
+    cell_hash.rebuild(&positions);
+    let mut food_hash =
+        SpatialHashGpu::with_context(&ctx, nf, cell_size, world_half_xy).unwrap();
+    food_hash.rebuild(&food_positions);
+    let mut smell = FieldGpu::with_context(&ctx, field_resolution, field_world_half, 32).unwrap();
+    let mut phero = FieldGpu::with_context(&ctx, field_resolution, field_world_half, 32).unwrap();
+    smell.step(0.0, 0.5, 0.1);
+    phero.step(0.0, 0.5, 0.1);
+
+    let mut sensor = SensorGatherGpu::with_context(&ctx, n, nf).unwrap();
+    sensor.upload_maze(&packed);
+
+    let f = std::mem::size_of::<f32>();
+    let mk_buf = |label: &str, size: usize, usage: wgpu::BufferUsages| {
+        ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: size as u64,
+            usage,
+            mapped_at_creation: false,
+        })
+    };
+    // Persistent spring-damper state — mirrors CellsGpu::whisker_state_buf.
+    let whisker_state = mk_buf(
+        "test-whisker-state",
+        n * 12 * f,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    );
+    ctx.queue.write_buffer(&whisker_state, 0, &vec![0u8; n * 12 * f]);
+    let stride = SENSOR_OUTPUT_STRIDE;
+    let output_rb = mk_buf(
+        "test-sensor-output-rb",
+        n * stride * f,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+    );
+    let whisker_state_rb = mk_buf(
+        "test-whisker-state-rb",
+        n * 12 * f,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+    );
+
+    let base_params = SensorParamsGpu {
+        hash_cell_size: cell_size,
+        world_half_x: world_half_xy[0],
+        world_half_y: world_half_xy[1],
+        world_half_z: 20.0,
+        field_res_x: field_resolution[0] as u32,
+        field_res_y: field_resolution[1] as u32,
+        field_res_z: field_resolution[2] as u32,
+        field_eps: 4.0,
+        field_world_half_x: field_world_half[0],
+        field_world_half_y: field_world_half[1],
+        field_world_half_z: field_world_half[2],
+        maze_active: 1,
+        maze_res_x,
+        maze_res_y,
+        ..SensorParamsGpu::default()
+    };
+
+    // CPU mirror of the persistent state.
+    let mut cpu_defl = vec![[0.0_f32; WHISKER_COUNT]; n];
+    let mut cpu_vel = vec![[0.0_f32; WHISKER_COUNT]; n];
+    let mut max_defl_seen = 0.0_f32;
+
+    let ticks = 120u32;
+    for tick in 0..ticks {
+        let mut params = base_params;
+        params.tick = tick;
+        sensor.dispatch_no_readback(
+            &positions, &eff_radii, &vision_radii, &food_positions,
+            &headings, &pitches,
+            &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell,
+            &whisker_state, params,
+        );
+
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(
+            sensor.output_buffer(),
+            0,
+            &output_rb,
+            0,
+            (n * stride * f) as u64,
+        );
+        ctx.queue.submit(Some(enc.finish()));
+        let slice = output_rb.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        ctx.device.poll(wgpu::Maintain::Wait);
+        let gpu_out: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+        output_rb.unmap();
+
+        for i in 0..n {
+            let raw = field.whisker_distances(positions[i], headings[i], pitches[i]);
+            for k in 0..WHISKER_COUNT {
+                let noise = whisker_noise(i as u32, tick, k as u32) * WHISKER_NOISE_AMPLITUDE;
+                let cpu_sensed =
+                    whisker_step(&mut cpu_defl[i][k], &mut cpu_vel[i][k], raw[k], noise);
+                let gpu_sensed = gpu_out[i * stride + 19 + k];
+                assert!(
+                    (cpu_sensed - gpu_sensed).abs() < 1e-4,
+                    "tick {tick} cell {i} whisker {k}: cpu sensed {cpu_sensed} vs gpu {gpu_sensed}"
+                );
+                max_defl_seen = max_defl_seen.max(cpu_defl[i][k].abs());
+            }
+        }
+    }
+
+    // Final persistent-state parity: deflection + velocity.
+    let mut enc = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    enc.copy_buffer_to_buffer(&whisker_state, 0, &whisker_state_rb, 0, (n * 12 * f) as u64);
+    ctx.queue.submit(Some(enc.finish()));
+    let slice = whisker_state_rb.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    ctx.device.poll(wgpu::Maintain::Wait);
+    let gpu_state: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+    whisker_state_rb.unmap();
+
+    for i in 0..n {
+        for k in 0..WHISKER_COUNT {
+            let gpu_d = gpu_state[i * 12 + k];
+            let gpu_v = gpu_state[i * 12 + 6 + k];
+            assert!(
+                (cpu_defl[i][k] - gpu_d).abs() < 1e-4,
+                "cell {i} whisker {k}: cpu deflection {} vs gpu {gpu_d}",
+                cpu_defl[i][k]
+            );
+            assert!(
+                (cpu_vel[i][k] - gpu_v).abs() < 1e-3,
+                "cell {i} whisker {k}: cpu velocity {} vs gpu {gpu_v}",
+                cpu_vel[i][k]
+            );
+        }
+    }
+
+    // Sanity: at least one whisker actually rang against a wall — otherwise
+    // the parity above would hold trivially with everything at rest.
+    assert!(
+        max_defl_seen > 0.05,
+        "no whisker saw a wall (max |deflection| {max_defl_seen}) — test exercised nothing"
+    );
 }
 
 #[test]

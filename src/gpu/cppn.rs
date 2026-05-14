@@ -201,8 +201,22 @@ impl CppnGpu {
         self.slots_scratch.clear();
         for &(slot, cppn) in children {
             self.slots_scratch.push(slot as u32);
-            self.meta_scratch
-                .push([cppn.num_nodes as u32, cppn.num_links as u32, 0, 0]);
+            // Precompute max_layer once per child so the shader doesn't
+            // rescan `cppn_nodes` on every one of the 4469 per-child queries.
+            let mut max_layer = 0u32;
+            for slot_node in cppn.nodes.iter() {
+                if let Some(n) = slot_node {
+                    if n.layer > max_layer {
+                        max_layer = n.layer;
+                    }
+                }
+            }
+            self.meta_scratch.push([
+                cppn.num_nodes as u32,
+                cppn.num_links as u32,
+                max_layer,
+                0,
+            ]);
             // Pack nodes 0..CPPN_MAX_NODES; unused slots stay zero (caller
             // never reads past `num_nodes`, so zeros are harmless).
             let node_start = self.nodes_scratch.len();

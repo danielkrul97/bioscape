@@ -10,7 +10,9 @@
 pub(super) mod sim_tick;
 pub(super) mod spikes;
 pub(super) mod transforms;
+pub(super) mod whiskers;
 
 pub(super) use sim_tick::*;
 pub(super) use spikes::*;
 pub(super) use transforms::*;
+pub(super) use whiskers::*;

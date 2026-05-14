@@ -143,3 +143,33 @@ fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     let write_pos = offsets[b] + local;
     sorted_cells[write_pos] = i;
 }
+
+// Determinism: `scatter` assigns within-bucket slots via `atomicAdd`, so the
+// order of cells inside a bucket is race-dependent. Sorting each bucket's
+// slice ascending by cell index makes `sorted_cells` byte-identical across
+// runs — every downstream neighbour walk (sensor, collision, predate) then
+// iterates a fixed order, which keeps their per-thread FP reductions
+// (`dx_acc += …`, `self_gain += …`) deterministic.
+@compute @workgroup_size(64)
+fn sort_buckets(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= NUM_BUCKETS) {
+        return;
+    }
+    let start = offsets[b];
+    let end = offsets[b + 1u];
+    // Insertion sort — bucket occupancy is tiny (avg < 1, worst case a few
+    // dozen), so O(k²) beats any parallel scheme here.
+    for (var k = start + 1u; k < end; k = k + 1u) {
+        let v = sorted_cells[k];
+        var j = k;
+        loop {
+            if (j <= start) { break; }
+            let prev = sorted_cells[j - 1u];
+            if (prev <= v) { break; }
+            sorted_cells[j] = prev;
+            j = j - 1u;
+        }
+        sorted_cells[j] = v;
+    }
+}

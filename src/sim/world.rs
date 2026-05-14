@@ -28,7 +28,8 @@ use crate::{BRAIN_HIDDEN, BRAIN_INPUTS};
 use crate::{
     gpu::{
         BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, EatFoodGpu, EatFoodParamsGpu,
-        FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, HebbianGpu,
+        FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, GpuProfiler,
+        HebbianGpu,
         MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
         ExcitabilityGpu, IzhikevichGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
         StdpApplyGpu, StdpEncodePreGpu, StdpStepGpu, StepGpu, StepParamsGpu, SynapticScaleGpu,
@@ -40,10 +41,10 @@ use crate::{
     PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
     PREDATION_REWARD_MAX, RewardAccumulator, RewardKind,
     ACTIVITY_EMA_ALPHA, DEFAULT_STDP_A_MINUS, DEFAULT_STDP_A_PLUS,
-    EXCITABILITY_DRIFT_PER_TICK, SCALING_PERIOD_TICKS, SCARCITY_FLOOR,
-    SCARCITY_RAMP_END_GEN, SHELL_COST_PER_SEC,
+    EXCITABILITY_DRIFT_PER_TICK, GRAM_SCHMIDT_STRENGTH, GS_PERIOD_TICKS, SCALING_PERIOD_TICKS,
+    SCARCITY_FLOOR, SCARCITY_RAMP_END_GEN, SHELL_COST_PER_SEC,
     LATERAL_INHIBITION_ALPHA, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
-    VELOCITY_CAP_FACTOR, WEIGHT_DECAY_PER_TICK, W_NORM_CAP,
+    VELOCITY_CAP_FACTOR, WEIGHT_DECAY_PER_TICK, W_NORM_CAP, W_NORM_FLOOR,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -192,6 +193,10 @@ pub struct World {
     /// jsou už bonded. O(1) lookup namísto lineárního scanu Cell.bonds per
     /// kandidáta.
     pub bonded_pairs_scratch: rustc_hash::FxHashSet<(u64, u64)>,
+    /// Scratch for `die_and_drop_carrion` Phase 3 — surviving cell_ids,
+    /// used to prune bonds whose partner was just swap-removed. Rebuilt
+    /// only on ticks where a death occurred.
+    pub survivor_ids_scratch: rustc_hash::FxHashSet<u64>,
     pub hidden_snapshot_scratch: Vec<[f32; BRAIN_HIDDEN]>,
     pub inputs_scratch: Vec<[f32; BRAIN_INPUTS]>,
     pub births_gen: u64,
@@ -380,6 +385,9 @@ pub struct GpuFullState {
     pub excitability: ExcitabilityGpu,
     /// Persistent CPU snapshots — reused per tick, zachovává kapacitu.
     pub scratch: GpuFullScratch,
+    /// Serialize-and-time per-shader GPU profiler. Disabled unless
+    /// `init_gpu_full_profiled(true)` — then every method is a no-op.
+    pub profiler: GpuProfiler,
 }
 
 impl World {
@@ -516,6 +524,7 @@ impl World {
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
             bonded_pairs_scratch: rustc_hash::FxHashSet::default(),
+            survivor_ids_scratch: rustc_hash::FxHashSet::default(),
             hidden_snapshot_scratch: Vec::new(),
             inputs_scratch: Vec::new(),
             births_gen: 0,
@@ -569,6 +578,13 @@ impl World {
     /// expect a GPU to be present; if you want a CPU-only path you'd have
     /// to revive the legacy code that Wave N deleted.
     pub fn init_gpu_full(&mut self) -> Result<(), String> {
+        self.init_gpu_full_profiled(false)
+    }
+
+    /// Same as `init_gpu_full`, but `gpu_profile = true` arms the
+    /// serialize-and-time per-shader `GpuProfiler` on the resulting
+    /// `GpuFullState`. Off, the profiler is inert.
+    pub fn init_gpu_full_profiled(&mut self, gpu_profile: bool) -> Result<(), String> {
         let cap = self.cells.len().max(self.max_population).max(64);
         let field_sources_cap =
             (food_target(1.0 + CYCLE_AMPLITUDE) + self.max_population) * 2;
@@ -727,6 +743,7 @@ impl World {
             synaptic_scale,
             excitability,
             scratch: GpuFullScratch::default(),
+            profiler: GpuProfiler::new(ctx.device.clone(), gpu_profile),
         });
 
         if let Some(field) = self.obstacles.as_ref() {
@@ -852,6 +869,7 @@ impl World {
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
             bonded_pairs_scratch: rustc_hash::FxHashSet::default(),
+            survivor_ids_scratch: rustc_hash::FxHashSet::default(),
             hidden_snapshot_scratch: Vec::new(),
             inputs_scratch: Vec::new(),
             births_gen: chk.births_gen,
@@ -1041,11 +1059,24 @@ impl World {
         if self.clock.tick % SCALING_PERIOD_TICKS == 0 {
             if let Some(gpu) = self.gpu_full.as_ref() {
                 let n = self.cells.len();
+                // Cap/decay/floor run every tick; the O(hidden_n²) GS pass is
+                // throttled to every GS_PERIOD_TICKS with its per-application
+                // strength scaled up by the same factor, so the time-averaged
+                // decorrelation rate stays at GRAM_SCHMIDT_STRENGTH. gs = 0 on
+                // off-ticks makes the shader branch past the GS block.
+                let gs_strength = if self.clock.tick % GS_PERIOD_TICKS == 0 {
+                    GRAM_SCHMIDT_STRENGTH * GS_PERIOD_TICKS as f32
+                } else {
+                    0.0
+                };
                 gpu.synaptic_scale.dispatch(
                     &gpu.cells,
                     n,
                     W_NORM_CAP,
                     WEIGHT_DECAY_PER_TICK,
+                    gs_strength,
+                    W_NORM_FLOOR,
+                    gpu.brain.hidden_n_buffer(),
                 );
             }
         }
@@ -1344,6 +1375,7 @@ impl World {
         let body_dims = s.body_dims.as_slice();
         let aux = s.aux.as_slice();
 
+        gpu.profiler.frame_start();
         // Phase 2: upload cell metadata + velocities + angular/pitch velocities.
         gpu.cells.upload_metadata(
             &energies,
@@ -1361,10 +1393,12 @@ impl World {
         gpu.cells.upload_body_dims(&body_dims);
         gpu.cells.upload_aux(&aux);
         gpu.cells.upload_bonded_inboxes(s.bonded_inboxes.as_slice());
+        gpu.profiler.mark("uploads");
 
         // Phase 3: GPU spatial hash dispatch (no readback).
         gpu.cell_hash.dispatch(&positions);
         gpu.food_hash.dispatch(&food_positions);
+        gpu.profiler.mark("spatial_hash");
 
         // Phase 4: GPU SensorGather dispatch_no_readback. Output v output_buf
         // storage; populate_inputs shader bind direct.
@@ -1394,6 +1428,11 @@ impl World {
                 .as_ref()
                 .map(|f| f.resolution[1] as u32)
                 .unwrap_or(0),
+            // Sprint 195: seeds the whisker spring-damper transduction noise.
+            tick: self.clock.tick as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         gpu.sensor.dispatch_no_readback(
             &positions,
@@ -1409,8 +1448,10 @@ impl World {
             &gpu.pheromone_ch1,
             &gpu.pheromone_ch2,
             &gpu.vibration,
+            gpu.cells.whisker_state_buffer(),
             sensor_params,
         );
+        gpu.profiler.mark("sensor_gather");
 
         // Phase 5: GPU populate_inputs. Čte sensor.output_buf + cells metadata
         // → píše cells.last_inputs_buf. damage_accum_buf reset v shaderu.
@@ -1430,6 +1471,7 @@ impl World {
         };
         gpu.populate
             .dispatch(&gpu.cells, &gpu.sensor, populate_params);
+        gpu.profiler.mark("populate_inputs");
 
         // Phase 6: GPU brain forward_persistent. Čte `last_inputs_buf` direct,
         // píše last_hidden + last_outputs storage buffers.
@@ -1439,6 +1481,7 @@ impl World {
             &gpu.scratch.hidden_ns,
             LATERAL_INHIBITION_ALPHA,
         );
+        gpu.profiler.mark("brain_forward");
         // Sprint 147: Izhikevich forward runs AFTER perceptron — cells whose
         // `neuron_models[i] == Izhikevich` overwrite the perceptron's
         // last_hidden / last_outputs with spike-rate outputs. Perceptron
@@ -1449,6 +1492,7 @@ impl World {
         // write are both visible to the trace step that follows.
         let tick_u32 = self.clock.tick as u32;
         gpu.stdp_encode_pre.dispatch(&gpu.cells, n, tick_u32);
+        gpu.profiler.mark("stdp_encode_pre");
         gpu.izhikevich.dispatch(
             &gpu.cells,
             n,
@@ -1456,15 +1500,18 @@ impl World {
             LATERAL_INHIBITION_ALPHA,
             &gpu.scratch.hidden_ns,
         );
+        gpu.profiler.mark("izhikevich");
         // Trace decay+accumulate based on both pre and post spike-times.
         gpu.stdp_step
             .dispatch(&gpu.cells, n, tick_u32, crate::DEFAULT_STDP_TAU_TICKS);
+        gpu.profiler.mark("stdp_step");
 
         // Phase 7: GPU motor.dispatch_with_cells. Čte last_outputs + heading/
         // pitch/turn_rate/eff_radius/max_speed, mutuje velocity/angular_vel/
         // pitch_vel buffery in-place. Mirror lib::Cell::apply_brain_motor.
         gpu.motor
             .dispatch_with_cells(&gpu.cells, n, dt, DRAG_COEFFICIENT);
+        gpu.profiler.mark("motor");
 
         // Phase 8: GPU brownian dispatch (Sprint 51 path). Mutuje velocity_buf
         // s xoshiro128++ per-cell noise. Fused do brain_act → apply_brownian
@@ -1472,6 +1519,7 @@ impl World {
         let has_z = WORLD_HALF[2] > 0.0;
         gpu.brownian
             .compute_persistent(&gpu.cells, n, THERMAL_NOISE, dt, has_z);
+        gpu.profiler.mark("brownian");
 
         // Phase 9: GPU step.dispatch_with_cells. Mirror lib Cell::step
         // (kinematics + drag + energy costs + world bounce). Mutuje position/
@@ -1533,6 +1581,7 @@ impl World {
                 .unwrap_or(0),
         };
         gpu.step.dispatch_with_cells(&gpu.cells, n, step_params);
+        gpu.profiler.mark("step");
 
         // Phase 10: single batch readback (Sprint 63: 9 buffers fused do
         // jednoho Wait barrier). Pre-fix path 9 fresh Vec collect/to_vec —
@@ -1550,6 +1599,7 @@ impl World {
             &mut gpu.scratch.dl_cooldowns,
             &mut gpu.scratch.dl_energies,
         );
+        gpu.profiler.mark("download");
 
         // Phase 11: CPU writeback. NO apply_brain_motor + NO Cell::step CPU
         // (oba byly GPU-side). damage_accum reset (mirror populate_inputs).
@@ -2143,17 +2193,33 @@ impl World {
         });
     }
 
-    /// Per-tick whisker raycast pass. Fills `cell.last_whisker_distances`
-    /// from `obstacles` so the sensor gather phase reads from the cell
-    /// without needing `&ObstacleField` plumbed through. No-op (leaves
-    /// defaults at 1.0 = "clear") when `obstacles` is `None`.
+    /// Per-tick whisker pass (Sprint 195): raycast the maze, then integrate
+    /// the per-whisker spring-damper so `cell.last_whisker_distances` holds
+    /// the *sensed* value the brain + renderer consume — not the raw raycast.
+    /// No-op (leaves defaults at 1.0 = "clear") when `obstacles` is `None`,
+    /// matching the maze-inactive GPU gate in `sensor_gather.wgsl`.
+    ///
+    /// The per-cell loop index `i` seeds the transduction noise and must
+    /// equal the GPU dispatch index for the same cell — both iterate
+    /// `self.cells` in order and this runs immediately before the GPU upload.
     pub fn update_whiskers(&mut self) {
         let Some(field) = self.obstacles.as_ref() else {
             return;
         };
-        self.cells.par_iter_mut().for_each(|cell| {
-            cell.last_whisker_distances =
+        let tick = self.clock.tick as u32;
+        self.cells.par_iter_mut().enumerate().for_each(|(i, cell)| {
+            let raw =
                 field.whisker_distances(cell.position, cell.heading, cell.pitch);
+            for k in 0..crate::WHISKER_COUNT {
+                let noise = crate::whisker_noise(i as u32, tick, k as u32)
+                    * crate::WHISKER_NOISE_AMPLITUDE;
+                cell.last_whisker_distances[k] = crate::whisker_step(
+                    &mut cell.whisker_deflection[k],
+                    &mut cell.whisker_deflection_vel[k],
+                    raw[k],
+                    noise,
+                );
+            }
         });
     }
 
@@ -2298,6 +2364,7 @@ impl World {
             }
         }
 
+        gpu.profiler.resume();
         let mut encoder = gpu
             .cells
             .device()
@@ -2306,6 +2373,19 @@ impl World {
             });
         gpu.cell_hash
             .dispatch_into(&mut encoder, &s.lt_positions);
+        if gpu.profiler.enabled() {
+            // Flush the hash on its own command buffer so it lands in a
+            // distinct bucket. Queue submissions execute in order, so the
+            // collision pass still reads a fresh hash.
+            gpu.cells.queue().submit(Some(encoder.finish()));
+            gpu.profiler.mark("collision_hash");
+            encoder = gpu
+                .cells
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("resolve-collisions-encoder"),
+                });
+        }
         gpu.collision.dispatch_into_cells(
             &mut encoder,
             &gpu.cells,
@@ -2320,7 +2400,9 @@ impl World {
             &gpu.cell_hash,
         );
         gpu.cells.queue().submit(Some(encoder.finish()));
+        gpu.profiler.mark("collision_shader");
         let result = gpu.collision.await_result(n);
+        gpu.profiler.mark("collision_readback");
 
         let max_contacts = crate::MAX_COLLISION_CONTACTS_PER_CELL as usize;
         for i in 0..n {
@@ -2733,6 +2815,7 @@ impl World {
         }
         // Refresh GPU spatial hash with current (post-resolve_collisions)
         // positions before the predate dispatch.
+        gpu.profiler.resume();
         gpu.cell_hash.dispatch(&s.lt_positions);
         let result = gpu.predate.compute(
             &s.lt_positions,
@@ -2748,6 +2831,7 @@ impl World {
             &gpu.cell_hash,
             params,
         );
+        gpu.profiler.mark("predate");
         // Sprint 186: pack-hunting diagnostics. `attacker_event_count[i]`
         // and `attacker_gain_sum[i]` come from the GPU; bonded vs solo
         // partition uses `cell.n_bonds() >= 1`. Per-victim swarm + pack
@@ -2968,6 +3052,7 @@ impl World {
             // food_hash needs to reflect the current food set — refresh
             // before the eat_food dispatch (predate's hash is keyed on
             // cells, not foods).
+            gpu.profiler.resume();
             gpu.food_hash.dispatch(&s.lt_food_positions);
             let result = gpu.eat_food.compute(
                 &s.lt_positions,
@@ -2982,6 +3067,7 @@ impl World {
                 &gpu.food_hash,
                 params,
             );
+            gpu.profiler.mark("eat_food");
             let sentinel = n_foods as u32;
             (0..n)
                 .map(|i| {
@@ -3015,7 +3101,6 @@ impl World {
                 let donor_state;
                 let donor_lineage;
                 let donor_altruism;
-                let donor_cluster_bonus;
                 {
                     let cell = &mut self.cells[cell_idx];
                     cell.energy += *value;
@@ -3023,20 +3108,24 @@ impl World {
                     donor_state = cell.cell_state;
                     donor_lineage = cell.lineage_id;
                     donor_altruism = cell.genome.altruism_share_frac;
-                    donor_cluster_bonus = cell.genome.cluster_share_bonus;
                 }
                 // Sprint 80: donor's cell_state modulates share fraction.
                 // State≈0 (selfish) → ~0%; state≈1 (altruist) → full rate.
-                // Sprint 187: replace global `self.share_frac` and
-                // `BOND_FOOD_SHARE_CLUSTER_BONUS` with per-genome traits so
-                // selfish vs altruist phenotypes can emerge from selection.
-                // `self.kin_filter` (Sprint 87 Hamilton sweep) still gates
-                // sharing to same-lineage partners when set.
-                let n_bonds = bonds_copy.iter().filter(|b| b.is_some()).count() as f32;
-                let cluster_mult =
-                    1.0 + (n_bonds - 1.0).max(0.0) * donor_cluster_bonus;
+                // Sprint 193: share is conservative + sub-linear. The donor
+                // distributes a FIXED pool `value × altruism × state` split
+                // evenly across its bonded partners, so per-partner share is
+                // `1/n` and total energy injected into a cluster no longer
+                // scales with its size. Pre-S193 each partner received the
+                // full pool times a super-linear `cluster_mult`, making large
+                // clusters a runaway free-energy attractor that swamped any
+                // foraging-skill selection (S193 5×100-gen sweep:
+                // bond_active_frac 0 → 0.93). `self.kin_filter` (Sprint 87
+                // Hamilton sweep) still gates sharing to same-lineage
+                // partners when set.
+                let n_bonds =
+                    bonds_copy.iter().filter(|b| b.is_some()).count() as u32;
                 let share_value =
-                    *value * donor_altruism * donor_state * cluster_mult;
+                    bonded_food_share(*value, donor_altruism, donor_state, n_bonds);
                 if share_value > 0.0 {
                     for bond_opt in bonds_copy.iter() {
                         if let Some(bond) = bond_opt {
@@ -3480,7 +3569,7 @@ impl World {
         // Phase 2: remove dead cells. --gpu-full uses swap_remove pattern so
         // GPU brain_weights + xoshiro_state lze udržet in sync přes O(deaths)
         // GPU memcpy operations (žádný full re-upload).
-        {
+        let deaths = {
             let before = self.cells.len();
             let gpu = self.gpu_full.as_ref().unwrap();
             let mut i = 0;
@@ -3496,7 +3585,33 @@ impl World {
                     i += 1;
                 }
             }
-            self.deaths_gen += (before - self.cells.len()) as u64;
+            let deaths = (before - self.cells.len()) as u64;
+            self.deaths_gen += deaths;
+            deaths
+        };
+
+        // Phase 3: prune bonds whose partner was just swap-removed. Without
+        // this the dangling bond survives until the next tick's
+        // `resolve_collisions` pruning, so any end-of-tick snapshot
+        // (inspector, headless dump, checkpoint) would show a bond to a
+        // cell that no longer exists.
+        if deaths > 0 {
+            self.survivor_ids_scratch.clear();
+            self.survivor_ids_scratch
+                .extend(self.cells.iter().map(|c| c.cell_id));
+            let survivors = &self.survivor_ids_scratch;
+            let mut pruned: u64 = 0;
+            for cell in self.cells.iter_mut() {
+                for slot in cell.bonds.iter_mut() {
+                    if let Some(bond) = *slot {
+                        if !survivors.contains(&bond.other_cell_id) {
+                            *slot = None;
+                            pruned += 1;
+                        }
+                    }
+                }
+            }
+            self.bonds_broken_gen += pruned;
         }
         self.foods.extend(new_foods);
     }
@@ -3534,6 +3649,24 @@ pub fn scarcity_factor(generation: u64) -> f32 {
     }
     let t = (generation as f32 / SCARCITY_RAMP_END_GEN as f32).min(1.0);
     1.0 + (SCARCITY_FLOOR - 1.0) * t
+}
+
+/// Sprint 193: per-partner bonded food-share amount. When a bonded cell eats
+/// food worth `value`, it distributes a fixed pool `value × altruism × state`
+/// split evenly across its `n_bonds` partners — so per-partner share is `1/n`
+/// and the total energy injected into a cluster is independent of its size.
+///
+/// Pre-S193 every partner received the full pool scaled by a super-linear
+/// `cluster_mult = 1 + (n−1) × cluster_bonus`, making total energy injected
+/// per food grow ~quadratically with cluster size. That turned "join the
+/// largest cluster" into a runaway attractor that swamped foraging-skill
+/// selection; the S193 scarcity ramp amplified it instead of breaking it
+/// (see `docs/sprints/193-202-environment-pressure.md`).
+pub fn bonded_food_share(value: f32, altruism: f32, state: f32, n_bonds: u32) -> f32 {
+    if n_bonds == 0 {
+        return 0.0;
+    }
+    (value * altruism * state) / n_bonds as f32
 }
 
 /// Rough static FLOP estimate per simulation tick at the given population.

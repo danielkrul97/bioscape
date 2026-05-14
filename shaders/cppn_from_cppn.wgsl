@@ -134,23 +134,19 @@ fn cppn_forward(cell_idx: u32, inputs: array<f32, 7>) -> vec2<f32> {
     let offsets_base = cell_idx * CPPN_LINK_OFFSETS_PER_CELL;
     let cell_meta = cppn_meta[cell_idx];
     let num_nodes = cell_meta.x;
+    // `cell_meta.z` carries the precomputed max_layer (CPU-side `pack`).
+    // Replaces the per-query O(num_nodes) scan over `cppn_nodes`.
+    let max_layer = cell_meta.z;
 
+    // WGSL zero-initializes function-scope `var` arrays — no explicit loop
+    // needed. Inputs immediately overwrite the slots they care about; the
+    // CPPN topological order ensures every `activations[from_id]` read in
+    // the layer pass has been written before.
     var activations: array<f32, 64>;
-    for (var k: u32 = 0u; k < CPPN_MAX_NODES; k = k + 1u) {
-        activations[k] = 0.0;
-    }
     // Inputs occupy nodes[0..CPPN_INPUTS] per `Cppn::random` layout.
     for (var k: u32 = 0u; k < CPPN_INPUTS; k = k + 1u) {
         let n = cppn_nodes[node_base + k];
         activations[n.id] = inputs[k];
-    }
-
-    var max_layer: u32 = 0u;
-    for (var k: u32 = 0u; k < num_nodes; k = k + 1u) {
-        let n = cppn_nodes[node_base + k];
-        if (n.layer > max_layer) {
-            max_layer = n.layer;
-        }
     }
 
     for (var layer: u32 = 1u; layer <= max_layer; layer = layer + 1u) {

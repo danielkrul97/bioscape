@@ -529,4 +529,12 @@ impl BrainGpu {
         let workgroups = (n as u32 + 63) / 64;
         pass.dispatch_workgroups(workgroups, 1, 1);
     }
+
+    /// Per-cell `hidden_n` buffer (binding 5 of the forward pass), kept
+    /// current by `forward_persistent_into`. Borrowed read-only by the
+    /// synaptic-scaling pass so its Gram-Schmidt step can gate work to the
+    /// active hidden range.
+    pub fn hidden_n_buffer(&self) -> &wgpu::Buffer {
+        &self.hidden_n_buf
+    }
 }

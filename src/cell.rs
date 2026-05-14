@@ -120,15 +120,23 @@ pub struct Cell {
     /// older saves overwrite on first `apply_brownian` re-seed.
     #[serde(default)]
     pub xoshiro_state: Xoshiro128PlusPlus,
-    /// Wave 2: whisker raycast results from the previous tick. Populated by
-    /// a pre-brain-act pass (`update_whiskers` in headless, separate system
-    /// in renderer); read by `populate_brain_inputs` into slots [33..39].
-    /// Stored on the cell to avoid plumbing `&ObstacleField` through every
-    /// sensor-gather call site (and to keep the sensor gather system param
-    /// count under Bevy's 16-cap). Defaults to all-ones (no walls) so when
-    /// the maze is off the brain reads neutral whisker signal.
+    /// Sensed whisker signal from the previous tick — the spring-damper
+    /// model's `sensed_k = clamp(1 − deflection, 0, 1) + noise`, NOT the raw
+    /// raycast distance (Sprint 195). Populated by `update_whiskers`; read by
+    /// `populate_brain_inputs` into slots [33..39] and by the renderer
+    /// whisker overlay. Defaults to all-ones (no walls) so when the maze is
+    /// off the brain reads neutral whisker signal.
     #[serde(default = "default_whiskers")]
     pub last_whisker_distances: [f32; WHISKER_COUNT],
+    /// Sprint 195: per-whisker spring-damper state — `deflection` (the bent
+    /// angle, 0 = straight) and its time derivative. Driven by wall proximity
+    /// (`target = 1 − raw_raycast`), integrated semi-implicit Euler each tick
+    /// in `update_whiskers`. May overshoot below 0 / above 1 (ringing). The
+    /// GPU full pipeline keeps the equivalent state in `whisker_state_buf`.
+    #[serde(default = "default_whiskers_zero")]
+    pub whisker_deflection: [f32; WHISKER_COUNT],
+    #[serde(default = "default_whiskers_zero")]
+    pub whisker_deflection_vel: [f32; WHISKER_COUNT],
     /// Wave 2 episodic novelty: ring buffer of recently visited
     /// `NOVELTY_GRID_CELL_SIZE`-bucketed voxel indices. New entries push out
     /// the oldest. `novelty_head` is the next-write slot index. When the
@@ -158,6 +166,10 @@ pub struct Cell {
 
 fn default_whiskers() -> [f32; WHISKER_COUNT] {
     [1.0; WHISKER_COUNT]
+}
+
+fn default_whiskers_zero() -> [f32; WHISKER_COUNT] {
+    [0.0; WHISKER_COUNT]
 }
 
 fn default_novelty_history() -> [u32; NOVELTY_HISTORY_LEN] {
@@ -275,6 +287,8 @@ impl Cell {
             // lockstep as long as both initialize from the same cell_id.
             xoshiro_state: Xoshiro128PlusPlus::from_cell_id(cell_id),
             last_whisker_distances: [1.0; WHISKER_COUNT],
+            whisker_deflection: [0.0; WHISKER_COUNT],
+            whisker_deflection_vel: [0.0; WHISKER_COUNT],
             novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
             novelty_head: 0,
             under_attack_streak: 0,

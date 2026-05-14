@@ -210,6 +210,8 @@ pub fn make_mating_child_no_brain(
         // the child's CPU and GPU brownian streams agree from tick 0.
         xoshiro_state: Xoshiro128PlusPlus::from_cell_id(cell_id),
         last_whisker_distances: [1.0; WHISKER_COUNT],
+        whisker_deflection: [0.0; WHISKER_COUNT],
+        whisker_deflection_vel: [0.0; WHISKER_COUNT],
         novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
         novelty_head: 0,
         under_attack_streak: 0,

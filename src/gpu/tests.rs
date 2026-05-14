@@ -559,6 +559,10 @@ fn sensor_gather_gpu_matches_cpu() {
     // raycast. Tests don't care, pass zeros (params.maze_active = 0 skips it).
     let test_headings = vec![0.0_f32; positions.len()];
     let test_pitches = vec![0.0_f32; positions.len()];
+    // Sprint 195: whisker spring-damper state buffer. params.maze_active = 0
+    // here gates the filter off, so the contents stay irrelevant — the bind
+    // group still requires binding 18.
+    let test_whisker_state = crate::test_helpers::whisker_state_buf(&ctx.device, n);
     let rows = sensor.compute(
         &positions,
         &eff_radii,
@@ -580,6 +584,7 @@ fn sensor_gather_gpu_matches_cpu() {
         // — vibration_grad/amp in returned rows will mirror smell, which is
         // outside the assertion surface.
         &smell_gpu,
+        &test_whisker_state,
         params,
     );
 

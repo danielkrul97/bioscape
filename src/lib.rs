@@ -52,6 +52,8 @@ pub use sensors::*;
 
 pub mod sim;
 
+pub mod json_export;
+
 pub mod xoshiro;
 pub use xoshiro::*;
 
@@ -213,13 +215,13 @@ pub const BOND_FORMATION_COST: f32 = 0.05;
 /// je výhoda (tissue stability), ale ne free. Tuned tak, aby cluster benefit
 /// rostl relativně k maintenance cost při low food periods.
 pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.015;
-/// Sprint 78: food-share fraction per bond. Když bonded cell eats food
-/// (FOOD_VALUE energy), každý bonded partner dostane `FOOD_VALUE × FRAC`
-/// extra energy (free reward, no energy conservation — modeluje „tissue
-/// metabolic cooperation"). Cluster s 2 bondy: eater +FOOD_VALUE,
-/// 2 partneři +0.6 × FOOD_VALUE = +12 each. Total cluster gain je
-/// 1 + 2×0.3 = 1.6× větší než solo. Direct positive selection signál pro
-/// bonding — fitness payoff přímo přes food share.
+/// Sprint 78: gen-0 default for the per-genome `altruism_share_frac` trait.
+/// When a bonded cell eats food, it distributes a pool `value × altruism ×
+/// state` split evenly across its bonded partners (see `bonded_food_share`).
+/// Sprint 193: the share is conservative + sub-linear — per-partner amount is
+/// `1/n`, so total energy injected per food no longer scales with cluster
+/// size. Pre-S193 every partner received the full pool times a super-linear
+/// `cluster_mult`, which made large clusters a runaway free-energy attractor.
 pub const BOND_FOOD_SHARE_FRAC: f32 = 2.5;
 /// Sprint 187: per-genome `altruism_share_frac` range. Wide span lets the
 /// initial population draw selfish (0..0.5) and altruist (2..3) phenotypes
@@ -235,12 +237,12 @@ pub const MAX_ALTRUISM_SHARE_FRAC: f32 = 5.0;
 /// validation ukázal collapse na 2 lineages od gen 30, takže penalty
 /// tightened: α 0.5 → 2.0 + lineární → kvadratická.
 pub const LINEAGE_DIVERSITY_ALPHA: f32 = 2.0;
-/// Sprint 87: cluster-size bonus pro food share fraction. Per-partner share =
-/// `FRAC × (1 + (n_bonds − 1) × BONUS) × donor_state`. Cells hluboko v tkáni
-/// (víc bondů) sdílí každému partnerovi vyšší podíl — empirie ze 300-gen
-/// runs ukázala kolaps tissue regimu (bond_active_frac → 0 do gen 200), takže
-/// linear bonus per added bond posiluje selekci pro velké clustery. n=1 →
-/// ×1.00, n=2 → ×1.15, n=6 (max) → ×1.75. Žádný cap (max je MAX_BONDS_PER_CELL=6).
+/// Sprint 87: gen-0 default for the per-genome `cluster_share_bonus` trait.
+/// Sprint 193: the food-share formula is now conservative + sub-linear
+/// (`bonded_food_share`) and no longer reads this trait. `cluster_share_bonus`
+/// is currently vestigial — still serialized + mutated + logged as the CSV
+/// `cluster_bonus_avg` column for genome-schema / CSV stability. Full removal
+/// is follow-up cleanup.
 pub const BOND_FOOD_SHARE_CLUSTER_BONUS: f32 = 0.40;
 /// Sprint 187: per-genome `cluster_share_bonus` range. Per-partner share
 /// multiplier scales linearly with active bond count: `share × (1 + (n−1) × bonus)`.

@@ -30,6 +30,13 @@ pub struct SensorParamsGpu {
     pub maze_active: u32,
     pub maze_res_x: u32,
     pub maze_res_y: u32,
+    /// Sprint 195: current sim tick — seeds the deterministic whisker
+    /// transduction noise. `_pad` rounds the struct to 80 bytes so the
+    /// uniform layout matches naga's std140 rounding of the WGSL struct.
+    pub tick: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -113,11 +120,13 @@ impl SensorGatherGpu {
         // read-only for whisker raycast direction).
         // Wave L: 16 → 18 bindings (bindings 16, 17 = pheromone ch1/ch2
         // grids read-only for multi-channel gradient sampling).
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..18)
+        // Sprint 195: 18 → 19 bindings (binding 18 = whisker spring-damper
+        // state, read_write persistent — owned by `CellsGpu`).
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..19)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
-                } else if i == 11 {
+                } else if i == 11 || i == 18 {
                     wgpu::BufferBindingType::Storage { read_only: false }
                 } else {
                     wgpu::BufferBindingType::Storage { read_only: true }
@@ -264,6 +273,7 @@ impl SensorGatherGpu {
         pheromone_ch1: &FieldGpu,
         pheromone_ch2: &FieldGpu,
         vibration: &FieldGpu,
+        whisker_state: &wgpu::Buffer,
         params: SensorParamsGpu,
     ) {
         if positions.is_empty() {
@@ -287,6 +297,7 @@ impl SensorGatherGpu {
             pheromone_ch1,
             pheromone_ch2,
             vibration,
+            whisker_state,
             params,
         );
         self.queue.submit(Some(encoder.finish()));
@@ -309,6 +320,7 @@ impl SensorGatherGpu {
         pheromone_ch1: &FieldGpu,
         pheromone_ch2: &FieldGpu,
         vibration: &FieldGpu,
+        whisker_state: &wgpu::Buffer,
         params: SensorParamsGpu,
     ) {
         let n = positions.len();
@@ -366,6 +378,7 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 16, resource: pheromone_ch1.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 17, resource: pheromone_ch2.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 18, resource: whisker_state.as_entire_binding() },
             ],
         });
 
@@ -397,6 +410,7 @@ impl SensorGatherGpu {
         pheromone_ch1: &FieldGpu,
         pheromone_ch2: &FieldGpu,
         vibration: &FieldGpu,
+        whisker_state: &wgpu::Buffer,
         params: SensorParamsGpu,
     ) -> Vec<SensorRow> {
         let n = positions.len();
@@ -456,6 +470,7 @@ impl SensorGatherGpu {
                 wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 16, resource: pheromone_ch1.current_grid_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 17, resource: pheromone_ch2.current_grid_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 18, resource: whisker_state.as_entire_binding() },
             ],
         });
 

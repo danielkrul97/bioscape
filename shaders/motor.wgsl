@@ -44,13 +44,11 @@ fn motor(@builtin(global_invocation_id) gid: vec3<u32>) {
     let thrust_norm = (outputs_in[i * BRAIN_OUTPUTS + 1u] + 1.0) * 0.5;
     let pitch_signal = outputs_in[i * BRAIN_OUTPUTS + 7u];
 
-    let ang_acc = turn_signal * turn_rate * inv_mass;
-    angular_velocities[i] = angular_velocities[i] + ang_acc * dt;
-    let pitch_acc = pitch_signal * turn_rate * inv_mass;
-    pitch_velocities[i] = pitch_velocities[i] + pitch_acc * dt;
+    let turn_scale = turn_rate * inv_mass;
+    angular_velocities[i] = angular_velocities[i] + turn_signal * turn_scale * dt;
+    pitch_velocities[i] = pitch_velocities[i] + pitch_signal * turn_scale * dt;
 
-    let a_max = params.drag_coefficient * max_speed * max_speed * inv_mass;
-    let a_dt = thrust_norm * a_max * dt;
+    let a_dt = thrust_norm * params.drag_coefficient * max_speed * max_speed * inv_mass * dt;
     let fwd = forward_vector(headings[i], pitches[i]);
     velocities[i * 3u + 0u] = velocities[i * 3u + 0u] + a_dt * fwd.x;
     velocities[i * 3u + 1u] = velocities[i * 3u + 1u] + a_dt * fwd.y;

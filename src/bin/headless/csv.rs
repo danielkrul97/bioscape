@@ -3,7 +3,7 @@
 use bioscape::sim::{World, EDGE_FRAC_THRESHOLD};
 
 use bioscape::{
-    Cell, EventCalendar, SpatialGrid, BRAIN_RECURRENT, GRID_CELL_SIZE,
+    Cell, EventCalendar, SpatialGrid, BRAIN_INPUTS_SENSORY, BRAIN_RECURRENT, GRID_CELL_SIZE,
     N_PHEROMONE_CHANNELS, TICKS_PER_GENERATION, WORLD_HALF,
 };
 use std::io::{BufWriter, Write};
@@ -45,7 +45,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
             //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
             //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000,0",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -572,9 +572,15 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     } else {
         0.0
     };
+    // Mean effective rank of the hidden layer's input weights. The
+    // environment-pressure decade asks "does evolution use brain capacity";
+    // every other column is a behavioural proxy — this is the only one that
+    // measures the capacity directly. 1.0 = rank-1 collapse (every hidden
+    // neuron the same receptive field), → hidden_n = fully decorrelated.
+    let w1_eff_rank = w1_effective_rank_avg(&world.cells);
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
         world.clock.generation,
         n,
         spd_m,
@@ -721,6 +727,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         rw_means[4], // Damage
         rw_means[5], // BondFormed
         rw_means[6], // MateSignalAccepted
+        w1_eff_rank,
     )
 }
 
@@ -797,6 +804,53 @@ fn w1_row_norm_avg(cells: &[Cell]) -> f64 {
     } else {
         sum / count as f64
     }
+}
+
+/// Mean participation ratio (effective rank) of `w1` across the population.
+/// Per cell `PR = (Σ‖rowᵢ‖²)² / Σᵢⱼ(rowᵢ·rowⱼ)²` over the active rows
+/// `[0, hidden_n)` and active columns `[0, BRAIN_INPUTS_SENSORY + hidden_n)`
+/// — dead-zone recurrent slots hold CPPN garbage on fresh cells and would
+/// poison the dot products. The identity `PR = trace(G)² / ‖G‖_F²` for the
+/// Gram matrix `G = W Wᵀ` yields the effective rank from pairwise dot
+/// products alone, no SVD. `PR = 1` ⇒ rank-1 collapse (every hidden neuron
+/// shares one receptive field); `PR → hidden_n` ⇒ fully decorrelated.
+fn w1_effective_rank_avg(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0_f64;
+    for cell in cells {
+        let h_n = cell.genome.brain.hidden_n as usize;
+        if h_n == 0 {
+            continue;
+        }
+        let active = BRAIN_INPUTS_SENSORY + h_n;
+        let w1 = &cell.genome.brain.w1;
+        let mut trace = 0.0_f64;
+        let mut frob_sq = 0.0_f64;
+        for i in 0..h_n {
+            let row_i = &w1[i];
+            // Diagonal: G_ii = ‖rowᵢ‖².
+            let g_ii: f64 = row_i[..active]
+                .iter()
+                .map(|v| (*v as f64) * (*v as f64))
+                .sum();
+            trace += g_ii;
+            frob_sq += g_ii * g_ii;
+            // Off-diagonal pairs counted twice (G symmetric).
+            for j in (i + 1)..h_n {
+                let row_j = &w1[j];
+                let g_ij: f64 = (0..active)
+                    .map(|k| row_i[k] as f64 * row_j[k] as f64)
+                    .sum();
+                frob_sq += 2.0 * g_ij * g_ij;
+            }
+        }
+        if frob_sq > 1e-12 {
+            sum += (trace * trace) / frob_sq;
+        }
+    }
+    sum / cells.len() as f64
 }
 
 /// Sprint 111: aktivní shock summary pro CSV. Vrací `(count, hazard_intensity_max)`,

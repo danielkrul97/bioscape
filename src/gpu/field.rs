@@ -40,6 +40,11 @@ pub struct FieldGpu {
     bind_group_layout: wgpu::BindGroupLayout,
     grid_a: wgpu::Buffer,
     grid_b: wgpu::Buffer,
+    /// Fixed-point integer deposit accumulator (shared bind-group binding 5).
+    /// Zeroed each `step()`; `field_deposit` atomicAdds into it and
+    /// `field_diffuse` decodes + folds it into the f32 grid. Replaces the
+    /// old non-deterministic CAS-based atomic float add on the grid.
+    deposit_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
     sources_buf: wgpu::Buffer,
     /// Wave 4: per-voxel obstacle mask (binding 4). One u32 per voxel,
@@ -162,6 +167,16 @@ impl FieldGpu {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -229,6 +244,15 @@ impl FieldGpu {
         });
         queue.write_buffer(&mask_buf, 0, &vec![0u8; grid_size_bytes as usize]);
 
+        // Fixed-point deposit accumulator (binding 5). Cleared per `step()`,
+        // so no need to zero at allocation.
+        let deposit_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("field-deposit-accum"),
+            size: grid_size_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let make_bg = |grid_in: &wgpu::Buffer, grid_out: &wgpu::Buffer, label: &str| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
@@ -254,6 +278,10 @@ impl FieldGpu {
                         binding: 4,
                         resource: mask_buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: deposit_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -278,6 +306,7 @@ impl FieldGpu {
             params_buf,
             sources_buf,
             mask_buf,
+            deposit_buf,
             mask_is_active: false,
             grid_readback,
             bg_round_a,
@@ -352,6 +381,10 @@ impl FieldGpu {
                         binding: 4,
                         resource: self.mask_buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.deposit_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -422,6 +455,8 @@ impl FieldGpu {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("field-encoder"),
             });
+        // Per-step scratch — clear before `deposit` accumulates into it.
+        encoder.clear_buffer(&self.deposit_buf, 0, None);
         if num_sources > 0 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("field-deposit-pass"),
