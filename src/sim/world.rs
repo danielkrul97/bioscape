@@ -75,7 +75,7 @@ const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
 /// RNG stream. V7 saves would deserialize via `serde(default)` to identical
 /// sentinel state across cells — that would make every cell move in noise
 /// lockstep, so we force-fail the version mismatch instead.
-const CHECKPOINT_VERSION: u32 = 8;
+const CHECKPOINT_VERSION: u32 = 9;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -1459,6 +1459,14 @@ impl World {
             ]);
             s.hidden_ns.push(cell.genome.brain.hidden_n);
             s.bonded_inboxes.push(cell.bonded_inbox);
+            // Sprint 198: symbiont state — read by populate_inputs.wgsl into
+            // brain input slots 39 (has) and 40 (deficit / threshold → [0, 1]).
+            let (sh, sd) = match cell.symbiont.as_ref() {
+                Some(sym) => (1u32, sym.deficit_streak),
+                None => (0u32, 0u32),
+            };
+            s.sym_has.push(sh);
+            s.sym_deficit.push(sd);
         }
         // Sprint 128: foods + coop_foods do single sensor pool.
         for food in self.foods.iter() {
@@ -1506,6 +1514,7 @@ impl World {
         gpu.cells.upload_body_dims(&body_dims);
         gpu.cells.upload_aux(&aux);
         gpu.cells.upload_bonded_inboxes(s.bonded_inboxes.as_slice());
+        gpu.cells.upload_symbiont_state(s.sym_has.as_slice(), s.sym_deficit.as_slice());
         gpu.profiler.mark("uploads");
 
         // Phase 3: GPU spatial hash dispatch (no readback).

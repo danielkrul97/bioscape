@@ -66,6 +66,14 @@ pub struct CellsGpu {
     /// uploaded from genome every reproduce phase so newborns track their
     /// per-cell threshold from tick 0.
     reproduce_at_energies_buf: wgpu::Buffer,
+    /// Sprint 198: per-cell symbiont presence flag (0 = no symbiont, 1 = has).
+    /// Read by `populate_inputs.wgsl` for brain input slot 39 (has_symbiont).
+    /// Default fill = 0; CPU uploads each tick before the brain pass.
+    symbiont_has_buf: wgpu::Buffer,
+    /// Sprint 198: per-cell `symbiont.deficit_streak` (u32 ticks). Read by
+    /// `populate_inputs.wgsl`; divided by SYMBIONT_UPKEEP_DEFICIT_TICKS in the
+    /// shader to normalize to [0, 1] for brain input slot 40 (deficit_norm).
+    symbiont_deficit_buf: wgpu::Buffer,
     /// Sprint 145: per-cell, per-hidden-neuron Izhikevich membrane
     /// potential `v`. Layout: `[capacity × BRAIN_HIDDEN]` f32, row-major
     /// (cell i hidden h at index `i * BRAIN_HIDDEN + h`). Initialised at
@@ -224,6 +232,24 @@ impl CellsGpu {
             0,
             bytemuck::cast_slice(&default_repro_fill),
         );
+        // Sprint 198: symbiont state buffers. Both default-filled to zero so
+        // a population with no bearers reads has=0, deficit=0 on every cell.
+        let u32_size = std::mem::size_of::<u32>() as u64;
+        let symbiont_has_buf =
+            mk("cells-symbiont-has", n * u32_size, stor_dst_src);
+        let symbiont_deficit_buf =
+            mk("cells-symbiont-deficit", n * u32_size, stor_dst_src);
+        let default_zero_u32 = vec![0u32; capacity];
+        queue.write_buffer(
+            &symbiont_has_buf,
+            0,
+            bytemuck::cast_slice(&default_zero_u32),
+        );
+        queue.write_buffer(
+            &symbiont_deficit_buf,
+            0,
+            bytemuck::cast_slice(&default_zero_u32),
+        );
         // Sprint 145: Izhikevich (v, u) buffers, sized like `last_hidden`.
         // Initial fill at resting potential / zero recovery so any cell
         // that's flipped to `NeuronModel::Izhikevich` mid-run starts the
@@ -354,6 +380,8 @@ impl CellsGpu {
             learning_rates_buf,
             trace_decays_buf,
             reproduce_at_energies_buf,
+            symbiont_has_buf,
+            symbiont_deficit_buf,
             membrane_buf,
             recovery_buf,
             neuron_models_buf,
@@ -424,6 +452,8 @@ impl CellsGpu {
     pub fn learning_rates_buffer(&self) -> &wgpu::Buffer { &self.learning_rates_buf }
     pub fn trace_decays_buffer(&self) -> &wgpu::Buffer { &self.trace_decays_buf }
     pub fn reproduce_at_energies_buffer(&self) -> &wgpu::Buffer { &self.reproduce_at_energies_buf }
+    pub fn symbiont_has_buffer(&self) -> &wgpu::Buffer { &self.symbiont_has_buf }
+    pub fn symbiont_deficit_buffer(&self) -> &wgpu::Buffer { &self.symbiont_deficit_buf }
     pub fn membrane_buffer(&self) -> &wgpu::Buffer { &self.membrane_buf }
     pub fn recovery_buffer(&self) -> &wgpu::Buffer { &self.recovery_buf }
     pub fn neuron_models_buffer(&self) -> &wgpu::Buffer { &self.neuron_models_buf }
@@ -988,6 +1018,17 @@ impl CellsGpu {
             slot as u64 * f,
             bytemuck::bytes_of(&value),
         );
+    }
+
+    /// Sprint 198: full-population upload of symbiont state. `has[i]` = 1 if
+    /// cell i is a bearer, 0 otherwise. `deficit[i]` = bearer's `deficit_streak`,
+    /// 0 for non-bearers. Called from `World::tick` before the brain dispatch.
+    pub fn upload_symbiont_state(&self, has: &[u32], deficit: &[u32]) {
+        assert_eq!(has.len(), deficit.len());
+        self.queue
+            .write_buffer(&self.symbiont_has_buf, 0, bytemuck::cast_slice(has));
+        self.queue
+            .write_buffer(&self.symbiont_deficit_buf, 0, bytemuck::cast_slice(deficit));
     }
 
     /// Sprint 137: write the rates for a single slot. Used by post-swap_to

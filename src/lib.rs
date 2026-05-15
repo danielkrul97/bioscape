@@ -377,10 +377,23 @@ pub const SYMBIONT_INHERIT_P: f32 = 0.95;
 pub const SYMBIONT_CAPTURE_P: f32 = 0.005;
 
 pub const SYMBIONT_PHOTO_RATE: f32 = 0.6;
+// S198 tuning history: PHOTO_RATE 0.6 unchanged (initial smoke already gave
+// good gain at high z). The losing knob was the niche width — most bearers
+// spawned outside the original threshold and shed before they could find
+// the light.
 /// 2D worlds (`WORLD_HALF[2] == 0`) skip the mechanic; this threshold is
 /// only meaningful in 3D where z maps to [0, 1].
-pub const SYMBIONT_PHOTO_Z_THRESHOLD: f32 = 0.5;
-pub const SYMBIONT_UPKEEP_PER_SEC: f32 = 0.15;
+pub const SYMBIONT_PHOTO_Z_THRESHOLD: f32 = 0.3;
+// S198 tune: 0.5 → 0.3. Original smoke at 0.5 left bearers in the middle
+// band (0 < z < 50, light=0) on a net-negative budget — 26 init bearers
+// dropped to 0 within 4 gens because most spawned at z below threshold.
+// Widening the lit band to z_norm > 0.3 (= z > -40) gives ~70 % of init
+// positions some photo gain.
+pub const SYMBIONT_UPKEEP_PER_SEC: f32 = 0.08;
+// S198 tune: 0.15 → 0.08. Halving upkeep widens the niche margin so a bearer
+// at z_norm = 0.5 (mid-light) is net-positive (~0.10/sec) instead of near
+// zero. Combined with the 0.3 threshold drop, bearers should now persist
+// through the early generations and let selection feedback take over.
 /// ~10 s at FIXED_TIMESTEP_HZ=60 — rides out a transient dive but a
 /// permanent deep-diver loses the symbiont.
 pub const SYMBIONT_UPKEEP_DEFICIT_TICKS: u32 = 600;

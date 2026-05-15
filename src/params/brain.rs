@@ -54,9 +54,19 @@ pub const N_BOND_MSG_CHANNELS: usize = 2;
 // [0, 1] (1 = clear, 0 = wall touching). Shifts BRAIN_INPUTS_SENSORY 33→39
 // and BRAIN_INPUTS 78→84. CHECKPOINT_VERSION bumped — pre-V9 brain weights
 // don't match the new w1 matrix shape and re-init from CPPN at next reproduce.
+//
+// Sprint 198 endosymbiosis brain integration (slots [39..41]): 2 symbiont
+// passenger inputs — has_symbiont (0 or 1) and deficit_norm (deficit_streak
+// / SYMBIONT_UPKEEP_DEFICIT_TICKS, clamped to [0, 1]). Lets the brain
+// correlate motor outputs with bearer status — without these, the host
+// can't evolve to swim toward upper z to keep its symbiont alive.
+// Shifts BRAIN_INPUTS_SENSORY 39→41, BRAIN_INPUTS 84→86. CHECKPOINT_VERSION
+// bumped to V9 — pre-V8 brain weight matrices don't match the new w1 shape.
+/// Per-host symbiont brain inputs: `has_symbiont` + `deficit_norm`.
+pub const N_SYMBIONT_INPUTS: usize = 2;
 pub const BRAIN_INPUTS_SENSORY: usize =
     27 + N_BOND_MSG_CHANNELS + crate::params::vibration::N_VIBRATION_INPUTS
-        + crate::params::maze::WHISKER_COUNT;
+        + crate::params::maze::WHISKER_COUNT + N_SYMBIONT_INPUTS;
 // Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
 // hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
 // w1 z 28×8=224 na 36×16=576 weights (2.6×).

@@ -68,8 +68,10 @@ pub const B2_OFFSET: usize = W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN;
 // `brain_forward.wgsl`, `hebbian.wgsl`, `populate_inputs.wgsl` are kept in
 // lock-step with these values.
 const _: () = assert!(W1_OFFSET == 0);
-const _: () = assert!(B1_OFFSET == 3780);
-const _: () = assert!(W2_OFFSET == 3825);
-const _: () = assert!(B2_OFFSET == 4455);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4469);
+// S198: BRAIN_INPUTS 84→86 (2 symbiont slots: has + deficit_norm). All
+// downstream offsets shift by BRAIN_HIDDEN × 2 = 90.
+const _: () = assert!(B1_OFFSET == 3870);
+const _: () = assert!(W2_OFFSET == 3915);
+const _: () = assert!(B2_OFFSET == 4545);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4559);
 

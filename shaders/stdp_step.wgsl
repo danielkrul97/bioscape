@@ -5,7 +5,7 @@
 //
 // Perceptron cells are early-exited.
 
-const BRAIN_INPUTS: u32 = 84u;
+const BRAIN_INPUTS: u32 = 86u;
 const BRAIN_HIDDEN: u32 = 45u;
 const NEURON_MODEL_IZHIKEVICH: u32 = 1u;
 

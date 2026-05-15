@@ -14,15 +14,15 @@
 // Layout mirrors `hebbian_apply_reward.wgsl`'s weight buffer; we share the
 // same `brain_weights_buf` binding from `CellsGpu`.
 
-const BRAIN_INPUTS: u32 = 84u;
-const BRAIN_INPUTS_SENSORY: u32 = 39u; // 27 + 2 bond inbox + 4 vibration + 6 whisker
+const BRAIN_INPUTS: u32 = 86u;
+const BRAIN_INPUTS_SENSORY: u32 = 41u; // S198: + 2 symbiont (has + deficit_norm)
 const BRAIN_HIDDEN: u32 = 45u;
 const BRAIN_OUTPUTS: u32 = 14u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3780u;        // BRAIN_HIDDEN * BRAIN_INPUTS
-const W2_OFFSET: u32 = 3825u;        // B1_OFFSET + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 4455u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
-const WEIGHTS_PER_CELL: u32 = 4469u; // B2_OFFSET + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 3870u;        // BRAIN_HIDDEN * BRAIN_INPUTS
+const W2_OFFSET: u32 = 3915u;        // B1_OFFSET + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 4545u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
+const WEIGHTS_PER_CELL: u32 = 4559u; // B2_OFFSET + BRAIN_OUTPUTS
 
 struct Params {
     num_cells: u32,

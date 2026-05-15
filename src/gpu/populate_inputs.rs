@@ -59,9 +59,10 @@ impl PopulateInputsGpu {
                 include_str!("../../shaders/populate_inputs.wgsl").into(),
             ),
         });
-        // 14 bindings: 0 uniform, 6 + 11 storage read_write, rest read-only.
+        // 16 bindings: 0 uniform, 6 + 11 storage read_write, rest read-only.
         // S187: binding 13 = per-cell reproduce_at_energies.
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14u32)
+        // S198: bindings 14 = symbiont_has, 15 = symbiont_deficit.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..16u32)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -174,6 +175,8 @@ impl PopulateInputsGpu {
                     wgpu::BindGroupEntry { binding: 11, resource: cells.last_inputs_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 12, resource: cells.bonded_inbox_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 13, resource: cells.reproduce_at_energies_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 14, resource: cells.symbiont_has_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 15, resource: cells.symbiont_deficit_buffer().as_entire_binding() },
                 ],
             }));
             self.cached_cells_epoch = cells_epoch;

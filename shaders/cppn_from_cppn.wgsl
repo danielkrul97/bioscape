@@ -33,21 +33,21 @@ const CPPN_INPUTS: u32 = 7u;
 const CPPN_OUTPUTS: u32 = 2u;
 const CPPN_LINK_EXISTS_THRESHOLD: f32 = 0.0;
 
-const BRAIN_INPUTS_SENSORY: u32 = 39u;  // Wave 2: 27 + 2 bond inbox + 4 vibration + 6 whisker
-const BRAIN_INPUTS: u32 = 84u;          // + 45 recurrent
+const BRAIN_INPUTS_SENSORY: u32 = 41u;  // S198: + 2 symbiont (has + deficit_norm)
+const BRAIN_INPUTS: u32 = 86u;          // + 45 recurrent
 const BRAIN_HIDDEN: u32 = 45u;
 const BRAIN_OUTPUTS: u32 = 14u;         // 12 motor/morph + 2 bond message
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3780u;
-const W2_OFFSET: u32 = 3825u;
-const B2_OFFSET: u32 = 4455u;
-const WEIGHTS_PER_CELL: u32 = 4469u;
+const B1_OFFSET: u32 = 3870u;
+const W2_OFFSET: u32 = 3915u;
+const B2_OFFSET: u32 = 4545u;
+const WEIGHTS_PER_CELL: u32 = 4559u;
 
-const NUM_W1: u32 = 3780u;     // BRAIN_HIDDEN × BRAIN_INPUTS
+const NUM_W1: u32 = 3870u;     // BRAIN_HIDDEN × BRAIN_INPUTS
 const NUM_B1: u32 = 45u;       // BRAIN_HIDDEN
 const NUM_W2: u32 = 630u;      // BRAIN_OUTPUTS × BRAIN_HIDDEN
 const NUM_B2: u32 = 14u;       // BRAIN_OUTPUTS
-const QUERIES_PER_CHILD: u32 = 4469u; // NUM_W1 + NUM_B1 + NUM_W2 + NUM_B2
+const QUERIES_PER_CHILD: u32 = 4559u; // NUM_W1 + NUM_B1 + NUM_W2 + NUM_B2
 
 struct Params {
     num_children: u32,

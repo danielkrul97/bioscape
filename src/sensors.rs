@@ -124,6 +124,22 @@ pub fn populate_brain_inputs(
     for k in 0..WHISKER_COUNT {
         inputs[wh_base + k] = sensors.whisker_distances[k] * 2.0 - 1.0;
     }
+    // Sprint 198: endosymbiosis brain integration. Two slots right after
+    // whiskers: has_symbiont (0/1 binary) and deficit_norm (current
+    // deficit_streak normalized to [0, 1]). Both stay at 0 for non-bearers,
+    // so a pre-S198 brain (everyone non-bearer) reads byte-identical zeros
+    // here — once the population evolves bearers, the brain has signals to
+    // correlate motor outputs with bearer status.
+    let sym_base = wh_base + WHISKER_COUNT;
+    let (sym_has, sym_def_norm) = match cell.symbiont.as_ref() {
+        Some(s) => (
+            1.0_f32,
+            (s.deficit_streak as f32 / SYMBIONT_UPKEEP_DEFICIT_TICKS as f32).clamp(0.0, 1.0),
+        ),
+        None => (0.0_f32, 0.0_f32),
+    };
+    inputs[sym_base] = sym_has;
+    inputs[sym_base + 1] = sym_def_norm;
     // Sprint 94: cluster-shared brain. Recurrent slots (21..52) čtou
     // `pooled_hidden` (mean self + bonded neighbors z předchozího ticku)
     // místo `last_hidden`. Solo cells: pool == self → behavior identical

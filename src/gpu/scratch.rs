@@ -27,6 +27,12 @@ pub struct GpuFullScratch {
     pub aux: Vec<[f32; 4]>,
     pub hidden_ns: Vec<u32>,
     pub bonded_inboxes: Vec<[f32; N_BOND_MSG_CHANNELS]>,
+    /// Sprint 198: per-cell symbiont presence (0/1) — read by populate_inputs
+    /// to drive brain input slot 39 (has_symbiont).
+    pub sym_has: Vec<u32>,
+    /// Sprint 198: per-cell symbiont `deficit_streak` (u32 ticks). Shader
+    /// normalises by SYMBIONT_UPKEEP_DEFICIT_TICKS for input slot 40.
+    pub sym_deficit: Vec<u32>,
     // Readback scratch — `CellsGpu::download_full_batch_into` zapisuje do těchto.
     /// Sprint 188: GPU now mirrors `last_inputs_buf` back to the CPU so
     /// `Cell.last_inputs` reflects what the brain actually saw this tick
@@ -102,6 +108,8 @@ impl GpuFullScratch {
         cr!(self.aux, n);
         cr!(self.hidden_ns, n);
         cr!(self.bonded_inboxes, n);
+        cr!(self.sym_has, n);
+        cr!(self.sym_deficit, n);
     }
 
     /// Resize all per-cell snapshot fields to exactly `n` elements (filling

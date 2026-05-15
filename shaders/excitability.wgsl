@@ -12,8 +12,8 @@
 
 const BRAIN_HIDDEN: u32 = 45u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3780u;        // BRAIN_HIDDEN * BRAIN_INPUTS
-const WEIGHTS_PER_CELL: u32 = 4469u;
+const B1_OFFSET: u32 = 3870u;        // BRAIN_HIDDEN * BRAIN_INPUTS
+const WEIGHTS_PER_CELL: u32 = 4559u;
 
 struct Params {
     num_cells: u32,
