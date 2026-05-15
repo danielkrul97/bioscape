@@ -3,7 +3,7 @@ use bioscape::WORLD_HALF;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use super::components::{BondSnapshot, CellEntity, Dying};
+use super::components::{BondSnapshot, CellEntity, Dying, Pooled};
 use super::material::adhesion_hue;
 use super::resources::{Clock, EventCalendarResource, VibrationResource};
 
@@ -26,7 +26,7 @@ impl Default for ShowVibration {
 /// sdílí hue). Toroidal wrap-aware: skip line, pokud raw distance > poloviny
 /// world (znamená že bond jde "přes okraj", straight line by visuálně lhala).
 pub(super) fn draw_bond_gizmos(
-    cells: Query<&CellEntity, Without<Dying>>,
+    cells: Query<&CellEntity, (Without<Dying>, Without<Pooled>)>,
     mut gizmos: Gizmos,
     mut id_to_pos: Local<FxHashMap<u64, Vec3>>,
     mut snapshot: Local<Vec<BondSnapshot>>,
@@ -88,7 +88,7 @@ pub(super) fn draw_bond_gizmos(
 pub(super) fn draw_vibration_gizmos(
     show: Res<ShowVibration>,
     vibration: Res<VibrationResource>,
-    cells: Query<&CellEntity, Without<Dying>>,
+    cells: Query<&CellEntity, (Without<Dying>, Without<Pooled>)>,
     mut gizmos: Gizmos,
 ) {
     if !show.0 {
@@ -185,7 +185,7 @@ pub(super) fn draw_hazard_pulse_gizmos(
 /// selfish (state≈0), červená = altruist (state≈1). Per-cell StandardMaterial
 /// rebind by byl drahý (každý tick allocate handle), gizmo line je free.
 pub(super) fn draw_cell_state_gizmos(
-    cells: Query<&CellEntity, Without<Dying>>,
+    cells: Query<&CellEntity, (Without<Dying>, Without<Pooled>)>,
     mut gizmos: Gizmos,
 ) {
     for cell in &cells {

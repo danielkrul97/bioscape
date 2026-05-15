@@ -613,7 +613,7 @@ fn substrate_y_zero_everywhere() {
 fn brain_from_cppn_has_default_hidden_n() {
     let mut rng = StdRng::seed_from_u64(91);
     let cppn = Cppn::random(&mut rng);
-    let brain = Brain::from_cppn(&cppn);
+    let brain = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
     assert_eq!(brain.hidden_n, BRAIN_HIDDEN_DEFAULT as u32);
 }
 
@@ -621,7 +621,7 @@ fn brain_from_cppn_has_default_hidden_n() {
 fn brain_from_cppn_weights_finite() {
     let mut rng = StdRng::seed_from_u64(93);
     let cppn = Cppn::random(&mut rng);
-    let brain = Brain::from_cppn(&cppn);
+    let brain = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
     for h in 0..BRAIN_HIDDEN {
         for i in 0..BRAIN_INPUTS {
             assert!(brain.w1[h][i].is_finite());
@@ -640,7 +640,7 @@ fn brain_from_cppn_weights_finite() {
 fn brain_from_cppn_weights_in_tanh_range() {
     let mut rng = StdRng::seed_from_u64(95);
     let cppn = Cppn::random(&mut rng);
-    let brain = Brain::from_cppn(&cppn);
+    let brain = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
     for h in 0..BRAIN_HIDDEN {
         for i in 0..BRAIN_INPUTS {
             let w = brain.w1[h][i];
@@ -659,8 +659,8 @@ fn brain_from_cppn_weights_in_tanh_range() {
 fn brain_from_cppn_deterministic() {
     let mut rng = StdRng::seed_from_u64(97);
     let cppn = Cppn::random(&mut rng);
-    let b1 = Brain::from_cppn(&cppn);
-    let b2 = Brain::from_cppn(&cppn);
+    let b1 = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
+    let b2 = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
     for h in 0..BRAIN_HIDDEN {
         for i in 0..BRAIN_INPUTS {
             assert_eq!(b1.w1[h][i].to_bits(), b2.w1[h][i].to_bits());
@@ -672,7 +672,7 @@ fn brain_from_cppn_deterministic() {
 fn brain_from_cppn_disabled_gate_zeros_weight() {
     let mut rng = StdRng::seed_from_u64(99);
     let cppn = Cppn::random(&mut rng);
-    let brain = Brain::from_cppn(&cppn);
+    let brain = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
     for h in 0..BRAIN_HIDDEN {
         for i in 0..BRAIN_INPUTS {
             let from_c = substrate_input_coords(i);

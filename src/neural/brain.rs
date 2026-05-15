@@ -176,15 +176,18 @@ impl Brain {
     /// (input, hidden) and (hidden, output) pair the CPPN is queried with
     /// both substrate coordinates and a sentinel input (1.0); the output
     /// supplies a weight and a link-existence bit. Biases come from a
-    /// self-loop query (from = to, sentinel = 0). The resulting brain has
-    /// `hidden_n = BRAIN_HIDDEN_DEFAULT`.
+    /// self-loop query (from = to, sentinel = 0). `hidden_n` is the active
+    /// hidden-neuron count carried by the genome (inherited + mutated);
+    /// it is clamped to `[BRAIN_HIDDEN_MIN, BRAIN_HIDDEN]`. Weights for all
+    /// `BRAIN_HIDDEN` storage rows are always painted — `hidden_n` only
+    /// gates how many the forward pass reads.
     ///
     /// All 4197 substrate queries go through `Cppn::forward_batch_x8`.
     /// Trailing partial batches (BRAIN_HIDDEN=45 has a 5-tail in L2 weights;
     /// the bias passes have 5- and 4-tails) are padded with copies of the
     /// last valid input so the SIMD lanes always do useful work; the
     /// padded outputs are discarded.
-    pub fn from_cppn(cppn: &Cppn) -> Brain {
+    pub fn from_cppn(cppn: &Cppn, hidden_n: u32) -> Brain {
         // Pre-compute substrate coordinates — otherwise input coords are
         // recomputed BRAIN_HIDDEN times, hidden coords BRAIN_OUTPUTS times.
         let input_coords: [_; BRAIN_INPUTS] =
@@ -321,7 +324,7 @@ impl Brain {
         }
 
         Brain {
-            hidden_n: BRAIN_HIDDEN_DEFAULT as u32,
+            hidden_n: hidden_n.clamp(BRAIN_HIDDEN_MIN as u32, BRAIN_HIDDEN as u32),
             w1,
             b1,
             w2,
@@ -343,7 +346,13 @@ pub struct Brain {
     /// Active hidden neuron count (≤ BRAIN_HIDDEN storage). forward, mutate,
     /// crossover, and hebbian iterate only `[0..hidden_n]`; the dead zone
     /// `[hidden_n..BRAIN_HIDDEN]` stays at zero and contributes nothing.
-    /// Structural mutations (add_neuron, remove_neuron, split_link) move it.
+    /// This is the one piece of brain topology evolved at the genome level:
+    /// `Genome::crossover` inherits it from a parent and `mutate_no_brain`
+    /// applies a ±1 random-walk step (`hidden_n_step_rate`). `from_cppn`
+    /// re-paints the weights every reproduction but takes `hidden_n` as a
+    /// parameter so the evolved size survives. (The `Brain::add_neuron` /
+    /// `split_link` / `remove_neuron` methods predate CPPN encoding and are
+    /// no longer on the reproduction path — from_cppn overwrites weights.)
     #[serde(default = "default_hidden_n")]
     pub hidden_n: u32,
     #[serde(with = "serde_arrays_w1")]

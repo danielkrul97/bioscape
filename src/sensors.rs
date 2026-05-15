@@ -26,9 +26,10 @@ pub struct BrainSensors {
     /// brain input [-1, 1] (Q10-aware škálování).
     pub temperature_local: f32,
     /// Mechanosensory gradient at cell position. Source = motion-driven
-    /// `VibrationField` (separate from chemical fields). Slots [29..32] in
-    /// `populate_brain_inputs`, tanh-normalized with
-    /// `VIBRATION_NORMALIZATION_GAIN`.
+    /// `VibrationField` (separate from chemical fields). Slots [29..31] in
+    /// `populate_brain_inputs`, tanh-normalized with `VIBRATION_GRAD_GAIN`
+    /// (split from the amp gain because the gradient magnitude is ~100×
+    /// smaller than the amp — same gain would leave grad at the noise floor).
     pub vibration_grad: [f32; 3],
     /// Local amplitude of the vibration field (= scalar sample at cell pos).
     /// Slot [32]. Combined with `vibration_grad` the brain can locate +
@@ -107,13 +108,14 @@ pub fn populate_brain_inputs(
         inputs[27 + k] = cell.bonded_inbox[k];
     }
     // Mechanosensory inputs — vibration gradient + amplitude. Slots
-    // [29..32] = grad_{x,y,z}, [32] = amp. tanh-normalized via
-    // `VIBRATION_NORMALIZATION_GAIN`; saturates on a single loud neighbor.
+    // [29..31] = grad_{x,y,z}, [32] = amp. Split gains: gradient is ~100×
+    // smaller than amp (diffuse field, large sample-epsilon), so it needs a
+    // bigger pre-tanh boost to escape the noise floor.
     let vib_base = 27 + N_BOND_MSG_CHANNELS;
-    inputs[vib_base] = tanh_fast_scalar(sensors.vibration_grad[0] * VIBRATION_NORMALIZATION_GAIN);
-    inputs[vib_base + 1] = tanh_fast_scalar(sensors.vibration_grad[1] * VIBRATION_NORMALIZATION_GAIN);
-    inputs[vib_base + 2] = tanh_fast_scalar(sensors.vibration_grad[2] * VIBRATION_NORMALIZATION_GAIN);
-    inputs[vib_base + 3] = tanh_fast_scalar(sensors.vibration_amp * VIBRATION_NORMALIZATION_GAIN);
+    inputs[vib_base] = tanh_fast_scalar(sensors.vibration_grad[0] * VIBRATION_GRAD_GAIN);
+    inputs[vib_base + 1] = tanh_fast_scalar(sensors.vibration_grad[1] * VIBRATION_GRAD_GAIN);
+    inputs[vib_base + 2] = tanh_fast_scalar(sensors.vibration_grad[2] * VIBRATION_GRAD_GAIN);
+    inputs[vib_base + 3] = tanh_fast_scalar(sensors.vibration_amp * VIBRATION_AMP_GAIN);
     // Wave 2 whiskers — [33..39] (= vib_base + 4 .. vib_base + 4 + WHISKER_COUNT).
     // Already in [0, 1] from the raycast helper; no extra normalization. Mapped
     // to [-1, 1] via 2x-1 so "clear" reads as +1 (preferred direction signal)

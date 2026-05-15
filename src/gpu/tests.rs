@@ -1398,7 +1398,7 @@ fn cppn_from_cppn_gpu_matches_cpu() {
         cppn = cppn.mutate(&mut rng, &CPPN_MUTATION_CONFIG);
     }
 
-    let cpu_brain = Brain::from_cppn(&cppn);
+    let cpu_brain = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
 
     let cells_gpu = CellsGpu::with_context(&ctx, 1);
     let mut cppn_gpu = CppnGpu::with_context(&ctx, 1);

@@ -24,11 +24,11 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // so drift-per-gen percentage is preserved.
     sigma_bond_stiffness: 18.0,
     sigma_bond_damping: 3.0,
-    // Structural brain mutations: ~2 % rates land roughly one structural
-    // change per cell every 30–50 gens, giving selection time to evaluate.
-    add_neuron_rate: 0.02,
-    split_link_rate: 0.02,
-    remove_neuron_rate: 0.01,
+    // Per-child probability of a ±1 step to `Brain.hidden_n` (the active
+    // hidden-neuron count). Random direction — an unbiased walk that
+    // selection biases. ~3 % lands roughly one step per lineage every
+    // ~30 gens, slow enough for selection to evaluate each topology size.
+    hidden_n_step_rate: 0.03,
     // ~1.7 % FOV range / gen — slower than body genes so evolution finds an
     // optimum before drifting into MIN_VISION_FOV.
     sigma_vision_fov: 0.05,
@@ -97,6 +97,8 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
         0.004,  // Damage (MAX 0.2)
         0.024,  // BondFormed (MAX 1.2)
         0.020,  // MateSignalAccepted (MAX 1.0)
+        0.012,  // HazardAvoided (MAX 0.6) — same magnitude as EscapedAttack
+        0.004,  // ThreatEscaped (MAX 0.2) — ~2% of range, scaled with halved default
     ],
 };
 
@@ -116,18 +118,12 @@ pub struct MutationConfig {
     pub adhesion_flip_rate: f32,
     pub sigma_bond_stiffness: f32,
     pub sigma_bond_damping: f32,
-    /// Probability of an `add_neuron` structural mutation per child. Set to
-    /// 0 to disable topology evolution; non-zero values diverge the RNG
-    /// trajectory from a no-structural-mutation baseline.
-    pub add_neuron_rate: f32,
-    /// NEAT-style split-link rate: pick a random active link (|w| above
-    /// `SPLIT_LINK_THRESHOLD`) and insert a hidden node between its
-    /// endpoints. Topology-preserving — forward output is unchanged at the
-    /// moment of insertion.
-    pub split_link_rate: f32,
-    /// Pruning rate that zeros a random hidden neuron — balances the growth
-    /// driven by `add_neuron_rate` and `split_link_rate`.
-    pub remove_neuron_rate: f32,
+    /// Per-child probability of a ±1 step to `Brain.hidden_n` (active
+    /// hidden-neuron count, clamped to `[BRAIN_HIDDEN_MIN, BRAIN_HIDDEN]`).
+    /// Direction is a fair coin — an unbiased random walk that selection
+    /// biases. Set to 0 to freeze topology; 0 also skips the RNG draw, so
+    /// the mutation sequence stays byte-identical with a pre-gene baseline.
+    pub hidden_n_step_rate: f32,
     /// Set to 0 to keep all cells at `INITIAL_VISION_FOV`; non-zero values
     /// engage cone filtering in sensor gather, opening the info-loss vs.
     /// energy-cost trade-off.
@@ -447,7 +443,7 @@ impl Genome {
         // selection rewards it; no ellipsoid prior is baked in.
         let body_size = rng.random_range(0.7..1.3);
         let cppn = Cppn::random(rng);
-        let brain = Brain::from_cppn(&cppn);
+        let brain = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
         Self {
             max_speed: rng.random_range(30.0..90.0),
             color_hue: rng.random_range(0.0..HUE_RANGE),
@@ -543,7 +539,10 @@ impl Genome {
 
     pub fn mutate(&self, rng: &mut impl Rng, cfg: &MutationConfig) -> Self {
         let mut g = self.mutate_no_brain(rng, cfg);
-        g.brain = Brain::from_cppn(&g.cppn);
+        // `mutate_no_brain` already baked the inherited+mutated `hidden_n`
+        // into the `Brain::zeros()` placeholder; thread it through so the
+        // CPPN-materialised brain keeps the evolved topology size.
+        g.brain = Brain::from_cppn(&g.cppn, g.brain.hidden_n);
         g
     }
 
@@ -667,7 +666,25 @@ impl Genome {
                 g
             },
             cppn: mutated_cppn,
-            brain: Brain::zeros(),
+            // Topology gene: `hidden_n` is inherited from `self` (the
+            // crossover output) and takes an occasional ±1 random-walk step.
+            // `hidden_n_step_rate > 0` gates the RNG draw, so a zero rate is
+            // byte-identical with a pre-gene baseline. Weights stay zeroed —
+            // the caller materialises them via `Brain::from_cppn` / GPU CPPN.
+            brain: {
+                let mut placeholder = Brain::zeros();
+                placeholder.hidden_n = if cfg.hidden_n_step_rate > 0.0
+                    && rng.random::<f32>() < cfg.hidden_n_step_rate
+                {
+                    let grow: bool = rng.random();
+                    let cur = self.brain.hidden_n as i32;
+                    let stepped = if grow { cur + 1 } else { cur - 1 };
+                    stepped.clamp(BRAIN_HIDDEN_MIN as i32, BRAIN_HIDDEN as i32) as u32
+                } else {
+                    self.brain.hidden_n
+                };
+                placeholder
+            },
             // Sprint 136: per-cell rate drift gated by sigma > 0 short-circuit
             // (same pattern as `vision_fov` in S82) — sigma = 0 default means
             // no RNG draw and no behavior change vs the pre-S136 baseline.
@@ -869,7 +886,23 @@ impl Genome {
                 }
                 g
             },
-            brain: Brain::zeros(),
+            brain: {
+                // `hidden_n` (active hidden-neuron count) is the one piece of
+                // brain topology carried at the genome level — inherited, not
+                // CPPN-derived. Same-value short-circuit (cf. `learning_rate`
+                // below) keeps the RNG sequence stable until the population
+                // diverges on topology size. Weights stay zeroed; the chained
+                // `.mutate()` fills them via `Brain::from_cppn`.
+                let mut placeholder = Brain::zeros();
+                placeholder.hidden_n = if a.brain.hidden_n == b.brain.hidden_n {
+                    a.brain.hidden_n
+                } else if rng.random::<bool>() {
+                    a.brain.hidden_n
+                } else {
+                    b.brain.hidden_n
+                };
+                placeholder
+            },
             cppn: child_cppn,
             // Sprint 136: same-value short-circuit so populations seeded at
             // the pre-S136 uniform rate (both parents = LEARNING_RATE) keep

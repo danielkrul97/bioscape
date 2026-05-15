@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bioscape::{whisker_directions, CELL_RADIUS, WHISKER_RANGE};
 
-use super::super::components::{CellEntity, Dying};
+use super::super::components::{CellEntity, Dying, Pooled};
 
 /// Renderer-side toggle for the whisker overlay. Default **off** — whiskers
 /// are a maze-navigation debugging aid, not a primary view, and drawing them
@@ -27,7 +27,7 @@ pub(crate) fn toggle_whiskers(
 /// (xy-only walls), so they show as constant full-length lines.
 pub(crate) fn draw_whiskers(
     show: Res<ShowWhiskers>,
-    cells: Query<&CellEntity, Without<Dying>>,
+    cells: Query<&CellEntity, (Without<Dying>, Without<Pooled>)>,
     mut gizmos: Gizmos,
 ) {
     if !show.0 {

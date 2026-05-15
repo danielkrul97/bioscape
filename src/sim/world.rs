@@ -7,7 +7,7 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use crate::{
-    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, MazeDifficulty,
+    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, MazeDifficulty, ShockEvent, ShockKind,
     ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
@@ -238,6 +238,21 @@ pub struct World {
     /// shocků. Default empty (no-op) — sim loop ho zatím nečte; integrace
     /// efektů přijde v Sprintu 110+.
     pub events: EventCalendar,
+    /// Active `HazardPulse` events at the current generation. Refreshed
+    /// once per tick by `refresh_active_events`. Without this scratch,
+    /// `hazard_shock_multiplier` would scan all ~50k calendar events per
+    /// cell per tick (200 cells × 60 Hz × 50k = 600M iter/s).
+    pub active_hazard_events: Vec<ShockEvent>,
+    /// Active `ClimateShift` events at the current generation. Same
+    /// rationale as `active_hazard_events`.
+    pub active_climate_events: Vec<ShockEvent>,
+    /// Cursor into `events.events` — the first index that hasn't yet
+    /// fully ended. Monotonically non-decreasing across ticks; advanced
+    /// in `refresh_active_events` past events whose
+    /// `start_gen + duration_gen <= generation`. Reset to 0 only at
+    /// `World` construction (fresh ctor or checkpoint load — both rebuild
+    /// the whole struct).
+    pub first_live_event_idx: usize,
     // Sprint 87 Hamilton-rule sweep: runtime overrides pro food share. Default
     // = pre-sweep behavior (BOND_FOOD_SHARE_FRAC, no kin filter).
     pub share_frac: f32,
@@ -545,6 +560,9 @@ impl World {
             mating_radius,
             max_population,
             events,
+            active_hazard_events: Vec::new(),
+            active_climate_events: Vec::new(),
+            first_live_event_idx: 0,
             share_frac: crate::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
             predation_gain_mult: 1.0,
@@ -893,6 +911,9 @@ impl World {
             // deterministicky odvozen z World seed). Resume CLI musí znovu
             // předat `--shocks-mean-gens`; jinak fresh empty.
             events: EventCalendar::default(),
+            active_hazard_events: Vec::new(),
+            active_climate_events: Vec::new(),
+            first_live_event_idx: 0,
             share_frac: crate::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
             predation_gain_mult: 1.0,
@@ -918,6 +939,57 @@ impl World {
         })
     }
 
+    /// Rebuild `active_hazard_events` / `active_climate_events` from the
+    /// full calendar. Called at the top of each `tick` so the per-cell
+    /// shock callers iterate only the small active window instead of the
+    /// full ~50k-event calendar.
+    ///
+    /// Cost is amortised by `first_live_event_idx`, a monotone cursor past
+    /// events whose `[start_gen, start_gen + duration_gen)` window is
+    /// fully behind us, and by `partition_point` for the not-yet-started
+    /// upper bound (events are sorted by `start_gen` ascending). With
+    /// 50k events sparsely distributed across 1M generations, each tick
+    /// touches only the handful of events overlapping the current gen.
+    ///
+    /// `FoodCrash` events are skipped — they're a global per-gen scalar
+    /// consumed once per generation boundary, not per cell.
+    ///
+    /// Tests that mutate `events.events` directly (instead of going
+    /// through `tick`) must call this manually to keep the scratch in
+    /// sync with the calendar.
+    pub fn refresh_active_events(&mut self) {
+        let gen = self.clock.generation;
+        let events = &self.events.events;
+        self.active_hazard_events.clear();
+        self.active_climate_events.clear();
+        if events.is_empty() {
+            return;
+        }
+        while self.first_live_event_idx < events.len() {
+            let e = &events[self.first_live_event_idx];
+            let end = e.start_gen.saturating_add(e.duration_gen as u64);
+            if end <= gen {
+                self.first_live_event_idx += 1;
+            } else {
+                break;
+            }
+        }
+        let upper = events.partition_point(|e| e.start_gen <= gen);
+        for e in &events[self.first_live_event_idx..upper] {
+            let end = e.start_gen.saturating_add(e.duration_gen as u64);
+            if gen >= end {
+                // Already ended, but an earlier event with longer duration
+                // is still live so we can't advance the cursor past it.
+                continue;
+            }
+            match e.kind {
+                ShockKind::HazardPulse => self.active_hazard_events.push(*e),
+                ShockKind::ClimateShift => self.active_climate_events.push(*e),
+                ShockKind::FoodCrash => {}
+            }
+        }
+    }
+
     /// Rebuild persistent `id_to_idx_scratch` from current `cells` order.
     /// Cell layout je stable v rámci fází 3–17 (před `reproduce` / `die_*`),
     /// takže build raz per tick stačí. `clear()` zachovává hashmap kapacity.
@@ -932,6 +1004,12 @@ impl World {
     pub fn tick(&mut self, rng: &mut impl Rng) -> Option<u64> {
         let dt = 1.0 / FIXED_TIMESTEP_HZ;
         let transitions = self.clock.advance();
+        // Filter the calendar down to events overlapping the current
+        // generation so per-cell shock callers (`apply_hazards`,
+        // `climate_offset_at`, the CPU `step` body) iterate O(active) not
+        // O(events). At `mean_gens_between=20` over 1M gens the full
+        // calendar is ~50k events but typically <10 overlap any given gen.
+        self.refresh_active_events();
         // Wave 3 curriculum: check ramp on generation roll-over. Rebuild
         // obstacles + masks when the active stage's difficulty differs from
         // what's currently allocated (and seed walks via maze_seed_step so
@@ -1465,8 +1543,8 @@ impl World {
             phero_norm_gain: PHEROMONE_NORMALIZATION_GAIN,
             damage_norm_gain: DAMAGE_NORMALIZATION_GAIN,
             density_norm: DENSITY_NORM_COUNT,
-            vibration_norm_gain: crate::VIBRATION_NORMALIZATION_GAIN,
-            _pad0: 0,
+            vibration_amp_gain: crate::VIBRATION_AMP_GAIN,
+            vibration_grad_gain: crate::VIBRATION_GRAD_GAIN,
             _pad1: 0,
         };
         gpu.populate
@@ -2039,7 +2117,7 @@ impl World {
         // events prázdné → step_with_climate je byte-identical s step().
         let tick = self.clock.tick;
         let gen = self.clock.generation;
-        let events = &self.events.events;
+        let events = self.active_climate_events.as_slice();
         let ctx = crate::ThermalCtx::for_tick(tick, gen);
         let obstacles = self.obstacles.as_ref();
         for cell in &mut self.cells {
@@ -2247,7 +2325,11 @@ impl World {
     }
 
     /// Sprint 112: per-cell climate offset helper, sdílený mezi tick hot path
-    /// a `write_stats` (CSV column `shock_climate_offset`).
+    /// a `write_stats` (CSV column `shock_climate_offset`). Reads the full
+    /// calendar (not the per-tick `active_climate_events` scratch) so
+    /// direct test access doesn't require manually refreshing the scratch.
+    /// CSV is per-gen-end so the O(events) scan is paid once per cell per
+    /// gen, not per tick.
     pub fn climate_offset_at(&self, pos_xy: [f32; 2]) -> f32 {
         crate::climate_shock_offset(
             &self.events.events,
@@ -2271,7 +2353,7 @@ impl World {
         // Sprint 110: HazardPulse shocks násobí drain (default 1.0 = no-op).
         let gen = self.clock.generation;
         let tick = self.clock.tick;
-        let events = &self.events.events;
+        let events = self.active_hazard_events.as_slice();
         let mut acc = RewardAccumulator::with_capacity(self.cells.len() / 16);
         for (i, cell) in self.cells.iter_mut().enumerate() {
             let noise = self
@@ -2287,11 +2369,21 @@ impl World {
             let drain = hazard_drain(noise) * dt * shock_mult;
             cell.energy -= drain;
             cell.damage_accum += drain;
-            if drain > 0.0 {
+            let in_hazard = drain > 0.0;
+            if in_hazard {
                 // Sprint 187: per-cell damage sensitivity replaces global.
                 let w = cell.genome.reward_weights[RewardKind::Damage as usize];
                 acc.push(i, RewardKind::Damage, -(drain * w));
+            } else if cell.was_in_hazard_last_tick {
+                // Transition-out: cell was taking drain last tick, isn't this
+                // tick. Credit the brain's sensing+motor decision. Edge case:
+                // a HazardPulse shock ending naturally fires this for every
+                // cell still inside that tick — small noise vs the dominant
+                // signal of cells actively moving out of static map hazards.
+                let w = cell.genome.reward_weights[RewardKind::HazardAvoided as usize];
+                acc.push(i, RewardKind::HazardAvoided, w);
             }
+            cell.was_in_hazard_last_tick = in_hazard;
         }
         if !acc.is_empty() && self.gpu_full.is_some() {
             let n = self.cells.len();
@@ -2941,6 +3033,18 @@ impl World {
                 {
                     acc.push(i, RewardKind::EscapedAttack, w_esc);
                     cell.escape_cooldown_ticks = ESCAPE_COOLDOWN_TICKS;
+                } else if cell.under_attack_streak >= 1
+                    && cell.escape_cooldown_ticks == 0
+                {
+                    // ThreatEscaped: brief-encounter survival — took at least
+                    // one tick of damage, then escaped before the persistent
+                    // EscapedAttack threshold. Shares the escape cooldown so
+                    // only one of {EscapedAttack, ThreatEscaped} fires per
+                    // window.
+                    let w_threat = cell.genome.reward_weights
+                        [RewardKind::ThreatEscaped as usize];
+                    acc.push(i, RewardKind::ThreatEscaped, w_threat);
+                    cell.escape_cooldown_ticks = ESCAPE_COOLDOWN_TICKS;
                 }
                 cell.under_attack_streak = 0;
             }
@@ -3305,7 +3409,12 @@ impl World {
             }
             let brains = gpu.cells.download_brains(n);
             for (cell, brain) in self.cells.iter_mut().zip(brains) {
+                // `download_brains` hardcodes `hidden_n = BRAIN_HIDDEN_DEFAULT`
+                // (it reads only the weight buffer); the evolved topology size
+                // lives in the CPU genome, so preserve it across the replace.
+                let hidden_n = cell.genome.brain.hidden_n;
                 cell.genome.brain = brain;
+                cell.genome.brain.hidden_n = hidden_n;
             }
         }
     }

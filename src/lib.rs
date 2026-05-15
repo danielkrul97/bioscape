@@ -304,12 +304,16 @@ pub const MAX_DEFENSE_CONTRIBUTION: f32 = 0.5;
 /// Sprint 187: per-cell reward weights. Each lineage evolves its own
 /// dopamine-like sensitivity to different events. Order matches
 /// `RewardKind` enum: `[EatFood, Novelty, Predation, EscapedAttack, Damage,
-/// BondFormed, MateSignalAccepted]`. Defaults equal the pre-S187 globals so
-/// fresh checkpoints behave like the baseline at gen 0. `MAX = 2 × default`
-/// per slot — clamp prevents reward inflation runaway (selection can't push
-/// every weight to infinity, the saturation cap forces a trade-off across
-/// kinds).
-pub const N_REWARD_KINDS: usize = 7;
+/// BondFormed, MateSignalAccepted, HazardAvoided, ThreatEscaped]`. Defaults
+/// equal the pre-S187 globals so fresh checkpoints behave like the baseline
+/// at gen 0. `MAX = 2 × default` per slot — clamp prevents reward inflation
+/// runaway (selection can't push every weight to infinity, the saturation cap
+/// forces a trade-off across kinds). `HazardAvoided` / `ThreatEscaped` are
+/// cognitive-task rewards (added when the maze/shock experiments showed env
+/// pressure alone can't shape brain evolution without a sensing→motor→reward
+/// loop) — first ones tied to brain-mediated outcomes rather than direct
+/// metabolic events.
+pub const N_REWARD_KINDS: usize = 9;
 pub const REWARD_WEIGHT_DEFAULTS: [f32; N_REWARD_KINDS] = [
     1.0,                          // EatFood (was hardcoded 1.0 at push site)
     NOVELTY_REWARD_MAGNITUDE,     // 0.05
@@ -318,9 +322,11 @@ pub const REWARD_WEIGHT_DEFAULTS: [f32; N_REWARD_KINDS] = [
     DAMAGE_REWARD_GAIN,           // 0.1
     BOND_FORMED_REWARD_MAGNITUDE, // 0.6
     MATING_REWARD_MAGNITUDE,      // 0.5
+    0.3,                          // HazardAvoided (similar to EscapedAttack — "escaped a threat")
+    0.1,                          // ThreatEscaped (brief-encounter escape; halved vs initial to reduce reproductive disruption observed in HA+TE smoke)
 ];
 pub const REWARD_WEIGHT_MAX: [f32; N_REWARD_KINDS] = [
-    2.0, 0.1, 0.8, 0.6, 0.2, 1.2, 1.0,
+    2.0, 0.1, 0.8, 0.6, 0.2, 1.2, 1.0, 0.6, 0.2,
 ];
 pub const REWARD_WEIGHT_MIN: [f32; N_REWARD_KINDS] = [
     0.0; N_REWARD_KINDS

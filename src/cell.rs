@@ -160,6 +160,12 @@ pub struct Cell {
     /// other tick.
     #[serde(default)]
     pub escape_cooldown_ticks: u16,
+    /// Tracks "was in a hazard zone (taking drain) on the previous tick" so
+    /// `apply_hazards` can detect the transition-out event and push a
+    /// `RewardKind::HazardAvoided` reward — credits the sensing+motor
+    /// decision that produced the escape, not just demographic survival.
+    #[serde(default)]
+    pub was_in_hazard_last_tick: bool,
     pub phenotype: Phenotype,
     pub genome: Genome,
 }
@@ -293,6 +299,7 @@ impl Cell {
             novelty_head: 0,
             under_attack_streak: 0,
             escape_cooldown_ticks: 0,
+            was_in_hazard_last_tick: false,
             phenotype,
             genome,
         }

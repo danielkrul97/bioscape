@@ -27,8 +27,8 @@ struct Params {
     phero_norm_gain: f32,
     damage_norm_gain: f32,
     density_norm: f32,
-    vibration_norm_gain: f32,    // V7: tanh gain on slots 29..32
-    _pad0: u32,
+    vibration_amp_gain: f32,     // tanh gain on slot 32 (amplitude)
+    vibration_grad_gain: f32,    // tanh gain on slots 29..31 (gradient — needs ~100× more than amp)
     _pad1: u32,                  // S187: was reproduce_threshold (now per-cell)
 }
 
@@ -189,10 +189,10 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the vibration FieldGpu directly, mirroring smell/pheromone semantics
     // (tanh-normalize through the per-channel gain so saturation behaviour
     // matches `lib::populate_brain_inputs`).
-    last_inputs[inputs_off + 29u] = tanh_fast(vib_grad_x * params.vibration_norm_gain);
-    last_inputs[inputs_off + 30u] = tanh_fast(vib_grad_y * params.vibration_norm_gain);
-    last_inputs[inputs_off + 31u] = tanh_fast(vib_grad_z * params.vibration_norm_gain);
-    last_inputs[inputs_off + 32u] = tanh_fast(vib_amp    * params.vibration_norm_gain);
+    last_inputs[inputs_off + 29u] = tanh_fast(vib_grad_x * params.vibration_grad_gain);
+    last_inputs[inputs_off + 30u] = tanh_fast(vib_grad_y * params.vibration_grad_gain);
+    last_inputs[inputs_off + 31u] = tanh_fast(vib_grad_z * params.vibration_grad_gain);
+    last_inputs[inputs_off + 32u] = tanh_fast(vib_amp    * params.vibration_amp_gain);
 
     // Wave 6: whisker raycast slots 33..38. sensor_gather.wgsl writes
     // normalized free-distances at sensor_off + 19..25; map [0, 1] →

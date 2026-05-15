@@ -110,7 +110,9 @@ pub fn make_mating_child(
     cell_id: u64,
 ) -> Cell {
     let mut child = make_mating_child_no_brain(parent_a, parent_b, rng, cell_id);
-    child.genome.brain = Brain::from_cppn(&child.genome.cppn);
+    // `make_mating_child_no_brain` carries the inherited+mutated `hidden_n`
+    // in the placeholder brain; preserve it through CPPN materialisation.
+    child.genome.brain = Brain::from_cppn(&child.genome.cppn, child.genome.brain.hidden_n);
     child
 }
 
@@ -216,6 +218,7 @@ pub fn make_mating_child_no_brain(
         novelty_head: 0,
         under_attack_streak: 0,
         escape_cooldown_ticks: 0,
+        was_in_hazard_last_tick: false,
         phenotype: child_phenotype,
         genome: child_genome,
     }

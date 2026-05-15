@@ -23,8 +23,8 @@ pub struct PopulateInputsParams {
     pub phero_norm_gain: f32,
     pub damage_norm_gain: f32,
     pub density_norm: f32,
-    pub vibration_norm_gain: f32,
-    pub _pad0: u32,
+    pub vibration_amp_gain: f32,
+    pub vibration_grad_gain: f32,
     pub _pad1: u32,
 }
 

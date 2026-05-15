@@ -8,7 +8,7 @@
 use bevy::prelude::*;
 use bioscape::{N_PHEROMONE_CHANNELS, SPIKE_SLOTS};
 
-use super::super::components::{CellEntity, SpikeEntity};
+use super::super::components::{CellEntity, Pooled, SpikeEntity};
 use super::super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::super::resources::{
     AdhesionMaterials, CellEntityPool, CellMesh, CellSlotMap, SimRng, SimWorld, SpikeMaterial,
@@ -97,12 +97,16 @@ pub(crate) fn sync_simworld_to_cellentity(
     let target_len = world_cells.len();
 
     if current_len > target_len {
-        // Shrink: hide + pool, don't despawn.
+        // Shrink: hide + pool, don't despawn. `Pooled` marker keeps the
+        // stale CellEntity data out of gizmo / transform queries (otherwise
+        // bonds / whiskers / vibration rings render at the dead cell's old
+        // position until recycle).
         for slot in (target_len..current_len).rev() {
             let entity = slot_map.slot_to_entity[slot];
             commands
                 .entity(entity)
-                .insert(Visibility::Hidden);
+                .insert(Visibility::Hidden)
+                .insert(Pooled);
             slot_map.entity_to_slot.remove(&entity);
             pool.free_cells.push(entity);
         }
@@ -123,14 +127,15 @@ pub(crate) fn sync_simworld_to_cellentity(
             let entity = if let Some(recycled) = pool.free_cells.pop() {
                 // Recycle: refresh CellEntity data, swap material (adhesion
                 // type of the new tenant likely differs), refresh transform,
-                // unhide. Spike children survive — their `owner` id is
-                // stable, only the `CellEntity` payload changed.
+                // unhide, clear `Pooled` marker. Spike children survive —
+                // their `owner` id is stable, only `CellEntity` changed.
                 commands
                     .entity(recycled)
                     .insert(CellEntity(*cell))
                     .insert(MeshMaterial3d(material))
                     .insert(transform)
-                    .insert(Visibility::Visible);
+                    .insert(Visibility::Visible)
+                    .remove::<Pooled>();
                 recycled
             } else {
                 // Pool empty (startup or under cap): spawn fresh entity +

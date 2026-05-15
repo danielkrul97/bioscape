@@ -78,9 +78,7 @@ pub fn zero_cfg() -> MutationConfig {
         adhesion_flip_rate: 0.0,
         sigma_bond_stiffness: 0.0,
         sigma_bond_damping: 0.0,
-        add_neuron_rate: 0.0,
-        split_link_rate: 0.0,
-        remove_neuron_rate: 0.0,
+        hidden_n_step_rate: 0.0,
         sigma_vision_fov: 0.0,
         sigma_thermal_optimum: 0.0,
         sigma_carnivore_score: 0.0,
@@ -152,6 +150,7 @@ pub fn base_cell() -> Cell {
         novelty_head: 0,
         under_attack_streak: 0,
         escape_cooldown_ticks: 0,
+        was_in_hazard_last_tick: false,
         phenotype,
         genome,
     }

@@ -35,12 +35,21 @@ pub const VIBRATION_K_LINEAR: f32 = 1.0;
 /// from dominating the field.
 pub const VIBRATION_K_ANGULAR: f32 = 0.5;
 
-/// Pre-tanh gain on brain-input slots [29..32] = grad_{x,y,z}, amp. With the
-/// 1.5/s decay the typical steady-state amp lands around 0.05–0.10 in dense
-/// scenes; `GAIN = 10` puts that into tanh's responsive zone (0.4–0.7) instead
-/// of the noise floor. Much higher than `SMELL_NORMALIZATION_GAIN = 0.5` —
-/// vibration is a sharper short-range cue.
-pub const VIBRATION_NORMALIZATION_GAIN: f32 = 10.0;
+/// Pre-tanh gain on the amplitude brain-input slot [32]. With the 1.5/s decay
+/// the typical steady-state amp lands around 0.05–0.10 in dense scenes;
+/// `GAIN = 10` puts that into tanh's responsive zone (0.4–0.7) instead of the
+/// noise floor. Much higher than `SMELL_NORMALIZATION_GAIN = 0.5` — vibration
+/// is a sharper short-range cue.
+pub const VIBRATION_AMP_GAIN: f32 = 10.0;
+
+/// Pre-tanh gain on gradient brain-input slots [29..31] = grad_{x,y,z}. The
+/// gradient is ~100× smaller than the amp because diffusion (0.15) smooths
+/// the field across the sample-epsilon (10 world units) — measured grad
+/// magnitudes land around 0.001 in healthy runs. With a 1000 gain, that maps
+/// to tanh(1.0) ≈ 0.76, in tanh's responsive zone. Pre-split (when the same
+/// gain=10 fed both amp and grad) the gradient slots sat at tanh(0.01)=0.01,
+/// effective noise floor → brains had no directional info, only "how loud."
+pub const VIBRATION_GRAD_GAIN: f32 = 1000.0;
 
 /// Central-differences epsilon for `gradient_at`. Same scale as
 /// `SMELL_SAMPLE_EPSILON` and `PHEROMONE_SAMPLE_EPSILON`.

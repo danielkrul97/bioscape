@@ -12,6 +12,15 @@ pub(super) struct Dying {
     pub(super) ticks_left: u32,
 }
 
+/// Marker for entities that have been swap-removed from the alive population
+/// and parked in `CellEntityPool::free_cells` awaiting recycle. The
+/// `CellEntity` payload retains the dead cell's last data (bonds, cell_id,
+/// position) so gizmos / transforms must filter this marker out to avoid
+/// drawing ghost bonds / whiskers / rings from old positions. Removed when
+/// the entity is recycled in the Grow branch of `sync_simworld_to_cellentity`.
+#[derive(Component)]
+pub(super) struct Pooled;
+
 /// Decorative spike rendered as a top-level entity tracking its owner cell.
 /// Avoids ChildOf scale composition with the parent ellipsoid. `slot` selects
 /// which Phenotype.spikes[k] drives the transform.
