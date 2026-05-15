@@ -20,8 +20,9 @@ use crate::{
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
     SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, SYMBIONT_CAPTURE_P, SYMBIONT_INIT_FRACTION,
-    SYMBIONT_PHOTO_RATE, SYMBIONT_PHOTO_Z_THRESHOLD, SYMBIONT_UPKEEP_DEFICIT_TICKS,
-    SYMBIONT_UPKEEP_PER_SEC, TICKS_PER_GENERATION, VIBRATION_DECAY,
+    SYMBIONT_PHOTO_BASE, SYMBIONT_PHOTO_RATE, SYMBIONT_PHOTO_Z_THRESHOLD,
+    SYMBIONT_UPKEEP_DEFICIT_TICKS, SYMBIONT_UPKEEP_PER_SEC, TICKS_PER_GENERATION,
+    VIBRATION_DECAY,
     VIBRATION_DIFFUSION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, VIBRATION_SAMPLE_EPSILON,
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP,
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
@@ -1150,7 +1151,12 @@ impl World {
         timed!(apply_morph, self.apply_morph(dt));
         timed!(apply_brownian, self.apply_brownian(rng, dt));
         timed!(step, self.step(dt));
-        self.apply_symbiont_energy(dt);
+        // Sprint 201: apply_symbiont_energy disabled. Energy-budget mechanic
+        // produced bearer fitness signals too weak to stabilize bearer
+        // fraction (≤2 % lifetime energy after 4 sprints of tuning). Bearer
+        // benefit is now damage resistance — applied directly at apply_hazards
+        // / predate / wall-bump sites via `Cell::damage_resist_factor()`.
+        // self.apply_symbiont_energy(dt);
         timed!(apply_food_gravity, self.apply_food_gravity(dt));
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
@@ -2410,7 +2416,9 @@ impl World {
                 tick,
                 WORLD_HALF,
             );
-            let drain = hazard_drain(noise) * dt * shock_mult;
+            let raw_drain = hazard_drain(noise) * dt * shock_mult;
+            // Sprint 201: bearer cells absorb less hazard damage.
+            let drain = raw_drain * cell.damage_resist_factor();
             cell.energy -= drain;
             cell.damage_accum += drain;
             let in_hazard = drain > 0.0;
@@ -3078,8 +3086,14 @@ impl World {
             let gained = result.energy_delta[i];
             let damage_this_tick = result.damage_delta[i];
 
-            cell.energy += gained;
-            cell.damage_accum += damage_this_tick;
+            // Sprint 201: bearer cells absorb only `(1 − RESIST_FRAC)` of the
+            // predation damage. `gained` is the GPU-computed net (raw_gain −
+            // raw_damage); we add back the resisted portion so net energy
+            // reflects actual harm taken.
+            let resist = cell.damage_resist_factor();
+            let damage_blocked = damage_this_tick * (1.0 - resist);
+            cell.energy += gained + damage_blocked;
+            cell.damage_accum += damage_this_tick * resist;
 
             if cell.escape_cooldown_ticks > 0 {
                 cell.escape_cooldown_ticks -= 1;
@@ -3167,13 +3181,15 @@ impl World {
             }
             let z_norm = ((cell.position[2] + half_z) / z_range).clamp(0.0, 1.0);
             let light = (z_norm - threshold).max(0.0) / denom;
-            let net = if light > 0.0 {
-                let temp = crate::temperature_at_z_with_ctx(cell.position[2], WORLD_HALF, &ctx);
-                let metabolism = crate::metabolism_factor(temp);
-                SYMBIONT_PHOTO_RATE * light * metabolism * dt - upkeep
-            } else {
-                -upkeep
-            };
+            // Sprint 200 redesign: gain = (PHOTO_BASE + PHOTO_RATE × light) × metab × dt.
+            // Baseline (PHOTO_BASE) is metab-scaled but light-independent — bearer at
+            // z=0 with metab=1 breaks even with UPKEEP_PER_SEC. Light bonus drives
+            // upper-z selection. Cold-dark bearers still shed (metab-scaled gain
+            // < non-scaled upkeep), preserving selection pressure.
+            let temp = crate::temperature_at_z_with_ctx(cell.position[2], WORLD_HALF, &ctx);
+            let metabolism = crate::metabolism_factor(temp);
+            let photo_gain = (SYMBIONT_PHOTO_BASE + SYMBIONT_PHOTO_RATE * light) * metabolism * dt;
+            let net = photo_gain - upkeep;
             cell.energy += net;
             let sym = cell.symbiont.as_mut().unwrap();
             if net < 0.0 {

@@ -360,7 +360,12 @@ pub fn bond_defense_factor(defense_pool: f32) -> f32 {
 /// Seed pool — without it the predation-derived origin pathway has nothing
 /// to copy from. 10 % is high enough to make bearer dynamics visible in the
 /// first generations and low enough that drift / loss can drive it down.
-pub const SYMBIONT_INIT_FRACTION: f32 = 0.10;
+pub const SYMBIONT_INIT_FRACTION: f32 = 0.50;
+// S199 tune: 0.10 → 0.50. Cross-seed 3×80-gen smoke at INIT=0.10 showed
+// bearer extinction gen 5-6 in all 3 seeds — kohort too small (26/200) for
+// brain-integration selection to amplify `has_symbiont → swim_up` correlation
+// before population vymře. 5× larger starting cohort (100/200) gives selection
+// dozens more bearer-bearing reproductions per gen.
 
 /// Per-offspring probability that a bearer parent passes its symbiont to the
 /// child. Models maternal-transmission imperfection: ~5 % of offspring lose
@@ -381,6 +386,14 @@ pub const SYMBIONT_PHOTO_RATE: f32 = 0.6;
 // good gain at high z). The losing knob was the niche width — most bearers
 // spawned outside the original threshold and shed before they could find
 // the light.
+
+/// Sprint 200 mitochondrial baseline: per-second gain that bearers receive
+/// at *any* z, independent of light. Like cellular respiration alongside
+/// photosynthesis — provides a survival floor so bearers don't shed instantly
+/// in dark zones, but the light component still drives upper-z selection.
+/// Tuned so bearer at z=0 + metab=1.0 breaks even with `UPKEEP_PER_SEC`,
+/// leaving the entire gain budget to the light bonus (= selection signal).
+pub const SYMBIONT_PHOTO_BASE: f32 = 0.04;
 /// 2D worlds (`WORLD_HALF[2] == 0`) skip the mechanic; this threshold is
 /// only meaningful in 3D where z maps to [0, 1].
 pub const SYMBIONT_PHOTO_Z_THRESHOLD: f32 = 0.3;
@@ -389,14 +402,30 @@ pub const SYMBIONT_PHOTO_Z_THRESHOLD: f32 = 0.3;
 // dropped to 0 within 4 gens because most spawned at z below threshold.
 // Widening the lit band to z_norm > 0.3 (= z > -40) gives ~70 % of init
 // positions some photo gain.
-pub const SYMBIONT_UPKEEP_PER_SEC: f32 = 0.08;
+pub const SYMBIONT_UPKEEP_PER_SEC: f32 = 0.04;
 // S198 tune: 0.15 → 0.08. Halving upkeep widens the niche margin so a bearer
 // at z_norm = 0.5 (mid-light) is net-positive (~0.10/sec) instead of near
 // zero. Combined with the 0.3 threshold drop, bearers should now persist
 // through the early generations and let selection feedback take over.
+// S199 tune: 0.08 → 0.04. S198 smoke still showed gen 5-6 extinction — even
+// gentler drain so bearers survive long enough for brain to learn the
+// `has_symbiont` correlation. Mid-light cells (z_norm 0.5) now net +0.13/sec
+// (vs +0.09 at 0.08); dark-zone bearers shed in ~25 s (vs ~12.5 s).
 /// ~10 s at FIXED_TIMESTEP_HZ=60 — rides out a transient dive but a
 /// permanent deep-diver loses the symbiont.
 pub const SYMBIONT_UPKEEP_DEFICIT_TICKS: u32 = 600;
+
+/// Sprint 201 — biological-shield pivot: bearer cells absorb only
+/// `(1 - DAMAGE_RESIST_FRAC)` of incoming damage (hazards, predation, maze
+/// wall bumps). Replaces S197-S200's energy-budget mechanic, which produced
+/// bearer fitness signals too weak (≤2 % lifetime energy) to stabilize
+/// bearer fraction across 4 sprints of tuning. Damage reduction is
+/// dimensionally significant — 50 % less drain in a hazard zone or
+/// predation hit doubles bearer survival in dangerous niches. Selection
+/// signal: bearers preferentially persist where damage is frequent;
+/// transmission failure (`P_inherit < 1`) plus host mortality remain the
+/// loss channels (no more deficit_streak shed).
+pub const SYMBIONT_DAMAGE_RESIST_FRAC: f32 = 0.5;
 
 // Sdílené testovací fixtures. Není gated #[cfg(test)] aby je mohly importovat
 // i binární testy (bin/headless/*_tests.rs) — bin se kompiluje proti lib bez

@@ -259,6 +259,19 @@ impl Cell {
         self.bonds.iter().filter(|b| b.is_some()).count() as u32
     }
 
+    /// Sprint 201: incoming-damage multiplier. Bearer cells take only
+    /// `(1 - SYMBIONT_DAMAGE_RESIST_FRAC)` of each damage event — applied at
+    /// hazards, predation hits, and maze wall bumps. Non-bearers see no
+    /// reduction (multiplier = 1.0).
+    #[inline]
+    pub fn damage_resist_factor(&self) -> f32 {
+        if self.symbiont.is_some() {
+            1.0 - SYMBIONT_DAMAGE_RESIST_FRAC
+        } else {
+            1.0
+        }
+    }
+
     pub fn from_genome(
         rng: &mut impl Rng,
         genome: Genome,
@@ -626,7 +639,7 @@ impl Cell {
                 self.velocity[1] -= v_dot_n * ny;
             }
         }
-        self.damage_accum += MAZE_WALL_BUMP_DAMAGE;
+        self.damage_accum += MAZE_WALL_BUMP_DAMAGE * self.damage_resist_factor();
         true
     }
 
