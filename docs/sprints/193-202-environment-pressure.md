@@ -259,3 +259,42 @@ Smoke validace: 25-gen headless `--maze medium` (seed 1) doběhl bez
 panic/NaN. Extinction gen 21 vs. pre-S195 baseline gen 15 na stejném seedu
 — maze mód je tvrdý na gen-0 random brains nezávisle na vousech; filtrovaný
 signál collapse nezhoršil.
+
+## Sprint 196 — Endosymbiosis plumbing
+
+**Cíl:** první slice endosymbiotické větve — zavést data + vertikální dědičnost + predací řízený origin pathway, **bez** energy mechaniky. Cílem je ověřit, že symbiont jako passenger genome se v populaci šíří, dědí a transferuje deterministicky, než Sprint 197 přidá fotosyntézu a conditional upkeep. Tier-1 designové rozhodnutí: plný druhý `Genome` (max evolvability, oproti mini-parametric variantě), origin z predačního "failed digestion" eventu, vertical inheritance s `P_inherit < 1.0` (3 loss channels: host death + transmission failure + attacker-already-bears predation skip).
+
+**Výstup:**
+
+- **Nové konstanty** v `src/lib.rs`:
+  - `SYMBIONT_INIT_FRACTION = 0.10` — gen-0 bearer pool
+  - `SYMBIONT_INHERIT_P = 0.95` — vertical transmission
+  - `SYMBIONT_CAPTURE_P = 0.005` — predace-derived origin rate
+
+- **Data layer** (`src/cell.rs`): nový `Symbiont { genome: Genome, lineage_id: u64, age: u64 }` se `#[derive(Copy, Clone, Serialize, Deserialize)]` (Genome už Copy z S187), a nové pole `Cell.symbiont: Option<Symbiont>` se `#[serde(default)]` pro forward-compat starých checkpointů.
+
+- **Sim layer** (`src/sim/world.rs`):
+  - `World.next_symbiont_lineage_id: u64` (counter nezávislý na `next_cell_id` — symbiontova identita přežívá predation transfer napříč hosty)
+  - Post-init pass v `new_with_maze` rolluje `SYMBIONT_INIT_FRACTION` per buňku a vytváří fresh random `Genome` přes `Genome::random(rng)`
+  - Checkpoint loader re-derivuje `next_symbiont_lineage_id` z `max(c.symbiont.lineage_id) + 1`
+  - V `predate()` po swarm/pack diagnostice: pro každý `(victim, attacker)` hit z `result.victim_attackers`, když victim bearer a attacker není, s `P_capture` attacker kopíruje (victim si symbionta nechává — Copy semantika). `predate` má teď `&mut Rng` parametr.
+
+- **Reprodukce** (`src/reproduction.rs`): v `make_mating_child_no_brain` před `Cell { ... }` literálem vzniká `child_symbiont: Option<Symbiont>` match-em přes `(parent_a.symbiont, parent_b.symbiont)` — `(None, None)` skip, single-bearer uses that one, both-bearer uniform pick. RNG draws jsou gated tak, že reprodukce v symbiont-free populaci nekonzumuje žádné nové draws (pre-Sprint-196 RNG sequence preserved pro non-bearer kohorty). Symbiontův genom mutuje přes `MUTATION_CONFIG.mutate_no_brain` paralelně s host genomem.
+
+- **Per-tick age** (`src/cell.rs`): obě `step_with_thermal*` zvyšují `s.age` paralelně s `self.age`.
+
+- **CSV** (`src/bin/headless/csv.rs`): 3 nové sloupce na konci řádku — `sym_count` (u64), `sym_fraction` (f64), `sym_lineage_count` (u64). Empty-pop variant taky upraven (zero-padded).
+
+- **JSON dump** (`src/json_export.rs`): no-op — `serde_json::to_value(cell)` přes derived `Serialize` automaticky pokryje nové pole.
+
+**Poznámky:**
+
+- **GPU buffer plumbing odložen** na Sprint 197. Sprint 196 schválně nemodifikuje žádný shader — symbiont je čistě CPU-side passive data a žádný GPU compute pass ho nečte ani neuploaduje. Cell-side fields jsou bytemuck-extracted do existujících GPU bufferů (positions, headings, atd.), takže layout change Cell struct se na GPU layer neprojevila.
+
+- **Renderer marker odložen** na Sprint 197 vedle samotné energy mechaniky. CSV dává plnou observabilitu (`sym_fraction` per gen). Visual diff lze sledovat skrz JSON dump (`--dump-dir` → human-readable per-cell dump obsahuje plný `symbiont` field včetně lineage_id).
+
+- **Determinismus**: pre-Sprint-196 RNG sequence je broken v rámci tohoto sprintu schvalně (`SYMBIONT_INIT_FRACTION > 0` přidává draw per init cell; inheritance přidává draws při bearer reprodukci). Validation pro Sprint 196 spočívá v cross-seed sweepu (`feedback_validation_sweep`) sledování `sym_fraction` trajektorie — bez energy mechaniky očekáváme drift (3 loss channels minus zero gain channels), což je správné chování pro plumbing-only.
+
+- **Risk callout**: 3 loss channels combined s low `P_capture` mohou erodovat populaci symbiona před Sprint 197 nasadí fotosyntézu. To je akceptovatelné — bearer fraction se v sprintu 196 nemusí stabilizovat, jen plumbing musí fungovat. Pokud bearer_fraction → 0 do 50 generací, Sprint 197 je tlačený.
+
+- **Symbiont struct cost**: per-cell paměť ~2× (plný druhý Genome + 16 B metadata). Akceptovatelný trade-off za max evolvability. GPU paměť beze změny (symbiont nezůstává v shader paths).

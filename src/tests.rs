@@ -1032,6 +1032,7 @@ fn base_cell() -> Cell {
         was_in_hazard_last_tick: false,
         phenotype,
         genome,
+        symbiont: None,
     }
 }
 
@@ -3363,4 +3364,127 @@ fn izhikevich_dead_zone_weights_do_not_affect_output() {
             d
         );
     }
+}
+
+// ─── Sprint 196: endosymbiosis ──────────────────────────────────────────────
+
+fn bearer_cell(cell_id: u64, sym_lineage: u64) -> Cell {
+    let mut c = base_cell();
+    c.cell_id = cell_id;
+    c.symbiont = Some(Symbiont {
+        genome: dummy_genome(),
+        lineage_id: sym_lineage,
+        age: 0,
+    });
+    c
+}
+
+#[test]
+fn symbiont_inherits_with_p_inherit_single_bearer_parent() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let parent_a = bearer_cell(1, 100);
+    let parent_b = base_cell();
+    const TRIALS: usize = 4000;
+    let mut bearer_count = 0;
+    for i in 0..TRIALS {
+        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 1000 + i as u64);
+        if child.symbiont.is_some() {
+            bearer_count += 1;
+        }
+    }
+    let observed = bearer_count as f64 / TRIALS as f64;
+    let expected = SYMBIONT_INHERIT_P as f64;
+    // 4σ binomial proportion tolerance: σ = √(p(1-p)/n).
+    let sigma = (expected * (1.0 - expected) / TRIALS as f64).sqrt();
+    let tolerance = 4.0 * sigma;
+    assert!(
+        (observed - expected).abs() < tolerance,
+        "observed {:.4} expected {:.4} ± {:.4} (4σ, n={})",
+        observed, expected, tolerance, TRIALS
+    );
+}
+
+#[test]
+fn symbiont_lineage_preserved_through_inheritance() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let parent_a = bearer_cell(1, 42);
+    let parent_b = base_cell();
+    for i in 0..200 {
+        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 5000 + i as u64);
+        if let Some(sym) = child.symbiont.as_ref() {
+            assert_eq!(sym.lineage_id, 42, "lineage_id must propagate verbatim");
+            assert_eq!(sym.age, 0, "child symbiont age must reset to 0");
+        }
+    }
+}
+
+#[test]
+fn symbiont_no_inherit_when_neither_parent_bears() {
+    let mut rng = StdRng::seed_from_u64(9);
+    let parent_a = base_cell();
+    let parent_b = base_cell();
+    for i in 0..200 {
+        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 6000 + i as u64);
+        assert!(child.symbiont.is_none());
+    }
+}
+
+#[test]
+fn symbiont_both_parents_offspring_picks_one_lineage() {
+    let mut rng = StdRng::seed_from_u64(13);
+    let parent_a = bearer_cell(1, 111);
+    let parent_b = bearer_cell(2, 222);
+    let mut from_a = 0u32;
+    let mut from_b = 0u32;
+    let mut none_count = 0u32;
+    const TRIALS: usize = 4000;
+    for i in 0..TRIALS {
+        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 7000 + i as u64);
+        match child.symbiont.as_ref().map(|s| s.lineage_id) {
+            Some(111) => from_a += 1,
+            Some(222) => from_b += 1,
+            Some(other) => panic!("unexpected lineage_id {}", other),
+            None => none_count += 1,
+        }
+    }
+    // Both parents bear → at most one P_inherit roll → bearer fraction
+    // matches P_inherit (single-parent path is statistically equivalent).
+    let bearer_frac = (from_a + from_b) as f64 / TRIALS as f64;
+    let expected = SYMBIONT_INHERIT_P as f64;
+    let sigma = (expected * (1.0 - expected) / TRIALS as f64).sqrt();
+    assert!(
+        (bearer_frac - expected).abs() < 4.0 * sigma,
+        "bearer_frac {:.4} vs expected {:.4} (4σ tolerance)",
+        bearer_frac, expected
+    );
+    // Within the bearers, both lineages must show up — picker is uniform.
+    let total_bearers = from_a + from_b;
+    assert!(from_a > 0 && from_b > 0,
+        "both parent lineages must contribute: from_a={} from_b={}", from_a, from_b);
+    let a_frac = from_a as f64 / total_bearers as f64;
+    let sigma_pick = (0.5 * 0.5 / total_bearers as f64).sqrt();
+    assert!(
+        (a_frac - 0.5).abs() < 4.0 * sigma_pick,
+        "donor pick must be ~50/50: from_a={} from_b={} a_frac={:.4}",
+        from_a, from_b, a_frac
+    );
+    let _ = none_count;
+}
+
+#[test]
+fn symbiont_age_persists_in_parent_resets_in_child() {
+    let mut rng = StdRng::seed_from_u64(101);
+    let mut parent_a = bearer_cell(1, 50);
+    parent_a.symbiont.as_mut().unwrap().age = 999;
+    let parent_b = base_cell();
+    // Force inheritance by retrying until a bearer child appears; with
+    // P_inherit ~ 0.95 this terminates fast.
+    for i in 0..40 {
+        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 8000 + i as u64);
+        if let Some(sym) = child.symbiont.as_ref() {
+            assert_eq!(sym.age, 0, "child symbiont must start with age 0");
+            return;
+        }
+    }
+    panic!("no bearer child in 40 trials — P_inherit far too low");
 }

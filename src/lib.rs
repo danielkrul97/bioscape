@@ -349,6 +349,33 @@ pub fn bond_defense_factor(defense_pool: f32) -> f32 {
 }
 
 
+// ─── Sprint 196: endosymbiosis plumbing ─────────────────────────────────────
+// First slice of the endosymbiosis arc — data + inheritance + visualization
+// only. No energy mechanic yet (Sprint 197 will add z-band photosynthesis +
+// conditional upkeep). Three loss channels apply from day one: host death,
+// transmission failure at reproduction (P_inherit < 1), and predation event
+// where the attacker already has a symbiont.
+
+/// Fraction of the gen-0 population that spawns with a random `Symbiont`.
+/// Seed pool — without it the predation-derived origin pathway has nothing
+/// to copy from. 10 % is high enough to make bearer dynamics visible in the
+/// first generations and low enough that drift / loss can drive it down.
+pub const SYMBIONT_INIT_FRACTION: f32 = 0.10;
+
+/// Per-offspring probability that a bearer parent passes its symbiont to the
+/// child. Models maternal-transmission imperfection: ~5 % of offspring lose
+/// the symbiont at birth even when the parent had one. Combined with host
+/// mortality and predation-event loss, this gives Sprint 196 three loss
+/// channels — Sprint 197 will add the conditional-upkeep deficit channel.
+pub const SYMBIONT_INHERIT_P: f32 = 0.95;
+
+/// Probability that an attacker without a symbiont acquires the victim's
+/// symbiont during a successful predation event ("failed digestion" →
+/// fagocytóza→endosymbióza, the canonical evolutionary pathway). Low rate
+/// keeps origin events rare enough that selection has time to fixate or
+/// purge a symbiont lineage between events.
+pub const SYMBIONT_CAPTURE_P: f32 = 0.005;
+
 // Sdílené testovací fixtures. Není gated #[cfg(test)] aby je mohly importovat
 // i binární testy (bin/headless/*_tests.rs) — bin se kompiluje proti lib bez
 // vlastního cfg(test) flagu lib.

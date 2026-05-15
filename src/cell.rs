@@ -25,6 +25,20 @@ pub struct Bond {
     pub age_ticks: u32,
 }
 
+/// Sprint 196: per-host endosymbiont passenger. Carries its own full `Genome`
+/// so it can co-evolve independently of the host (mitochondria-style: separate
+/// genetic lineage living inside the host). `lineage_id` uses a counter
+/// independent from host lineages and stays stable across predation transfer;
+/// `age` is reset at reproduction (offspring symbiont = fresh copy) and
+/// persists across transfer events. Sprint 196 only plumbs data and
+/// inheritance — no shader reads the symbiont yet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Symbiont {
+    pub genome: Genome,
+    pub lineage_id: u64,
+    pub age: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Cell {
     pub position: [f32; 3],
@@ -168,6 +182,11 @@ pub struct Cell {
     pub was_in_hazard_last_tick: bool,
     pub phenotype: Phenotype,
     pub genome: Genome,
+    /// Sprint 196: endosymbiont passenger. `None` for the bulk of cells; the
+    /// bearer fraction at init is `SYMBIONT_INIT_FRACTION` and changes only
+    /// at reproduction (P_inherit) and predation transfer (P_capture).
+    #[serde(default)]
+    pub symbiont: Option<Symbiont>,
 }
 
 fn default_whiskers() -> [f32; WHISKER_COUNT] {
@@ -302,6 +321,7 @@ impl Cell {
             was_in_hazard_last_tick: false,
             phenotype,
             genome,
+            symbiont: None,
         }
     }
 
@@ -357,6 +377,9 @@ impl Cell {
         // Aging + cooldown decrement run before energy costs so the age ramp
         // sees the post-increment age.
         self.age = self.age.saturating_add(1);
+        if let Some(s) = self.symbiont.as_mut() {
+            s.age = s.age.saturating_add(1);
+        }
         if self.reproduce_cooldown_ticks > 0 {
             self.reproduce_cooldown_ticks -= 1;
         }
@@ -382,6 +405,9 @@ impl Cell {
         obstacles: Option<&ObstacleField>,
     ) {
         self.age = self.age.saturating_add(1);
+        if let Some(s) = self.symbiont.as_mut() {
+            s.age = s.age.saturating_add(1);
+        }
         if self.reproduce_cooldown_ticks > 0 {
             self.reproduce_cooldown_ticks -= 1;
         }

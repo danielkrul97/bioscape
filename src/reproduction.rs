@@ -168,6 +168,42 @@ pub fn make_mating_child_no_brain(
         None => mid_pos,
     };
     let child_phenotype = Phenotype::from_genome(&child_genome);
+    // Sprint 196: symbiont vertical inheritance. Passes from a bearer parent
+    // with probability SYMBIONT_INHERIT_P (~0.95) — the < 1.0 cap models
+    // imperfect maternal transmission, one of three Sprint 196 loss channels
+    // (alongside host death and attacker-already-bears predation skip). When
+    // both parents are bearers, pick uniformly (no maternal/paternal
+    // distinction in this sim). Symbiont genome mutates via MUTATION_CONFIG
+    // independently of host genome, opening a second evolutionary axis.
+    let child_symbiont: Option<Symbiont> = match (
+        parent_a.symbiont.as_ref(),
+        parent_b.symbiont.as_ref(),
+    ) {
+        (None, None) => None,
+        (Some(donor), None) | (None, Some(donor)) => {
+            if rng.random::<f32>() < SYMBIONT_INHERIT_P {
+                Some(Symbiont {
+                    genome: donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
+                    lineage_id: donor.lineage_id,
+                    age: 0,
+                })
+            } else {
+                None
+            }
+        }
+        (Some(a_sym), Some(b_sym)) => {
+            if rng.random::<f32>() < SYMBIONT_INHERIT_P {
+                let donor = if rng.random::<bool>() { a_sym } else { b_sym };
+                Some(Symbiont {
+                    genome: donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
+                    lineage_id: donor.lineage_id,
+                    age: 0,
+                })
+            } else {
+                None
+            }
+        }
+    };
     Cell {
         position: pos,
         velocity: [
@@ -221,6 +257,7 @@ pub fn make_mating_child_no_brain(
         was_in_hazard_last_tick: false,
         phenotype: child_phenotype,
         genome: child_genome,
+        symbiont: child_symbiont,
     }
 }
 

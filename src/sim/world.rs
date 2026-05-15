@@ -7,8 +7,8 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use crate::{
-    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, MazeDifficulty, ShockEvent, ShockKind,
-    ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap, BOND_BREAK_THRESHOLD,
+    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, Genome, MazeDifficulty, ShockEvent, ShockKind,
+    ObstacleField, SimClock, SmellField, SpatialGrid, Symbiont, WorldMap, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
     CONTACT_DECAY_TICKS, COOP_FOOD_MAX_CONCURRENT, COOP_FOOD_SPAWN_RATE_PER_TICK,
@@ -19,7 +19,8 @@ use crate::{
     PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH,
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, VIBRATION_DECAY,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, SYMBIONT_CAPTURE_P, SYMBIONT_INIT_FRACTION,
+    TICKS_PER_GENERATION, VIBRATION_DECAY,
     VIBRATION_DIFFUSION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, VIBRATION_SAMPLE_EPSILON,
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP,
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
@@ -206,6 +207,11 @@ pub struct World {
     /// Sprint 66: monotonic counter pro stable Cell.cell_id přidělování.
     /// Initial population uses 0..INITIAL_CELLS, takže start = INITIAL_CELLS.
     pub next_cell_id: u64,
+    /// Sprint 196: independent monotonic counter for `Symbiont.lineage_id`.
+    /// Separate from `next_cell_id` so host and symbiont lineages live in
+    /// disjoint ID spaces — a symbiont's identity is decoupled from any
+    /// specific host (predation transfer preserves the lineage_id).
+    pub next_symbiont_lineage_id: u64,
     /// Sprint 66: per-pair (min_id, max_id) → consecutive contact ticks.
     /// Vstupy se přidávají v `resolve_collisions` Phase 2 (sequential merge),
     /// odebírají při decay timeout. Sparse — pouze dvojice s aktuálním kontaktem.
@@ -472,7 +478,7 @@ impl World {
         // Initial cells: in maze mode reject spawn positions inside walls
         // (rejection sampling against the obstacle field). Non-maze path
         // unchanged.
-        let cells: Vec<Cell> = (0..initial_cells)
+        let mut cells: Vec<Cell> = (0..initial_cells)
             .map(|i| {
                 if let Some(field) = obstacles.as_ref() {
                     for _ in 0..MAX_SPAWN_ATTEMPTS {
@@ -487,6 +493,23 @@ impl World {
                 }
             })
             .collect();
+        // Sprint 196: seed the bearer pool. With probability SYMBIONT_INIT_FRACTION
+        // per cell, attach a freshly random Symbiont with its own independent
+        // lineage_id. Without this seed pool the predation-derived origin
+        // pathway has nothing to copy from. Runs after the cells collect so the
+        // host RNG sequence stays untouched until the symbiont draws begin.
+        let mut next_symbiont_lineage_id: u64 = 0;
+        for cell in cells.iter_mut() {
+            if rng.random::<f32>() < SYMBIONT_INIT_FRACTION {
+                let sym_genome = Genome::random(rng);
+                cell.symbiont = Some(Symbiont {
+                    genome: sym_genome,
+                    lineage_id: next_symbiont_lineage_id,
+                    age: 0,
+                });
+                next_symbiont_lineage_id += 1;
+            }
+        }
         let target = food_target(1.0);
         let foods = (0..target)
             .map(|_| {
@@ -547,6 +570,7 @@ impl World {
             fertile_ticks_gen: 0,
             predation_events_gen: 0,
             next_cell_id: initial_cells as u64,
+            next_symbiont_lineage_id,
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
@@ -847,6 +871,15 @@ impl World {
             .max()
             .map(|m| m + 1)
             .unwrap_or(0);
+        // Sprint 196: re-derive next_symbiont_lineage_id from loaded cells.
+        // Symbiont presence is sparse — `filter_map` skips hosts without one.
+        let next_symbiont_lineage_id = chk
+            .cells
+            .iter()
+            .filter_map(|c| c.symbiont.as_ref().map(|s| s.lineage_id))
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
         // Sprint 126: deserialize multi-channel pheromone_fields. Délka
         // checkpoint pole se musí shodovat s build-time `N_PHEROMONE_CHANNELS`.
         if chk.pheromone_fields.len() != N_PHEROMONE_CHANNELS {
@@ -895,6 +928,7 @@ impl World {
             fertile_ticks_gen: chk.fertile_ticks_gen,
             predation_events_gen: chk.predation_events_gen,
             next_cell_id,
+            next_symbiont_lineage_id,
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
@@ -1119,7 +1153,7 @@ impl World {
         timed!(apply_food_gravity, self.apply_food_gravity(dt));
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
-        timed!(predate, self.predate());
+        timed!(predate, self.predate(rng));
         timed!(eat_food, self.eat_food());
         timed!(spawn_food, self.spawn_food(rng));
         self.spawn_coop_food(rng);
@@ -2823,7 +2857,7 @@ impl World {
     /// first-K `victim_attackers`) so `bonded_attacks_gen`,
     /// `solo_attacks_gen`, `swarm_attacks_gen`, `pack_attacks_gen` and
     /// `attack_victims_gen` track real activity instead of staying at zero.
-    fn predate(&mut self) {
+    fn predate(&mut self, rng: &mut impl Rng) {
         let n = self.cells.len();
         if n == 0 {
             return;
@@ -2986,6 +3020,40 @@ impl World {
             }
             if is_pack {
                 self.pack_attacks_gen += 1;
+            }
+        }
+
+        // Sprint 196: predation-derived symbiont acquisition. For each
+        // recorded (attacker, victim) hit, when victim is a bearer and
+        // attacker is not, with P_capture the attacker absorbs a copy
+        // (failed-digestion → endosymbiosis pathway). Victim keeps its
+        // symbiont (Symbiont is Copy) so multiple attackers can each
+        // independently roll without ordering dependencies.
+        for victim_idx in 0..n_cells {
+            let count = result.victim_attacker_count[victim_idx];
+            if count == 0 {
+                continue;
+            }
+            let Some(victim_sym) = self.cells[victim_idx].symbiont else {
+                continue;
+            };
+            let base = victim_idx * max_atk;
+            let slots = (count as usize).min(max_atk);
+            for k in 0..slots {
+                let raw = result.victim_attackers[base + k];
+                if raw == 0 {
+                    continue;
+                }
+                let attacker_idx = (raw - 1) as usize;
+                if attacker_idx >= n_cells || attacker_idx == victim_idx {
+                    continue;
+                }
+                if self.cells[attacker_idx].symbiont.is_some() {
+                    continue;
+                }
+                if rng.random::<f32>() < SYMBIONT_CAPTURE_P {
+                    self.cells[attacker_idx].symbiont = Some(victim_sym);
+                }
             }
         }
 

@@ -153,6 +153,7 @@ pub fn base_cell() -> Cell {
         was_in_hazard_last_tick: false,
         phenotype,
         genome,
+        symbiont: None,
     }
 }
 
