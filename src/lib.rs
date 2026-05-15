@@ -376,6 +376,15 @@ pub const SYMBIONT_INHERIT_P: f32 = 0.95;
 /// purge a symbiont lineage between events.
 pub const SYMBIONT_CAPTURE_P: f32 = 0.005;
 
+pub const SYMBIONT_PHOTO_RATE: f32 = 0.6;
+/// 2D worlds (`WORLD_HALF[2] == 0`) skip the mechanic; this threshold is
+/// only meaningful in 3D where z maps to [0, 1].
+pub const SYMBIONT_PHOTO_Z_THRESHOLD: f32 = 0.5;
+pub const SYMBIONT_UPKEEP_PER_SEC: f32 = 0.15;
+/// ~10 s at FIXED_TIMESTEP_HZ=60 — rides out a transient dive but a
+/// permanent deep-diver loses the symbiont.
+pub const SYMBIONT_UPKEEP_DEFICIT_TICKS: u32 = 600;
+
 // Sdílené testovací fixtures. Není gated #[cfg(test)] aby je mohly importovat
 // i binární testy (bin/headless/*_tests.rs) — bin se kompiluje proti lib bez
 // vlastního cfg(test) flagu lib.

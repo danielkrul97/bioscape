@@ -37,6 +37,14 @@ pub struct Symbiont {
     pub genome: Genome,
     pub lineage_id: u64,
     pub age: u64,
+    #[serde(default)]
+    pub deficit_streak: u32,
+}
+
+impl Symbiont {
+    pub fn new(genome: Genome, lineage_id: u64) -> Self {
+        Self { genome, lineage_id, age: 0, deficit_streak: 0 }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

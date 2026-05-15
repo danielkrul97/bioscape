@@ -31,6 +31,11 @@ pub(super) struct SpikeEntity {
 }
 
 #[derive(Component)]
+pub(super) struct SymbiontMarker {
+    pub(super) owner: Entity,
+}
+
+#[derive(Component)]
 pub(super) struct StatsRoot;
 
 #[derive(Component)]

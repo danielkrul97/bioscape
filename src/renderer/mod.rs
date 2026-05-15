@@ -173,7 +173,7 @@ pub fn run() {
                 screencast_capture,
             ),
         )
-        .add_systems(Update, (toggle_whiskers, draw_whiskers))
+        .add_systems(Update, (toggle_whiskers, draw_whiskers, sync_symbionts))
         // God-mode pipeline runs before camera input so RMB orbit suppression
         // takes effect on the same tick as the press. Order inside the chain:
         // handle button hits first, then run the RMB state machine, then close

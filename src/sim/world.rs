@@ -20,7 +20,8 @@ use crate::{
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
     SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, SYMBIONT_CAPTURE_P, SYMBIONT_INIT_FRACTION,
-    TICKS_PER_GENERATION, VIBRATION_DECAY,
+    SYMBIONT_PHOTO_RATE, SYMBIONT_PHOTO_Z_THRESHOLD, SYMBIONT_UPKEEP_DEFICIT_TICKS,
+    SYMBIONT_UPKEEP_PER_SEC, TICKS_PER_GENERATION, VIBRATION_DECAY,
     VIBRATION_DIFFUSION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, VIBRATION_SAMPLE_EPSILON,
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP,
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
@@ -204,6 +205,7 @@ pub struct World {
     pub deaths_gen: u64,
     pub fertile_ticks_gen: u64,
     pub predation_events_gen: u64,
+    pub sym_sheds_gen: u64,
     /// Sprint 66: monotonic counter pro stable Cell.cell_id přidělování.
     /// Initial population uses 0..INITIAL_CELLS, takže start = INITIAL_CELLS.
     pub next_cell_id: u64,
@@ -502,11 +504,7 @@ impl World {
         for cell in cells.iter_mut() {
             if rng.random::<f32>() < SYMBIONT_INIT_FRACTION {
                 let sym_genome = Genome::random(rng);
-                cell.symbiont = Some(Symbiont {
-                    genome: sym_genome,
-                    lineage_id: next_symbiont_lineage_id,
-                    age: 0,
-                });
+                cell.symbiont = Some(Symbiont::new(sym_genome, next_symbiont_lineage_id));
                 next_symbiont_lineage_id += 1;
             }
         }
@@ -569,6 +567,7 @@ impl World {
             deaths_gen: 0,
             fertile_ticks_gen: 0,
             predation_events_gen: 0,
+            sym_sheds_gen: 0,
             next_cell_id: initial_cells as u64,
             next_symbiont_lineage_id,
             contact_progress: rustc_hash::FxHashMap::default(),
@@ -927,6 +926,7 @@ impl World {
             deaths_gen: chk.deaths_gen,
             fertile_ticks_gen: chk.fertile_ticks_gen,
             predation_events_gen: chk.predation_events_gen,
+            sym_sheds_gen: 0,
             next_cell_id,
             next_symbiont_lineage_id,
             contact_progress: rustc_hash::FxHashMap::default(),
@@ -1150,6 +1150,7 @@ impl World {
         timed!(apply_morph, self.apply_morph(dt));
         timed!(apply_brownian, self.apply_brownian(rng, dt));
         timed!(step, self.step(dt));
+        self.apply_symbiont_energy(dt);
         timed!(apply_food_gravity, self.apply_food_gravity(dt));
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
@@ -3052,7 +3053,9 @@ impl World {
                     continue;
                 }
                 if rng.random::<f32>() < SYMBIONT_CAPTURE_P {
-                    self.cells[attacker_idx].symbiont = Some(victim_sym);
+                    let mut transferred = victim_sym;
+                    transferred.deficit_streak = 0;
+                    self.cells[attacker_idx].symbiont = Some(transferred);
                 }
             }
         }
@@ -3135,6 +3138,46 @@ impl World {
                 DEFAULT_STDP_A_MINUS,
             );
         }
+    }
+
+    /// 2D worlds skip the mechanic so pre-S197 2D smokes stay byte-identical.
+    pub(crate) fn apply_symbiont_energy(&mut self, dt: f32) {
+        let half_z = WORLD_HALF[2];
+        if half_z <= 0.0 {
+            return;
+        }
+        let z_range = 2.0 * half_z;
+        let threshold = SYMBIONT_PHOTO_Z_THRESHOLD;
+        let denom = (1.0 - threshold).max(f32::EPSILON);
+        let upkeep = SYMBIONT_UPKEEP_PER_SEC * dt;
+        let ctx = crate::ThermalCtx::for_tick(self.clock.tick, self.clock.generation);
+        let mut sheds_this_pass: u64 = 0;
+        for cell in self.cells.iter_mut() {
+            if cell.symbiont.is_none() {
+                continue;
+            }
+            let z_norm = ((cell.position[2] + half_z) / z_range).clamp(0.0, 1.0);
+            let light = (z_norm - threshold).max(0.0) / denom;
+            let net = if light > 0.0 {
+                let temp = crate::temperature_at_z_with_ctx(cell.position[2], WORLD_HALF, &ctx);
+                let metabolism = crate::metabolism_factor(temp);
+                SYMBIONT_PHOTO_RATE * light * metabolism * dt - upkeep
+            } else {
+                -upkeep
+            };
+            cell.energy += net;
+            let sym = cell.symbiont.as_mut().unwrap();
+            if net < 0.0 {
+                sym.deficit_streak += 1;
+                if sym.deficit_streak > SYMBIONT_UPKEEP_DEFICIT_TICKS {
+                    cell.symbiont = None;
+                    sheds_this_pass += 1;
+                }
+            } else {
+                sym.deficit_streak = 0;
+            }
+        }
+        self.sym_sheds_gen += sheds_this_pass;
     }
 
 

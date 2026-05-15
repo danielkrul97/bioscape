@@ -532,6 +532,7 @@ fn main() {
             world.deaths_gen = 0;
             world.fertile_ticks_gen = 0;
             world.predation_events_gen = 0;
+            world.sym_sheds_gen = 0;
             // Sprint 66: bond formation/break per-gen counters.
             world.bonds_formed_gen = 0;
             world.bonds_broken_gen = 0;

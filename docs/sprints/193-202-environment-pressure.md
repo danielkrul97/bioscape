@@ -298,3 +298,54 @@ signál collapse nezhoršil.
 - **Risk callout**: 3 loss channels combined s low `P_capture` mohou erodovat populaci symbiona před Sprint 197 nasadí fotosyntézu. To je akceptovatelné — bearer fraction se v sprintu 196 nemusí stabilizovat, jen plumbing musí fungovat. Pokud bearer_fraction → 0 do 50 generací, Sprint 197 je tlačený.
 
 - **Symbiont struct cost**: per-cell paměť ~2× (plný druhý Genome + 16 B metadata). Akceptovatelný trade-off za max evolvability. GPU paměť beze změny (symbiont nezůstává v shader paths).
+
+## Sprint 197 — Endosymbiosis: photosynthesis + upkeep
+
+**Cíl:** druhý slice endosymbiotické větve — aktivovat energy mechaniku, která dělá z bearer-fraction niche-conditional dynamiku. Surface hosts (upper z-band) získávají z symbionta čistý zisk přes "fotosyntézu"; hluboký pás platí jen upkeep cost a po prolonged deficitu host shazuje. Cíl je vidět vertikální stratifikaci v `sym_z_avg` CSV sloupci a sustainable bearer_fraction (oproti pure-drift v S196).
+
+**Výstup:**
+
+- **Nové konstanty** (`src/lib.rs`):
+  - `SYMBIONT_PHOTO_RATE = 0.6` (per-sec gain na vrcholu světa)
+  - `SYMBIONT_PHOTO_Z_THRESHOLD = 0.5` (jen horní polovina světa svítí)
+  - `SYMBIONT_UPKEEP_PER_SEC = 0.15` (konstatní drain per bearer)
+  - `SYMBIONT_UPKEEP_DEFICIT_TICKS = 600` (~10 s @ 60 Hz před shedding)
+
+- **Symbiont struct** (`src/cell.rs`): nové pole `deficit_streak: u32` s `#[serde(default)]` (forward-compat s S196 checkpointy). Reset na 0 při origin (init, inheritance, predation transfer).
+
+- **World** (`src/sim/world.rs`):
+  - Nové pole `World.sym_sheds_gen: u64` (per-gen counter — kolik symbiontů zaniklo deficit-shedding)
+  - Nová metoda `pub fn apply_symbiont_energy(&mut self, dt: f32)`:
+    - `z_norm = (cell.z + half_z) / world_z_total` v `[0, 1]`
+    - `light = max(0, z_norm − threshold) / (1 − threshold)` — lineární attenuation nad prahem
+    - `photo_gain = PHOTO_RATE × light × metabolism_factor(T) × dt` — temperature-scaled (cold cells get less, just like other energy costs)
+    - `upkeep = UPKEEP_PER_SEC × dt` — fixní per-tick drain
+    - `cell.energy += (photo_gain − upkeep)`
+    - Negativní net → `deficit_streak += 1`; positivní → reset na 0
+    - `deficit_streak > THRESHOLD` → `cell.symbiont = None`, `sym_sheds_gen += 1`
+  - Volání z `tick()` hned po `step` (po host energy costs, před predate)
+  - 2D mode (`WORLD_HALF[2] == 0`) skipuje celou metodu — non-3D smokes zůstávají byte-identical
+
+- **CSV** (`src/bin/headless/csv.rs`): 3 nové sloupce na konci řádky:
+  - `sym_z_avg` (f64, 4 dec) — mean normalized z bearerů (stratification proxy; > 0.5 = surface-leaning)
+  - `sym_deficit_avg` (f64, 2 dec) — mean `deficit_streak` přes bearers (stress proxy; > 0 = pod tlakem)
+  - `sym_sheds` (u64) — `world.sym_sheds_gen`
+  - Empty-pop variant dostává `0.0000,0.00,0`.
+
+- **Per-gen reset** (`src/renderer/systems/sim_tick.rs` + `src/bin/headless/main.rs`): `world.sym_sheds_gen = 0;` u ostatních gen-counter resetů.
+
+- **Tests** (`src/tests.rs`): 5 nových testů. `gains_at_top` (positive net + streak=0), `drains_at_bottom_streak_increments` (negative net + streak=1), `sheds_after_deficit_threshold` (po `THRESHOLD+1` ticks symbiont=None + sym_sheds_gen=1), `skips_non_bearers` (no-op pro hosty bez symbionta), `streak_resets_on_positive_tick` (deficit → top → streak=0).
+
+**Poznámky:**
+
+- **CPU-only mechanika** schválně — žádný shader symbionta nečte. Volání z `tick()` po GPU dispatch sérii. Kdyby fotosyntéza měla per-tick perf dopad (1000 cells × ~10 ops = trivial), refactor na GPU shader je triviální v Sprint 198+.
+
+- **Tuning otevřený**: `PHOTO_RATE = 0.6` a `UPKEEP_PER_SEC = 0.15` jsou educated guesses. Reálná validace = 5×100-gen cross-seed sweep ([[feedback_validation_sweep]]), sledovat `sym_z_avg` a `sym_fraction` trajektorie. Cíle: (a) `sym_fraction` stabilizuje (≠ kolaps na 0, ≠ fixace na 1), (b) `sym_z_avg > 0.5` (bearers preferentially in upper band), (c) `sym_sheds > 0` v deep-niche generacích (mechanika opravdu shazuje). Pokud `sym_fraction → 0`, snižit upkeep nebo zvýšit photo rate. Pokud `sym_fraction → 1`, opačně.
+
+- **Brain integration odložena** na Sprint 198. Brain zatím "nevidí" zda má symbionta — host nemůže behaviorálně reagovat (např. zaplavat nahoru pro fotosyntézu). To bude další iterace.
+
+- **Renderer marker stále odložen** na Sprint 198+. S197 dělá energy mechaniku CPU-side; CSV (`sym_z_avg`, `sym_deficit_avg`) plus JSON dump (`Symbiont.deficit_streak`) plně pokrývají observability potřeby. Visual layer = bonus pro intuici, lze přidat až mechanika konverguje.
+
+- **Determinismus**: S197 nepřidává RNG draws v tick() — `apply_symbiont_energy` je deterministic given cells state. Cross-seed reproducibility within S197 zachována, pre-S197 sequence broken (host energy trajectory změněn všude, kde běží 3D bearers).
+
+- **Risk callout — niche margin**: parametry `PHOTO_RATE - UPKEEP_PER_SEC` při `light=1` (top of world) dávají net `+0.45/sec`; při `light=0` (anywhere below threshold) dávají `−0.15/sec`. Bearer ve middle band (z_norm=0.75, light=0.5) má `+0.15/sec`. Jsou to malé částky vůči host's body cost (řád 1–10/sec) — symbiont je *modulator*, ne *life-support*. Pokud měl měl výrazně přebíjet host metabolism, evoluce bude ignorovat zbytek mechanik.

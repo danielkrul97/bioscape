@@ -3371,11 +3371,7 @@ fn izhikevich_dead_zone_weights_do_not_affect_output() {
 fn bearer_cell(cell_id: u64, sym_lineage: u64) -> Cell {
     let mut c = base_cell();
     c.cell_id = cell_id;
-    c.symbiont = Some(Symbiont {
-        genome: dummy_genome(),
-        lineage_id: sym_lineage,
-        age: 0,
-    });
+    c.symbiont = Some(Symbiont::new(dummy_genome(), sym_lineage));
     c
 }
 
@@ -3487,4 +3483,113 @@ fn symbiont_age_persists_in_parent_resets_in_child() {
         }
     }
     panic!("no bearer child in 40 trials — P_inherit far too low");
+}
+
+fn world_with_n_cells(n: usize) -> crate::sim::world::World {
+    let mut rng = StdRng::seed_from_u64(7);
+    let mut world = crate::sim::world::World::new(
+        &mut rng,
+        1,
+        100.0,
+        n,
+        1000,
+        crate::EventCalendar::default(),
+    );
+    for c in world.cells.iter_mut() {
+        c.symbiont = None;
+    }
+    world
+}
+
+fn attach_symbiont(cell: &mut Cell, lineage_id: u64) {
+    cell.symbiont = Some(Symbiont::new(cell.genome, lineage_id));
+}
+
+#[test]
+fn symbiont_energy_gains_at_top() {
+    if WORLD_HALF[2] <= 0.0 {
+        return;
+    }
+    let mut world = world_with_n_cells(2);
+    world.cells[0].position = [0.0, 0.0, WORLD_HALF[2] * 0.95];
+    world.cells[0].energy = 100.0;
+    attach_symbiont(&mut world.cells[0], 1);
+    let dt = 1.0 / FIXED_TIMESTEP_HZ;
+    let before = world.cells[0].energy;
+    world.apply_symbiont_energy(dt);
+    let delta = world.cells[0].energy - before;
+    assert!(delta > 0.0, "expected positive net at z=top, got Δ={}", delta);
+    assert_eq!(world.cells[0].symbiont.as_ref().unwrap().deficit_streak, 0);
+}
+
+#[test]
+fn symbiont_energy_drains_at_bottom_streak_increments() {
+    if WORLD_HALF[2] <= 0.0 {
+        return;
+    }
+    let mut world = world_with_n_cells(2);
+    world.cells[0].position = [0.0, 0.0, -WORLD_HALF[2] * 0.95];
+    world.cells[0].energy = 100.0;
+    attach_symbiont(&mut world.cells[0], 1);
+    let dt = 1.0 / FIXED_TIMESTEP_HZ;
+    let before = world.cells[0].energy;
+    world.apply_symbiont_energy(dt);
+    let delta = world.cells[0].energy - before;
+    assert!(delta < 0.0, "expected drain at z=bottom, got Δ={}", delta);
+    assert_eq!(world.cells[0].symbiont.as_ref().unwrap().deficit_streak, 1);
+}
+
+#[test]
+fn symbiont_sheds_after_deficit_threshold() {
+    if WORLD_HALF[2] <= 0.0 {
+        return;
+    }
+    let mut world = world_with_n_cells(2);
+    world.cells[0].position = [0.0, 0.0, -WORLD_HALF[2] * 0.95];
+    // Keep alive across the shedding window — host energy depletion is not the assertion target.
+    world.cells[0].energy = 1e9;
+    attach_symbiont(&mut world.cells[0], 1);
+    let dt = 1.0 / FIXED_TIMESTEP_HZ;
+    for _ in 0..(SYMBIONT_UPKEEP_DEFICIT_TICKS + 1) {
+        world.apply_symbiont_energy(dt);
+    }
+    assert!(world.cells[0].symbiont.is_none(),
+        "symbiont should be shed after {} deficit ticks", SYMBIONT_UPKEEP_DEFICIT_TICKS);
+    assert_eq!(world.sym_sheds_gen, 1);
+}
+
+#[test]
+fn symbiont_skips_non_bearers() {
+    if WORLD_HALF[2] <= 0.0 {
+        return;
+    }
+    let mut world = world_with_n_cells(2);
+    world.cells[1].position = [0.0, 0.0, -WORLD_HALF[2] * 0.95];
+    world.cells[1].energy = 50.0;
+    assert!(world.cells[1].symbiont.is_none());
+    let dt = 1.0 / FIXED_TIMESTEP_HZ;
+    let before = world.cells[1].energy;
+    world.apply_symbiont_energy(dt);
+    assert_eq!(world.cells[1].energy, before,
+        "non-bearer cell must not be touched by apply_symbiont_energy");
+    assert_eq!(world.sym_sheds_gen, 0);
+}
+
+#[test]
+fn symbiont_streak_resets_on_positive_tick() {
+    if WORLD_HALF[2] <= 0.0 {
+        return;
+    }
+    let mut world = world_with_n_cells(2);
+    world.cells[0].position = [0.0, 0.0, -WORLD_HALF[2] * 0.95];
+    world.cells[0].energy = 100.0;
+    attach_symbiont(&mut world.cells[0], 1);
+    let dt = 1.0 / FIXED_TIMESTEP_HZ;
+    for _ in 0..5 {
+        world.apply_symbiont_energy(dt);
+    }
+    assert_eq!(world.cells[0].symbiont.as_ref().unwrap().deficit_streak, 5);
+    world.cells[0].position = [0.0, 0.0, WORLD_HALF[2] * 0.95];
+    world.apply_symbiont_energy(dt);
+    assert_eq!(world.cells[0].symbiont.as_ref().unwrap().deficit_streak, 0);
 }

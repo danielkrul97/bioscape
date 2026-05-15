@@ -182,11 +182,10 @@ pub fn make_mating_child_no_brain(
         (None, None) => None,
         (Some(donor), None) | (None, Some(donor)) => {
             if rng.random::<f32>() < SYMBIONT_INHERIT_P {
-                Some(Symbiont {
-                    genome: donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
-                    lineage_id: donor.lineage_id,
-                    age: 0,
-                })
+                Some(Symbiont::new(
+                    donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
+                    donor.lineage_id,
+                ))
             } else {
                 None
             }
@@ -194,11 +193,10 @@ pub fn make_mating_child_no_brain(
         (Some(a_sym), Some(b_sym)) => {
             if rng.random::<f32>() < SYMBIONT_INHERIT_P {
                 let donor = if rng.random::<bool>() { a_sym } else { b_sym };
-                Some(Symbiont {
-                    genome: donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
-                    lineage_id: donor.lineage_id,
-                    age: 0,
-                })
+                Some(Symbiont::new(
+                    donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
+                    donor.lineage_id,
+                ))
             } else {
                 None
             }

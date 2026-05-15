@@ -19,13 +19,15 @@ use bioscape::gpu::{
 };
 use std::time::Duration;
 
-use super::components::{CellEntity, FoodEntity, SpikeEntity, StatsRoot, StatsText, WorldMapOverlay};
+use super::components::{
+    CellEntity, FoodEntity, SpikeEntity, StatsRoot, StatsText, SymbiontMarker, WorldMapOverlay,
+};
 use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
     AdhesionMaterials, CellMesh, CellSlotMap, EventCalendarResource, FoodMaterial, FoodMesh,
     OrbitCamera, PheromoneResource, SimRng, SimWorld, SmellResource, SpikeMaterial, SpikeMesh,
-    VibrationResource, WorldExtent, WorldMapResource,
+    SymbiontMaterial, SymbiontMesh, VibrationResource, WorldExtent, WorldMapResource,
 };
 use super::sim_config::{SimConfig, CONFIG_FILENAME};
 use super::resources_gpu::GpuFullPipeline;
@@ -236,6 +238,14 @@ pub(super) fn setup(
         metallic: 0.6,
         ..default()
     });
+    let symbiont_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS).mesh().ico(1).unwrap());
+    let symbiont_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.85, 0.30),
+        emissive: LinearRgba::new(1.6, 1.1, 0.30, 1.0),
+        perceptual_roughness: 0.3,
+        metallic: 0.4,
+        ..default()
+    });
     // Sprint 53: jídlo decentnější — menší radius (10× větší food count po
     // 3D volume scaling jinak vytváří plný display) + ground-matching tint
     // (low-saturation green) místo skoro-černé proti bílému ClearColoru.
@@ -276,6 +286,13 @@ pub(super) fn setup(
                 Visibility::Hidden,
             ));
         }
+        commands.spawn((
+            SymbiontMarker { owner: entity },
+            Mesh3d(symbiont_mesh_handle.clone()),
+            MeshMaterial3d(symbiont_material.clone()),
+            Transform::default(),
+            Visibility::Hidden,
+        ));
         slot_map.allocate(entity);
         initial_cells.push(cell);
     }
@@ -465,6 +482,8 @@ pub(super) fn setup(
     commands.insert_resource(FoodMaterial(food_material));
     commands.insert_resource(SpikeMesh(spike_mesh_handle));
     commands.insert_resource(SpikeMaterial(spike_material));
+    commands.insert_resource(SymbiontMesh(symbiont_mesh_handle));
+    commands.insert_resource(SymbiontMaterial(symbiont_material));
 
     commands.insert_resource(SmellResource(SmellField::new(
         [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
