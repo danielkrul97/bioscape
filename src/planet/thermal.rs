@@ -24,9 +24,10 @@ pub const U_MIN: f32 = 1e-6;
 pub const U_MAX: f32 = 1.0e3;
 
 /// Sprint 204 — thermal conductivity κ in the Cleary–Monaghan SPH
-/// conduction term. Tuned so a moderate gradient (ΔT ≈ 1) equilibrates
-/// on a small fraction of one `t_ff` for the default config.
-pub const THERMAL_CONDUCTIVITY_KAPPA: f32 = 1.0;
+/// conduction term. Diffusion time scale τ_diff ≈ R² ρ c_v / κ ≈ 1/κ
+/// in normalised units; κ = 0.1 ⇒ τ_diff ≈ 10 t_ff (slow conduction)
+/// so the planet retains thermal gradients over many free-fall times.
+pub const THERMAL_CONDUCTIVITY_KAPPA: f32 = 0.1;
 
 /// Sprint 205 — surface detection threshold. A particle counts as
 /// "surface" when its density drops below this fraction of the mean

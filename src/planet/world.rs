@@ -4,7 +4,8 @@
 
 use crate::gpu::GpuContext;
 use crate::planet::gpu::{
-    DensityGpu, PlanetGpu, SpatialHashGpu, SphForceGpu, ThermalIntegrateGpu,
+    DensityGpu, PlanetGpu, SpatialHashGpu, SphForceGpu, ThermalConductionGpu,
+    ThermalIntegrateGpu,
 };
 use crate::planet::particle::Particles;
 use clap::ValueEnum;
@@ -132,6 +133,8 @@ pub struct PlanetWorld {
     /// Sprint 202: explicit-Euler integrator for the per-particle
     /// internal energy buffer + safety clamps + scratch clear.
     pub thermal_integrate: Option<ThermalIntegrateGpu>,
+    /// Sprint 204: Cleary–Monaghan SPH thermal conduction pass.
+    pub thermal_conduction: Option<ThermalConductionGpu>,
     /// Bounding-half of the world used by the spatial hash. Set in
     /// `init_gpu_full` from torus extent + 100 % slack so post-collapse
     /// particles still land in the hash grid.
@@ -152,6 +155,7 @@ impl PlanetWorld {
             density: None,
             sph_force: None,
             thermal_integrate: None,
+            thermal_conduction: None,
             world_half: 2.5,
         }
     }
@@ -188,6 +192,7 @@ impl PlanetWorld {
         let hash = SpatialHashGpu::new(Arc::clone(&ctx), n, world_half, gpu.positions_buffer())?;
         let density = DensityGpu::new(Arc::clone(&ctx), &gpu, &hash)?;
         let sph_force = SphForceGpu::new(Arc::clone(&ctx), &gpu, &hash)?;
+        let thermal_conduction = ThermalConductionGpu::new(Arc::clone(&ctx), &gpu, &hash)?;
         let thermal_integrate = ThermalIntegrateGpu::new(Arc::clone(&ctx), &gpu)?;
 
         gpu.upload_state(
@@ -222,6 +227,7 @@ impl PlanetWorld {
         self.hash = Some(hash);
         self.density = Some(density);
         self.sph_force = Some(sph_force);
+        self.thermal_conduction = Some(thermal_conduction);
         self.thermal_integrate = Some(thermal_integrate);
         Ok(())
     }
@@ -238,6 +244,7 @@ impl PlanetWorld {
         let hash = self.hash.as_ref().unwrap();
         let density = self.density.as_ref().unwrap();
         let sph_force = self.sph_force.as_ref().unwrap();
+        let thermal_conduction = self.thermal_conduction.as_ref().unwrap();
         let thermal_integrate = self.thermal_integrate.as_ref().unwrap();
         let dt = self.config.dt;
 
@@ -253,6 +260,7 @@ impl PlanetWorld {
             self.config.visc_alpha,
             self.config.visc_beta,
         );
+        thermal_conduction.dispatch(n);
         thermal_integrate.dispatch(n, dt);
         gpu.kick(n, 0.5 * dt);
 
