@@ -106,8 +106,8 @@ struct CameraOrbit {
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum ColorMode {
-    #[default]
     Rock,
+    #[default]
     Temperature,
 }
 
