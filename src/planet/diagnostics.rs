@@ -162,17 +162,26 @@ pub fn total_energy(particles: &Particles, g: f32, softening: f32) -> (f64, f64,
 
 /// CFL-stable timestep estimate. For each particle:
 ///   dt_i = C · h_i / (c_s_i + |v_i|)
-/// Reduces to the global minimum. `c_s = √(γ K ρ^(γ-1))`.
-pub fn cfl_dt(particles: &Particles, eos_k: f32, eos_gamma: f32, c_courant: f32) -> f32 {
+/// Reduces to the global minimum. Ideal-gas sound speed
+/// `c_s = √(γ(γ−1) u)`; `eos_k` is accepted for binary compatibility
+/// with the pre-S203 polytropic CLI flag and otherwise ignored.
+pub fn cfl_dt(particles: &Particles, _eos_k: f32, eos_gamma: f32, c_courant: f32) -> f32 {
+    let have_u = particles.internal_energies.len() == particles.positions.len();
+    let gm1 = eos_gamma - 1.0;
     let mut dt_min = f32::INFINITY;
-    for ((v, &h), &rho) in particles
+    for (i, (v, &h)) in particles
         .velocities
         .iter()
         .zip(&particles.smoothing_lengths)
-        .zip(&particles.densities)
+        .enumerate()
     {
         let v_mag = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        let c_s = (eos_gamma * eos_k * rho.max(1e-30).powf(eos_gamma - 1.0)).sqrt();
+        let u = if have_u {
+            particles.internal_energies[i].max(crate::planet::thermal::U_MIN)
+        } else {
+            crate::planet::thermal::INITIAL_INTERNAL_ENERGY
+        };
+        let c_s = (eos_gamma * gm1 * u).sqrt();
         let denom = c_s + v_mag;
         if denom > 0.0 {
             let dt = c_courant * h / denom;

@@ -1,21 +1,25 @@
-// Merged SPH non-gravity force: pressure + Monaghan artificial viscosity
-// + thermodynamic feedback in a single neighbour scan. Replaces the
-// previously separate `planet_pressure.wgsl` and `planet_viscosity.wgsl`.
+// Merged SPH non-gravity force: ideal-gas pressure + Monaghan
+// artificial viscosity + adiabatic compression + viscous heating in a
+// single neighbour scan.
 //
-// Per neighbour j (one bucket scan per particle i):
-//   1. compute r, q, Wendland-C2 gradient `∇_i W_ij` — needed by all terms
+// EOS (S203): ideal gas `P = ρ u (γ−1)`. `eos_k` in params is unused
+// (kept in the struct for binary compatibility with the polytropic
+// CLI flag; the previous `K · ρ^γ` form was retired in S203). Sound
+// speed `c = √(γ(γ−1) u)` with `u` floored at `U_MIN` upstream.
+//
+// Per neighbour j:
+//   1. compute r, q, Wendland-C2 gradient `∇_i W_ij` — shared by all
 //   2. pressure: dv/dt += −m_j (P_i/ρ_i² + P_j/ρ_j²) ∇_i W_ij
-//   3. viscosity (only if v_ij·r_ij < 0):
+//   3. adiabatic heating (always):
+//          du_i/dt += (P_i/ρ_i²) m_j (v_i − v_j) · ∇_i W_ij
+//      (derived from −P/ρ · ∇·v with SPH continuity; compression heats,
+//       expansion cools.)
+//   4. viscosity (only if v_ij·r_ij < 0):
 //          μ_ij = h̄ (v_ij·r_ij) / (r² + 0.01 h̄²)
 //          Π_ij = (−α c̄ μ_ij + β μ_ij²) / ρ̄
 //          dv/dt += −m_j Π_ij ∇_i W_ij
-//   4. viscous heating into `du_dt`:
 //          du_i/dt += ½ m_j Π_ij (v_i − v_j) · ∇_i W_ij     (Monaghan 1992)
-//   5. Sprint 203 will add the adiabatic pdV term here and swap the EOS
-//      to ideal gas `P = ρ u (γ−1)` reading `u` from binding 9.
 //
-// EOS (S202): polytropic `P = K · ρ^γ` — `u` is plumbed through but does
-//             not yet feed back into pressure.
 // Kernel: Wendland C2 with `h_i`.
 // `accelerations` (binding 6) is **added** to (gravity wrote first);
 // `du_dt` (binding 10) is **overwritten** so the integrator sees only
@@ -25,6 +29,7 @@ const PI: f32 = 3.14159265358979;
 const GRID_N: i32 = 32;
 const HALF_N: i32 = 16;
 const VISC_EPS: f32 = 0.01;
+const U_MIN: f32 = 1.0e-6;
 
 struct SphForceParams {
     num_particles: u32,
@@ -78,17 +83,17 @@ fn sph_force(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let hi = smoothing_lengths[i];
     let rho_i = max(densities[i], 1e-30);
-    let p_i = params.eos_k * pow(rho_i, params.eos_gamma);
+    let u_i = max(internal_energies[i], U_MIN);
+    let gm1 = params.eos_gamma - 1.0;
+    let p_i = rho_i * u_i * gm1;
     let inv_rho_i2 = 1.0 / (rho_i * rho_i);
-    let c_i = sqrt(params.eos_gamma * p_i / rho_i);
-    // S202 plumbing: u_i is bound but unused in S202; S203 reads it for
-    // the ideal-gas pressure and writes the adiabatic pdV heating term.
-    let _u_i = internal_energies[i];
+    let c_i = sqrt(params.eos_gamma * gm1 * u_i);
 
     var ax: f32 = 0.0;
     var ay: f32 = 0.0;
     var az: f32 = 0.0;
     var du_visc: f32 = 0.0;
+    var du_pdv: f32 = 0.0;
 
     let b = bucket_xyz(xi);
     let kernel_coeff = -105.0 / (16.0 * PI);
@@ -118,8 +123,7 @@ fn sph_force(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let q = r / hi;
                     if (q >= 2.0) { continue; }
 
-                    // Wendland C2 radial gradient + direction. Shared by
-                    // both pressure and viscosity contributions.
+                    // Wendland C2 radial gradient + direction.
                     let one_minus_half_q = 1.0 - 0.5 * q;
                     let cube = one_minus_half_q * one_minus_half_q * one_minus_half_q;
                     let dW_dr = kernel_coeff * q * cube / h4;
@@ -128,39 +132,40 @@ fn sph_force(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let grad_y = dW_dr * dvec.y * inv_r;
                     let grad_z = dW_dr * dvec.z * inv_r;
 
-                    // Shared neighbour loads — pressure needs ρ_j and m_j,
-                    // viscosity needs the same plus v_j and h_j.
                     let mj = masses[j];
                     let rho_j = max(densities[j], 1e-30);
-                    let p_j = params.eos_k * pow(rho_j, params.eos_gamma);
+                    let u_j = max(internal_energies[j], U_MIN);
+                    let p_j = rho_j * u_j * gm1;
 
                     // Pressure: always contributes.
                     let inv_rho_j2 = 1.0 / (rho_j * rho_j);
                     var factor = mj * (p_i * inv_rho_i2 + p_j * inv_rho_j2);
 
-                    // Viscosity: only for approaching pairs.
+                    // Relative velocity is shared by adiabatic pdV and viscosity.
                     let vj = vec3<f32>(
                         velocities[j * 3u + 0u],
                         velocities[j * 3u + 1u],
                         velocities[j * 3u + 2u],
                     );
                     let v_rel = vi - vj;
+                    let v_dot_grad = v_rel.x * grad_x + v_rel.y * grad_y + v_rel.z * grad_z;
+
+                    // Adiabatic pdV heating. Positive on compression
+                    // (v_rel · ∇W > 0) ⇒ warms; negative on expansion.
+                    du_pdv = du_pdv + p_i * inv_rho_i2 * mj * v_dot_grad;
+
+                    // Viscosity: only for approaching pairs.
                     let v_dot_r = dot(v_rel, dvec);
                     if (v_dot_r < 0.0) {
                         let hj = smoothing_lengths[j];
                         let h_bar = 0.5 * (hi + hj);
                         let mu = h_bar * v_dot_r / (r2 + VISC_EPS * h_bar * h_bar);
-                        let c_j = sqrt(params.eos_gamma * p_j / rho_j);
+                        let c_j = sqrt(params.eos_gamma * gm1 * u_j);
                         let c_bar = 0.5 * (c_i + c_j);
                         let rho_bar = 0.5 * (rho_i + rho_j);
                         let pi_ij = (-params.alpha * c_bar * mu + params.beta * mu * mu)
                             / max(rho_bar, 1e-30);
                         factor = factor + mj * pi_ij;
-                        // Viscous heating (symmetric ½ split). Π_ij ≥ 0 for
-                        // approaching pairs; v_rel · ∇W is positive on
-                        // approach (∇W points opposite to dvec, dW/dr < 0),
-                        // so each contribution warms i.
-                        let v_dot_grad = v_rel.x * grad_x + v_rel.y * grad_y + v_rel.z * grad_z;
                         du_visc = du_visc + 0.5 * mj * pi_ij * v_dot_grad;
                     }
 
@@ -176,8 +181,8 @@ fn sph_force(@builtin(global_invocation_id) gid: vec3<u32>) {
     accelerations[i * 3u + 1u] = accelerations[i * 3u + 1u] + ay;
     accelerations[i * 3u + 2u] = accelerations[i * 3u + 2u] + az;
 
-    // Overwrite du/dt with this tick's SPH-side source terms. Thermal
-    // conduction (S204) adds on top; the integrator (planet_thermal_integrate)
-    // applies dt + radiation and clears the buffer.
-    du_dt[i] = du_visc;
+    // Overwrite du/dt with this tick's SPH-side source terms.
+    // Thermal conduction (S204) adds on top; the integrator
+    // applies dt + radiation (S205) and clears the buffer.
+    du_dt[i] = du_visc + du_pdv;
 }
