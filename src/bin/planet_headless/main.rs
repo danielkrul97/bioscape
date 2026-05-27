@@ -189,7 +189,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "tick,time,t_over_t_ff,mass,ke,pe,e_total,u_total,e_full,mean_t,lz,i_a,i_b,i_c,axis_a_over_c,axis_b_over_c,max_radius"
+        "tick,time,t_over_t_ff,mass,ke,pe,e_total,u_total,e_full,mean_t,min_t,max_t,drift_pct,lz,i_a,i_b,i_c,axis_a_over_c,axis_b_over_c,max_radius"
     )
     .unwrap();
 
@@ -198,6 +198,9 @@ fn main() {
 
     // Initial diagnostic row (t = 0).
     world.download_state();
+    let scalar0 = ScalarDiagnostics::compute(&world.particles);
+    let (ke0, pe0, _) = total_energy(&world.particles, world.config.g_const, cli.softening);
+    let e_full_init = ke0 + pe0 + scalar0.internal_energy;
     write_diag(
         &mut log,
         world.tick,
@@ -205,7 +208,9 @@ fn main() {
         t_ff,
         &world,
         cli.softening,
+        e_full_init,
     );
+    let mut last_drift_warn = 0.0_f64;
 
     let mut profile = if cli.profile {
         Some(ProfileBuckets::default())
@@ -221,14 +226,27 @@ fn main() {
         }
         if step % cli.diag_every == 0 || step == n_steps {
             world.download_state();
-            write_diag(
+            let drift = write_diag(
                 &mut log,
                 world.tick,
                 world.time,
                 t_ff,
                 &world,
                 cli.softening,
+                e_full_init,
             );
+            // Drift detector — only warn on each new 1 % milestone so
+            // long runs don't spam the log.
+            let milestone = (drift.abs() * 100.0).floor();
+            if milestone >= 1.0 && milestone > last_drift_warn {
+                eprintln!(
+                    "  ⚠ energy drift {:+.2} % at step {} (radiation lowers e_full; \
+                     adiabatic/leapfrog drift can lift it — interpret with care)",
+                    drift * 100.0,
+                    step
+                );
+                last_drift_warn = milestone;
+            }
         }
         if last_progress.elapsed().as_secs() >= 5 {
             eprintln!(
@@ -351,6 +369,9 @@ fn tick_sph_profiled(world: &mut PlanetWorld, p: &mut ProfileBuckets) {
     world.time += dt;
 }
 
+/// Writes one diagnostic row and returns the relative drift of e_full
+/// vs. the run's initial value (radiation pulls negative, leapfrog
+/// drift can push positive).
 fn write_diag<W: Write>(
     log: &mut W,
     tick: u64,
@@ -358,11 +379,12 @@ fn write_diag<W: Write>(
     t_ff: f32,
     world: &PlanetWorld,
     softening: f32,
-) {
+    e_full_init: f64,
+) -> f64 {
     let particles = &world.particles;
     let scalar = ScalarDiagnostics::compute(particles);
     let (ke, pe, e_total) = total_energy(particles, world.config.g_const, softening);
-    let _it = inertia_tensor(particles); // available for richer CSV later
+    let _it = inertia_tensor(particles);
     let mom = principal_moments(particles);
     let axis_ac = mom[0] / mom[2].max(1e-30);
     let axis_bc = mom[1] / mom[2].max(1e-30);
@@ -378,10 +400,17 @@ fn write_diag<W: Write>(
 
     let u_total = scalar.internal_energy;
     let mean_t = scalar.mean_temperature;
+    let min_t = scalar.min_temperature;
+    let max_t = scalar.max_temperature;
     let e_full = e_total + u_total;
+    let drift = if e_full_init.abs() > 1e-30 {
+        (e_full - e_full_init) / e_full_init.abs()
+    } else {
+        0.0
+    };
     writeln!(
         log,
-        "{tick},{time:.6},{:.6},{:.6},{ke:.6},{pe:.6},{e_total:.6},{u_total:.6},{e_full:.6},{mean_t:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{max_r:.6}",
+        "{tick},{time:.6},{:.6},{:.6},{ke:.6},{pe:.6},{e_total:.6},{u_total:.6},{e_full:.6},{mean_t:.6},{min_t:.6},{max_t:.6},{drift:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{max_r:.6}",
         time / t_ff,
         scalar.total_mass,
         scalar.angular_momentum_z,
@@ -392,4 +421,5 @@ fn write_diag<W: Write>(
         axis_bc,
     )
     .unwrap();
+    drift
 }

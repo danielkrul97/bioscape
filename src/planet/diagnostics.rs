@@ -21,6 +21,11 @@ pub struct ScalarDiagnostics {
     /// Sprint 202: mass-weighted mean temperature. Equals
     /// `Σ m_i u_i / (Σ m_i · c_v)`.
     pub mean_temperature: f64,
+    /// Sprint 207: extremes of the per-particle temperature distribution.
+    /// `min_t` flags cold spots that may stall conduction; `max_t` flags
+    /// hot anomalies that could drive runaway radiation.
+    pub min_temperature: f32,
+    pub max_temperature: f32,
 }
 
 impl ScalarDiagnostics {
@@ -29,7 +34,10 @@ impl ScalarDiagnostics {
         let mut l_z = 0.0_f64;
         let mut m_sum = 0.0_f64;
         let mut u_sum = 0.0_f64;
+        let mut t_min = f32::INFINITY;
+        let mut t_max = f32::NEG_INFINITY;
         let have_u = particles.internal_energies.len() == particles.positions.len();
+        let cv_f32 = crate::planet::thermal::HEAT_CAPACITY_CV;
         for (i, ((p, v), &m)) in particles
             .positions
             .iter()
@@ -45,10 +53,18 @@ impl ScalarDiagnostics {
             l_z += m64 * (p[0] as f64 * vy - p[1] as f64 * vx);
             m_sum += m64;
             if have_u {
-                u_sum += m64 * particles.internal_energies[i] as f64;
+                let u_i = particles.internal_energies[i];
+                u_sum += m64 * u_i as f64;
+                let t_i = u_i / cv_f32;
+                if t_i < t_min { t_min = t_i; }
+                if t_i > t_max { t_max = t_i; }
             }
         }
-        let cv = crate::planet::thermal::HEAT_CAPACITY_CV as f64;
+        if !have_u {
+            t_min = 0.0;
+            t_max = 0.0;
+        }
+        let cv = cv_f32 as f64;
         let mean_t = if m_sum > 0.0 && cv > 0.0 {
             u_sum / (m_sum * cv)
         } else {
@@ -60,6 +76,8 @@ impl ScalarDiagnostics {
             angular_momentum_z: l_z,
             internal_energy: u_sum,
             mean_temperature: mean_t,
+            min_temperature: t_min,
+            max_temperature: t_max,
         }
     }
 }
