@@ -17,6 +17,7 @@ pub mod integrator;
 pub mod gravity_cpu;
 pub mod diagnostics;
 pub mod gpu;
+pub mod thermal;
 
 pub use particle::Particles;
 pub use world::{primary_radius, shape_max_extent, PlanetConfig, PlanetShape, PlanetWorld};

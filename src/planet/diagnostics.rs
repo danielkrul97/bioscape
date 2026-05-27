@@ -14,6 +14,13 @@ pub struct ScalarDiagnostics {
     pub total_mass: f64,
     pub kinetic_energy: f64,
     pub angular_momentum_z: f64,
+    /// Sprint 202: total internal energy `Σ m_i · u_i`. Combined with
+    /// kinetic + potential gives the closed-system energy that conduction
+    /// + viscous heating must conserve (radiation is a sink).
+    pub internal_energy: f64,
+    /// Sprint 202: mass-weighted mean temperature. Equals
+    /// `Σ m_i u_i / (Σ m_i · c_v)`.
+    pub mean_temperature: f64,
 }
 
 impl ScalarDiagnostics {
@@ -21,11 +28,14 @@ impl ScalarDiagnostics {
         let mut t_kin = 0.0_f64;
         let mut l_z = 0.0_f64;
         let mut m_sum = 0.0_f64;
-        for ((p, v), &m) in particles
+        let mut u_sum = 0.0_f64;
+        let have_u = particles.internal_energies.len() == particles.positions.len();
+        for (i, ((p, v), &m)) in particles
             .positions
             .iter()
             .zip(&particles.velocities)
             .zip(&particles.masses)
+            .enumerate()
         {
             let m64 = m as f64;
             let vx = v[0] as f64;
@@ -34,11 +44,22 @@ impl ScalarDiagnostics {
             t_kin += 0.5 * m64 * (vx * vx + vy * vy + vz * vz);
             l_z += m64 * (p[0] as f64 * vy - p[1] as f64 * vx);
             m_sum += m64;
+            if have_u {
+                u_sum += m64 * particles.internal_energies[i] as f64;
+            }
         }
+        let cv = crate::planet::thermal::HEAT_CAPACITY_CV as f64;
+        let mean_t = if m_sum > 0.0 && cv > 0.0 {
+            u_sum / (m_sum * cv)
+        } else {
+            0.0
+        };
         Self {
             total_mass: m_sum,
             kinetic_energy: t_kin,
             angular_momentum_z: l_z,
+            internal_energy: u_sum,
+            mean_temperature: mean_t,
         }
     }
 }

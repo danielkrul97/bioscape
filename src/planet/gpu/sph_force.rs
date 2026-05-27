@@ -49,11 +49,11 @@ impl SphForceGpu {
                 include_str!("../../../shaders/planet_sph_force.wgsl").into(),
             ),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..9)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..11)
             .map(|i| {
                 let ty = match i {
                     0 => wgpu::BufferBindingType::Uniform,
-                    6 => wgpu::BufferBindingType::Storage { read_only: false },
+                    6 | 10 => wgpu::BufferBindingType::Storage { read_only: false },
                     _ => wgpu::BufferBindingType::Storage { read_only: true },
                 };
                 wgpu::BindGroupLayoutEntry {
@@ -112,6 +112,8 @@ impl SphForceGpu {
                 wgpu::BindGroupEntry { binding: 6, resource: gpu.accelerations_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: hash.offsets_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: hash.sorted_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: gpu.internal_energies_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: gpu.du_dt_buffer().as_entire_binding() },
             ],
         });
 

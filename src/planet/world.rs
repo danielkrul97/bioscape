@@ -3,7 +3,9 @@
 //! incrementally as later sprints land.
 
 use crate::gpu::GpuContext;
-use crate::planet::gpu::{DensityGpu, PlanetGpu, SpatialHashGpu, SphForceGpu};
+use crate::planet::gpu::{
+    DensityGpu, PlanetGpu, SpatialHashGpu, SphForceGpu, ThermalIntegrateGpu,
+};
 use crate::planet::particle::Particles;
 use clap::ValueEnum;
 use std::sync::Arc;
@@ -127,6 +129,9 @@ pub struct PlanetWorld {
     /// Merged pressure + Monaghan-viscosity pass. Replaced the two
     /// standalone pipelines in S220 (~30 % step speedup at N=25k).
     pub sph_force: Option<SphForceGpu>,
+    /// Sprint 202: explicit-Euler integrator for the per-particle
+    /// internal energy buffer + safety clamps + scratch clear.
+    pub thermal_integrate: Option<ThermalIntegrateGpu>,
     /// Bounding-half of the world used by the spatial hash. Set in
     /// `init_gpu_full` from torus extent + 100 % slack so post-collapse
     /// particles still land in the hash grid.
@@ -146,6 +151,7 @@ impl PlanetWorld {
             hash: None,
             density: None,
             sph_force: None,
+            thermal_integrate: None,
             world_half: 2.5,
         }
     }
@@ -182,6 +188,7 @@ impl PlanetWorld {
         let hash = SpatialHashGpu::new(Arc::clone(&ctx), n, world_half, gpu.positions_buffer())?;
         let density = DensityGpu::new(Arc::clone(&ctx), &gpu, &hash)?;
         let sph_force = SphForceGpu::new(Arc::clone(&ctx), &gpu, &hash)?;
+        let thermal_integrate = ThermalIntegrateGpu::new(Arc::clone(&ctx), &gpu)?;
 
         gpu.upload_state(
             &self.particles.positions,
@@ -190,11 +197,15 @@ impl PlanetWorld {
         );
         gpu.upload_smoothing_lengths(&self.particles.smoothing_lengths);
         gpu.upload_densities(&self.particles.densities);
+        gpu.upload_internal_energies(&self.particles.internal_energies);
+        gpu.clear_du_dt(n);
 
         // Seed `a_0`: density → gravity (OVERWRITES the acc buffer for
         // all valid i < n) → merged pressure+viscosity (adds; viscosity
         // is a no-op at t=0 unless any pair is already approaching).
         // No prior zero-fill needed — nbody.wgsl writes every valid slot.
+        // sph_force also writes the initial `du/dt` (zero at t=0 since
+        // viscosity is zero) which the first integrator call will apply.
         hash.rebuild(n);
         density.dispatch(n);
         gpu.compute_accelerations(n, self.config.g_const, self.config.softening);
@@ -211,12 +222,13 @@ impl PlanetWorld {
         self.hash = Some(hash);
         self.density = Some(density);
         self.sph_force = Some(sph_force);
+        self.thermal_integrate = Some(thermal_integrate);
         Ok(())
     }
 
     /// One KDK leapfrog step on the GPU with full SPH (density,
-    /// pressure, viscosity) + self-gravity. Requires
-    /// `init_gpu_full` to have been called first.
+    /// pressure, viscosity) + self-gravity + thermal integration.
+    /// Requires `init_gpu_full` to have been called first.
     pub fn tick_sph(&mut self) {
         let n = self.particles.len();
         if n == 0 {
@@ -226,6 +238,7 @@ impl PlanetWorld {
         let hash = self.hash.as_ref().unwrap();
         let density = self.density.as_ref().unwrap();
         let sph_force = self.sph_force.as_ref().unwrap();
+        let thermal_integrate = self.thermal_integrate.as_ref().unwrap();
         let dt = self.config.dt;
 
         gpu.kick(n, 0.5 * dt);
@@ -240,6 +253,7 @@ impl PlanetWorld {
             self.config.visc_alpha,
             self.config.visc_beta,
         );
+        thermal_integrate.dispatch(n, dt);
         gpu.kick(n, 0.5 * dt);
 
         self.tick += 1;
@@ -278,6 +292,8 @@ impl PlanetWorld {
             );
             gpu.upload_smoothing_lengths(&self.particles.smoothing_lengths);
             gpu.upload_densities(&self.particles.densities);
+            gpu.upload_internal_energies(&self.particles.internal_energies);
+            gpu.clear_du_dt(n);
             hash.rebuild(n);
             density.dispatch(n);
             gpu.compute_accelerations(n, g, softening);
@@ -301,6 +317,7 @@ impl PlanetWorld {
         self.particles.accelerations = gpu.download_accelerations(n);
         self.particles.smoothing_lengths = gpu.download_smoothing_lengths(n);
         self.particles.densities = gpu.download_densities(n);
+        self.particles.internal_energies = gpu.download_internal_energies(n);
     }
 
     /// Free-fall time scale `t_ff = sqrt(R³ / (G·M))` using the

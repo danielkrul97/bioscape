@@ -15,6 +15,10 @@ pub struct Particles {
     pub smoothing_lengths: Vec<f32>,
     /// Per-particle SPH density. Same lifecycle as `smoothing_lengths`.
     pub densities: Vec<f32>,
+    /// Sprint 202: per-particle internal energy per unit mass. Carries the
+    /// thermodynamic state (viscous heating, adiabatic work, conduction,
+    /// radiation). `T = u / HEAT_CAPACITY_CV`.
+    pub internal_energies: Vec<f32>,
 }
 
 impl Particles {
@@ -26,6 +30,7 @@ impl Particles {
             masses: Vec::with_capacity(n),
             smoothing_lengths: Vec::with_capacity(n),
             densities: Vec::with_capacity(n),
+            internal_energies: Vec::with_capacity(n),
         }
     }
 
@@ -44,6 +49,7 @@ impl Particles {
         self.masses.push(mass);
         self.smoothing_lengths.push(0.0);
         self.densities.push(0.0);
+        self.internal_energies.push(crate::planet::thermal::INITIAL_INTERNAL_ENERGY);
     }
 
     pub fn clear(&mut self) {
@@ -53,6 +59,7 @@ impl Particles {
         self.masses.clear();
         self.smoothing_lengths.clear();
         self.densities.clear();
+        self.internal_energies.clear();
     }
 
     pub fn total_mass(&self) -> f64 {

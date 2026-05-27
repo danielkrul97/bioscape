@@ -9,9 +9,11 @@ pub mod nbody;
 pub mod spatial_hash;
 pub mod sph_force;
 pub mod state;
+pub mod thermal_integrate;
 
 pub use density::{wendland_c2_cpu, DensityGpu};
 pub use nbody::NBodyGpu;
 pub use spatial_hash::{bucket_id_cpu, SpatialHashGpu, GRID_N, NUM_BUCKETS};
 pub use sph_force::SphForceGpu;
 pub use state::PlanetGpu;
+pub use thermal_integrate::ThermalIntegrateGpu;

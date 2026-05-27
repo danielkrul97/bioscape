@@ -1,21 +1,25 @@
-// Merged SPH non-gravity force: polytropic pressure + Monaghan
-// artificial viscosity in a single neighbour scan. Replaces the
+// Merged SPH non-gravity force: pressure + Monaghan artificial viscosity
+// + thermodynamic feedback in a single neighbour scan. Replaces the
 // previously separate `planet_pressure.wgsl` and `planet_viscosity.wgsl`.
 //
 // Per neighbour j (one bucket scan per particle i):
-//   1. compute r, q, Wendland-C2 gradient `∇_i W_ij` — needed by both terms
+//   1. compute r, q, Wendland-C2 gradient `∇_i W_ij` — needed by all terms
 //   2. pressure: dv/dt += −m_j (P_i/ρ_i² + P_j/ρ_j²) ∇_i W_ij
 //   3. viscosity (only if v_ij·r_ij < 0):
 //          μ_ij = h̄ (v_ij·r_ij) / (r² + 0.01 h̄²)
 //          Π_ij = (−α c̄ μ_ij + β μ_ij²) / ρ̄
 //          dv/dt += −m_j Π_ij ∇_i W_ij
-//   4. sound speed `c = √(γ P / ρ)` reuses `P_j` from the pressure step
-//      (one pow per neighbour instead of two).
+//   4. viscous heating into `du_dt`:
+//          du_i/dt += ½ m_j Π_ij (v_i − v_j) · ∇_i W_ij     (Monaghan 1992)
+//   5. Sprint 203 will add the adiabatic pdV term here and swap the EOS
+//      to ideal gas `P = ρ u (γ−1)` reading `u` from binding 9.
 //
-// Polytropic EOS: `P = K · ρ^γ`. Kernel: Wendland C2 with `h_i` (Newton's
-// 3rd law holds for equal h, see notes in `planet_pressure.wgsl`).
-// Contribution is **added** to `accelerations`; caller writes gravity
-// first.
+// EOS (S202): polytropic `P = K · ρ^γ` — `u` is plumbed through but does
+//             not yet feed back into pressure.
+// Kernel: Wendland C2 with `h_i`.
+// `accelerations` (binding 6) is **added** to (gravity wrote first);
+// `du_dt` (binding 10) is **overwritten** so the integrator sees only
+// this tick's source terms.
 
 const PI: f32 = 3.14159265358979;
 const GRID_N: i32 = 32;
@@ -43,6 +47,8 @@ struct SphForceParams {
 @group(0) @binding(6) var<storage, read_write> accelerations: array<f32>;
 @group(0) @binding(7) var<storage, read> hash_offsets: array<u32>;
 @group(0) @binding(8) var<storage, read> sorted_particles: array<u32>;
+@group(0) @binding(9) var<storage, read> internal_energies: array<f32>;
+@group(0) @binding(10) var<storage, read_write> du_dt: array<f32>;
 
 fn bucket_xyz(pos: vec3<f32>) -> vec3<i32> {
     let bx = i32(floor(pos.x / params.cell_size)) + HALF_N;
@@ -75,10 +81,14 @@ fn sph_force(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p_i = params.eos_k * pow(rho_i, params.eos_gamma);
     let inv_rho_i2 = 1.0 / (rho_i * rho_i);
     let c_i = sqrt(params.eos_gamma * p_i / rho_i);
+    // S202 plumbing: u_i is bound but unused in S202; S203 reads it for
+    // the ideal-gas pressure and writes the adiabatic pdV heating term.
+    let _u_i = internal_energies[i];
 
     var ax: f32 = 0.0;
     var ay: f32 = 0.0;
     var az: f32 = 0.0;
+    var du_visc: f32 = 0.0;
 
     let b = bucket_xyz(xi);
     let kernel_coeff = -105.0 / (16.0 * PI);
@@ -146,6 +156,12 @@ fn sph_force(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let pi_ij = (-params.alpha * c_bar * mu + params.beta * mu * mu)
                             / max(rho_bar, 1e-30);
                         factor = factor + mj * pi_ij;
+                        // Viscous heating (symmetric ½ split). Π_ij ≥ 0 for
+                        // approaching pairs; v_rel · ∇W is positive on
+                        // approach (∇W points opposite to dvec, dW/dr < 0),
+                        // so each contribution warms i.
+                        let v_dot_grad = v_rel.x * grad_x + v_rel.y * grad_y + v_rel.z * grad_z;
+                        du_visc = du_visc + 0.5 * mj * pi_ij * v_dot_grad;
                     }
 
                     ax = ax - factor * grad_x;
@@ -159,4 +175,9 @@ fn sph_force(@builtin(global_invocation_id) gid: vec3<u32>) {
     accelerations[i * 3u + 0u] = accelerations[i * 3u + 0u] + ax;
     accelerations[i * 3u + 1u] = accelerations[i * 3u + 1u] + ay;
     accelerations[i * 3u + 2u] = accelerations[i * 3u + 2u] + az;
+
+    // Overwrite du/dt with this tick's SPH-side source terms. Thermal
+    // conduction (S204) adds on top; the integrator (planet_thermal_integrate)
+    // applies dt + radiation and clears the buffer.
+    du_dt[i] = du_visc;
 }

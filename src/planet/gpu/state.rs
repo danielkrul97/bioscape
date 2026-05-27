@@ -57,12 +57,19 @@ pub struct PlanetGpu {
     masses_buf: wgpu::Buffer,
     smoothing_lengths_buf: wgpu::Buffer,
     densities_buf: wgpu::Buffer,
+    /// Sprint 202: per-particle internal energy per unit mass.
+    internal_energies_buf: wgpu::Buffer,
+    /// Sprint 202: per-particle scratch buffer for `du/dt` accumulation
+    /// across one tick (viscous, adiabatic, conduction). Cleared by the
+    /// thermal integrator at the end of each tick.
+    du_dt_buf: wgpu::Buffer,
 
     positions_rb: wgpu::Buffer,
     velocities_rb: wgpu::Buffer,
     accelerations_rb: wgpu::Buffer,
     smoothing_lengths_rb: wgpu::Buffer,
     densities_rb: wgpu::Buffer,
+    internal_energies_rb: wgpu::Buffer,
 
     nbody_pipeline: wgpu::ComputePipeline,
     nbody_params_buf: wgpu::Buffer,
@@ -101,11 +108,14 @@ impl PlanetGpu {
         let masses_buf = mk("planet-masses", n * f, stor);
         let smoothing_lengths_buf = mk("planet-h", n * f, stor);
         let densities_buf = mk("planet-rho", n * f, stor);
+        let internal_energies_buf = mk("planet-u", n * f, stor);
+        let du_dt_buf = mk("planet-du-dt", n * f, stor);
         let positions_rb = mk("planet-positions-rb", n * 3 * f, read);
         let velocities_rb = mk("planet-velocities-rb", n * 3 * f, read);
         let accelerations_rb = mk("planet-accelerations-rb", n * 3 * f, read);
         let smoothing_lengths_rb = mk("planet-h-rb", n * f, read);
         let densities_rb = mk("planet-rho-rb", n * f, read);
+        let internal_energies_rb = mk("planet-u-rb", n * f, read);
 
         // NBody pipeline
         let nbody_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -189,11 +199,14 @@ impl PlanetGpu {
             masses_buf,
             smoothing_lengths_buf,
             densities_buf,
+            internal_energies_buf,
+            du_dt_buf,
             positions_rb,
             velocities_rb,
             accelerations_rb,
             smoothing_lengths_rb,
             densities_rb,
+            internal_energies_rb,
             nbody_pipeline,
             nbody_params_buf,
             nbody_bg,
@@ -369,6 +382,12 @@ impl PlanetGpu {
     pub fn densities_buffer(&self) -> &wgpu::Buffer {
         &self.densities_buf
     }
+    pub fn internal_energies_buffer(&self) -> &wgpu::Buffer {
+        &self.internal_energies_buf
+    }
+    pub fn du_dt_buffer(&self) -> &wgpu::Buffer {
+        &self.du_dt_buf
+    }
 
     pub fn upload_smoothing_lengths(&self, h: &[f32]) {
         if h.is_empty() {
@@ -390,12 +409,43 @@ impl PlanetGpu {
             .write_buffer(&self.densities_buf, 0, bytemuck::cast_slice(rho));
     }
 
+    pub fn upload_internal_energies(&self, u: &[f32]) {
+        if u.is_empty() {
+            return;
+        }
+        assert!(u.len() <= self.capacity);
+        self.ctx
+            .queue
+            .write_buffer(&self.internal_energies_buf, 0, bytemuck::cast_slice(u));
+    }
+
+    /// Zero the `du/dt` scratch buffer. Called once after initial upload
+    /// so the first SPH dispatch sees a clean slate before overwriting.
+    pub fn clear_du_dt(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let bytes = (n as u64) * std::mem::size_of::<f32>() as u64;
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("planet-du-dt-clear"),
+            });
+        encoder.clear_buffer(&self.du_dt_buf, 0, Some(bytes));
+        self.ctx.queue.submit(Some(encoder.finish()));
+    }
+
     pub fn download_smoothing_lengths(&self, n: usize) -> Vec<f32> {
         self.download_f32(&self.smoothing_lengths_buf, &self.smoothing_lengths_rb, n)
     }
 
     pub fn download_densities(&self, n: usize) -> Vec<f32> {
         self.download_f32(&self.densities_buf, &self.densities_rb, n)
+    }
+
+    pub fn download_internal_energies(&self, n: usize) -> Vec<f32> {
+        self.download_f32(&self.internal_energies_buf, &self.internal_energies_rb, n)
     }
 
     fn download_f32(&self, src: &wgpu::Buffer, rb: &wgpu::Buffer, n: usize) -> Vec<f32> {

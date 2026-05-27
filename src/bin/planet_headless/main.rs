@@ -160,13 +160,13 @@ fn main() {
         eprintln!("gpu init failed: {e}");
         std::process::exit(1);
     }
-    eprintln!("gpu init OK (4 pipelines: nbody, kick, drift, density, sph_force)");
+    eprintln!("gpu init OK (pipelines: nbody, kick, drift, density, sph_force, thermal_integrate)");
 
     let file = std::fs::File::create(&out_path).expect("can't create CSV");
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "tick,time,t_over_t_ff,mass,ke,pe,e_total,lz,i_a,i_b,i_c,axis_a_over_c,axis_b_over_c,max_radius"
+        "tick,time,t_over_t_ff,mass,ke,pe,e_total,u_total,e_full,mean_t,lz,i_a,i_b,i_c,axis_a_over_c,axis_b_over_c,max_radius"
     )
     .unwrap();
 
@@ -353,9 +353,12 @@ fn write_diag<W: Write>(
     }
     let max_r = max_r2.sqrt();
 
+    let u_total = scalar.internal_energy;
+    let mean_t = scalar.mean_temperature;
+    let e_full = e_total + u_total;
     writeln!(
         log,
-        "{tick},{time:.6},{:.6},{:.6},{ke:.6},{pe:.6},{e_total:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{max_r:.6}",
+        "{tick},{time:.6},{:.6},{:.6},{ke:.6},{pe:.6},{e_total:.6},{u_total:.6},{e_full:.6},{mean_t:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{max_r:.6}",
         time / t_ff,
         scalar.total_mass,
         scalar.angular_momentum_z,
