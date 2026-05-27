@@ -20,7 +20,56 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::planet::particle::Particles;
+use crate::planet::thermal::internal_energy_of;
 use crate::planet::world::{primary_radius, PlanetConfig, PlanetShape};
+
+/// Initial temperature distribution. Picked at run start; the per-particle
+/// `internal_energies` buffer is filled accordingly and then evolves under
+/// the thermal model (viscous + adiabatic + conduction + radiation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TemperatureProfile {
+    /// All particles start at `core` (interpreted as the uniform value).
+    #[default]
+    Uniform,
+    /// Quadratic radial falloff `T(r) = core + (surface − core)·(r/R)²`.
+    /// Smooth — equilibrates gently under conduction.
+    HotCore,
+    /// Step profile: core temperature inside `R/2`, surface outside.
+    /// Sharp — useful for stress-testing conduction.
+    Differentiated,
+}
+
+/// Overwrite `internal_energies` according to a temperature profile.
+/// Takes the *primary radius* of the shape so r/R is well-defined for
+/// each generator; non-spherical shapes still work because all profiles
+/// only need a monotonic radial coordinate.
+pub fn apply_temperature_profile(
+    particles: &mut Particles,
+    profile: TemperatureProfile,
+    core_temp: f32,
+    surface_temp: f32,
+    r_primary: f32,
+) {
+    let r_max = r_primary.max(1e-30);
+    for (i, pos) in particles.positions.iter().enumerate() {
+        let r = (pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]).sqrt();
+        let t = match profile {
+            TemperatureProfile::Uniform => core_temp,
+            TemperatureProfile::HotCore => {
+                let f = (r / r_max).min(1.0);
+                core_temp + (surface_temp - core_temp) * f * f
+            }
+            TemperatureProfile::Differentiated => {
+                if r < 0.5 * r_max {
+                    core_temp
+                } else {
+                    surface_temp
+                }
+            }
+        };
+        particles.internal_energies[i] = internal_energy_of(t).max(0.0);
+    }
+}
 
 /// Smoothing-length coefficient `η` in `h = η · (m / ρ_mean)^(1/3)`.
 /// Wendland C2 is well-behaved at ~50 neighbours, which for a 3D

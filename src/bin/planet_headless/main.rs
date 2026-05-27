@@ -13,6 +13,8 @@
 use bioscape::planet::diagnostics::{
     inertia_tensor, principal_moments, total_energy, ScalarDiagnostics,
 };
+use bioscape::planet::init::TemperatureProfile;
+use bioscape::planet::world::primary_radius;
 use bioscape::planet::{init, PlanetConfig, PlanetShape, PlanetWorld};
 use clap::Parser;
 use std::io::{BufWriter, Write};
@@ -102,6 +104,20 @@ struct Cli {
     /// Run length is honoured (use `--t-end 0.1` for a quick profile).
     #[arg(long)]
     profile: bool,
+
+    /// Sprint 206: initial temperature profile.
+    #[arg(long, value_enum, default_value_t = TemperatureProfile::Uniform)]
+    init_temp_profile: TemperatureProfile,
+
+    /// Sprint 206: core/inner temperature for the chosen profile
+    /// (in sim units; with `cv = 1`, equals internal energy per mass).
+    #[arg(long, default_value_t = 0.01)]
+    init_temp_core: f32,
+
+    /// Sprint 206: surface/outer temperature for the chosen profile.
+    /// Ignored when `--init-temp-profile uniform`.
+    #[arg(long, default_value_t = 0.01)]
+    init_temp_surface: f32,
 }
 
 fn main() {
@@ -130,6 +146,13 @@ fn main() {
 
     let mut world = PlanetWorld::new(config.clone());
     world.particles = init::generate(&config);
+    init::apply_temperature_profile(
+        &mut world.particles,
+        cli.init_temp_profile,
+        cli.init_temp_core,
+        cli.init_temp_surface,
+        primary_radius(&config),
+    );
     let t_ff = world.t_ff();
     let n_steps = ((cli.t_end * t_ff) / cli.dt).ceil() as u64;
 
