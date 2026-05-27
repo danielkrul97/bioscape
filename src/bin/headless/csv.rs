@@ -45,7 +45,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
             //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
             //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000,0,0.00,0,0.000,0.000,0,0.0000,0,0.0000,0.00,0",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000,0,0.00,0,0.000,0.000,0,0.0000,0,0.0000,0.00,0,0.0000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -172,11 +172,13 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     // the brain actually saw this tick (sample + gradient at each cell's
     // position), plus the population's mean emission rate.
     let mut vib_emit_sum = 0.0_f64;
+    let mut vib_emit_active_sum = 0.0_f64;
     let mut vib_amp_sum = 0.0_f64;
     let mut vib_grad_mag_sum = 0.0_f64;
     for c in &world.cells {
         let pos = c.position;
         vib_emit_sum += bioscape::vibration_emit_for_cell(c) as f64;
+        vib_emit_active_sum += bioscape::vibration_active_emit_for_cell(c) as f64;
         vib_amp_sum += world.vibration.sample(pos) as f64;
         let g = world
             .vibration
@@ -184,6 +186,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         vib_grad_mag_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
     }
     let vib_emit_m = if cell_count > 0 { vib_emit_sum / cell_count as f64 } else { 0.0 };
+    let vib_emit_active_m = if cell_count > 0 { vib_emit_active_sum / cell_count as f64 } else { 0.0 };
     let vib_amp_m = if cell_count > 0 { vib_amp_sum / cell_count as f64 } else { 0.0 };
     let vib_grad_mag_m = if cell_count > 0 { vib_grad_mag_sum / cell_count as f64 } else { 0.0 };
     // Sprint 107: speciation distance diagnostic. Sample N pairs random,
@@ -615,7 +618,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let sym_deficit_avg = if sym_count > 0 { sym_deficit_sum / sym_count as f64 } else { 0.0 };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{:.3},{:.3},{},{:.4},{},{:.4},{:.2},{}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{:.3},{:.3},{},{:.4},{},{:.4},{:.2},{},{:.4}",
         world.clock.generation,
         n,
         spd_m,
@@ -774,6 +777,10 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         sym_z_avg,
         sym_deficit_avg,
         world.sym_sheds_gen,
+        // Brain-controlled vibration emit (rectified last_outputs[14] ×
+        // MAX_ACTIVE_EMIT, averaged over the population). Compare with
+        // `vib_emit_m` (total) — passive component = total − active.
+        vib_emit_active_m,
     )
 }
 

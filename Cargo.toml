@@ -78,8 +78,19 @@ pollster = "0.4"
 clap = { version = "4", features = ["derive"] }
 bevy_egui = "0.39.1"
 rfd = "0.17"
+# Vibration sonification (renderer-only). `cpal` opens an OS audio stream
+# directly; `fundsp` builds the procedural DSP graph (noise → SVF → pan).
+# Both optional behind the `audio` feature so headless CI can build on boxes
+# without `libasound2-dev`.
+cpal = { version = "0.17", optional = true }
+fundsp = { version = "0.23", optional = true, default-features = false, features = ["std"] }
 
 [features]
+default = ["audio"]
+# Renderer audio sonification of the vibration field. Requires libasound2-dev
+# at link time on Linux. Disable with `--no-default-features` for CI / headless
+# boxes that don't have ALSA.
+audio = ["dep:cpal", "dep:fundsp"]
 # Speeds up incremental rebuilds during development.
 # Run with: cargo run --features dev
 dev = ["bevy/dynamic_linking"]

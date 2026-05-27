@@ -28,12 +28,12 @@
 
 const BRAIN_INPUTS: u32 = 86u;
 const BRAIN_HIDDEN: u32 = 45u;
-const BRAIN_OUTPUTS: u32 = 14u;
+const BRAIN_OUTPUTS: u32 = 15u;
 const W1_OFFSET: u32 = 0u;
 const B1_OFFSET: u32 = 3870u;
 const W2_OFFSET: u32 = 3915u;
-const B2_OFFSET: u32 = 4545u;
-const WEIGHTS_PER_CELL: u32 = 4559u;
+const B2_OFFSET: u32 = 4590u;
+const WEIGHTS_PER_CELL: u32 = 4605u;
 
 struct ApplyParams {
     num_cells: u32,

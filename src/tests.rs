@@ -1019,6 +1019,7 @@ fn base_cell() -> Cell {
         reproduce_cooldown_ticks: 0,
         cell_id: 0,
         bonds: [None; MAX_BONDS_PER_CELL],
+        bond_rest_cos: [[0.0; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL],
         cell_state: 0.5,
         last_best_food_d2: f32::MAX,
         xoshiro_state: crate::Xoshiro128PlusPlus::from_cell_id(0),
@@ -3509,58 +3510,9 @@ fn attach_symbiont(cell: &mut Cell, lineage_id: u64) {
     cell.symbiont = Some(Symbiont::new(cell.genome, lineage_id));
 }
 
-#[test]
-fn symbiont_energy_gains_at_top() {
-    if WORLD_HALF[2] <= 0.0 {
-        return;
-    }
-    let mut world = world_with_n_cells(2);
-    world.cells[0].position = [0.0, 0.0, WORLD_HALF[2] * 0.95];
-    world.cells[0].energy = 100.0;
-    attach_symbiont(&mut world.cells[0], 1);
-    let dt = 1.0 / FIXED_TIMESTEP_HZ;
-    let before = world.cells[0].energy;
-    world.apply_symbiont_energy(dt);
-    let delta = world.cells[0].energy - before;
-    assert!(delta > 0.0, "expected positive net at z=top, got Δ={}", delta);
-    assert_eq!(world.cells[0].symbiont.as_ref().unwrap().deficit_streak, 0);
-}
-
-#[test]
-fn symbiont_energy_drains_at_bottom_streak_increments() {
-    if WORLD_HALF[2] <= 0.0 {
-        return;
-    }
-    let mut world = world_with_n_cells(2);
-    world.cells[0].position = [0.0, 0.0, -WORLD_HALF[2] * 0.95];
-    world.cells[0].energy = 100.0;
-    attach_symbiont(&mut world.cells[0], 1);
-    let dt = 1.0 / FIXED_TIMESTEP_HZ;
-    let before = world.cells[0].energy;
-    world.apply_symbiont_energy(dt);
-    let delta = world.cells[0].energy - before;
-    assert!(delta < 0.0, "expected drain at z=bottom, got Δ={}", delta);
-    assert_eq!(world.cells[0].symbiont.as_ref().unwrap().deficit_streak, 1);
-}
-
-#[test]
-fn symbiont_sheds_after_deficit_threshold() {
-    if WORLD_HALF[2] <= 0.0 {
-        return;
-    }
-    let mut world = world_with_n_cells(2);
-    world.cells[0].position = [0.0, 0.0, -WORLD_HALF[2] * 0.95];
-    // Keep alive across the shedding window — host energy depletion is not the assertion target.
-    world.cells[0].energy = 1e9;
-    attach_symbiont(&mut world.cells[0], 1);
-    let dt = 1.0 / FIXED_TIMESTEP_HZ;
-    for _ in 0..(SYMBIONT_UPKEEP_DEFICIT_TICKS + 1) {
-        world.apply_symbiont_energy(dt);
-    }
-    assert!(world.cells[0].symbiont.is_none(),
-        "symbiont should be shed after {} deficit ticks", SYMBIONT_UPKEEP_DEFICIT_TICKS);
-    assert_eq!(world.sym_sheds_gen, 1);
-}
+// S204 pivot: photosynthesis + shed tests removed. apply_symbiont_energy is
+// now a pure bearer-energy drain (counterbalance to damage_resist). The
+// remaining tests cover the new semantics + the damage_resist mechanic.
 
 #[test]
 fn symbiont_skips_non_bearers() {
@@ -3639,20 +3591,21 @@ fn maze_wall_bump_scales_with_resist_factor() {
 }
 
 #[test]
-fn symbiont_streak_resets_on_positive_tick() {
-    if WORLD_HALF[2] <= 0.0 {
-        return;
-    }
+fn symbiont_bearer_body_cost_drains_energy() {
     let mut world = world_with_n_cells(2);
-    world.cells[0].position = [0.0, 0.0, -WORLD_HALF[2] * 0.95];
-    world.cells[0].energy = 100.0;
     attach_symbiont(&mut world.cells[0], 1);
+    world.cells[0].energy = 100.0;
     let dt = 1.0 / FIXED_TIMESTEP_HZ;
-    for _ in 0..5 {
-        world.apply_symbiont_energy(dt);
-    }
-    assert_eq!(world.cells[0].symbiont.as_ref().unwrap().deficit_streak, 5);
-    world.cells[0].position = [0.0, 0.0, WORLD_HALF[2] * 0.95];
+    let before = world.cells[0].energy;
     world.apply_symbiont_energy(dt);
-    assert_eq!(world.cells[0].symbiont.as_ref().unwrap().deficit_streak, 0);
+    let delta = world.cells[0].energy - before;
+    let expected = -SYMBIONT_BODY_COST_PER_SEC * dt;
+    // 1e-4 tolerance — `100.0 - 0.0083` loses ~1.5e-5 absolute precision in
+    // f32 round-trip; testing intent is "bearer paid the cost", not bit-exact.
+    assert!(
+        (delta - expected).abs() < 1e-4,
+        "bearer energy delta {} expected {}",
+        delta,
+        expected
+    );
 }

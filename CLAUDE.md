@@ -4,7 +4,8 @@ Cílem výzkumného projektu Bioscape je vytvořit simulaci evoluce, abych pocho
 
 **Architektura:**
 
-- **Engine:** Bevy 0.18 (ECS, 3D rendering přes wgpu — orbit Camera3d, StandardMaterial, sphere mesh + non-uniform scale pro ellipsoid těla). `default-features = false` plus ručně vybraný feature set bez `bevy_gilrs` a `audio` — projekt nepotřebuje gamepad ani zvuk a tahle volba odstraňuje závislost na systémových `libudev-dev` / `libasound2-dev`.
+- **Engine:** Bevy 0.18 (ECS, 3D rendering přes wgpu — orbit Camera3d, StandardMaterial, sphere mesh + non-uniform scale pro ellipsoid těla). `default-features = false` plus ručně vybraný feature set bez `bevy_gilrs` a `audio` — projekt nepotřebuje gamepad a Bevy built-in audio.
+- **Audio sonifikace vibrací:** renderer-only modul `src/renderer/audio.rs` (Bevy plugin) za Cargo feature `audio` (default on). Otevírá vlastní `cpal` output stream a sonifikuje `VibrationResource` na pozici kamery přes `fundsp` procedurální graph (pink noise → SVF lowpass → stereo pan). Headless ho nikdy nepoužívá. Pro CI / boxy bez `libasound2-dev`: `cargo build --no-default-features --bin headless`. F8 toggle on/off za běhu.
 - **Split kódu:**
   - `src/lib.rs` — sim type definitions (`Cell`, `Genome`, `Bond`, `Spike`, …) + `params/*` `pub const` parametry + `MUTATION_CONFIG` / `PHYSICS_CONFIG`. **Single source of truth** pro renderer i headless — uploaduje se přímo do GPU bufferů. Nové tuneables patří sem.
   - `src/gpu/*` — GPU compute layer: per-pipeline Rust API kolem `shaders/*.wgsl` (brain, sensor_gather, populate_inputs, motor, brownian, step, hebbian, collision, predate, food_spawn, field, izhikevich, stdp_*, synaptic_scale, excitability, …). Tahle vrstva je sdílená renderer + headless.

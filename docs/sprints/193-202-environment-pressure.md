@@ -405,3 +405,56 @@ signál collapse nezhoršil.
 - **Renderer marker beze změny** — S197 animace pulse+orbit zůstává relevantní, jen teď zobrazuje cells s brain-aware symbiotic dynamics. `sym_deficit_avg` v CSV koreluje s renderer pulse frequency (stress visualization).
 
 - **GPU memory cost**: 2 × N × 4 bytes = 8 B per cell. Pro 1000 cells = 8 KB → trivial. Brain weight matrix re-size: per-cell w1 z 3780 na 3870 floats (+ 90 floats × N cells × 4 B = +360 KB pro 1000 cells). Acceptable.
+
+## Sprint 202 — Real-physics layer: mass, flow advekce, thermal advekce, bond bending
+
+**Cíl:** Posunout simulační prostor blíže k reálné fyzice čtyřmi nezávislými přidanými primitivy:
+
+1. **Inerciální hmotnost** `mass = body_volume × MASS_DENSITY`. Pre-S202 motor používal `effective_radius` (linear scaling s velikostí); collision impulses ignorovaly hmotu úplně; brownian měl uniform amplitudu. Real physics: F=ma → větší cells jsou setrvačnější.
+2. **Bulk-flow advekce** sdíleného vektorového pole pro smell + 3 pheromone kanály + vibration + thermal perturbace. Pre-S202 pole jen difundovala; teď je proudění transportuje upstream/downstream.
+3. **Thermal advekce** — nová `thermal_perturbation` 3D grid difundující + advekovaná stejným flow polem. Pre-S202 byla teplota čistá funkce `z + diurnal/seasonal sin`; teď warm/cool patches putují prostorem.
+4. **Bond bending/torzní tuhost** — angle-spring mezi dvojicí bondů sdílejících jednu cell. Pre-S202 spring bonds držely jen vzdálenost → multi-cell agregáty floppy. Bend term zachycuje úhel mezi dvojicí bondů v okamžiku formace.
+
+**Výstup:**
+
+- **`params/physics.rs`** — 9 nových konstant: `MASS_DENSITY=0.1`, `FLOW_MAGNITUDE=8.0`, `FLOW_SCALE=0.003`, `BOND_BENDING_STIFFNESS=0.4`, `BOND_BENDING_DAMPING=0.6`, `THERMAL_PERTURBATION_AMP=3.0`, `THERMAL_PERTURBATION_SOURCES_PER_GEN=16`, `THERMAL_PERTURBATION_DECAY=0.1`, `THERMAL_PERTURBATION_DIFFUSION=0.12`.
+
+- **`Phenotype::mass()`** — `volume() × MASS_DENSITY`. Pre-S202 motor používal `effective_radius` (linear v dimenzích), mass je nyní kubická → typická 3³ buňka má m ≈ 2.7 (srovnatelné s pre-S202 motor scale), extreme cells mají větší dynamic range.
+
+- **GPU mass buffer** — `CellsGpu::mass_buf` + accessor + extended `upload_metadata(... masses)`. `motor.wgsl` binding 6 přejmenován `effective_radii → masses`. `brownian.wgsl` přidal binding 3 (masses) + scale `inverseSqrt(mass)` (equipartition). `collision.wgsl` přidal binding 16 (masses) + bond spring/damping impulse dělené mass.
+
+- **CPU mirror** — `Cell::apply_brain_motor` přepnut na `phenotype.mass()`, `Cell::apply_brownian` přepnut na `noise × 1/√mass`. Existující energy costs (v² scaled) ponechány.
+
+- **`FieldGpu`** — nový binding 6 `flow_field: array<vec4<f32>>` (vec3 + pad pro WGSL alignment). Bind group layout entries 0..7. Nová metoda `upload_flow_field(&[[f32; 3]])`. Field params struct rozšířen o `flow_active: u32, dt: f32`.
+
+- **`field_diffuse.wgsl`** — po difuzním kroku přidán first-order upwind advection term: `c -= dt · (v · ∇c)` s upstream sampling. `flow_active = 0` byte-identical s pre-S202.
+
+- **`generate_curl_flow_field`** — analytic divergence-free 2D curl z stream funkce `ψ = sin(k₁x)·sin(k₁y) + 0.35·sin(k₂y)·cos(k₂x)`. Detuned spatial freq (`k₂/k₁ = 2.3`) zabrání lattice resonance. Z komponenta = 0 (svět je v z tenký).
+
+- **Thermal perturbation `FieldGpu`** — nová instance se sdílenou rozlišením `SMELL_GRID_RES`. `World::update_thermal_perturbation` deposit warm/cool patches každých 60 ticks na rotující angular pozici. Per-tick step (diffuse + advect ve sdíleném flow poli).
+
+- **`step.wgsl`** — přidán binding 13 `thermal_pert_grid` + 4 fields v `StepParams` (`thermal_pert_active`, `thermal_res_x/y/z`). V thermal-Q10 metabolism bloku: po výpočtu analytic base+diurnal+seasonal sample `thermal_pert_grid` nearest-voxel a přičti.
+
+- **Bond bending** — `Cell::bond_rest_cos: [[f32; 6]; 6]` (per-cell pair angle matrix). Zaznamenává se při bond formaci v `tick()`. Cleared při bond pruning (`World::clear_bond_rest_cos_slot`). Persisted v checkpointech přes `#[serde(default = "default_bond_rest_cos")]`.
+
+- **`collision.wgsl` bond loop** — rozšířen o pair-wise restoring force: `F_bend = -K · (cos_now − cos_rest) − D · cos_dot`, aplikovaná na cell i podél bisektoru `(n_a + n_b) × dt/mass`. Pro BPC=6 max 15 pair čtení per cell. `BOND_BENDING_STIFFNESS=0` skip pro disable.
+
+- **Scratch** — `GpuFullScratch::masses, lt_masses, lt_bond_rest_cos` přidány a plněny v `clear_and_reserve` / `resize_snapshot`. `World::brain_act_gpu_full` i `resolve_collisions` populují podle `Phenotype::mass()` a `Cell::bond_rest_cos`.
+
+**Poznámky:**
+
+- **Smoke validation passed** — 30 gen seed=42, finální pop=372 (init=200), 18000 ticks v 407s ≈ 44 ticks/s. Žádná extinkce, žádný panic. Phase timings comparable s pre-S202.
+
+- **Determinismus** — všechny změny jsou per-cell deterministic. Mass / bend cos jsou per-cell (no atomics). Flow field je static (generated at init). Thermal perturbation deposit jde přes existující fixed-point atomic accumulator. Replay seed=42 byte-deterministic.
+
+- **Není byte-identical s pre-S202**: motor mass změna (effective_radius → volume×density) změnila populační dynamiku v stejném seedu. Pop trajectory ze seed=42 v S201 vs S202 diverguje od gen 2 — to je očekávané (smoke validuje survival, ne reprodukci).
+
+- **Restitution=0 zachované** — collision elastic damping nebyl mass-scaled. Hard collision impulse je position-only depenetration + closing-velocity damping (fraction, ne force), takže mass scaling tam by byl matematicky chybný. Pouze bond spring + bend (= true forces) jsou dělené mass.
+
+- **Future work directly suggested by S202:**
+  - **Restitution per shell**: cells s `aux.shell > X` by mohly dostat positive restitution → tank strategie odražení predátora.
+  - **Mass-aware energy cost**: kinetic energy je `½mv²`, current cost je `c·v²`. Refactor by udělal smaller cells thrifty.
+  - **Anizotropní viscosity field**: kelp-forest patches, mud bottom → drag = base × local_visc. Sdílí flow infrastructure.
+  - **Vibration → wave equation**: parabolic diffusion (S195 acknowledged shortcut) nahradit hyperbolic wave equation s konečnou propagation speed → Doppler, echolocation.
+
+

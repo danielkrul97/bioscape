@@ -31,7 +31,10 @@ pub struct MotorGpu {
     pitches_buf: wgpu::Buffer,
     max_speeds_buf: wgpu::Buffer,
     turn_rates_buf: wgpu::Buffer,
-    eff_radii_buf: wgpu::Buffer,
+    /// Sprint 202: bound at binding 6 — was `effective_radii` pre-S202. The
+    /// shader now expects `volume × MASS_DENSITY` for the `Δv = F/m · dt`
+    /// inertia model.
+    masses_buf: wgpu::Buffer,
     velocities_buf: wgpu::Buffer,
     angular_buf: wgpu::Buffer,
     pitch_vel_buf: wgpu::Buffer,
@@ -114,7 +117,7 @@ impl MotorGpu {
             pitches_buf,
             max_speeds_buf,
             turn_rates_buf,
-            eff_radii_buf,
+            masses_buf,
             velocities_buf,
             angular_buf,
             pitch_vel_buf,
@@ -132,7 +135,7 @@ impl MotorGpu {
                 wgpu::BindGroupEntry { binding: 3, resource: pitches_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: max_speeds_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: turn_rates_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: eff_radii_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: masses_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: velocities_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: angular_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: pitch_vel_buf.as_entire_binding() },
@@ -150,7 +153,7 @@ impl MotorGpu {
             pitches_buf,
             max_speeds_buf,
             turn_rates_buf,
-            eff_radii_buf,
+            masses_buf,
             velocities_buf,
             angular_buf,
             pitch_vel_buf,
@@ -192,7 +195,7 @@ impl MotorGpu {
             mk("motor-pitches", n * f as u64, stor_dst),
             mk("motor-max-speeds", n * f as u64, stor_dst),
             mk("motor-turn-rates", n * f as u64, stor_dst),
-            mk("motor-eff-radii", n * f as u64, stor_dst),
+            mk("motor-masses", n * f as u64, stor_dst),
             mk("motor-velocities", n * 3 * f as u64, stor_dst_src),
             mk("motor-angular", n * f as u64, stor_dst_src),
             mk("motor-pitch-vel", n * f as u64, stor_dst_src),
@@ -212,7 +215,7 @@ impl MotorGpu {
         pitches: &[f32],
         max_speeds: &[f32],
         turn_rates: &[f32],
-        eff_radii: &[f32],
+        masses: &[f32],
         velocities_in: &[[f32; 3]],
         angular_in: &[f32],
         pitch_vel_in: &[f32],
@@ -243,7 +246,7 @@ impl MotorGpu {
         self.queue.write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
         self.queue.write_buffer(&self.max_speeds_buf, 0, bytemuck::cast_slice(max_speeds));
         self.queue.write_buffer(&self.turn_rates_buf, 0, bytemuck::cast_slice(turn_rates));
-        self.queue.write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
+        self.queue.write_buffer(&self.masses_buf, 0, bytemuck::cast_slice(masses));
         self.queue.write_buffer(&self.velocities_buf, 0, bytemuck::cast_slice(&self.pos_packed));
         self.queue.write_buffer(&self.angular_buf, 0, bytemuck::cast_slice(angular_in));
         self.queue.write_buffer(&self.pitch_vel_buf, 0, bytemuck::cast_slice(pitch_vel_in));
@@ -349,7 +352,7 @@ impl MotorGpu {
                     wgpu::BindGroupEntry { binding: 3, resource: cells.pitch_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: cells.max_speed_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: cells.turn_rate_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: cells.eff_radius_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: cells.mass_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 7, resource: cells.velocities_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 8, resource: cells.angular_velocity_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: cells.pitch_velocity_buffer().as_entire_binding() },

@@ -1,6 +1,12 @@
 // Sprint 51: GPU mirror of Cell::apply_brownian. Per-cell xoshiro128++ RNG
 // state (vec4<u32>) mutates velocities[N×3] by adding
-// gaussian × thermal_noise × sqrt(dt) on each axis (z only when has_z != 0).
+// gaussian × thermal_noise × sqrt(dt) / sqrt(mass) on each axis (z only when
+// has_z != 0).
+//
+// Sprint 202: Brownian impulse scaled by 1/sqrt(mass) — small cells get
+// more wobble, large cells stay still. Matches the equipartition theorem
+// for thermal motion (⟨½mv²⟩ = ½kT → ⟨v²⟩ ∝ 1/m), where larger inertia
+// damps the same heat-bath kick into a smaller velocity excursion.
 //
 // Deterministic per-cell: same seed → same sequence across runs
 // (part of Sprint 48 GPU determinism goal for stochastic phases).
@@ -15,6 +21,7 @@ struct BrownianParams {
 @group(0) @binding(0) var<uniform> params: BrownianParams;
 @group(0) @binding(1) var<storage, read_write> velocities: array<f32>;
 @group(0) @binding(2) var<storage, read_write> xoshiro_state: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> masses: array<f32>;
 
 fn rotl_u32(x: u32, k: u32) -> u32 {
     return (x << k) | (x >> (32u - k));
@@ -59,7 +66,8 @@ fn brownian(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     var s = xoshiro_state[i];
-    let scale = params.thermal_noise * params.sqrt_dt;
+    let inv_sqrt_mass = inverseSqrt(max(masses[i], 0.01));
+    let scale = params.thermal_noise * params.sqrt_dt * inv_sqrt_mass;
 
     let g_xy = gaussian_pair(&s);
     velocities[i * 3u + 0u] = velocities[i * 3u + 0u] + g_xy.x * scale;

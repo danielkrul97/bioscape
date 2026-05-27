@@ -11,6 +11,10 @@ pub struct GpuFullScratch {
     // Upload scratch — naplňuje `brain_act_gpu_full` Phase 1 single pass přes cells.
     pub positions: Vec<[f32; 3]>,
     pub eff_radii: Vec<f32>,
+    /// Sprint 202 — inertial mass `volume × MASS_DENSITY`. Uploaded alongside
+    /// `eff_radii`; consumed by motor / collision / brownian shaders for the
+    /// `Δv = impulse / mass` conversion.
+    pub masses: Vec<f32>,
     pub vision_radii: Vec<f32>,
     pub food_positions: Vec<[f32; 3]>,
     pub energies: Vec<f32>,
@@ -57,6 +61,10 @@ pub struct GpuFullScratch {
     pub lt_headings: Vec<f32>,
     pub lt_pitches: Vec<f32>,
     pub lt_eff_radii: Vec<f32>,
+    /// Sprint 202 — late-tick inertial mass snapshot (volume × DENSITY) used
+    /// by `resolve_collisions_gpu_pass1` so bond / damping / adhesion impulses
+    /// convert correctly via `Δv = impulse · dt / mass`.
+    pub lt_masses: Vec<f32>,
     pub lt_max_axes: Vec<f32>,
     pub lt_body_dims: Vec<[f32; 3]>,
     pub lt_carnivore: Vec<f32>,
@@ -74,6 +82,9 @@ pub struct GpuFullScratch {
     pub lt_bond_rest: Vec<f32>,
     pub lt_bond_stiff: Vec<f32>,
     pub lt_bond_damp: Vec<f32>,
+    /// Sprint 202: BPC² flattened rest cosines per cell for the bond-bend
+    /// angle-spring term in `collision.wgsl`.
+    pub lt_bond_rest_cos: Vec<f32>,
     pub lt_rewards: Vec<f32>,
     // Per-food scratch (eat_food). Lengths == self.foods.len(), variable
     // across ticks as carrion drops/decays.
@@ -92,6 +103,7 @@ impl GpuFullScratch {
         }
         cr!(self.positions, n);
         cr!(self.eff_radii, n);
+        cr!(self.masses, n);
         cr!(self.vision_radii, n);
         cr!(self.food_positions, food_n);
         cr!(self.energies, n);
@@ -121,6 +133,8 @@ impl GpuFullScratch {
         self.positions.resize(n, [0.0; 3]);
         self.eff_radii.clear();
         self.eff_radii.resize(n, 0.0);
+        self.masses.clear();
+        self.masses.resize(n, 0.0);
         self.vision_radii.clear();
         self.vision_radii.resize(n, 0.0);
         self.energies.clear();

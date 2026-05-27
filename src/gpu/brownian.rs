@@ -25,6 +25,11 @@ pub struct BrownianGpu {
     params_buf: wgpu::Buffer,
     velocities_buf: wgpu::Buffer,
     state_buf: wgpu::Buffer,
+    /// Sprint 202: per-cell mass for `1/√mass` thermal scaling. Owned by
+    /// the legacy non-persistent `compute()` path's bind group; the
+    /// persistent path binds `cells_gpu.mass_buffer()` instead.
+    #[allow(dead_code)]
+    masses_buf: wgpu::Buffer,
     velocities_rb: wgpu::Buffer,
     state_rb: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -51,10 +56,12 @@ impl BrownianGpu {
             label: Some("brownian"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/brownian.wgsl").into()),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..3)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..4)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
+                } else if i == 3 {
+                    wgpu::BufferBindingType::Storage { read_only: true }
                 } else {
                     wgpu::BufferBindingType::Storage { read_only: false }
                 };
@@ -102,6 +109,10 @@ impl BrownianGpu {
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let velocities_buf = mk("brownian-vel", n * 3 * f, stor_dst_src);
         let state_buf = mk("brownian-state", n * 4 * 4, stor_dst_src);
+        let masses_buf = mk("brownian-masses", n * f, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        // Default = 1.0 so legacy `compute()` callers without a mass upload
+        // behave like the pre-S202 (no-mass) shader.
+        queue.write_buffer(&masses_buf, 0, bytemuck::cast_slice(&vec![1.0_f32; capacity]));
         let velocities_rb = mk("brownian-vel-rb", n * 3 * f, read);
         let state_rb = mk("brownian-state-rb", n * 4 * 4, read);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -111,11 +122,12 @@ impl BrownianGpu {
                 wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: velocities_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: masses_buf.as_entire_binding() },
             ],
         });
         Ok(Self {
             device, queue, pipeline, bind_group_layout, capacity,
-            params_buf, velocities_buf, state_buf, velocities_rb, state_rb, bind_group,
+            params_buf, velocities_buf, state_buf, masses_buf, velocities_rb, state_rb, bind_group,
             cached_persistent_bg: None,
             cached_persistent_epoch: 0,
         })
@@ -237,6 +249,7 @@ impl BrownianGpu {
                     wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.velocities_buffer().as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.xoshiro_state_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.mass_buffer().as_entire_binding() },
                 ],
             }));
             self.cached_persistent_epoch = cells_epoch;

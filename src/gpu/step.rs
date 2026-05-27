@@ -67,6 +67,12 @@ pub struct StepParamsGpu {
     pub maze_active: u32,
     pub maze_res_x: u32,
     pub maze_res_y: u32,
+    /// Sprint 202 — thermal perturbation grid sampling. Active flag + 3D
+    /// resolution. Grid buffer is bound at slot 13 (see `dispatch_into_cells`).
+    pub thermal_pert_active: u32,
+    pub thermal_res_x: u32,
+    pub thermal_res_y: u32,
+    pub thermal_res_z: u32,
 }
 
 pub struct StepGpu {
@@ -95,6 +101,11 @@ pub struct StepGpu {
     /// the maze is small or absent. Zeroed initial contents make the
     /// no-maze path identical to pre-Wave-4 (no spurious collisions).
     maze_mask_buf: wgpu::Buffer,
+    /// Sprint 202 — internal placeholder thermal grid for the non-persistent
+    /// `bind_group`. Zero-filled. The persistent `dispatch_into_cells` path
+    /// binds the live `FieldGpu` grid directly at slot 13.
+    #[allow(dead_code)]
+    thermal_pert_buf: wgpu::Buffer,
     pos_rb: wgpu::Buffer,
     vel_rb: wgpu::Buffer,
     heading_rb: wgpu::Buffer,
@@ -105,7 +116,9 @@ pub struct StepGpu {
     cooldown_rb: wgpu::Buffer,
     energy_rb: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    #[allow(dead_code)]
     cached_cells_bg: Option<wgpu::BindGroup>,
+    #[allow(dead_code)]
     cached_cells_epoch: u64,
 }
 
@@ -145,7 +158,7 @@ impl StepGpu {
         // Wave 4: 12 → 13 bindings (added maze_mask at binding 12, read-only
         // storage). Bindings 10, 11, 12 are read-only; everything else
         // unchanged.
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..13)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..14)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -224,6 +237,23 @@ impl StepGpu {
             MAZE_MASK_CAPACITY as u64 * std::mem::size_of::<u32>() as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
+        // Sprint 202 — placeholder thermal grid (zero-filled) for the legacy
+        // bind_group. Sized at the smell-grid voxel count, the same as the
+        // production thermal field uploaded by `FieldGpu`. Persistent dispatch
+        // uses the live `FieldGpu` buffer instead.
+        let thermal_voxels = (crate::SMELL_GRID_RES
+            * crate::SMELL_GRID_RES
+            * crate::SMELL_GRID_RES_Z) as u64;
+        let thermal_pert_buf = mk(
+            "step-thermal-pert",
+            thermal_voxels * std::mem::size_of::<u32>() as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        queue.write_buffer(
+            &thermal_pert_buf,
+            0,
+            &vec![0u8; (thermal_voxels * 4) as usize],
+        );
 
         let pos_rb = mk("step-pos-rb", n * 3 * f, read);
         let vel_rb = mk("step-vel-rb", n * 3 * f, read);
@@ -252,6 +282,7 @@ impl StepGpu {
                 wgpu::BindGroupEntry { binding: 10, resource: body_dims_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: aux_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: maze_mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: thermal_pert_buf.as_entire_binding() },
             ],
         });
 
@@ -274,6 +305,7 @@ impl StepGpu {
             body_dims_buf,
             aux_buf,
             maze_mask_buf,
+            thermal_pert_buf,
             pos_rb,
             vel_rb,
             heading_rb,
@@ -456,6 +488,7 @@ impl StepGpu {
         cells: &CellsGpu,
         num_cells: usize,
         params: StepParamsGpu,
+        thermal_grid: &wgpu::Buffer,
     ) {
         if num_cells == 0 {
             return;
@@ -463,7 +496,7 @@ impl StepGpu {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("step-dispatch-cells-encoder"),
         });
-        self.dispatch_with_cells_into(&mut encoder, cells, num_cells, params);
+        self.dispatch_with_cells_into(&mut encoder, cells, num_cells, params, thermal_grid);
         self.queue.submit(Some(encoder.finish()));
     }
 
@@ -473,6 +506,7 @@ impl StepGpu {
         cells: &CellsGpu,
         num_cells: usize,
         params: StepParamsGpu,
+        thermal_grid: &wgpu::Buffer,
     ) {
         if num_cells == 0 {
             return;
@@ -481,30 +515,31 @@ impl StepGpu {
         params.num_cells = num_cells as u32;
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let cells_epoch = cells.epoch();
-        if self.cached_cells_bg.is_none() || self.cached_cells_epoch != cells_epoch {
-            self.cached_cells_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("step-bg-cells"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: cells.position_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: cells.velocities_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: cells.heading_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: cells.pitch_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: cells.angular_velocity_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: cells.pitch_velocity_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: cells.age_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: cells.cooldown_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 9, resource: cells.energy_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 10, resource: cells.body_dims_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 11, resource: cells.aux_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 12, resource: self.maze_mask_buf.as_entire_binding() },
-                ],
-            }));
-            self.cached_cells_epoch = cells_epoch;
-        }
-        let bind_group = self.cached_cells_bg.as_ref().unwrap();
+        // Sprint 202 — the thermal grid pointer ping-pongs each `FieldGpu`
+        // step, so we recreate the bind group per dispatch instead of caching.
+        // BG creation at this binding count is well under a microsecond.
+        let _ = cells.epoch();
+        let bind_group_owned = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("step-bg-cells"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells.position_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cells.velocities_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells.heading_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cells.pitch_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cells.angular_velocity_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: cells.pitch_velocity_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: cells.age_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: cells.cooldown_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: cells.energy_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: cells.body_dims_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: cells.aux_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: self.maze_mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: thermal_grid.as_entire_binding() },
+            ],
+        });
+        let bind_group = &bind_group_owned;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("step-pass"),
             timestamp_writes: None,

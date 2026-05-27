@@ -25,9 +25,9 @@ struct Params {
     world_half_y: f32,
     world_half_z: f32,
     mask_active: u32,
-    _pad0: u32,
+    flow_active: u32,
+    dt: f32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -40,6 +40,9 @@ struct Params {
 @group(0) @binding(4) var<storage, read> obstacle_mask_unused: array<u32>;
 // Fixed-point deposit accumulator (binding 5). Zeroed by the host each step.
 @group(0) @binding(5) var<storage, read_write> deposit_accum: array<atomic<u32>>;
+// Sprint 202: flow_field declared so the bind group layout matches diffuse;
+// not read here. Naga prunes unused storage buffers.
+@group(0) @binding(6) var<storage, read> flow_field_unused: array<vec4<f32>>;
 
 @compute @workgroup_size(64)
 fn deposit(@builtin(global_invocation_id) gid: vec3<u32>) {

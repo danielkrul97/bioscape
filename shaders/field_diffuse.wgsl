@@ -26,9 +26,12 @@ struct Params {
     world_half_z: f32,
     // Wave 4: when non-zero, masked voxels become Neumann zero-flux walls.
     mask_active: u32,
-    _pad0: u32,
+    // Sprint 202: when non-zero, the flow_field binding (6) carries a 3D
+    // velocity field that drives an upwind advection step. `dt` is the
+    // step length used to convert flow speed into a per-cell shift.
+    flow_active: u32,
+    dt: f32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -44,6 +47,9 @@ struct Params {
 // folded into the f32 grid here — keeps the deposit add associative (host
 // zeroes it each step) while diffuse stays the single writer per voxel.
 @group(0) @binding(5) var<storage, read_write> deposit_accum: array<u32>;
+// Sprint 202: per-voxel flow vector (world-units / sec). `flow_active = 0`
+// skips advection and leaves diffuse running like pre-S202.
+@group(0) @binding(6) var<storage, read> flow_field: array<vec4<f32>>;
 
 const DEPOSIT_FIXED_INV: f32 = 1.0 / 1048576.0;
 
@@ -104,6 +110,26 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (obstacle_mask[idx_front] != 0u) { front = center; }
     }
 
-    let new_val = center + params.diffusion * (left + right + up + down + back + front - 6.0 * center);
+    var new_val = center + params.diffusion * (left + right + up + down + back + front - 6.0 * center);
+
+    // Sprint 202 — upwind advection: `c_new -= dt · (v · ∇c)`. Approximate
+    // the gradient with the same six neighbors already read above by picking
+    // the upwind one along each axis (the value the fluid is *flowing from*).
+    // First-order upwind is dissipative but stable for arbitrary flow.
+    if (params.flow_active != 0u) {
+        let v = flow_field[idx].xyz;
+        let cfl_x = v.x * params.dt / params.cell_size_x;
+        let cfl_y = v.y * params.dt / params.cell_size_y;
+        let cfl_z = v.z * params.dt / params.cell_size_z;
+        // Choose upstream sample along each axis based on sign of v.
+        let up_x = select(right, left, v.x >= 0.0);
+        let up_y = select(down, up, v.y >= 0.0);
+        let up_z = select(front, back, v.z >= 0.0);
+        new_val = new_val
+            - cfl_x * (center - up_x)
+            - cfl_y * (center - up_y)
+            - cfl_z * (center - up_z);
+    }
+
     grid_out[idx] = bitcast<u32>(new_val * params.decay);
 }

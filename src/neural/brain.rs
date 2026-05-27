@@ -322,6 +322,10 @@ impl Brain {
             }
             b2[o] += gaussian(&mut rng) * INIT_JITTER_SIGMA;
         }
+        // Active vibration emit defaults to silent — see
+        // INNATE_VIBRATION_EMIT_BIAS. Applied AFTER jitter so the bias
+        // dominates the small symmetry-breaking noise.
+        b2[VIBRATION_EMIT_OUTPUT] += INNATE_VIBRATION_EMIT_BIAS;
 
         Brain {
             hidden_n: hidden_n.clamp(BRAIN_HIDDEN_MIN as u32, BRAIN_HIDDEN as u32),
@@ -622,6 +626,8 @@ impl Brain {
         // wants a high baseline). Just enough to avoid a cold start near 0.
         b2[10] += INNATE_PHEROMONE_AUX_BIAS;
         b2[11] += INNATE_PHEROMONE_AUX_BIAS;
+        // Vibration emit: silent default. See INNATE_VIBRATION_EMIT_BIAS docs.
+        b2[VIBRATION_EMIT_OUTPUT] += INNATE_VIBRATION_EMIT_BIAS;
         Self {
             hidden_n,
             w1,

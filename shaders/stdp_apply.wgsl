@@ -12,7 +12,7 @@
 const BRAIN_INPUTS: u32 = 86u;
 const BRAIN_HIDDEN: u32 = 45u;
 const W1_OFFSET: u32 = 0u;
-const WEIGHTS_PER_CELL: u32 = 4559u;
+const WEIGHTS_PER_CELL: u32 = 4605u;
 const NEURON_MODEL_IZHIKEVICH: u32 = 1u;
 
 struct Params {

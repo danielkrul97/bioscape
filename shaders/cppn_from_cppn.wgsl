@@ -36,18 +36,20 @@ const CPPN_LINK_EXISTS_THRESHOLD: f32 = 0.0;
 const BRAIN_INPUTS_SENSORY: u32 = 41u;  // S198: + 2 symbiont (has + deficit_norm)
 const BRAIN_INPUTS: u32 = 86u;          // + 45 recurrent
 const BRAIN_HIDDEN: u32 = 45u;
-const BRAIN_OUTPUTS: u32 = 14u;         // 12 motor/morph + 2 bond message
+const BRAIN_OUTPUTS: u32 = 15u;         // 12 motor/morph + 2 bond message + 1 vibration emit
 const W1_OFFSET: u32 = 0u;
 const B1_OFFSET: u32 = 3870u;
 const W2_OFFSET: u32 = 3915u;
-const B2_OFFSET: u32 = 4545u;
-const WEIGHTS_PER_CELL: u32 = 4559u;
+const B2_OFFSET: u32 = 4590u;
+const WEIGHTS_PER_CELL: u32 = 4605u;
+const VIBRATION_EMIT_OUTPUT: u32 = 14u;
+const INNATE_VIBRATION_EMIT_BIAS: f32 = -2.0;
 
 const NUM_W1: u32 = 3870u;     // BRAIN_HIDDEN × BRAIN_INPUTS
 const NUM_B1: u32 = 45u;       // BRAIN_HIDDEN
-const NUM_W2: u32 = 630u;      // BRAIN_OUTPUTS × BRAIN_HIDDEN
-const NUM_B2: u32 = 14u;       // BRAIN_OUTPUTS
-const QUERIES_PER_CHILD: u32 = 4559u; // NUM_W1 + NUM_B1 + NUM_W2 + NUM_B2
+const NUM_W2: u32 = 675u;      // BRAIN_OUTPUTS × BRAIN_HIDDEN
+const NUM_B2: u32 = 15u;       // BRAIN_OUTPUTS
+const QUERIES_PER_CHILD: u32 = 4605u; // NUM_W1 + NUM_B1 + NUM_W2 + NUM_B2
 
 struct Params {
     num_children: u32,
@@ -239,6 +241,12 @@ fn cppn_from_cppn(@builtin(global_invocation_id) gid: vec3<u32>) {
     var value: f32 = 0.0;
     if (is_bias) {
         value = out.x * 0.5;
+        // Vibration emit: default silent — bias the b2[14] slot strongly
+        // negative so rectified output starts at 0. Mirrors CPU
+        // `Brain::from_cppn`'s post-jitter bias addition.
+        if (write_offset == B2_OFFSET + VIBRATION_EMIT_OUTPUT) {
+            value = value + INNATE_VIBRATION_EMIT_BIAS;
+        }
     } else if (out.y >= CPPN_LINK_EXISTS_THRESHOLD) {
         value = out.x;
     }

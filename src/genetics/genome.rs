@@ -361,6 +361,12 @@ pub fn default_bonded_inbox() -> [f32; N_BOND_MSG_CHANNELS] {
     [0.0; N_BOND_MSG_CHANNELS]
 }
 
+/// Sprint 202 — default for `Cell::bond_rest_cos` on deserialization of
+/// pre-S202 checkpoints. Zero-filled = no bend constraints recorded yet.
+pub fn default_bond_rest_cos() -> [[f32; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL] {
+    [[0.0; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL]
+}
+
 pub fn default_vision_fov() -> f32 {
     INITIAL_VISION_FOV
 }

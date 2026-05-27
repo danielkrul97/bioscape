@@ -19,10 +19,8 @@ use crate::{
     PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH,
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, SYMBIONT_CAPTURE_P, SYMBIONT_INIT_FRACTION,
-    SYMBIONT_PHOTO_BASE, SYMBIONT_PHOTO_RATE, SYMBIONT_PHOTO_Z_THRESHOLD,
-    SYMBIONT_UPKEEP_DEFICIT_TICKS, SYMBIONT_UPKEEP_PER_SEC, TICKS_PER_GENERATION,
-    VIBRATION_DECAY,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, SYMBIONT_BODY_COST_PER_SEC, SYMBIONT_CAPTURE_P,
+    SYMBIONT_INIT_FRACTION, TICKS_PER_GENERATION, VIBRATION_DECAY,
     VIBRATION_DIFFUSION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, VIBRATION_SAMPLE_EPSILON,
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP,
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
@@ -31,13 +29,15 @@ use crate::{BRAIN_HIDDEN, BRAIN_INPUTS};
 use crate::{
     gpu::{
         BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, EatFoodGpu, EatFoodParamsGpu,
+        generate_curl_flow_field,
         FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, GpuProfiler,
         HebbianGpu,
         MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
         ExcitabilityGpu, IzhikevichGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
         StdpApplyGpu, StdpEncodePreGpu, StdpStepGpu, StepGpu, StepParamsGpu, SynapticScaleGpu,
     },
-    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY,
+    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, FLOW_MAGNITUDE, FLOW_SCALE,
+    THERMAL_PERTURBATION_AMP, THERMAL_PERTURBATION_SOURCES_PER_GEN,
     BRAIN_OUTPUTS, CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN,
     DENSITY_NORM_COUNT, DRAG_COEFFICIENT, ESCAPE_COOLDOWN_TICKS,
     ESCAPE_STREAK_THRESHOLD, FlushMode, GRAVITY as PHYS_GRAVITY,
@@ -76,7 +76,11 @@ const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
 /// RNG stream. V7 saves would deserialize via `serde(default)` to identical
 /// sentinel state across cells — that would make every cell move in noise
 /// lockstep, so we force-fail the version mismatch instead.
-const CHECKPOINT_VERSION: u32 = 9;
+/// V10: brain-controlled vibration emit — `BRAIN_OUTPUTS 14→15` resizes
+/// `Brain.w2`, `b2`, `trace_w2`, and `Cell.last_outputs`. V9 weight matrices
+/// don't match the new shape; force version mismatch rather than silently
+/// truncate / pad.
+const CHECKPOINT_VERSION: u32 = 10;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -366,6 +370,11 @@ pub struct GpuFullState {
     /// binding 12. CPU `World.vibration` shadow is not synced on the
     /// `--gpu-full` path (kept only for checkpoint round-trip).
     pub vibration: FieldGpu,
+    /// Sprint 202 — thermal perturbation field. Diffuses + advects with the
+    /// same flow as smell / pheromone / vibration. Sampled by `step.wgsl`
+    /// and added on top of the analytic `temperature_at_z` base so warm
+    /// currents propagate spatially instead of being a pure function of z.
+    pub thermal_perturbation: FieldGpu,
     /// Sprint 60: GPU spatial hashes pro sensor broad-phase. Per-tick
     /// `dispatch()` (no readback) + sensor shader čte `offsets_buffer()` /
     /// `sorted_buffer()` přes binding group.
@@ -667,6 +676,16 @@ impl World {
             WORLD_HALF,
             cap,
         )?;
+        // Sprint 202 — thermal perturbation field. Same resolution as smell
+        // so the same flow vector field can be reused without resampling.
+        // Sources are sparse (`THERMAL_PERTURBATION_SOURCES_PER_GEN`); the
+        // capacity matches that.
+        let thermal_perturbation = FieldGpu::with_context(
+            &ctx,
+            [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+            WORLD_HALF,
+            THERMAL_PERTURBATION_SOURCES_PER_GEN.max(1),
+        )?;
         let cell_hash = SpatialHashGpu::with_context(
             &ctx,
             cap,
@@ -771,6 +790,7 @@ impl World {
             pheromone_ch1,
             pheromone_ch2,
             vibration,
+            thermal_perturbation,
             cell_hash,
             food_hash,
             sensor,
@@ -809,6 +829,45 @@ impl World {
                 gpu.pheromone.upload_obstacle_mask(&phero_mask);
                 gpu.vibration.upload_obstacle_mask(&vib_mask);
             }
+        }
+
+        // Sprint 202 — generate the static curl-noise flow field once and
+        // share it across smell, pheromone (3 channels), vibration. All five
+        // fields use the same grid resolution + world bounds so a single
+        // sample table covers them.
+        if FLOW_MAGNITUDE > 0.0 {
+            let flow = generate_curl_flow_field(
+                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+                WORLD_HALF,
+                FLOW_MAGNITUDE,
+                FLOW_SCALE,
+            );
+            if let Some(gpu) = self.gpu_full.as_mut() {
+                gpu.smell.upload_flow_field(&flow);
+                gpu.pheromone.upload_flow_field(&flow);
+                gpu.pheromone_ch1.upload_flow_field(&flow);
+                gpu.pheromone_ch2.upload_flow_field(&flow);
+                gpu.vibration.upload_flow_field(&flow);
+                gpu.thermal_perturbation.upload_flow_field(&flow);
+            }
+        }
+
+        // Sprint 202 — seed the thermal perturbation field with one initial
+        // round of warm patches so the smoke run sees thermal advection from
+        // tick 0. Subsequent ticks refresh sources in `step_thermal_field`.
+        if let Some(gpu) = self.gpu_full.as_mut() {
+            for s in 0..THERMAL_PERTURBATION_SOURCES_PER_GEN {
+                let frac = (s as f32 + 0.5) / THERMAL_PERTURBATION_SOURCES_PER_GEN as f32;
+                let x = (frac * 2.0 - 1.0) * WORLD_HALF[0] * 0.9;
+                let y = (frac * 6.28).sin() * WORLD_HALF[1] * 0.9;
+                gpu.thermal_perturbation
+                    .add_source([x, y, 0.0], THERMAL_PERTURBATION_AMP);
+            }
+            gpu.thermal_perturbation.step(
+                crate::THERMAL_PERTURBATION_DIFFUSION,
+                crate::THERMAL_PERTURBATION_DECAY,
+                1.0 / crate::FIXED_TIMESTEP_HZ,
+            );
         }
         Ok(())
     }
@@ -992,6 +1051,16 @@ impl World {
     /// Tests that mutate `events.events` directly (instead of going
     /// through `tick`) must call this manually to keep the scratch in
     /// sync with the calendar.
+    /// Sprint 202: clear row + column `slot` of `cell.bond_rest_cos` so that
+    /// a future bond reusing this slot doesn't pick up stale rest-cosines
+    /// from the previous occupant. Called from bond pruning paths.
+    fn clear_bond_rest_cos_slot(cell: &mut Cell, slot: usize) {
+        for t in 0..MAX_BONDS_PER_CELL {
+            cell.bond_rest_cos[slot][t] = 0.0;
+            cell.bond_rest_cos[t][slot] = 0.0;
+        }
+    }
+
     pub fn refresh_active_events(&mut self) {
         let gen = self.clock.generation;
         let events = &self.events.events;
@@ -1105,6 +1174,10 @@ impl World {
         timed!(update_smell, self.update_smell(dt));
         timed!(update_pheromone, self.update_pheromone(dt));
         timed!(update_vibration, self.update_vibration(dt));
+        timed!(
+            update_vibration,
+            self.update_thermal_perturbation(dt)
+        );
         // Persistent cell_id → idx — built once per tick, consumed v pool_bonded_hidden,
         // brain_act, resolve_collisions, eat_food. Cell layout je stable
         // od tady přes eat_food; reproduce/die_and_drop_carrion na konci ticku
@@ -1151,12 +1224,11 @@ impl World {
         timed!(apply_morph, self.apply_morph(dt));
         timed!(apply_brownian, self.apply_brownian(rng, dt));
         timed!(step, self.step(dt));
-        // Sprint 201: apply_symbiont_energy disabled. Energy-budget mechanic
-        // produced bearer fitness signals too weak to stabilize bearer
-        // fraction (≤2 % lifetime energy after 4 sprints of tuning). Bearer
-        // benefit is now damage resistance — applied directly at apply_hazards
-        // / predate / wall-bump sites via `Cell::damage_resist_factor()`.
-        // self.apply_symbiont_energy(dt);
+        // Sprint 204: re-enabled as bearer body cost (rewritten to drain energy
+        // per tick instead of photosynthesis). Counterbalances damage_resist
+        // benefit — produces niche-conditional polymorphism. See
+        // apply_symbiont_energy for details.
+        self.apply_symbiont_energy(dt);
         timed!(apply_food_gravity, self.apply_food_gravity(dt));
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
@@ -1347,6 +1419,38 @@ impl World {
         gpu.vibration.step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt);
     }
 
+    /// Sprint 202 — diffuse + advect the thermal perturbation field. Every
+    /// `THERMAL_REFRESH_PERIOD_TICKS` ticks, drop a fresh warm patch at a
+    /// rotating angular position so the seasonal warmth has a moving origin.
+    fn update_thermal_perturbation(&mut self, dt: f32) {
+        const THERMAL_REFRESH_PERIOD_TICKS: u64 = 60;
+        let tick = self.clock.tick;
+        let gpu = self.gpu_full.as_mut().expect("gpu_full mandatory");
+        if tick % THERMAL_REFRESH_PERIOD_TICKS == 0 {
+            for s in 0..crate::THERMAL_PERTURBATION_SOURCES_PER_GEN {
+                let phase = (tick as f32 / 60.0
+                    + s as f32 * core::f32::consts::TAU
+                        / crate::THERMAL_PERTURBATION_SOURCES_PER_GEN as f32)
+                    .rem_euclid(core::f32::consts::TAU);
+                let radius_xy = WORLD_HALF[0].min(WORLD_HALF[1]) * 0.75;
+                let x = phase.cos() * radius_xy;
+                let y = phase.sin() * radius_xy;
+                // Alternate sign so half the patches are cool perturbations.
+                let amp = if s % 2 == 0 {
+                    crate::THERMAL_PERTURBATION_AMP
+                } else {
+                    -crate::THERMAL_PERTURBATION_AMP
+                };
+                gpu.thermal_perturbation.add_source([x, y, 0.0], amp);
+            }
+        }
+        gpu.thermal_perturbation.step(
+            crate::THERMAL_PERTURBATION_DIFFUSION,
+            crate::THERMAL_PERTURBATION_DECAY,
+            dt,
+        );
+    }
+
     fn emit_pheromones(&mut self, dt: f32) {
         // Per-channel emission. Brain output slot map:
         //   [2]  = ch0 (slow, mating-friendly)
@@ -1439,6 +1543,7 @@ impl World {
         for cell in self.cells.iter() {
             s.positions.push(cell.position);
             s.eff_radii.push(cell.phenotype.effective_radius());
+            s.masses.push(cell.phenotype.mass());
             s.vision_radii.push(cell.genome.vision_radius);
             s.energies.push(cell.energy);
             s.headings.push(cell.heading);
@@ -1486,6 +1591,7 @@ impl World {
         // názvy proměnných, takže downstream kód zůstane beze změny).
         let positions = s.positions.as_slice();
         let eff_radii = s.eff_radii.as_slice();
+        let masses = s.masses.as_slice();
         let vision_radii = s.vision_radii.as_slice();
         let food_positions = s.food_positions.as_slice();
         let energies = s.energies.as_slice();
@@ -1511,6 +1617,7 @@ impl World {
             &damage_accums,
             &max_speeds,
             &eff_radii,
+            &masses,
         );
         gpu.cells.upload_velocities(&velocities);
         gpu.cells.upload_angular_pitch(&angular_vels, &pitch_vels);
@@ -1707,8 +1814,14 @@ impl World {
                 .as_ref()
                 .map(|f| f.resolution[1] as u32)
                 .unwrap_or(0),
+            thermal_pert_active: if FLOW_MAGNITUDE > 0.0 { 1 } else { 0 },
+            thermal_res_x: crate::SMELL_GRID_RES as u32,
+            thermal_res_y: crate::SMELL_GRID_RES as u32,
+            thermal_res_z: crate::SMELL_GRID_RES_Z as u32,
         };
-        gpu.step.dispatch_with_cells(&gpu.cells, n, step_params);
+        let thermal_grid_buf = gpu.thermal_perturbation.current_grid_buffer();
+        gpu.step
+            .dispatch_with_cells(&gpu.cells, n, step_params, thermal_grid_buf);
         gpu.profiler.mark("step");
 
         // Phase 10: single batch readback (Sprint 63: 9 buffers fused do
@@ -2478,11 +2591,13 @@ impl World {
         let s = &mut gpu.scratch;
         s.lt_positions.clear();
         s.lt_eff_radii.clear();
+        s.lt_masses.clear();
         s.lt_max_axes.clear();
         s.lt_adhesion_types.clear();
         for c in cells.iter() {
             s.lt_positions.push(c.position);
             s.lt_eff_radii.push(c.phenotype.effective_radius());
+            s.lt_masses.push(c.phenotype.mass());
             s.lt_max_axes.push(c.phenotype.max_axis());
             s.lt_adhesion_types.push(c.genome.adhesion_type as u32);
         }
@@ -2494,6 +2609,11 @@ impl World {
         s.lt_bond_stiff.resize(total, 0.0);
         s.lt_bond_damp.clear();
         s.lt_bond_damp.resize(total, 0.0);
+        // Sprint 202: BPC² rest cosines per cell (shader reads only `b > a`).
+        let pair_stride = slots * slots;
+        let pairs_total = n * pair_stride;
+        s.lt_bond_rest_cos.clear();
+        s.lt_bond_rest_cos.resize(pairs_total, 0.0);
         for (i, c) in cells.iter().enumerate() {
             for (k, slot) in c.bonds.iter().enumerate() {
                 if let Some(b) = slot {
@@ -2504,6 +2624,16 @@ impl World {
                         s.lt_bond_stiff[idx] = b.stiffness;
                         s.lt_bond_damp[idx] = b.damping;
                     }
+                }
+            }
+            // Sprint 202: flatten the per-cell rest-cos matrix into the
+            // per-tick scratch. Only entries where both endpoint slots also
+            // map to live partners contribute to the shader bend pass; the
+            // shader gates by `bond_active[a]` AND `bond_active[b]`.
+            for a in 0..slots {
+                for b in 0..slots {
+                    let dst = i * pair_stride + a * slots + b;
+                    s.lt_bond_rest_cos[dst] = c.bond_rest_cos[a][b];
                 }
             }
         }
@@ -2541,6 +2671,7 @@ impl World {
             &s.lt_bond_rest,
             &s.lt_bond_stiff,
             &s.lt_bond_damp,
+            &s.lt_bond_rest_cos,
             &gpu.cell_hash,
         );
         gpu.cells.queue().submit(Some(encoder.finish()));
@@ -2676,11 +2807,13 @@ impl World {
                 let Some(bond) = self.cells[i].bonds[slot] else { continue };
                 if explicit_break {
                     self.cells[i].bonds[slot] = None;
+                    Self::clear_bond_rest_cos_slot(&mut self.cells[i], slot);
                     bonds_broken_this_tick += 1;
                     continue;
                 }
                 let Some(&j_idx) = id_to_idx.get(&bond.other_cell_id) else {
                     self.cells[i].bonds[slot] = None;
+                    Self::clear_bond_rest_cos_slot(&mut self.cells[i], slot);
                     bonds_broken_this_tick += 1;
                     continue;
                 };
@@ -2689,6 +2822,7 @@ impl World {
                 let d = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
                 if d > bond.rest_length * crate::BOND_BREAK_FACTOR || d <= f32::EPSILON {
                     self.cells[i].bonds[slot] = None;
+                    Self::clear_bond_rest_cos_slot(&mut self.cells[i], slot);
                     bonds_broken_this_tick += 1;
                     continue;
                 }
@@ -2825,6 +2959,44 @@ impl World {
                 damping,
                 age_ticks: 0,
             });
+            // Sprint 202: record rest cosines between the new bond and any
+            // existing bonds on each endpoint, for the angle-spring bend
+            // term in `collision.wgsl`. Stored symmetric (`[a][b] = [b][a]`).
+            if dist > 1e-6 {
+                let n_ab = [d_vec[0] / dist, d_vec[1] / dist, d_vec[2] / dist];
+                let n_ba = [-n_ab[0], -n_ab[1], -n_ab[2]];
+                for &(self_idx, new_slot, n_new) in
+                    [(i_a, sa, n_ab), (i_b, sb, n_ba)].iter()
+                {
+                    let pos_self = positions_snapshot[self_idx];
+                    let cell = &mut self.cells[self_idx];
+                    for t in 0..MAX_BONDS_PER_CELL {
+                        if t == new_slot {
+                            continue;
+                        }
+                        let other_id = match cell.bonds[t] {
+                            Some(b) => b.other_cell_id,
+                            None => continue,
+                        };
+                        let Some(&t_idx) = id_to_idx.get(&other_id) else {
+                            continue;
+                        };
+                        let pos_t = positions_snapshot[t_idx];
+                        let dv = crate::min_image_delta(pos_t, pos_self, WORLD_HALF);
+                        let dt2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+                        if dt2 < 1e-12 {
+                            continue;
+                        }
+                        let inv = dt2.sqrt().recip();
+                        let n_t = [dv[0] * inv, dv[1] * inv, dv[2] * inv];
+                        let cos = n_new[0] * n_t[0]
+                            + n_new[1] * n_t[1]
+                            + n_new[2] * n_t[2];
+                        cell.bond_rest_cos[new_slot][t] = cos;
+                        cell.bond_rest_cos[t][new_slot] = cos;
+                    }
+                }
+            }
             // One-shot cost rozdělen na obě cells.
             self.cells[i_a].energy -= BOND_FORMATION_COST;
             self.cells[i_b].energy -= BOND_FORMATION_COST;
@@ -3163,46 +3335,24 @@ impl World {
         }
     }
 
-    /// 2D worlds skip the mechanic so pre-S197 2D smokes stay byte-identical.
+    /// Sprint 204: bearer cells pay extra body maintenance per tick. CPU post-
+    /// step pass (GPU step shader doesn't read symbiont state). Counterbalance
+    /// to `damage_resist_factor` — without this, bearers fixed at frac ~0.94
+    /// across S201-S203 because damage-resist gave asymmetric benefit. Bearer
+    /// cost creates trade-off: bearers thrive in dangerous niches (resist
+    /// savings > cost), non-bearers thrive in safe niches.
+    ///
+    /// Note: previously this method handled photosynthesis + upkeep + shed
+    /// (S197-S203). After S204 pivot to damage-resist, those mechanics moved
+    /// to apply_hazards / predate as multipliers; this method now just drains
+    /// bearer energy. Photosynthesis constants kept for future re-use.
     pub(crate) fn apply_symbiont_energy(&mut self, dt: f32) {
-        let half_z = WORLD_HALF[2];
-        if half_z <= 0.0 {
-            return;
-        }
-        let z_range = 2.0 * half_z;
-        let threshold = SYMBIONT_PHOTO_Z_THRESHOLD;
-        let denom = (1.0 - threshold).max(f32::EPSILON);
-        let upkeep = SYMBIONT_UPKEEP_PER_SEC * dt;
-        let ctx = crate::ThermalCtx::for_tick(self.clock.tick, self.clock.generation);
-        let mut sheds_this_pass: u64 = 0;
+        let drain = SYMBIONT_BODY_COST_PER_SEC * dt;
         for cell in self.cells.iter_mut() {
-            if cell.symbiont.is_none() {
-                continue;
-            }
-            let z_norm = ((cell.position[2] + half_z) / z_range).clamp(0.0, 1.0);
-            let light = (z_norm - threshold).max(0.0) / denom;
-            // Sprint 200 redesign: gain = (PHOTO_BASE + PHOTO_RATE × light) × metab × dt.
-            // Baseline (PHOTO_BASE) is metab-scaled but light-independent — bearer at
-            // z=0 with metab=1 breaks even with UPKEEP_PER_SEC. Light bonus drives
-            // upper-z selection. Cold-dark bearers still shed (metab-scaled gain
-            // < non-scaled upkeep), preserving selection pressure.
-            let temp = crate::temperature_at_z_with_ctx(cell.position[2], WORLD_HALF, &ctx);
-            let metabolism = crate::metabolism_factor(temp);
-            let photo_gain = (SYMBIONT_PHOTO_BASE + SYMBIONT_PHOTO_RATE * light) * metabolism * dt;
-            let net = photo_gain - upkeep;
-            cell.energy += net;
-            let sym = cell.symbiont.as_mut().unwrap();
-            if net < 0.0 {
-                sym.deficit_streak += 1;
-                if sym.deficit_streak > SYMBIONT_UPKEEP_DEFICIT_TICKS {
-                    cell.symbiont = None;
-                    sheds_this_pass += 1;
-                }
-            } else {
-                sym.deficit_streak = 0;
+            if cell.symbiont.is_some() {
+                cell.energy -= drain;
             }
         }
-        self.sym_sheds_gen += sheds_this_pass;
     }
 
 
@@ -3459,7 +3609,9 @@ impl World {
     /// `self.foods`. Variable allocation stays CPU-side; GPU only does the
     /// rejection work (world_map richness + obstacle mask + cell exclusion).
     fn spawn_food_dispatch(&mut self, rng: &mut impl Rng, budget: usize) {
-        if budget == 0 {
+        if budget == 0 || self.cells.is_empty() {
+            // wgpu refuses zero-sized storage bindings; the food-spawn shader
+            // also has nothing to reject against if the population is dead.
             return;
         }
         let k = budget * crate::MAX_SPAWN_ATTEMPTS;

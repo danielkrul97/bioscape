@@ -24,7 +24,7 @@ pub const VIBRATION_DIFFUSION: f32 = 0.15;
 /// dissipate quickly, but the original 4.0 was so aggressive that steady-state
 /// amplitude landed around 0.02 (sub-noise once tanh-normalized). 1.5 keeps
 /// vibrations clearly "of the moment" while letting the brain register them.
-pub const VIBRATION_DECAY: f32 = 1.5;
+pub const VIBRATION_DECAY: f32 = 0.7;
 
 /// Linear-motion contribution to emission. `K_LINEAR * speed / max_speed`
 /// reaches ~1.0 for a cell cruising at its own maximum velocity.
@@ -58,3 +58,20 @@ pub const VIBRATION_SAMPLE_EPSILON: f32 = 10.0;
 /// Brain input slot count owned by the vibration channel: `[grad_x, grad_y,
 /// grad_z, amp]` → 4 slots in `BRAIN_INPUTS_SENSORY`.
 pub const N_VIBRATION_INPUTS: usize = 4;
+
+/// Brain output index controlling active (brain-driven) vibration emission.
+/// `last_outputs[VIBRATION_EMIT_OUTPUT]` is rectified (max 0) and scaled by
+/// `MAX_ACTIVE_EMIT` before being added on top of passive motion emission.
+/// See `vibration_emit_for_cell` for the formula.
+pub const VIBRATION_EMIT_OUTPUT: usize = 14;
+
+/// Ceiling on the active emit component. Matches the passive emit max
+/// (`K_LINEAR + 2·K_ANGULAR = 2.0`) in order of magnitude so neither term
+/// can dominate the field on its own — selection has to combine them.
+pub const MAX_ACTIVE_EMIT: f32 = 1.5;
+
+/// Per-tick energy drain for brain-controlled emission. Drain at full output
+/// is `MAX_ACTIVE_EMIT × VIBRATION_EMIT_COST = 0.075`/s — comparable with
+/// `SENSOR_GAIN_COST × 1.0 = 0.1`/s but intentionally lower, so selection
+/// can carry the channel through the cold-start before listening evolves.
+pub const VIBRATION_EMIT_COST: f32 = 0.05;

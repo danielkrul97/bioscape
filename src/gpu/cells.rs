@@ -115,6 +115,10 @@ pub struct CellsGpu {
     damage_accum_buf: wgpu::Buffer,
     max_speed_buf: wgpu::Buffer,
     eff_radius_buf: wgpu::Buffer,
+    /// Sprint 202: inertial mass (`volume × MASS_DENSITY`). Replaces the
+    /// pre-S202 use of `effective_radius` as a mass proxy in motor /
+    /// collision / brownian shaders.
+    mass_buf: wgpu::Buffer,
     /// Bond-mediated communication inbox per cell, written each tick from CPU
     /// (mean of bonded peers' last_outputs message channels). Read by
     /// populate_inputs shader into brain inputs slots [27..29].
@@ -322,6 +326,10 @@ impl CellsGpu {
         let damage_accum_buf = mk("cells-damage", n * f, stor_dst_src);
         let max_speed_buf = mk("cells-max-speed", n * f, stor_dst_src);
         let eff_radius_buf = mk("cells-eff-radius", n * f, stor_dst_src);
+        // Sprint 202: inertial mass = volume × MASS_DENSITY. Uploaded
+        // alongside eff_radii each tick; consumed by motor / collision /
+        // brownian shaders.
+        let mass_buf = mk("cells-mass", n * f, stor_dst_src);
         let bonded_inbox_buf = mk(
             "cells-bonded-inbox",
             n * (N_BOND_MSG_CHANNELS as u64) * f,
@@ -395,6 +403,7 @@ impl CellsGpu {
             damage_accum_buf,
             max_speed_buf,
             eff_radius_buf,
+            mass_buf,
             bonded_inbox_buf,
             turn_rate_buf,
             angular_velocity_buf,
@@ -468,6 +477,7 @@ impl CellsGpu {
     pub fn damage_accum_buffer(&self) -> &wgpu::Buffer { &self.damage_accum_buf }
     pub fn max_speed_buffer(&self) -> &wgpu::Buffer { &self.max_speed_buf }
     pub fn eff_radius_buffer(&self) -> &wgpu::Buffer { &self.eff_radius_buf }
+    pub fn mass_buffer(&self) -> &wgpu::Buffer { &self.mass_buf }
     pub fn bonded_inbox_buffer(&self) -> &wgpu::Buffer { &self.bonded_inbox_buf }
     /// Motor accessors. `turn_rate` is read-only; angular/pitch velocities
     /// are read-write.
@@ -865,18 +875,21 @@ impl CellsGpu {
         damage_accums: &[f32],
         max_speeds: &[f32],
         eff_radii: &[f32],
+        masses: &[f32],
     ) {
         debug_assert_eq!(energies.len(), headings.len());
         debug_assert_eq!(energies.len(), pitches.len());
         debug_assert_eq!(energies.len(), damage_accums.len());
         debug_assert_eq!(energies.len(), max_speeds.len());
         debug_assert_eq!(energies.len(), eff_radii.len());
+        debug_assert_eq!(energies.len(), masses.len());
         self.queue.write_buffer(&self.energy_buf, 0, bytemuck::cast_slice(energies));
         self.queue.write_buffer(&self.heading_buf, 0, bytemuck::cast_slice(headings));
         self.queue.write_buffer(&self.pitch_buf, 0, bytemuck::cast_slice(pitches));
         self.queue.write_buffer(&self.damage_accum_buf, 0, bytemuck::cast_slice(damage_accums));
         self.queue.write_buffer(&self.max_speed_buf, 0, bytemuck::cast_slice(max_speeds));
         self.queue.write_buffer(&self.eff_radius_buf, 0, bytemuck::cast_slice(eff_radii));
+        self.queue.write_buffer(&self.mass_buf, 0, bytemuck::cast_slice(masses));
     }
 
     /// Uploaduje brain weights pro N cells. Volá se na sim init + po reproduce

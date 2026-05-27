@@ -168,7 +168,7 @@ pub fn los_clear(field: Option<&ObstacleField>, origin: [f32; 3], target: [f32; 
 /// so the baseline drain is ~0.9/s — comparable with body maintenance.
 /// Cells that turn off duplicate sensors in a cluster save proportionally,
 /// making specialization net-positive.
-pub const SENSOR_GAIN_COST: f32 = 0.3;
+pub const SENSOR_GAIN_COST: f32 = 0.1;
 /// Per-category gain range. 0 = sensor effectively off, 1 = neutral, 2 =
 /// boosted (better detection, higher cost).
 pub const MIN_SENSOR_GAIN: f32 = 0.0;
@@ -331,18 +331,11 @@ where
     acc
 }
 
-/// Per-cell vibration emission rate — amplitude added to the field at
-/// `cell.position` each tick (caller multiplies by `dt`). Composed of two
-/// terms: linear speed normalized by the cell's own `max_speed`, and angular
-/// speed normalized by `turn_rate`. Both terms are clamped so a cell never
-/// emits unbounded amounts even if a numerical excursion temporarily exceeds
-/// its quoted maxima. Pure read — no side effects.
-///
-/// Single source of truth: headless `World::update_vibration`,
-/// `csv::write_stats`, and the renderer's `update_vibration_field` all call
-/// this so the emission formula stays in one place.
+/// Passive motion-driven emission only — linear + angular speed normalized
+/// by the cell's own max. Reuses the V7 formula; split out so callers can
+/// log passive vs active components separately without recomputing.
 #[inline]
-pub fn vibration_emit_for_cell(cell: &Cell) -> f32 {
+pub fn vibration_passive_emit_for_cell(cell: &Cell) -> f32 {
     let max_speed = cell.genome.max_speed.max(1e-3);
     let turn_rate = cell.genome.turn_rate.max(1e-3);
     let vx = cell.velocity[0];
@@ -353,4 +346,26 @@ pub fn vibration_emit_for_cell(cell: &Cell) -> f32 {
     let rot_norm = ((cell.angular_velocity.abs() + cell.pitch_velocity.abs()) / turn_rate)
         .clamp(0.0, 2.0);
     VIBRATION_K_LINEAR * speed_norm + VIBRATION_K_ANGULAR * rot_norm
+}
+
+/// Active (brain-controlled) emission — rectified `last_outputs[14]` scaled
+/// by `MAX_ACTIVE_EMIT`. Strict gate: negative output means silence, so
+/// selection sees a clear "emit / don't" decision boundary. Energy drain
+/// `active × VIBRATION_EMIT_COST × dt` is applied separately in `cell.rs`.
+#[inline]
+pub fn vibration_active_emit_for_cell(cell: &Cell) -> f32 {
+    cell.last_outputs[VIBRATION_EMIT_OUTPUT].max(0.0) * MAX_ACTIVE_EMIT
+}
+
+/// Per-cell vibration emission rate — amplitude added to the field at
+/// `cell.position` each tick (caller multiplies by `dt`). Sum of the V7
+/// passive motion-driven term and a new brain-controlled active term
+/// (see `vibration_active_emit_for_cell`). Pure read — no side effects.
+///
+/// Single source of truth: headless `World::update_vibration`,
+/// `csv::write_stats`, and the renderer's `update_vibration_field` all call
+/// this so the emission formula stays in one place.
+#[inline]
+pub fn vibration_emit_for_cell(cell: &Cell) -> f32 {
+    vibration_passive_emit_for_cell(cell) + vibration_active_emit_for_cell(cell)
 }

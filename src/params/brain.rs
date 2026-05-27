@@ -129,7 +129,10 @@ pub const BRAIN_INPUTS: usize = BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT;
 // Sloty 12..14 = bond message emit (N_BOND_MSG_CHANNELS). Brain forward
 // generuje raw signal v [-1, 1] (tanh); recipient sensor čte tyto hodnoty
 // z partnerova last_outputs.
-pub const BRAIN_OUTPUTS: usize = 12 + N_BOND_MSG_CHANNELS;
+// Slot 14 = active vibration emit (rectified, added to passive motion emit).
+// See `params/vibration.rs::{VIBRATION_EMIT_OUTPUT, MAX_ACTIVE_EMIT,
+// VIBRATION_EMIT_COST}` and `vibration_emit_for_cell`.
+pub const BRAIN_OUTPUTS: usize = 12 + N_BOND_MSG_CHANNELS + 1;
 /// Inicializační bias na thrust output bin v `Brain::random`. Bez něj má ~½
 /// random brainů thrust output blízko nuly (cell se sotva hýbe), což vytvářelo
 /// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce
@@ -156,3 +159,10 @@ pub const INNATE_ATTACK_BIAS: f32 = 0.4;
 /// emituje signal nad threshold by default; selekce pak negativně tuní
 /// (cells co nechtějí bondovat učí brain weights pull dolů).
 pub const INNATE_BOND_BIAS: f32 = 2.5;
+/// Vibration emit bias (b2[14]). Strongly negative so random brains default
+/// to silence — without this every fresh cell would emit ~0.3 × MAX_ACTIVE
+/// from gen 0, saturating the field, drowning the gradient signal, and
+/// burning energy with no selective justification. Selection has to pull
+/// the bias positive (or build positive weight pathways from hidden units)
+/// before active emission turns on. tanh(-2.0) ≈ -0.96, rectified to 0.
+pub const INNATE_VIBRATION_EMIT_BIAS: f32 = -2.0;

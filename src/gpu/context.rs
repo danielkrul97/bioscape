@@ -72,6 +72,8 @@ const _: () = assert!(W1_OFFSET == 0);
 // downstream offsets shift by BRAIN_HIDDEN × 2 = 90.
 const _: () = assert!(B1_OFFSET == 3870);
 const _: () = assert!(W2_OFFSET == 3915);
-const _: () = assert!(B2_OFFSET == 4545);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4559);
+// Active vibration emit: BRAIN_OUTPUTS 14→15 adds one row to w2 (45 floats)
+// and one extra b2 entry. Downstream offsets shift accordingly.
+const _: () = assert!(B2_OFFSET == 4590);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4605);
 

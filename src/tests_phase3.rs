@@ -756,7 +756,7 @@ fn motor_gpu_zero_outputs_parity_with_cpu() {
     let pitches = vec![0.0_f32; n];
     let max_speeds = vec![60.0_f32; n];
     let turn_rates = vec![2.5_f32; n];
-    let eff_radii = vec![1.0_f32; n];
+    let masses = vec![1.0_f32; n];
     let velocities_in = vec![[1.0_f32, 0.0, 0.0]; n];
     let angular_in = vec![0.0_f32; n];
     let pitch_vel_in = vec![0.0_f32; n];
@@ -769,7 +769,7 @@ fn motor_gpu_zero_outputs_parity_with_cpu() {
         }
     };
     let (gpu_v, _ga, _gp) = gpu.compute(
-        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &eff_radii,
+        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &masses,
         &velocities_in, &angular_in, &pitch_vel_in, dt, DRAG_COEFFICIENT,
     );
 
@@ -809,7 +809,7 @@ fn motor_gpu_small_batch_parity() {
     let pitches: Vec<f32> = cells.iter().map(|c| c.pitch).collect();
     let max_speeds: Vec<f32> = cells.iter().map(|c| c.genome.max_speed).collect();
     let turn_rates: Vec<f32> = cells.iter().map(|c| c.genome.turn_rate).collect();
-    let eff_radii: Vec<f32> = cells.iter().map(|c| c.phenotype.effective_radius()).collect();
+    let masses: Vec<f32> = cells.iter().map(|c| c.phenotype.mass()).collect();
     let velocities_in: Vec<[f32; 3]> = cells.iter().map(|c| c.velocity).collect();
     let angular_in: Vec<f32> = cells.iter().map(|c| c.angular_velocity).collect();
     let pitch_vel_in: Vec<f32> = cells.iter().map(|c| c.pitch_velocity).collect();
@@ -819,7 +819,7 @@ fn motor_gpu_small_batch_parity() {
         Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
     };
     let (gpu_v, gpu_a, gpu_p) = gpu.compute(
-        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &eff_radii,
+        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &masses,
         &velocities_in, &angular_in, &pitch_vel_in, dt, DRAG_COEFFICIENT,
     );
     for (i, cell) in cells.iter_mut().enumerate() {

@@ -232,6 +232,7 @@ pub fn make_mating_child_no_brain(
         // Sprint 66: child startuje bez bondů (čistý slate). Bondy se vytvoří
         // podle vlastního chování dítěte, neinheritují se po rodičích.
         bonds: [None; MAX_BONDS_PER_CELL],
+        bond_rest_cos: [[0.0; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL],
         // Sprint 80: cell_state se DĚDÍ (mid-parent + uniform noise σ ≈
         // CELL_STATE_INHERIT_NOISE), na rozdíl od bondů. Tím vzniká
         // fenotypová paměť přes generace bez genetické změny — lineage

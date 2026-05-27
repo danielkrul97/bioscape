@@ -117,6 +117,14 @@ pub struct Cell {
     /// Persistent spring bonds. Fixed-size array of `Option<Bond>` so `Cell`
     /// stays `Copy` and there are no per-cell heap allocations.
     pub bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
+    /// Sprint 202: rest cosine for every pair of bond slots, captured at the
+    /// moment the second bond of the pair forms. `bond_rest_cos[a][b] = cos`
+    /// where `cos` is the angle between bond `a` and bond `b` as seen from
+    /// this cell at formation time. Symmetric matrix (`[a][b] == [b][a]`);
+    /// diagonal and rows/cols of empty slots are unused (the shader skips
+    /// inactive bonds). Cleared per slot when a bond breaks.
+    #[serde(default = "default_bond_rest_cos")]
+    pub bond_rest_cos: [[f32; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL],
     /// Bistable cell state in `[0, 1]`. Not in the genome — inherited from
     /// the parent with noise, acting as phenotypic memory across generations.
     /// Positive feedback around 0.5 plus a `n_bonds()` bias produces two
@@ -322,6 +330,7 @@ impl Cell {
             reproduce_cooldown_ticks: 0,
             cell_id,
             bonds: [None; MAX_BONDS_PER_CELL],
+            bond_rest_cos: [[0.0; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL],
             // Kick around 0.5 (the unstable fixed point of the feedback)
             // so cells don't get stuck in the neutral zone at spawn. The
             // RNG draw is appended at the end so earlier draws retain
@@ -557,6 +566,8 @@ impl Cell {
         self.energy -= dev * dev * physics.thermal_optimum_penalty * dt;
         let total_sensor_gain: f32 = self.genome.sensor_gains.iter().sum();
         self.energy -= total_sensor_gain * SENSOR_GAIN_COST * dt_eff;
+        let active_vib_emit = self.last_outputs[VIBRATION_EMIT_OUTPUT].max(0.0) * MAX_ACTIVE_EMIT;
+        self.energy -= active_vib_emit * VIBRATION_EMIT_COST * dt_eff;
     }
 
     /// XY uses toroidal wrap (cylinder topology), Z reflects. Reflective XY
@@ -663,11 +674,13 @@ impl Cell {
     /// pitch_velocity. Reads `outputs[0] = turn`, `[1] = thrust`,
     /// `[7] = pitch`.
     pub fn apply_brain_motor(&mut self, outputs: &[f32; BRAIN_OUTPUTS], dt: f32) {
-        // F=ma with `mass = effective_radius` (arithmetic mean of body axes),
-        // not full `volume()`. Volume scaled inertia too aggressively for
-        // untrained brains and led to mass extinction in early smokes; the
-        // mean keeps inertia-by-size scaling without the cubic cost shock.
-        let mass = self.phenotype.effective_radius().max(0.01);
+        // Sprint 202: F=ma with `mass = volume × MASS_DENSITY`. Pre-S202 used
+        // `effective_radius` (linear scaling with size) as a mass proxy after
+        // a full-volume attempt killed untrained populations; the new
+        // `MASS_DENSITY = 0.1` keeps a typical 3³ cell at mass ≈ 2.7,
+        // matching the pre-S202 motor scale at typical size while restoring
+        // proper cubic dependence at the extremes.
+        let mass = self.phenotype.mass();
         let turn_rate = self.genome.turn_rate;
         let max_speed = self.genome.max_speed;
         let turn_signal = outputs[0];
@@ -873,7 +886,9 @@ impl Cell {
     /// in 2D mode so the stream state stays in lockstep regardless of
     /// `world_half_z`).
     pub fn apply_brownian(&mut self, sqrt_dt: f32, world_half_z: f32) {
-        let scale = THERMAL_NOISE * sqrt_dt;
+        // Sprint 202: brownian kicks scale as 1/√mass (equipartition).
+        let inv_sqrt_mass = self.phenotype.mass().sqrt().recip();
+        let scale = THERMAL_NOISE * sqrt_dt * inv_sqrt_mass;
         let (gx, gy) = self.xoshiro_state.next_gaussian_pair();
         self.velocity[0] += gx * scale;
         self.velocity[1] += gy * scale;

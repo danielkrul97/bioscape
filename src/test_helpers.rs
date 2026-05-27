@@ -140,6 +140,7 @@ pub fn base_cell() -> Cell {
         reproduce_cooldown_ticks: 0,
         cell_id: 0,
         bonds: [None; MAX_BONDS_PER_CELL],
+        bond_rest_cos: [[0.0; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL],
         cell_state: 0.5,
         last_best_food_d2: f32::MAX,
         xoshiro_state: Xoshiro128PlusPlus::from_cell_id(0),

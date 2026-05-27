@@ -1,10 +1,13 @@
 // Per-cell motor update — mirrors CPU `Cell::apply_brain_motor`. Reads
 // brain output slots 0 (turn), 1 (thrust), 7 (pitch); the remaining slots
-// are written by other consumers. Mass = `effective_radius` (the arithmetic
-// mean of the three body axes), not full volume — smoke-tuned for inertia
-// scaling without quadratic cost shock on untrained brains.
+// are written by other consumers.
+//
+// Sprint 202: `mass = volume × MASS_DENSITY` (the host fills `masses` from
+// `Phenotype::mass()`). Pre-S202 binding 6 carried `effective_radius` as a
+// mass proxy — the cubic dependence on size now matches real-physics
+// inertia instead of the linear approximation.
 
-const BRAIN_OUTPUTS: u32 = 14u; // 12 motor/morph + 2 bond message (V7)
+const BRAIN_OUTPUTS: u32 = 15u; // 12 motor/morph + 2 bond message + 1 vibration emit
 
 struct Params {
     num_cells: u32,
@@ -19,7 +22,7 @@ struct Params {
 @group(0) @binding(3) var<storage, read> pitches: array<f32>;
 @group(0) @binding(4) var<storage, read> max_speeds: array<f32>;
 @group(0) @binding(5) var<storage, read> turn_rates: array<f32>;
-@group(0) @binding(6) var<storage, read> effective_radii: array<f32>;
+@group(0) @binding(6) var<storage, read> masses: array<f32>;
 @group(0) @binding(7) var<storage, read_write> velocities: array<f32>;
 @group(0) @binding(8) var<storage, read_write> angular_velocities: array<f32>;
 @group(0) @binding(9) var<storage, read_write> pitch_velocities: array<f32>;
@@ -35,7 +38,7 @@ fn motor(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_cells) {
         return;
     }
-    let mass = max(effective_radii[i], 0.01);
+    let mass = max(masses[i], 0.01);
     let inv_mass = 1.0 / mass;
     let turn_rate = turn_rates[i];
     let max_speed = max_speeds[i];

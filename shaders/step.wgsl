@@ -45,6 +45,15 @@ struct StepParams {
     maze_active: u32,
     maze_res_x: u32,
     maze_res_y: u32,
+    // Sprint 202: thermal perturbation field (binding 13). Sampled at cell
+    // position and added to the analytic temperature base; lets warm /
+    // cool currents propagate spatially instead of being a strict function
+    // of z. `thermal_pert_active = 0` skips the sample so the legacy path
+    // stays byte-identical.
+    thermal_pert_active: u32,
+    thermal_res_x: u32,
+    thermal_res_y: u32,
+    thermal_res_z: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: StepParams;
@@ -67,6 +76,9 @@ struct StepParams {
 // at `MAZE_MASK_CAPACITY` u32s; only the first `maze_res_x * maze_res_y`
 // are read when `maze_active != 0`.
 @group(0) @binding(12) var<storage, read> maze_mask: array<u32>;
+// Sprint 202: thermal perturbation grid. Each voxel = f32 (bitcast<u32> on
+// upload by FieldGpu). Optional: skipped when `thermal_pert_active = 0`.
+@group(0) @binding(13) var<storage, read> thermal_pert_grid: array<u32>;
 
 @compute @workgroup_size(64)
 fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -140,7 +152,24 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
         let base = params.thermal_bottom + (params.thermal_top - params.thermal_bottom) * norm;
         let seasonal_offset = params.thermal_seasonal_amp * params.thermal_seasonal_sin;
         let diurnal_offset = params.thermal_diurnal_amp * norm * params.thermal_diurnal_sin;
-        let temp = base + seasonal_offset + diurnal_offset;
+        var temp = base + seasonal_offset + diurnal_offset;
+        // Sprint 202: nearest-voxel sample of the advected thermal pert field.
+        if (params.thermal_pert_active != 0u) {
+            let nx = params.thermal_res_x;
+            let ny = params.thermal_res_y;
+            let nz = params.thermal_res_z;
+            let cs_x = (2.0 * params.world_half_x) / f32(nx);
+            let cs_y = (2.0 * params.world_half_y) / f32(ny);
+            let cs_z = (2.0 * params.world_half_z) / f32(nz);
+            let xi = i32(floor((pos.x + params.world_half_x) / cs_x));
+            let yi = i32(floor((pos.y + params.world_half_y) / cs_y));
+            let zi = i32(floor((pos.z + params.world_half_z) / cs_z));
+            let xim = ((xi % i32(nx)) + i32(nx)) % i32(nx);
+            let yim = ((yi % i32(ny)) + i32(ny)) % i32(ny);
+            let zim = clamp(zi, 0, i32(nz) - 1);
+            let idx = u32(zim) * nx * ny + u32(yim) * nx + u32(xim);
+            temp = temp + bitcast<f32>(thermal_pert_grid[idx]);
+        }
         // `pow(q10, x) == exp2(x * log2(q10))`; CPU-side `thermal_log2_q10`
         // turns the per-cell pow into a single mul + exp2.
         let metabolism = exp2((temp - params.thermal_ref_temp) * 0.1 * params.thermal_log2_q10);

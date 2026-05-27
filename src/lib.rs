@@ -379,7 +379,14 @@ pub const SYMBIONT_INHERIT_P: f32 = 0.95;
 /// fagocytóza→endosymbióza, the canonical evolutionary pathway). Low rate
 /// keeps origin events rare enough that selection has time to fixate or
 /// purge a symbiont lineage between events.
-pub const SYMBIONT_CAPTURE_P: f32 = 0.005;
+pub const SYMBIONT_CAPTURE_P: f32 = 0.0;
+// S203: 0.005 → 0. S202 smoke showed bearer fraction stuck at 0.94-0.96
+// regardless of `SYMBIONT_DAMAGE_RESIST_FRAC` magnitude — predation transfer
+// was the dominant force, "infecting" non-bearers with bearer status faster
+// than transmission failure could erode the fraction. Disabling transfer
+// isolates the surviving channels: vertical inheritance (P_inherit=0.95
+// drift down) vs damage-resist survival edge (selection up). The
+// equilibrium between these two should produce real polymorphism.
 
 pub const SYMBIONT_PHOTO_RATE: f32 = 0.6;
 // S198 tuning history: PHOTO_RATE 0.6 unchanged (initial smoke already gave
@@ -425,7 +432,21 @@ pub const SYMBIONT_UPKEEP_DEFICIT_TICKS: u32 = 600;
 /// signal: bearers preferentially persist where damage is frequent;
 /// transmission failure (`P_inherit < 1`) plus host mortality remain the
 /// loss channels (no more deficit_streak shed).
-pub const SYMBIONT_DAMAGE_RESIST_FRAC: f32 = 0.5;
+pub const SYMBIONT_DAMAGE_RESIST_FRAC: f32 = 0.10;
+
+/// Sprint 204: bearer cells pay an extra per-second energy drain — the
+/// metabolic cost of maintaining the symbiont passenger. Counter-balances
+/// the damage-resist benefit (asymmetric advantage led to fixation in S201-
+/// S203). Trade-off: bearer thrives in danger-frequent niches (resist > cost),
+/// non-bearer thrives in safe niches (no cost > no benefit). Polymorphism
+/// emerges when both niches exist in the same world. Tuned at 0.5/sec ≈
+/// 5-15 % of typical baseline body cost.
+pub const SYMBIONT_BODY_COST_PER_SEC: f32 = 0.5;
+// S202 tune: 0.5 → 0.10. S201 smoke at 0.5 stabilized bearers but bearer
+// fraction climbed to 0.95-1.0 (near fixation) — selection advantage too
+// strong vs P_inherit=0.95 transmission failure. Polymorphism collapsed.
+// 5× weaker resist (10 % vs 50 %) aims for equilibrium ~50-70 %, preserving
+// bearer / non-bearer coexistence as a real evolutionary tension.
 
 // Sdílené testovací fixtures. Není gated #[cfg(test)] aby je mohly importovat
 // i binární testy (bin/headless/*_tests.rs) — bin se kompiluje proti lib bez

@@ -410,7 +410,7 @@ fn motor_gpu_matches_cpu() {
     let pitches: Vec<f32> = cells.iter().map(|c| c.pitch).collect();
     let max_speeds: Vec<f32> = cells.iter().map(|c| c.genome.max_speed).collect();
     let turn_rates: Vec<f32> = cells.iter().map(|c| c.genome.turn_rate).collect();
-    let eff_radii: Vec<f32> = cells.iter().map(|c| c.phenotype.effective_radius()).collect();
+    let masses: Vec<f32> = cells.iter().map(|c| c.phenotype.mass()).collect();
     let velocities_in: Vec<[f32; 3]> = cells.iter().map(|c| c.velocity).collect();
     let angular_in: Vec<f32> = cells.iter().map(|c| c.angular_velocity).collect();
     let pitch_vel_in: Vec<f32> = cells.iter().map(|c| c.pitch_velocity).collect();
@@ -420,7 +420,7 @@ fn motor_gpu_matches_cpu() {
         Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
     };
     let (gpu_v, gpu_a, gpu_p) = gpu.compute(
-        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &eff_radii,
+        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &masses,
         &velocities_in, &angular_in, &pitch_vel_in, dt, DRAG_COEFFICIENT,
     );
 

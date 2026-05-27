@@ -5,6 +5,8 @@ use bioscape::{
 };
 use std::path::PathBuf;
 
+#[cfg(feature = "audio")]
+mod audio;
 mod camera;
 mod components;
 mod config;
@@ -79,6 +81,9 @@ pub fn run() {
     // Sprint 187: Cell inspector — picking + gizmo outline + egui dialog
     // + JSON export. Pulls in `EguiPlugin` automatically.
     app.add_plugins(inspector::InspectorPlugin);
+
+    #[cfg(feature = "audio")]
+    app.add_plugins(audio::BioscapeAudioPlugin);
 
     // FrameTimeDiagnosticsPlugin runs unconditionally so the stats overlay
     // can show FPS — its overhead is just a few timestamps per frame. The

@@ -8,6 +8,45 @@ use super::*;
 // GPU field diffusion shared by smell and pheromone fields — same compute
 // path, separate `FieldGpu` instances.
 
+/// Sprint 202 — analytical curl-noise–like flow field, divergence-free in
+/// XY. Two superposed counter-rotating gyres + a small high-frequency
+/// modulation so the pattern is not strictly periodic. Z component is left
+/// at zero — the world is thin in z and vertical bulk flow would dominate
+/// the cell's own buoyancy. Returns world-units / sec per voxel.
+pub fn generate_curl_flow_field(
+    resolution: [usize; 3],
+    world_half: [f32; 3],
+    magnitude: f32,
+    scale: f32,
+) -> Vec<[f32; 3]> {
+    let n = resolution[0] * resolution[1] * resolution[2];
+    let mut out = vec![[0.0_f32; 3]; n];
+    let cs_x = 2.0 * world_half[0] / resolution[0] as f32;
+    let cs_y = 2.0 * world_half[1] / resolution[1] as f32;
+    let k1 = scale;
+    let k2 = scale * 2.3; // detuned to avoid a clean lattice resonance.
+    for k in 0..resolution[2] {
+        for j in 0..resolution[1] {
+            for i in 0..resolution[0] {
+                let x = -world_half[0] + (i as f32 + 0.5) * cs_x;
+                let y = -world_half[1] + (j as f32 + 0.5) * cs_y;
+                // Stream function ψ = sin(k1·x)·sin(k1·y) + 0.35·sin(k2·y)·cos(k2·x).
+                // Velocity = curl of ψ ẑ = (∂ψ/∂y, -∂ψ/∂x, 0), divergence-free
+                // by construction.
+                let vx = k1 * (k1 * x).sin() * (k1 * y).cos()
+                    + 0.35 * k2 * (k2 * y).cos() * (k2 * x).cos();
+                let vy = -k1 * (k1 * x).cos() * (k1 * y).sin()
+                    + 0.35 * k2 * (k2 * y).sin() * (k2 * x).sin();
+                let inv = ((vx * vx + vy * vy).sqrt() + 1e-6).recip();
+                let nrm = magnitude * inv;
+                let idx = k * resolution[0] * resolution[1] + j * resolution[0] + i;
+                out[idx] = [vx * nrm, vy * nrm, 0.0];
+            }
+        }
+    }
+    out
+}
+
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 struct FieldParams {
@@ -27,9 +66,11 @@ struct FieldParams {
     /// `mask[idx] != 0u` as Neumann zero-flux walls (mirror of CPU
     /// `SmellField::step_masked`). Mask buffer is binding 4.
     mask_active: u32,
-    _pad0: u32,
+    /// Sprint 202: when non-zero, the diffuse shader applies first-order
+    /// upwind advection using the flow_field buffer (binding 6).
+    flow_active: u32,
+    dt: f32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 pub struct FieldGpu {
@@ -55,6 +96,12 @@ pub struct FieldGpu {
     /// Wave 4: cached active-mask state. When `false`, the params'
     /// `mask_active` flag is also 0 and shader skips the mask check.
     mask_is_active: bool,
+    /// Sprint 202: per-voxel flow vector field (vec4 per voxel — vec3 + pad
+    /// to satisfy WGSL vec4 alignment). Set via `upload_flow_field`. While
+    /// not uploaded, defaults to zero → `flow_active = false` and advection
+    /// is skipped, so the no-flow path stays byte-identical.
+    flow_buf: wgpu::Buffer,
+    flow_is_active: bool,
     grid_readback: wgpu::Buffer,
     bg_round_a: wgpu::BindGroup,
     bg_round_b: wgpu::BindGroup,
@@ -177,6 +224,16 @@ impl FieldGpu {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -253,6 +310,22 @@ impl FieldGpu {
             mapped_at_creation: false,
         });
 
+        // Sprint 202 — per-voxel flow vector field (binding 6). vec4 stride
+        // = 16 bytes (3 floats + 1 pad to satisfy WGSL vec3 storage
+        // alignment). Zero-init = no advection on the unconfigured path.
+        let flow_size_bytes = (resolution[0]
+            * resolution[1]
+            * resolution[2]
+            * 4
+            * std::mem::size_of::<f32>()) as u64;
+        let flow_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("field-flow"),
+            size: flow_size_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&flow_buf, 0, &vec![0u8; flow_size_bytes as usize]);
+
         let make_bg = |grid_in: &wgpu::Buffer, grid_out: &wgpu::Buffer, label: &str| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
@@ -282,6 +355,10 @@ impl FieldGpu {
                         binding: 5,
                         resource: deposit_buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: flow_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -308,6 +385,8 @@ impl FieldGpu {
             mask_buf,
             deposit_buf,
             mask_is_active: false,
+            flow_buf,
+            flow_is_active: false,
             grid_readback,
             bg_round_a,
             bg_round_b,
@@ -385,11 +464,30 @@ impl FieldGpu {
                         binding: 5,
                         resource: self.deposit_buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: self.flow_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
         self.bg_round_a = make_bg(&self.grid_a, &self.grid_b, "field-bg-round-a");
         self.bg_round_b = make_bg(&self.grid_b, &self.grid_a, "field-bg-round-b");
+    }
+
+    /// Sprint 202 — upload a per-voxel flow vector field. `flow.len()` must
+    /// equal `res_x * res_y * res_z`; each entry is a world-units/sec
+    /// velocity. The shader packs vec3 into vec4 stride for WGSL alignment.
+    pub fn upload_flow_field(&mut self, flow: &[[f32; 3]]) {
+        let n = self.resolution[0] * self.resolution[1] * self.resolution[2];
+        assert_eq!(flow.len(), n, "flow field len mismatch");
+        let mut padded: Vec<f32> = Vec::with_capacity(n * 4);
+        for v in flow {
+            padded.extend_from_slice(&[v[0], v[1], v[2], 0.0]);
+        }
+        self.queue
+            .write_buffer(&self.flow_buf, 0, bytemuck::cast_slice(&padded));
+        self.flow_is_active = true;
     }
 
     /// Wave 4: upload an obstacle mask sized to this field's grid (one bool
@@ -437,9 +535,9 @@ impl FieldGpu {
             world_half_y: self.world_half[1],
             world_half_z: self.world_half[2],
             mask_active: if self.mask_is_active { 1 } else { 0 },
-            _pad0: 0,
+            flow_active: if self.flow_is_active { 1 } else { 0 },
+            dt,
             _pad1: 0,
-            _pad2: 0,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
