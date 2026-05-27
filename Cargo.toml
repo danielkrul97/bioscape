@@ -13,6 +13,14 @@ path = "src/lib.rs"
 name = "bioscape"
 path = "src/main.rs"
 
+[[bin]]
+name = "planet_view"
+path = "src/bin/planet_view/main.rs"
+
+[[bin]]
+name = "planet_headless"
+path = "src/bin/planet_headless/main.rs"
+
 # Trimmed Bevy feature set: skips `bevy_gilrs` (libudev) and `audio` (alsa)
 # so we don't need system packages for an evolution sim that uses neither.
 [dependencies]

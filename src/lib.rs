@@ -52,6 +52,8 @@ pub use sensors::*;
 
 pub mod sim;
 
+pub mod planet;
+
 pub mod json_export;
 
 pub mod xoshiro;
