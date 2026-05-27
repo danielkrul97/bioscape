@@ -161,6 +161,9 @@ fn eat_food(@builtin(global_invocation_id) gid: vec3<u32>) {
     let l = max(body.x * eat_f, 1e-9);
     let w = max(body.y * eat_f, 1e-9);
     let h = max(body.z * eat_f, 1e-9);
+    let inv_l = 1.0 / l;
+    let inv_w = 1.0 / w;
+    let inv_h = 1.0 / h;
 
     let search_r = eat_f * max_axis;
     let r_cells = i32(ceil(search_r / params.cell_size));
@@ -206,11 +209,11 @@ fn eat_food(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let dp = mdx * fwd.x + mdy * fwd.y + mdz * fwd.z;
                     let dr = mdx * right.x + mdy * right.y + mdz * right.z;
                     let du = mdx * up.x + mdy * up.y + mdz * up.z;
+                    let dp_n = dp * inv_l;
+                    let dr_n = dr * inv_w;
+                    let du_n = du * inv_h;
                     let inside =
-                        (dp / l) * (dp / l)
-                            + (dr / w) * (dr / w)
-                            + (du / h) * (du / h)
-                            <= 1.0;
+                        dp_n * dp_n + dr_n * dr_n + du_n * du_n <= 1.0;
                     if (!inside) {
                         continue;
                     }

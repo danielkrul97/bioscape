@@ -11,6 +11,10 @@ pub struct GpuFullScratch {
     // Upload scratch — naplňuje `brain_act_gpu_full` Phase 1 single pass přes cells.
     pub positions: Vec<[f32; 3]>,
     pub eff_radii: Vec<f32>,
+    /// Sprint 202 — inertial mass `volume × MASS_DENSITY`. Uploaded alongside
+    /// `eff_radii`; consumed by motor / collision / brownian shaders for the
+    /// `Δv = impulse / mass` conversion.
+    pub masses: Vec<f32>,
     pub vision_radii: Vec<f32>,
     pub food_positions: Vec<[f32; 3]>,
     pub energies: Vec<f32>,
@@ -27,6 +31,12 @@ pub struct GpuFullScratch {
     pub aux: Vec<[f32; 4]>,
     pub hidden_ns: Vec<u32>,
     pub bonded_inboxes: Vec<[f32; N_BOND_MSG_CHANNELS]>,
+    /// Sprint 198: per-cell symbiont presence (0/1) — read by populate_inputs
+    /// to drive brain input slot 39 (has_symbiont).
+    pub sym_has: Vec<u32>,
+    /// Sprint 198: per-cell symbiont `deficit_streak` (u32 ticks). Shader
+    /// normalises by SYMBIONT_UPKEEP_DEFICIT_TICKS for input slot 40.
+    pub sym_deficit: Vec<u32>,
     // Readback scratch — `CellsGpu::download_full_batch_into` zapisuje do těchto.
     /// Sprint 188: GPU now mirrors `last_inputs_buf` back to the CPU so
     /// `Cell.last_inputs` reflects what the brain actually saw this tick
@@ -51,6 +61,10 @@ pub struct GpuFullScratch {
     pub lt_headings: Vec<f32>,
     pub lt_pitches: Vec<f32>,
     pub lt_eff_radii: Vec<f32>,
+    /// Sprint 202 — late-tick inertial mass snapshot (volume × DENSITY) used
+    /// by `resolve_collisions_gpu_pass1` so bond / damping / adhesion impulses
+    /// convert correctly via `Δv = impulse · dt / mass`.
+    pub lt_masses: Vec<f32>,
     pub lt_max_axes: Vec<f32>,
     pub lt_body_dims: Vec<[f32; 3]>,
     pub lt_carnivore: Vec<f32>,
@@ -68,6 +82,9 @@ pub struct GpuFullScratch {
     pub lt_bond_rest: Vec<f32>,
     pub lt_bond_stiff: Vec<f32>,
     pub lt_bond_damp: Vec<f32>,
+    /// Sprint 202: BPC² flattened rest cosines per cell for the bond-bend
+    /// angle-spring term in `collision.wgsl`.
+    pub lt_bond_rest_cos: Vec<f32>,
     pub lt_rewards: Vec<f32>,
     // Per-food scratch (eat_food). Lengths == self.foods.len(), variable
     // across ticks as carrion drops/decays.
@@ -86,6 +103,7 @@ impl GpuFullScratch {
         }
         cr!(self.positions, n);
         cr!(self.eff_radii, n);
+        cr!(self.masses, n);
         cr!(self.vision_radii, n);
         cr!(self.food_positions, food_n);
         cr!(self.energies, n);
@@ -102,6 +120,8 @@ impl GpuFullScratch {
         cr!(self.aux, n);
         cr!(self.hidden_ns, n);
         cr!(self.bonded_inboxes, n);
+        cr!(self.sym_has, n);
+        cr!(self.sym_deficit, n);
     }
 
     /// Resize all per-cell snapshot fields to exactly `n` elements (filling
@@ -113,6 +133,8 @@ impl GpuFullScratch {
         self.positions.resize(n, [0.0; 3]);
         self.eff_radii.clear();
         self.eff_radii.resize(n, 0.0);
+        self.masses.clear();
+        self.masses.resize(n, 0.0);
         self.vision_radii.clear();
         self.vision_radii.resize(n, 0.0);
         self.energies.clear();

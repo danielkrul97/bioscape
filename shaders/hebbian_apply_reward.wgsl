@@ -26,14 +26,14 @@
 // genome `learning_rate`. The legacy `hebbian.wgsl` parity-test path keeps
 // the uniform scalar.
 
-const BRAIN_INPUTS: u32 = 84u;
+const BRAIN_INPUTS: u32 = 86u;
 const BRAIN_HIDDEN: u32 = 45u;
-const BRAIN_OUTPUTS: u32 = 14u;
+const BRAIN_OUTPUTS: u32 = 15u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3780u;
-const W2_OFFSET: u32 = 3825u;
-const B2_OFFSET: u32 = 4455u;
-const WEIGHTS_PER_CELL: u32 = 4469u;
+const B1_OFFSET: u32 = 3870u;
+const W2_OFFSET: u32 = 3915u;
+const B2_OFFSET: u32 = 4590u;
+const WEIGHTS_PER_CELL: u32 = 4605u;
 
 struct ApplyParams {
     num_cells: u32,

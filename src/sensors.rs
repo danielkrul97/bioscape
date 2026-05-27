@@ -26,9 +26,10 @@ pub struct BrainSensors {
     /// brain input [-1, 1] (Q10-aware škálování).
     pub temperature_local: f32,
     /// Mechanosensory gradient at cell position. Source = motion-driven
-    /// `VibrationField` (separate from chemical fields). Slots [29..32] in
-    /// `populate_brain_inputs`, tanh-normalized with
-    /// `VIBRATION_NORMALIZATION_GAIN`.
+    /// `VibrationField` (separate from chemical fields). Slots [29..31] in
+    /// `populate_brain_inputs`, tanh-normalized with `VIBRATION_GRAD_GAIN`
+    /// (split from the amp gain because the gradient magnitude is ~100×
+    /// smaller than the amp — same gain would leave grad at the noise floor).
     pub vibration_grad: [f32; 3],
     /// Local amplitude of the vibration field (= scalar sample at cell pos).
     /// Slot [32]. Combined with `vibration_grad` the brain can locate +
@@ -107,13 +108,14 @@ pub fn populate_brain_inputs(
         inputs[27 + k] = cell.bonded_inbox[k];
     }
     // Mechanosensory inputs — vibration gradient + amplitude. Slots
-    // [29..32] = grad_{x,y,z}, [32] = amp. tanh-normalized via
-    // `VIBRATION_NORMALIZATION_GAIN`; saturates on a single loud neighbor.
+    // [29..31] = grad_{x,y,z}, [32] = amp. Split gains: gradient is ~100×
+    // smaller than amp (diffuse field, large sample-epsilon), so it needs a
+    // bigger pre-tanh boost to escape the noise floor.
     let vib_base = 27 + N_BOND_MSG_CHANNELS;
-    inputs[vib_base] = tanh_fast_scalar(sensors.vibration_grad[0] * VIBRATION_NORMALIZATION_GAIN);
-    inputs[vib_base + 1] = tanh_fast_scalar(sensors.vibration_grad[1] * VIBRATION_NORMALIZATION_GAIN);
-    inputs[vib_base + 2] = tanh_fast_scalar(sensors.vibration_grad[2] * VIBRATION_NORMALIZATION_GAIN);
-    inputs[vib_base + 3] = tanh_fast_scalar(sensors.vibration_amp * VIBRATION_NORMALIZATION_GAIN);
+    inputs[vib_base] = tanh_fast_scalar(sensors.vibration_grad[0] * VIBRATION_GRAD_GAIN);
+    inputs[vib_base + 1] = tanh_fast_scalar(sensors.vibration_grad[1] * VIBRATION_GRAD_GAIN);
+    inputs[vib_base + 2] = tanh_fast_scalar(sensors.vibration_grad[2] * VIBRATION_GRAD_GAIN);
+    inputs[vib_base + 3] = tanh_fast_scalar(sensors.vibration_amp * VIBRATION_AMP_GAIN);
     // Wave 2 whiskers — [33..39] (= vib_base + 4 .. vib_base + 4 + WHISKER_COUNT).
     // Already in [0, 1] from the raycast helper; no extra normalization. Mapped
     // to [-1, 1] via 2x-1 so "clear" reads as +1 (preferred direction signal)
@@ -122,6 +124,22 @@ pub fn populate_brain_inputs(
     for k in 0..WHISKER_COUNT {
         inputs[wh_base + k] = sensors.whisker_distances[k] * 2.0 - 1.0;
     }
+    // Sprint 198: endosymbiosis brain integration. Two slots right after
+    // whiskers: has_symbiont (0/1 binary) and deficit_norm (current
+    // deficit_streak normalized to [0, 1]). Both stay at 0 for non-bearers,
+    // so a pre-S198 brain (everyone non-bearer) reads byte-identical zeros
+    // here — once the population evolves bearers, the brain has signals to
+    // correlate motor outputs with bearer status.
+    let sym_base = wh_base + WHISKER_COUNT;
+    let (sym_has, sym_def_norm) = match cell.symbiont.as_ref() {
+        Some(s) => (
+            1.0_f32,
+            (s.deficit_streak as f32 / SYMBIONT_UPKEEP_DEFICIT_TICKS as f32).clamp(0.0, 1.0),
+        ),
+        None => (0.0_f32, 0.0_f32),
+    };
+    inputs[sym_base] = sym_has;
+    inputs[sym_base + 1] = sym_def_norm;
     // Sprint 94: cluster-shared brain. Recurrent slots (21..52) čtou
     // `pooled_hidden` (mean self + bonded neighbors z předchozího ticku)
     // místo `last_hidden`. Solo cells: pool == self → behavior identical
@@ -150,7 +168,7 @@ pub fn los_clear(field: Option<&ObstacleField>, origin: [f32; 3], target: [f32; 
 /// so the baseline drain is ~0.9/s — comparable with body maintenance.
 /// Cells that turn off duplicate sensors in a cluster save proportionally,
 /// making specialization net-positive.
-pub const SENSOR_GAIN_COST: f32 = 0.3;
+pub const SENSOR_GAIN_COST: f32 = 0.1;
 /// Per-category gain range. 0 = sensor effectively off, 1 = neutral, 2 =
 /// boosted (better detection, higher cost).
 pub const MIN_SENSOR_GAIN: f32 = 0.0;
@@ -313,18 +331,11 @@ where
     acc
 }
 
-/// Per-cell vibration emission rate — amplitude added to the field at
-/// `cell.position` each tick (caller multiplies by `dt`). Composed of two
-/// terms: linear speed normalized by the cell's own `max_speed`, and angular
-/// speed normalized by `turn_rate`. Both terms are clamped so a cell never
-/// emits unbounded amounts even if a numerical excursion temporarily exceeds
-/// its quoted maxima. Pure read — no side effects.
-///
-/// Single source of truth: headless `World::update_vibration`,
-/// `csv::write_stats`, and the renderer's `update_vibration_field` all call
-/// this so the emission formula stays in one place.
+/// Passive motion-driven emission only — linear + angular speed normalized
+/// by the cell's own max. Reuses the V7 formula; split out so callers can
+/// log passive vs active components separately without recomputing.
 #[inline]
-pub fn vibration_emit_for_cell(cell: &Cell) -> f32 {
+pub fn vibration_passive_emit_for_cell(cell: &Cell) -> f32 {
     let max_speed = cell.genome.max_speed.max(1e-3);
     let turn_rate = cell.genome.turn_rate.max(1e-3);
     let vx = cell.velocity[0];
@@ -335,4 +346,26 @@ pub fn vibration_emit_for_cell(cell: &Cell) -> f32 {
     let rot_norm = ((cell.angular_velocity.abs() + cell.pitch_velocity.abs()) / turn_rate)
         .clamp(0.0, 2.0);
     VIBRATION_K_LINEAR * speed_norm + VIBRATION_K_ANGULAR * rot_norm
+}
+
+/// Active (brain-controlled) emission — rectified `last_outputs[14]` scaled
+/// by `MAX_ACTIVE_EMIT`. Strict gate: negative output means silence, so
+/// selection sees a clear "emit / don't" decision boundary. Energy drain
+/// `active × VIBRATION_EMIT_COST × dt` is applied separately in `cell.rs`.
+#[inline]
+pub fn vibration_active_emit_for_cell(cell: &Cell) -> f32 {
+    cell.last_outputs[VIBRATION_EMIT_OUTPUT].max(0.0) * MAX_ACTIVE_EMIT
+}
+
+/// Per-cell vibration emission rate — amplitude added to the field at
+/// `cell.position` each tick (caller multiplies by `dt`). Sum of the V7
+/// passive motion-driven term and a new brain-controlled active term
+/// (see `vibration_active_emit_for_cell`). Pure read — no side effects.
+///
+/// Single source of truth: headless `World::update_vibration`,
+/// `csv::write_stats`, and the renderer's `update_vibration_field` all call
+/// this so the emission formula stays in one place.
+#[inline]
+pub fn vibration_emit_for_cell(cell: &Cell) -> f32 {
+    vibration_passive_emit_for_cell(cell) + vibration_active_emit_for_cell(cell)
 }

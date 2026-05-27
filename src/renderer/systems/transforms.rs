@@ -2,12 +2,12 @@ use bevy::diagnostic::Diagnostics;
 use bevy::prelude::*;
 use std::time::Instant;
 
-use super::super::components::{CellEntity, Dying};
+use super::super::components::{CellEntity, Dying, Pooled};
 use super::super::config::{DEATH_FADE_TICKS, DIAG_SYNC_TRANSFORMS};
 use super::super::material::{cell_rotation, cell_scale};
 
 pub(crate) fn sync_transforms(
-    mut cells: Query<(&CellEntity, &mut Transform), Without<Dying>>,
+    mut cells: Query<(&CellEntity, &mut Transform), (Without<Dying>, Without<Pooled>)>,
     mut diag: Diagnostics,
 ) {
     let t = Instant::now();

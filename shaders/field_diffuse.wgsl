@@ -26,9 +26,12 @@ struct Params {
     world_half_z: f32,
     // Wave 4: when non-zero, masked voxels become Neumann zero-flux walls.
     mask_active: u32,
-    _pad0: u32,
+    // Sprint 202: when non-zero, the flow_field binding (6) carries a 3D
+    // velocity field that drives an upwind advection step. `dt` is the
+    // step length used to convert flow speed into a per-cell shift.
+    flow_active: u32,
+    dt: f32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -40,6 +43,20 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> grid_in: array<u32>;
 @group(0) @binding(3) var<storage, read_write> grid_out: array<u32>;
 @group(0) @binding(4) var<storage, read> obstacle_mask: array<u32>;
+// Fixed-point deposit accumulator written by field_deposit.wgsl. Decoded and
+// folded into the f32 grid here — keeps the deposit add associative (host
+// zeroes it each step) while diffuse stays the single writer per voxel.
+@group(0) @binding(5) var<storage, read_write> deposit_accum: array<u32>;
+// Sprint 202: per-voxel flow vector (world-units / sec). `flow_active = 0`
+// skips advection and leaves diffuse running like pre-S202.
+@group(0) @binding(6) var<storage, read> flow_field: array<vec4<f32>>;
+
+const DEPOSIT_FIXED_INV: f32 = 1.0 / 1048576.0;
+
+// Effective field value = persistent f32 grid + this step's decoded deposit.
+fn grid_val(idx: u32) -> f32 {
+    return bitcast<f32>(grid_in[idx]) + f32(deposit_accum[idx]) * DEPOSIT_FIXED_INV;
+}
 
 @compute @workgroup_size(4, 4, 4)
 fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -53,13 +70,15 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let plane = nx * ny;
-    let idx = k * plane + j * nx + i;
+    let plane_k = k * plane;
+    let row_jk = plane_k + j * nx;
+    let idx = row_jk + i;
     let masked = params.mask_active != 0u;
     if (masked && obstacle_mask[idx] != 0u) {
         grid_out[idx] = bitcast<u32>(0.0);
         return;
     }
-    let center = bitcast<f32>(grid_in[idx]);
+    let center = grid_val(idx);
 
     // Branchless toroidal wrap on xy.
     let i_left  = select(i - 1u, nx - 1u, i == 0u);
@@ -70,18 +89,18 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k_back  = select(k - 1u, 0u,      k == 0u);
     let k_front = select(k + 1u, nz - 1u, k + 1u == nz);
 
-    let idx_left  = k * plane + j * nx + i_left;
-    let idx_right = k * plane + j * nx + i_right;
-    let idx_up    = k * plane + j_up * nx + i;
-    let idx_down  = k * plane + j_down * nx + i;
+    let idx_left  = row_jk + i_left;
+    let idx_right = row_jk + i_right;
+    let idx_up    = plane_k + j_up * nx + i;
+    let idx_down  = plane_k + j_down * nx + i;
     let idx_back  = k_back * plane + j * nx + i;
     let idx_front = k_front * plane + j * nx + i;
-    var left  = bitcast<f32>(grid_in[idx_left]);
-    var right = bitcast<f32>(grid_in[idx_right]);
-    var up    = bitcast<f32>(grid_in[idx_up]);
-    var down  = bitcast<f32>(grid_in[idx_down]);
-    var back  = bitcast<f32>(grid_in[idx_back]);
-    var front = bitcast<f32>(grid_in[idx_front]);
+    var left  = grid_val(idx_left);
+    var right = grid_val(idx_right);
+    var up    = grid_val(idx_up);
+    var down  = grid_val(idx_down);
+    var back  = grid_val(idx_back);
+    var front = grid_val(idx_front);
     if (masked) {
         if (obstacle_mask[idx_left]  != 0u) { left  = center; }
         if (obstacle_mask[idx_right] != 0u) { right = center; }
@@ -91,6 +110,26 @@ fn diffuse(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (obstacle_mask[idx_front] != 0u) { front = center; }
     }
 
-    let new_val = center + params.diffusion * (left + right + up + down + back + front - 6.0 * center);
+    var new_val = center + params.diffusion * (left + right + up + down + back + front - 6.0 * center);
+
+    // Sprint 202 — upwind advection: `c_new -= dt · (v · ∇c)`. Approximate
+    // the gradient with the same six neighbors already read above by picking
+    // the upwind one along each axis (the value the fluid is *flowing from*).
+    // First-order upwind is dissipative but stable for arbitrary flow.
+    if (params.flow_active != 0u) {
+        let v = flow_field[idx].xyz;
+        let cfl_x = v.x * params.dt / params.cell_size_x;
+        let cfl_y = v.y * params.dt / params.cell_size_y;
+        let cfl_z = v.z * params.dt / params.cell_size_z;
+        // Choose upstream sample along each axis based on sign of v.
+        let up_x = select(right, left, v.x >= 0.0);
+        let up_y = select(down, up, v.y >= 0.0);
+        let up_z = select(front, back, v.z >= 0.0);
+        new_val = new_val
+            - cfl_x * (center - up_x)
+            - cfl_y * (center - up_y)
+            - cfl_z * (center - up_z);
+    }
+
     grid_out[idx] = bitcast<u32>(new_val * params.decay);
 }

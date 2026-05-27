@@ -29,12 +29,17 @@ struct CollisionParams {
     bonds_per_cell: u32,
     max_contacts_per_cell: u32,
     // Sprint 192: dt = 1 / FIXED_TIMESTEP_HZ. Multiplies Hookean bond force
-    // to convert it into a per-tick velocity delta (`Δv = F · dt`). Pre-S192
-    // omitted dt → bond impulses were 60× too strong.
+    // to convert it into a per-tick velocity delta (`Δv = F · dt / m`).
+    // Pre-S192 omitted dt → bond impulses were 60× too strong; Sprint 202
+    // adds the `/m` term.
     dt: f32,
-    _pad0: u32,
+    // Sprint 202: bond bending stiffness/damping. Restoring force pulls each
+    // bond-pair on cell i back toward the rest cosine recorded at the moment
+    // the pair first appeared. Zero disables bending; conservative defaults
+    // in `params::physics`.
+    bond_bend_stiffness: f32,
+    bond_bend_damping: f32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: CollisionParams;
@@ -53,6 +58,17 @@ struct CollisionParams {
 @group(0) @binding(13) var<storage, read> bond_damping: array<f32>;
 @group(0) @binding(14) var<storage, read_write> contact_count: array<atomic<u32>>;
 @group(0) @binding(15) var<storage, read_write> contact_partners: array<u32>;
+// Sprint 202: per-cell inertial mass for bond spring impulse conversion
+// (`Δv = F · dt / mass`). Adhesion and depenetration stay mass-free —
+// adhesion is a per-tick velocity nudge (not a force), and depenetration
+// is position-only.
+@group(0) @binding(16) var<storage, read> masses: array<f32>;
+// Sprint 202: per-cell heading/pitch used by bond-bending to apply the
+// restoring force in the bond-pair plane. Bend storage:
+// `bond_rest_cos[i * BPC² + a * BPC + b]` = cosine of the rest angle
+// between bond slot `a` and slot `b` on cell `i`, captured at the moment
+// the second bond formed. `b > a` is canonical; `b <= a` slots are unused.
+@group(0) @binding(17) var<storage, read> bond_rest_cos: array<f32>;
 
 fn min_image_xy(d: f32, half: f32) -> f32 {
     let w = 2.0 * half;
@@ -210,10 +226,22 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Sprint 66 spring bonds: each cell carries up to `bonds_per_cell` slots
     // pre-resolved by the caller to partner indices (-1 = empty). The bond
     // force is Hookean spring × (dist − rest) plus per-bond linear damping
-    // along the spring axis. Overstretched bonds (dist > rest × break_factor)
-    // contribute zero force — the CPU side handles the actual break decision
-    // in a follow-up pass.
+    // along the spring axis. Sprint 202: divided by cell mass so the same
+    // genome-encoded stiffness produces consistent kinematics regardless of
+    // cell size. Overstretched bonds (dist > rest × break_factor) contribute
+    // zero force — the CPU side handles the actual break decision in a
+    // follow-up pass.
     let bond_base = i * params.bonds_per_cell;
+    let inv_mass = 1.0 / max(masses[i], 0.01);
+    let dt_over_m = params.dt * inv_mass;
+    // First pass: collect unit bond directions + cache `dist` for bending.
+    // BPC ≤ 6 (see `MAX_BONDS_PER_CELL`), so a static 6-slot scratch is fine.
+    var bond_dir: array<vec3<f32>, 6>;
+    var bond_active: array<u32, 6>;
+    for (var slot = 0u; slot < 6u; slot = slot + 1u) {
+        bond_dir[slot] = vec3<f32>(0.0, 0.0, 0.0);
+        bond_active[slot] = 0u;
+    }
     for (var slot = 0u; slot < params.bonds_per_cell; slot = slot + 1u) {
         let bond_idx = bond_base + slot;
         let j_signed = bond_partner_idx[bond_idx];
@@ -235,14 +263,16 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (d2 <= 1e-20) {
             continue;
         }
-        let dist = sqrt(d2);
+        let inv_d = inverseSqrt(d2);
+        let dist = d2 * inv_d;
         let rest = bond_rest[bond_idx];
         let break_len = rest * params.bond_break_factor;
         if (dist > break_len) {
             continue;
         }
-        let inv_d = 1.0 / dist;
         let n = d * inv_d;
+        bond_dir[slot] = n;
+        bond_active[slot] = 1u;
         let extension = dist - rest;
         let stiffness = bond_stiffness[bond_idx];
         let damping = bond_damping[bond_idx];
@@ -255,12 +285,67 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v_rel = vel_i - vel_j;
         let v_rel_n = dot(v_rel, n);
         let damp = -damping * v_rel_n;
-        // Sprint 192: integrate Hookean force over the tick. Pre-S192 wrote
-        // `mag` directly to `vel_deltas` (effectively 60× too strong).
-        let mag = (spring + damp) * params.dt;
+        // Sprint 192/202: integrate Hookean force over the tick AND divide
+        // by mass (`Δv = F · dt / m`).
+        let mag = (spring + damp) * dt_over_m;
         vdx_acc = vdx_acc + mag * n.x;
         vdy_acc = vdy_acc + mag * n.y;
         vdz_acc = vdz_acc + mag * n.z;
+    }
+
+    // Sprint 202 bond bending: for each pair of active bonds (a < b), pull
+    // the bond-pair angle back toward the rest cosine recorded at pair
+    // formation. The restoring force on cell i acts along the bisector of
+    // the two bond directions — when `cos(now) > cos(rest)` the angle is
+    // smaller than rest, so push i along (n_a + n_b) (outward) to open it
+    // up; when `cos(now) < cos(rest)` push along -(n_a + n_b) to close it.
+    // Damping uses the time-derivative of the cosine via v_rel projections.
+    if (params.bond_bend_stiffness > 0.0) {
+        let bpc = params.bonds_per_cell;
+        let cos_base = i * bpc * bpc;
+        for (var a = 0u; a < bpc; a = a + 1u) {
+            if (bond_active[a] == 0u) { continue; }
+            let n_a = bond_dir[a];
+            // Velocity of bond endpoint a relative to i (along n_a is radial,
+            // perpendicular is tangential). Used by damping below.
+            let bond_idx_a = bond_base + a;
+            let j_a = u32(bond_partner_idx[bond_idx_a]);
+            let vel_j_a = vec3<f32>(
+                velocities[j_a * 3u + 0u],
+                velocities[j_a * 3u + 1u],
+                velocities[j_a * 3u + 2u],
+            );
+            let v_rel_a = vel_i - vel_j_a;
+            for (var b = a + 1u; b < bpc; b = b + 1u) {
+                if (bond_active[b] == 0u) { continue; }
+                let n_b = bond_dir[b];
+                let cos_now = dot(n_a, n_b);
+                let cos_rest = bond_rest_cos[cos_base + a * bpc + b];
+                let bond_idx_b = bond_base + b;
+                let j_b = u32(bond_partner_idx[bond_idx_b]);
+                let vel_j_b = vec3<f32>(
+                    velocities[j_b * 3u + 0u],
+                    velocities[j_b * 3u + 1u],
+                    velocities[j_b * 3u + 2u],
+                );
+                let v_rel_b = vel_i - vel_j_b;
+                // Time derivative of n_a · n_b approximated from relative
+                // tangential motion at both endpoints.
+                let cos_dot = dot(v_rel_a, n_b) + dot(v_rel_b, n_a);
+                let bend_err = cos_now - cos_rest;
+                let bend_f =
+                    -params.bond_bend_stiffness * bend_err
+                    - params.bond_bend_damping * cos_dot;
+                // Apply along bisector direction (n_a + n_b). When bend_err
+                // is positive (angle too narrow), bend_f is negative → push
+                // i opposite the bisector → opens the angle.
+                let bisector = n_a + n_b;
+                let mag_b = bend_f * dt_over_m;
+                vdx_acc = vdx_acc + mag_b * bisector.x;
+                vdy_acc = vdy_acc + mag_b * bisector.y;
+                vdz_acc = vdz_acc + mag_b * bisector.z;
+            }
+        }
     }
 
     deltas[i * 3u + 0u] = dx_acc;

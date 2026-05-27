@@ -7,8 +7,8 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use crate::{
-    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, MazeDifficulty,
-    ObstacleField, SimClock, SmellField, SpatialGrid, WorldMap, BOND_BREAK_THRESHOLD,
+    reject_food_for_richness, Bond, Cell, CoopFood, EventCalendar, Food, Genome, MazeDifficulty, ShockEvent, ShockKind,
+    ObstacleField, SimClock, SmellField, SpatialGrid, Symbiont, WorldMap, BOND_BREAK_THRESHOLD,
     BOND_FORMATION_COST, BOND_FORM_THRESHOLD, BOND_FORM_TICKS, BOND_MAINTENANCE_PER_SEC,
     BOND_REST_LENGTH_SLACK, BRAIN_RECURRENT, CARRION_FOOD_COUNT, CELL_RADIUS,
     CONTACT_DECAY_TICKS, COOP_FOOD_MAX_CONCURRENT, COOP_FOOD_SPAWN_RATE_PER_TICK,
@@ -19,7 +19,8 @@ use crate::{
     PHEROMONE_COST_PER_RATE, PHEROMONE_DECAY_PER_CH, PHEROMONE_DIFFUSION_PER_CH,
     PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, PHEROMONE_SAMPLE_EPSILON, PHYSICS_CONFIG,
     SMELL_DECAY, SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, TICKS_PER_GENERATION, VIBRATION_DECAY,
+    SMELL_PER_FOOD, SMELL_SAMPLE_EPSILON, SYMBIONT_BODY_COST_PER_SEC, SYMBIONT_CAPTURE_P,
+    SYMBIONT_INIT_FRACTION, TICKS_PER_GENERATION, VIBRATION_DECAY,
     VIBRATION_DIFFUSION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, VIBRATION_SAMPLE_EPSILON,
     WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_FOOD_AMP,
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_UNITS_PER_FOOD,
@@ -28,22 +29,25 @@ use crate::{BRAIN_HIDDEN, BRAIN_INPUTS};
 use crate::{
     gpu::{
         BrainGpu, BrownianGpu, CellsGpu, CollisionGpu, CppnGpu, EatFoodGpu, EatFoodParamsGpu,
-        FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, HebbianGpu,
+        generate_curl_flow_field,
+        FieldGpu, FoodSpawnGpu, FoodSpawnParamsGpu, GpuContext, GpuFullScratch, GpuProfiler,
+        HebbianGpu,
         MotorGpu, PopulateInputsGpu, PopulateInputsParams, PredateGpu, PredateParamsGpu,
         ExcitabilityGpu, IzhikevichGpu, SensorGatherGpu, SensorParamsGpu, SpatialHashGpu,
         StdpApplyGpu, StdpEncodePreGpu, StdpStepGpu, StepGpu, StepParamsGpu, SynapticScaleGpu,
     },
-    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY,
+    AGE_DECAY_PER_SEC, ATTACK_COST_PER_SEC, BRAIN_INPUTS_SENSORY, FLOW_MAGNITUDE, FLOW_SCALE,
+    THERMAL_PERTURBATION_AMP, THERMAL_PERTURBATION_SOURCES_PER_GEN,
     BRAIN_OUTPUTS, CARRION_DECAY_PER_SEC, CARRION_FOOD_VALUE, DAMAGE_NORMALIZATION_GAIN,
     DENSITY_NORM_COUNT, DRAG_COEFFICIENT, ESCAPE_COOLDOWN_TICKS,
     ESCAPE_STREAK_THRESHOLD, FlushMode, GRAVITY as PHYS_GRAVITY,
     PHEROMONE_NORMALIZATION_GAIN, PLANT_FOOD_VALUE,
     PREDATION_REWARD_MAX, RewardAccumulator, RewardKind,
     ACTIVITY_EMA_ALPHA, DEFAULT_STDP_A_MINUS, DEFAULT_STDP_A_PLUS,
-    EXCITABILITY_DRIFT_PER_TICK, SCALING_PERIOD_TICKS, SCARCITY_FLOOR,
-    SCARCITY_RAMP_END_GEN, SHELL_COST_PER_SEC,
+    EXCITABILITY_DRIFT_PER_TICK, GRAM_SCHMIDT_STRENGTH, GS_PERIOD_TICKS, SCALING_PERIOD_TICKS,
+    SCARCITY_FLOOR, SCARCITY_RAMP_END_GEN, SHELL_COST_PER_SEC,
     LATERAL_INHIBITION_ALPHA, SMELL_NORMALIZATION_GAIN, SPIKE_COST_PER_SEC, THERMAL_NOISE,
-    VELOCITY_CAP_FACTOR, WEIGHT_DECAY_PER_TICK, W_NORM_CAP,
+    VELOCITY_CAP_FACTOR, WEIGHT_DECAY_PER_TICK, W_NORM_CAP, W_NORM_FLOOR,
 };
 use rand::Rng;
 use rayon::prelude::*;
@@ -72,7 +76,11 @@ const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
 /// RNG stream. V7 saves would deserialize via `serde(default)` to identical
 /// sentinel state across cells — that would make every cell move in noise
 /// lockstep, so we force-fail the version mismatch instead.
-const CHECKPOINT_VERSION: u32 = 8;
+/// V10: brain-controlled vibration emit — `BRAIN_OUTPUTS 14→15` resizes
+/// `Brain.w2`, `b2`, `trace_w2`, and `Cell.last_outputs`. V9 weight matrices
+/// don't match the new shape; force version mismatch rather than silently
+/// truncate / pad.
+const CHECKPOINT_VERSION: u32 = 10;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -192,15 +200,25 @@ pub struct World {
     /// jsou už bonded. O(1) lookup namísto lineárního scanu Cell.bonds per
     /// kandidáta.
     pub bonded_pairs_scratch: rustc_hash::FxHashSet<(u64, u64)>,
+    /// Scratch for `die_and_drop_carrion` Phase 3 — surviving cell_ids,
+    /// used to prune bonds whose partner was just swap-removed. Rebuilt
+    /// only on ticks where a death occurred.
+    pub survivor_ids_scratch: rustc_hash::FxHashSet<u64>,
     pub hidden_snapshot_scratch: Vec<[f32; BRAIN_HIDDEN]>,
     pub inputs_scratch: Vec<[f32; BRAIN_INPUTS]>,
     pub births_gen: u64,
     pub deaths_gen: u64,
     pub fertile_ticks_gen: u64,
     pub predation_events_gen: u64,
+    pub sym_sheds_gen: u64,
     /// Sprint 66: monotonic counter pro stable Cell.cell_id přidělování.
     /// Initial population uses 0..INITIAL_CELLS, takže start = INITIAL_CELLS.
     pub next_cell_id: u64,
+    /// Sprint 196: independent monotonic counter for `Symbiont.lineage_id`.
+    /// Separate from `next_cell_id` so host and symbiont lineages live in
+    /// disjoint ID spaces — a symbiont's identity is decoupled from any
+    /// specific host (predation transfer preserves the lineage_id).
+    pub next_symbiont_lineage_id: u64,
     /// Sprint 66: per-pair (min_id, max_id) → consecutive contact ticks.
     /// Vstupy se přidávají v `resolve_collisions` Phase 2 (sequential merge),
     /// odebírají při decay timeout. Sparse — pouze dvojice s aktuálním kontaktem.
@@ -233,6 +251,21 @@ pub struct World {
     /// shocků. Default empty (no-op) — sim loop ho zatím nečte; integrace
     /// efektů přijde v Sprintu 110+.
     pub events: EventCalendar,
+    /// Active `HazardPulse` events at the current generation. Refreshed
+    /// once per tick by `refresh_active_events`. Without this scratch,
+    /// `hazard_shock_multiplier` would scan all ~50k calendar events per
+    /// cell per tick (200 cells × 60 Hz × 50k = 600M iter/s).
+    pub active_hazard_events: Vec<ShockEvent>,
+    /// Active `ClimateShift` events at the current generation. Same
+    /// rationale as `active_hazard_events`.
+    pub active_climate_events: Vec<ShockEvent>,
+    /// Cursor into `events.events` — the first index that hasn't yet
+    /// fully ended. Monotonically non-decreasing across ticks; advanced
+    /// in `refresh_active_events` past events whose
+    /// `start_gen + duration_gen <= generation`. Reset to 0 only at
+    /// `World` construction (fresh ctor or checkpoint load — both rebuild
+    /// the whole struct).
+    pub first_live_event_idx: usize,
     // Sprint 87 Hamilton-rule sweep: runtime overrides pro food share. Default
     // = pre-sweep behavior (BOND_FOOD_SHARE_FRAC, no kin filter).
     pub share_frac: f32,
@@ -337,6 +370,11 @@ pub struct GpuFullState {
     /// binding 12. CPU `World.vibration` shadow is not synced on the
     /// `--gpu-full` path (kept only for checkpoint round-trip).
     pub vibration: FieldGpu,
+    /// Sprint 202 — thermal perturbation field. Diffuses + advects with the
+    /// same flow as smell / pheromone / vibration. Sampled by `step.wgsl`
+    /// and added on top of the analytic `temperature_at_z` base so warm
+    /// currents propagate spatially instead of being a pure function of z.
+    pub thermal_perturbation: FieldGpu,
     /// Sprint 60: GPU spatial hashes pro sensor broad-phase. Per-tick
     /// `dispatch()` (no readback) + sensor shader čte `offsets_buffer()` /
     /// `sorted_buffer()` přes binding group.
@@ -380,6 +418,9 @@ pub struct GpuFullState {
     pub excitability: ExcitabilityGpu,
     /// Persistent CPU snapshots — reused per tick, zachovává kapacitu.
     pub scratch: GpuFullScratch,
+    /// Serialize-and-time per-shader GPU profiler. Disabled unless
+    /// `init_gpu_full_profiled(true)` — then every method is a no-op.
+    pub profiler: GpuProfiler,
 }
 
 impl World {
@@ -449,7 +490,7 @@ impl World {
         // Initial cells: in maze mode reject spawn positions inside walls
         // (rejection sampling against the obstacle field). Non-maze path
         // unchanged.
-        let cells: Vec<Cell> = (0..initial_cells)
+        let mut cells: Vec<Cell> = (0..initial_cells)
             .map(|i| {
                 if let Some(field) = obstacles.as_ref() {
                     for _ in 0..MAX_SPAWN_ATTEMPTS {
@@ -464,6 +505,19 @@ impl World {
                 }
             })
             .collect();
+        // Sprint 196: seed the bearer pool. With probability SYMBIONT_INIT_FRACTION
+        // per cell, attach a freshly random Symbiont with its own independent
+        // lineage_id. Without this seed pool the predation-derived origin
+        // pathway has nothing to copy from. Runs after the cells collect so the
+        // host RNG sequence stays untouched until the symbiont draws begin.
+        let mut next_symbiont_lineage_id: u64 = 0;
+        for cell in cells.iter_mut() {
+            if rng.random::<f32>() < SYMBIONT_INIT_FRACTION {
+                let sym_genome = Genome::random(rng);
+                cell.symbiont = Some(Symbiont::new(sym_genome, next_symbiont_lineage_id));
+                next_symbiont_lineage_id += 1;
+            }
+        }
         let target = food_target(1.0);
         let foods = (0..target)
             .map(|_| {
@@ -516,13 +570,16 @@ impl World {
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
             bonded_pairs_scratch: rustc_hash::FxHashSet::default(),
+            survivor_ids_scratch: rustc_hash::FxHashSet::default(),
             hidden_snapshot_scratch: Vec::new(),
             inputs_scratch: Vec::new(),
             births_gen: 0,
             deaths_gen: 0,
             fertile_ticks_gen: 0,
             predation_events_gen: 0,
+            sym_sheds_gen: 0,
             next_cell_id: initial_cells as u64,
+            next_symbiont_lineage_id,
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
@@ -536,6 +593,9 @@ impl World {
             mating_radius,
             max_population,
             events,
+            active_hazard_events: Vec::new(),
+            active_climate_events: Vec::new(),
+            first_live_event_idx: 0,
             share_frac: crate::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
             predation_gain_mult: 1.0,
@@ -569,6 +629,13 @@ impl World {
     /// expect a GPU to be present; if you want a CPU-only path you'd have
     /// to revive the legacy code that Wave N deleted.
     pub fn init_gpu_full(&mut self) -> Result<(), String> {
+        self.init_gpu_full_profiled(false)
+    }
+
+    /// Same as `init_gpu_full`, but `gpu_profile = true` arms the
+    /// serialize-and-time per-shader `GpuProfiler` on the resulting
+    /// `GpuFullState`. Off, the profiler is inert.
+    pub fn init_gpu_full_profiled(&mut self, gpu_profile: bool) -> Result<(), String> {
         let cap = self.cells.len().max(self.max_population).max(64);
         let field_sources_cap =
             (food_target(1.0 + CYCLE_AMPLITUDE) + self.max_population) * 2;
@@ -608,6 +675,16 @@ impl World {
             [VIBRATION_GRID_RES, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z],
             WORLD_HALF,
             cap,
+        )?;
+        // Sprint 202 — thermal perturbation field. Same resolution as smell
+        // so the same flow vector field can be reused without resampling.
+        // Sources are sparse (`THERMAL_PERTURBATION_SOURCES_PER_GEN`); the
+        // capacity matches that.
+        let thermal_perturbation = FieldGpu::with_context(
+            &ctx,
+            [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+            WORLD_HALF,
+            THERMAL_PERTURBATION_SOURCES_PER_GEN.max(1),
         )?;
         let cell_hash = SpatialHashGpu::with_context(
             &ctx,
@@ -713,6 +790,7 @@ impl World {
             pheromone_ch1,
             pheromone_ch2,
             vibration,
+            thermal_perturbation,
             cell_hash,
             food_hash,
             sensor,
@@ -727,6 +805,7 @@ impl World {
             synaptic_scale,
             excitability,
             scratch: GpuFullScratch::default(),
+            profiler: GpuProfiler::new(ctx.device.clone(), gpu_profile),
         });
 
         if let Some(field) = self.obstacles.as_ref() {
@@ -750,6 +829,45 @@ impl World {
                 gpu.pheromone.upload_obstacle_mask(&phero_mask);
                 gpu.vibration.upload_obstacle_mask(&vib_mask);
             }
+        }
+
+        // Sprint 202 — generate the static curl-noise flow field once and
+        // share it across smell, pheromone (3 channels), vibration. All five
+        // fields use the same grid resolution + world bounds so a single
+        // sample table covers them.
+        if FLOW_MAGNITUDE > 0.0 {
+            let flow = generate_curl_flow_field(
+                [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+                WORLD_HALF,
+                FLOW_MAGNITUDE,
+                FLOW_SCALE,
+            );
+            if let Some(gpu) = self.gpu_full.as_mut() {
+                gpu.smell.upload_flow_field(&flow);
+                gpu.pheromone.upload_flow_field(&flow);
+                gpu.pheromone_ch1.upload_flow_field(&flow);
+                gpu.pheromone_ch2.upload_flow_field(&flow);
+                gpu.vibration.upload_flow_field(&flow);
+                gpu.thermal_perturbation.upload_flow_field(&flow);
+            }
+        }
+
+        // Sprint 202 — seed the thermal perturbation field with one initial
+        // round of warm patches so the smoke run sees thermal advection from
+        // tick 0. Subsequent ticks refresh sources in `step_thermal_field`.
+        if let Some(gpu) = self.gpu_full.as_mut() {
+            for s in 0..THERMAL_PERTURBATION_SOURCES_PER_GEN {
+                let frac = (s as f32 + 0.5) / THERMAL_PERTURBATION_SOURCES_PER_GEN as f32;
+                let x = (frac * 2.0 - 1.0) * WORLD_HALF[0] * 0.9;
+                let y = (frac * 6.28).sin() * WORLD_HALF[1] * 0.9;
+                gpu.thermal_perturbation
+                    .add_source([x, y, 0.0], THERMAL_PERTURBATION_AMP);
+            }
+            gpu.thermal_perturbation.step(
+                crate::THERMAL_PERTURBATION_DIFFUSION,
+                crate::THERMAL_PERTURBATION_DECAY,
+                1.0 / crate::FIXED_TIMESTEP_HZ,
+            );
         }
         Ok(())
     }
@@ -812,6 +930,15 @@ impl World {
             .max()
             .map(|m| m + 1)
             .unwrap_or(0);
+        // Sprint 196: re-derive next_symbiont_lineage_id from loaded cells.
+        // Symbiont presence is sparse — `filter_map` skips hosts without one.
+        let next_symbiont_lineage_id = chk
+            .cells
+            .iter()
+            .filter_map(|c| c.symbiont.as_ref().map(|s| s.lineage_id))
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
         // Sprint 126: deserialize multi-channel pheromone_fields. Délka
         // checkpoint pole se musí shodovat s build-time `N_PHEROMONE_CHANNELS`.
         if chk.pheromone_fields.len() != N_PHEROMONE_CHANNELS {
@@ -852,13 +979,16 @@ impl World {
             seen_pairs_scratch: rustc_hash::FxHashSet::default(),
             bond_candidates_scratch: Vec::new(),
             bonded_pairs_scratch: rustc_hash::FxHashSet::default(),
+            survivor_ids_scratch: rustc_hash::FxHashSet::default(),
             hidden_snapshot_scratch: Vec::new(),
             inputs_scratch: Vec::new(),
             births_gen: chk.births_gen,
             deaths_gen: chk.deaths_gen,
             fertile_ticks_gen: chk.fertile_ticks_gen,
             predation_events_gen: chk.predation_events_gen,
+            sym_sheds_gen: 0,
             next_cell_id,
+            next_symbiont_lineage_id,
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
             bonds_broken_gen: 0,
@@ -875,6 +1005,9 @@ impl World {
             // deterministicky odvozen z World seed). Resume CLI musí znovu
             // předat `--shocks-mean-gens`; jinak fresh empty.
             events: EventCalendar::default(),
+            active_hazard_events: Vec::new(),
+            active_climate_events: Vec::new(),
+            first_live_event_idx: 0,
             share_frac: crate::BOND_FOOD_SHARE_FRAC,
             kin_filter: false,
             predation_gain_mult: 1.0,
@@ -900,6 +1033,67 @@ impl World {
         })
     }
 
+    /// Rebuild `active_hazard_events` / `active_climate_events` from the
+    /// full calendar. Called at the top of each `tick` so the per-cell
+    /// shock callers iterate only the small active window instead of the
+    /// full ~50k-event calendar.
+    ///
+    /// Cost is amortised by `first_live_event_idx`, a monotone cursor past
+    /// events whose `[start_gen, start_gen + duration_gen)` window is
+    /// fully behind us, and by `partition_point` for the not-yet-started
+    /// upper bound (events are sorted by `start_gen` ascending). With
+    /// 50k events sparsely distributed across 1M generations, each tick
+    /// touches only the handful of events overlapping the current gen.
+    ///
+    /// `FoodCrash` events are skipped — they're a global per-gen scalar
+    /// consumed once per generation boundary, not per cell.
+    ///
+    /// Tests that mutate `events.events` directly (instead of going
+    /// through `tick`) must call this manually to keep the scratch in
+    /// sync with the calendar.
+    /// Sprint 202: clear row + column `slot` of `cell.bond_rest_cos` so that
+    /// a future bond reusing this slot doesn't pick up stale rest-cosines
+    /// from the previous occupant. Called from bond pruning paths.
+    fn clear_bond_rest_cos_slot(cell: &mut Cell, slot: usize) {
+        for t in 0..MAX_BONDS_PER_CELL {
+            cell.bond_rest_cos[slot][t] = 0.0;
+            cell.bond_rest_cos[t][slot] = 0.0;
+        }
+    }
+
+    pub fn refresh_active_events(&mut self) {
+        let gen = self.clock.generation;
+        let events = &self.events.events;
+        self.active_hazard_events.clear();
+        self.active_climate_events.clear();
+        if events.is_empty() {
+            return;
+        }
+        while self.first_live_event_idx < events.len() {
+            let e = &events[self.first_live_event_idx];
+            let end = e.start_gen.saturating_add(e.duration_gen as u64);
+            if end <= gen {
+                self.first_live_event_idx += 1;
+            } else {
+                break;
+            }
+        }
+        let upper = events.partition_point(|e| e.start_gen <= gen);
+        for e in &events[self.first_live_event_idx..upper] {
+            let end = e.start_gen.saturating_add(e.duration_gen as u64);
+            if gen >= end {
+                // Already ended, but an earlier event with longer duration
+                // is still live so we can't advance the cursor past it.
+                continue;
+            }
+            match e.kind {
+                ShockKind::HazardPulse => self.active_hazard_events.push(*e),
+                ShockKind::ClimateShift => self.active_climate_events.push(*e),
+                ShockKind::FoodCrash => {}
+            }
+        }
+    }
+
     /// Rebuild persistent `id_to_idx_scratch` from current `cells` order.
     /// Cell layout je stable v rámci fází 3–17 (před `reproduce` / `die_*`),
     /// takže build raz per tick stačí. `clear()` zachovává hashmap kapacity.
@@ -914,6 +1108,12 @@ impl World {
     pub fn tick(&mut self, rng: &mut impl Rng) -> Option<u64> {
         let dt = 1.0 / FIXED_TIMESTEP_HZ;
         let transitions = self.clock.advance();
+        // Filter the calendar down to events overlapping the current
+        // generation so per-cell shock callers (`apply_hazards`,
+        // `climate_offset_at`, the CPU `step` body) iterate O(active) not
+        // O(events). At `mean_gens_between=20` over 1M gens the full
+        // calendar is ~50k events but typically <10 overlap any given gen.
+        self.refresh_active_events();
         // Wave 3 curriculum: check ramp on generation roll-over. Rebuild
         // obstacles + masks when the active stage's difficulty differs from
         // what's currently allocated (and seed walks via maze_seed_step so
@@ -974,6 +1174,10 @@ impl World {
         timed!(update_smell, self.update_smell(dt));
         timed!(update_pheromone, self.update_pheromone(dt));
         timed!(update_vibration, self.update_vibration(dt));
+        timed!(
+            update_vibration,
+            self.update_thermal_perturbation(dt)
+        );
         // Persistent cell_id → idx — built once per tick, consumed v pool_bonded_hidden,
         // brain_act, resolve_collisions, eat_food. Cell layout je stable
         // od tady přes eat_food; reproduce/die_and_drop_carrion na konci ticku
@@ -1020,10 +1224,15 @@ impl World {
         timed!(apply_morph, self.apply_morph(dt));
         timed!(apply_brownian, self.apply_brownian(rng, dt));
         timed!(step, self.step(dt));
+        // Sprint 204: re-enabled as bearer body cost (rewritten to drain energy
+        // per tick instead of photosynthesis). Counterbalances damage_resist
+        // benefit — produces niche-conditional polymorphism. See
+        // apply_symbiont_energy for details.
+        self.apply_symbiont_energy(dt);
         timed!(apply_food_gravity, self.apply_food_gravity(dt));
         timed!(apply_hazards, self.apply_hazards(dt));
         timed!(resolve_collisions, self.resolve_collisions());
-        timed!(predate, self.predate());
+        timed!(predate, self.predate(rng));
         timed!(eat_food, self.eat_food());
         timed!(spawn_food, self.spawn_food(rng));
         self.spawn_coop_food(rng);
@@ -1041,11 +1250,24 @@ impl World {
         if self.clock.tick % SCALING_PERIOD_TICKS == 0 {
             if let Some(gpu) = self.gpu_full.as_ref() {
                 let n = self.cells.len();
+                // Cap/decay/floor run every tick; the O(hidden_n²) GS pass is
+                // throttled to every GS_PERIOD_TICKS with its per-application
+                // strength scaled up by the same factor, so the time-averaged
+                // decorrelation rate stays at GRAM_SCHMIDT_STRENGTH. gs = 0 on
+                // off-ticks makes the shader branch past the GS block.
+                let gs_strength = if self.clock.tick % GS_PERIOD_TICKS == 0 {
+                    GRAM_SCHMIDT_STRENGTH * GS_PERIOD_TICKS as f32
+                } else {
+                    0.0
+                };
                 gpu.synaptic_scale.dispatch(
                     &gpu.cells,
                     n,
                     W_NORM_CAP,
                     WEIGHT_DECAY_PER_TICK,
+                    gs_strength,
+                    W_NORM_FLOOR,
+                    gpu.brain.hidden_n_buffer(),
                 );
             }
         }
@@ -1197,6 +1419,38 @@ impl World {
         gpu.vibration.step(VIBRATION_DIFFUSION, VIBRATION_DECAY, dt);
     }
 
+    /// Sprint 202 — diffuse + advect the thermal perturbation field. Every
+    /// `THERMAL_REFRESH_PERIOD_TICKS` ticks, drop a fresh warm patch at a
+    /// rotating angular position so the seasonal warmth has a moving origin.
+    fn update_thermal_perturbation(&mut self, dt: f32) {
+        const THERMAL_REFRESH_PERIOD_TICKS: u64 = 60;
+        let tick = self.clock.tick;
+        let gpu = self.gpu_full.as_mut().expect("gpu_full mandatory");
+        if tick % THERMAL_REFRESH_PERIOD_TICKS == 0 {
+            for s in 0..crate::THERMAL_PERTURBATION_SOURCES_PER_GEN {
+                let phase = (tick as f32 / 60.0
+                    + s as f32 * core::f32::consts::TAU
+                        / crate::THERMAL_PERTURBATION_SOURCES_PER_GEN as f32)
+                    .rem_euclid(core::f32::consts::TAU);
+                let radius_xy = WORLD_HALF[0].min(WORLD_HALF[1]) * 0.75;
+                let x = phase.cos() * radius_xy;
+                let y = phase.sin() * radius_xy;
+                // Alternate sign so half the patches are cool perturbations.
+                let amp = if s % 2 == 0 {
+                    crate::THERMAL_PERTURBATION_AMP
+                } else {
+                    -crate::THERMAL_PERTURBATION_AMP
+                };
+                gpu.thermal_perturbation.add_source([x, y, 0.0], amp);
+            }
+        }
+        gpu.thermal_perturbation.step(
+            crate::THERMAL_PERTURBATION_DIFFUSION,
+            crate::THERMAL_PERTURBATION_DECAY,
+            dt,
+        );
+    }
+
     fn emit_pheromones(&mut self, dt: f32) {
         // Per-channel emission. Brain output slot map:
         //   [2]  = ch0 (slow, mating-friendly)
@@ -1289,6 +1543,7 @@ impl World {
         for cell in self.cells.iter() {
             s.positions.push(cell.position);
             s.eff_radii.push(cell.phenotype.effective_radius());
+            s.masses.push(cell.phenotype.mass());
             s.vision_radii.push(cell.genome.vision_radius);
             s.energies.push(cell.energy);
             s.headings.push(cell.heading);
@@ -1315,6 +1570,14 @@ impl World {
             ]);
             s.hidden_ns.push(cell.genome.brain.hidden_n);
             s.bonded_inboxes.push(cell.bonded_inbox);
+            // Sprint 198: symbiont state — read by populate_inputs.wgsl into
+            // brain input slots 39 (has) and 40 (deficit / threshold → [0, 1]).
+            let (sh, sd) = match cell.symbiont.as_ref() {
+                Some(sym) => (1u32, sym.deficit_streak),
+                None => (0u32, 0u32),
+            };
+            s.sym_has.push(sh);
+            s.sym_deficit.push(sd);
         }
         // Sprint 128: foods + coop_foods do single sensor pool.
         for food in self.foods.iter() {
@@ -1328,6 +1591,7 @@ impl World {
         // názvy proměnných, takže downstream kód zůstane beze změny).
         let positions = s.positions.as_slice();
         let eff_radii = s.eff_radii.as_slice();
+        let masses = s.masses.as_slice();
         let vision_radii = s.vision_radii.as_slice();
         let food_positions = s.food_positions.as_slice();
         let energies = s.energies.as_slice();
@@ -1344,6 +1608,7 @@ impl World {
         let body_dims = s.body_dims.as_slice();
         let aux = s.aux.as_slice();
 
+        gpu.profiler.frame_start();
         // Phase 2: upload cell metadata + velocities + angular/pitch velocities.
         gpu.cells.upload_metadata(
             &energies,
@@ -1352,6 +1617,7 @@ impl World {
             &damage_accums,
             &max_speeds,
             &eff_radii,
+            &masses,
         );
         gpu.cells.upload_velocities(&velocities);
         gpu.cells.upload_angular_pitch(&angular_vels, &pitch_vels);
@@ -1361,10 +1627,13 @@ impl World {
         gpu.cells.upload_body_dims(&body_dims);
         gpu.cells.upload_aux(&aux);
         gpu.cells.upload_bonded_inboxes(s.bonded_inboxes.as_slice());
+        gpu.cells.upload_symbiont_state(s.sym_has.as_slice(), s.sym_deficit.as_slice());
+        gpu.profiler.mark("uploads");
 
         // Phase 3: GPU spatial hash dispatch (no readback).
         gpu.cell_hash.dispatch(&positions);
         gpu.food_hash.dispatch(&food_positions);
+        gpu.profiler.mark("spatial_hash");
 
         // Phase 4: GPU SensorGather dispatch_no_readback. Output v output_buf
         // storage; populate_inputs shader bind direct.
@@ -1394,6 +1663,11 @@ impl World {
                 .as_ref()
                 .map(|f| f.resolution[1] as u32)
                 .unwrap_or(0),
+            // Sprint 195: seeds the whisker spring-damper transduction noise.
+            tick: self.clock.tick as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         gpu.sensor.dispatch_no_readback(
             &positions,
@@ -1409,8 +1683,10 @@ impl World {
             &gpu.pheromone_ch1,
             &gpu.pheromone_ch2,
             &gpu.vibration,
+            gpu.cells.whisker_state_buffer(),
             sensor_params,
         );
+        gpu.profiler.mark("sensor_gather");
 
         // Phase 5: GPU populate_inputs. Čte sensor.output_buf + cells metadata
         // → píše cells.last_inputs_buf. damage_accum_buf reset v shaderu.
@@ -1424,12 +1700,13 @@ impl World {
             phero_norm_gain: PHEROMONE_NORMALIZATION_GAIN,
             damage_norm_gain: DAMAGE_NORMALIZATION_GAIN,
             density_norm: DENSITY_NORM_COUNT,
-            vibration_norm_gain: crate::VIBRATION_NORMALIZATION_GAIN,
-            _pad0: 0,
+            vibration_amp_gain: crate::VIBRATION_AMP_GAIN,
+            vibration_grad_gain: crate::VIBRATION_GRAD_GAIN,
             _pad1: 0,
         };
         gpu.populate
             .dispatch(&gpu.cells, &gpu.sensor, populate_params);
+        gpu.profiler.mark("populate_inputs");
 
         // Phase 6: GPU brain forward_persistent. Čte `last_inputs_buf` direct,
         // píše last_hidden + last_outputs storage buffers.
@@ -1439,6 +1716,7 @@ impl World {
             &gpu.scratch.hidden_ns,
             LATERAL_INHIBITION_ALPHA,
         );
+        gpu.profiler.mark("brain_forward");
         // Sprint 147: Izhikevich forward runs AFTER perceptron — cells whose
         // `neuron_models[i] == Izhikevich` overwrite the perceptron's
         // last_hidden / last_outputs with spike-rate outputs. Perceptron
@@ -1449,6 +1727,7 @@ impl World {
         // write are both visible to the trace step that follows.
         let tick_u32 = self.clock.tick as u32;
         gpu.stdp_encode_pre.dispatch(&gpu.cells, n, tick_u32);
+        gpu.profiler.mark("stdp_encode_pre");
         gpu.izhikevich.dispatch(
             &gpu.cells,
             n,
@@ -1456,15 +1735,18 @@ impl World {
             LATERAL_INHIBITION_ALPHA,
             &gpu.scratch.hidden_ns,
         );
+        gpu.profiler.mark("izhikevich");
         // Trace decay+accumulate based on both pre and post spike-times.
         gpu.stdp_step
             .dispatch(&gpu.cells, n, tick_u32, crate::DEFAULT_STDP_TAU_TICKS);
+        gpu.profiler.mark("stdp_step");
 
         // Phase 7: GPU motor.dispatch_with_cells. Čte last_outputs + heading/
         // pitch/turn_rate/eff_radius/max_speed, mutuje velocity/angular_vel/
         // pitch_vel buffery in-place. Mirror lib::Cell::apply_brain_motor.
         gpu.motor
             .dispatch_with_cells(&gpu.cells, n, dt, DRAG_COEFFICIENT);
+        gpu.profiler.mark("motor");
 
         // Phase 8: GPU brownian dispatch (Sprint 51 path). Mutuje velocity_buf
         // s xoshiro128++ per-cell noise. Fused do brain_act → apply_brownian
@@ -1472,6 +1754,7 @@ impl World {
         let has_z = WORLD_HALF[2] > 0.0;
         gpu.brownian
             .compute_persistent(&gpu.cells, n, THERMAL_NOISE, dt, has_z);
+        gpu.profiler.mark("brownian");
 
         // Phase 9: GPU step.dispatch_with_cells. Mirror lib Cell::step
         // (kinematics + drag + energy costs + world bounce). Mutuje position/
@@ -1531,8 +1814,15 @@ impl World {
                 .as_ref()
                 .map(|f| f.resolution[1] as u32)
                 .unwrap_or(0),
+            thermal_pert_active: if FLOW_MAGNITUDE > 0.0 { 1 } else { 0 },
+            thermal_res_x: crate::SMELL_GRID_RES as u32,
+            thermal_res_y: crate::SMELL_GRID_RES as u32,
+            thermal_res_z: crate::SMELL_GRID_RES_Z as u32,
         };
-        gpu.step.dispatch_with_cells(&gpu.cells, n, step_params);
+        let thermal_grid_buf = gpu.thermal_perturbation.current_grid_buffer();
+        gpu.step
+            .dispatch_with_cells(&gpu.cells, n, step_params, thermal_grid_buf);
+        gpu.profiler.mark("step");
 
         // Phase 10: single batch readback (Sprint 63: 9 buffers fused do
         // jednoho Wait barrier). Pre-fix path 9 fresh Vec collect/to_vec —
@@ -1550,6 +1840,7 @@ impl World {
             &mut gpu.scratch.dl_cooldowns,
             &mut gpu.scratch.dl_energies,
         );
+        gpu.profiler.mark("download");
 
         // Phase 11: CPU writeback. NO apply_brain_motor + NO Cell::step CPU
         // (oba byly GPU-side). damage_accum reset (mirror populate_inputs).
@@ -1989,7 +2280,7 @@ impl World {
         // events prázdné → step_with_climate je byte-identical s step().
         let tick = self.clock.tick;
         let gen = self.clock.generation;
-        let events = &self.events.events;
+        let events = self.active_climate_events.as_slice();
         let ctx = crate::ThermalCtx::for_tick(tick, gen);
         let obstacles = self.obstacles.as_ref();
         for cell in &mut self.cells {
@@ -2143,17 +2434,33 @@ impl World {
         });
     }
 
-    /// Per-tick whisker raycast pass. Fills `cell.last_whisker_distances`
-    /// from `obstacles` so the sensor gather phase reads from the cell
-    /// without needing `&ObstacleField` plumbed through. No-op (leaves
-    /// defaults at 1.0 = "clear") when `obstacles` is `None`.
+    /// Per-tick whisker pass (Sprint 195): raycast the maze, then integrate
+    /// the per-whisker spring-damper so `cell.last_whisker_distances` holds
+    /// the *sensed* value the brain + renderer consume — not the raw raycast.
+    /// No-op (leaves defaults at 1.0 = "clear") when `obstacles` is `None`,
+    /// matching the maze-inactive GPU gate in `sensor_gather.wgsl`.
+    ///
+    /// The per-cell loop index `i` seeds the transduction noise and must
+    /// equal the GPU dispatch index for the same cell — both iterate
+    /// `self.cells` in order and this runs immediately before the GPU upload.
     pub fn update_whiskers(&mut self) {
         let Some(field) = self.obstacles.as_ref() else {
             return;
         };
-        self.cells.par_iter_mut().for_each(|cell| {
-            cell.last_whisker_distances =
+        let tick = self.clock.tick as u32;
+        self.cells.par_iter_mut().enumerate().for_each(|(i, cell)| {
+            let raw =
                 field.whisker_distances(cell.position, cell.heading, cell.pitch);
+            for k in 0..crate::WHISKER_COUNT {
+                let noise = crate::whisker_noise(i as u32, tick, k as u32)
+                    * crate::WHISKER_NOISE_AMPLITUDE;
+                cell.last_whisker_distances[k] = crate::whisker_step(
+                    &mut cell.whisker_deflection[k],
+                    &mut cell.whisker_deflection_vel[k],
+                    raw[k],
+                    noise,
+                );
+            }
         });
     }
 
@@ -2181,7 +2488,11 @@ impl World {
     }
 
     /// Sprint 112: per-cell climate offset helper, sdílený mezi tick hot path
-    /// a `write_stats` (CSV column `shock_climate_offset`).
+    /// a `write_stats` (CSV column `shock_climate_offset`). Reads the full
+    /// calendar (not the per-tick `active_climate_events` scratch) so
+    /// direct test access doesn't require manually refreshing the scratch.
+    /// CSV is per-gen-end so the O(events) scan is paid once per cell per
+    /// gen, not per tick.
     pub fn climate_offset_at(&self, pos_xy: [f32; 2]) -> f32 {
         crate::climate_shock_offset(
             &self.events.events,
@@ -2205,7 +2516,7 @@ impl World {
         // Sprint 110: HazardPulse shocks násobí drain (default 1.0 = no-op).
         let gen = self.clock.generation;
         let tick = self.clock.tick;
-        let events = &self.events.events;
+        let events = self.active_hazard_events.as_slice();
         let mut acc = RewardAccumulator::with_capacity(self.cells.len() / 16);
         for (i, cell) in self.cells.iter_mut().enumerate() {
             let noise = self
@@ -2218,14 +2529,26 @@ impl World {
                 tick,
                 WORLD_HALF,
             );
-            let drain = hazard_drain(noise) * dt * shock_mult;
+            let raw_drain = hazard_drain(noise) * dt * shock_mult;
+            // Sprint 201: bearer cells absorb less hazard damage.
+            let drain = raw_drain * cell.damage_resist_factor();
             cell.energy -= drain;
             cell.damage_accum += drain;
-            if drain > 0.0 {
+            let in_hazard = drain > 0.0;
+            if in_hazard {
                 // Sprint 187: per-cell damage sensitivity replaces global.
                 let w = cell.genome.reward_weights[RewardKind::Damage as usize];
                 acc.push(i, RewardKind::Damage, -(drain * w));
+            } else if cell.was_in_hazard_last_tick {
+                // Transition-out: cell was taking drain last tick, isn't this
+                // tick. Credit the brain's sensing+motor decision. Edge case:
+                // a HazardPulse shock ending naturally fires this for every
+                // cell still inside that tick — small noise vs the dominant
+                // signal of cells actively moving out of static map hazards.
+                let w = cell.genome.reward_weights[RewardKind::HazardAvoided as usize];
+                acc.push(i, RewardKind::HazardAvoided, w);
             }
+            cell.was_in_hazard_last_tick = in_hazard;
         }
         if !acc.is_empty() && self.gpu_full.is_some() {
             let n = self.cells.len();
@@ -2268,11 +2591,13 @@ impl World {
         let s = &mut gpu.scratch;
         s.lt_positions.clear();
         s.lt_eff_radii.clear();
+        s.lt_masses.clear();
         s.lt_max_axes.clear();
         s.lt_adhesion_types.clear();
         for c in cells.iter() {
             s.lt_positions.push(c.position);
             s.lt_eff_radii.push(c.phenotype.effective_radius());
+            s.lt_masses.push(c.phenotype.mass());
             s.lt_max_axes.push(c.phenotype.max_axis());
             s.lt_adhesion_types.push(c.genome.adhesion_type as u32);
         }
@@ -2284,6 +2609,11 @@ impl World {
         s.lt_bond_stiff.resize(total, 0.0);
         s.lt_bond_damp.clear();
         s.lt_bond_damp.resize(total, 0.0);
+        // Sprint 202: BPC² rest cosines per cell (shader reads only `b > a`).
+        let pair_stride = slots * slots;
+        let pairs_total = n * pair_stride;
+        s.lt_bond_rest_cos.clear();
+        s.lt_bond_rest_cos.resize(pairs_total, 0.0);
         for (i, c) in cells.iter().enumerate() {
             for (k, slot) in c.bonds.iter().enumerate() {
                 if let Some(b) = slot {
@@ -2296,8 +2626,19 @@ impl World {
                     }
                 }
             }
+            // Sprint 202: flatten the per-cell rest-cos matrix into the
+            // per-tick scratch. Only entries where both endpoint slots also
+            // map to live partners contribute to the shader bend pass; the
+            // shader gates by `bond_active[a]` AND `bond_active[b]`.
+            for a in 0..slots {
+                for b in 0..slots {
+                    let dst = i * pair_stride + a * slots + b;
+                    s.lt_bond_rest_cos[dst] = c.bond_rest_cos[a][b];
+                }
+            }
         }
 
+        gpu.profiler.resume();
         let mut encoder = gpu
             .cells
             .device()
@@ -2306,6 +2647,19 @@ impl World {
             });
         gpu.cell_hash
             .dispatch_into(&mut encoder, &s.lt_positions);
+        if gpu.profiler.enabled() {
+            // Flush the hash on its own command buffer so it lands in a
+            // distinct bucket. Queue submissions execute in order, so the
+            // collision pass still reads a fresh hash.
+            gpu.cells.queue().submit(Some(encoder.finish()));
+            gpu.profiler.mark("collision_hash");
+            encoder = gpu
+                .cells
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("resolve-collisions-encoder"),
+                });
+        }
         gpu.collision.dispatch_into_cells(
             &mut encoder,
             &gpu.cells,
@@ -2317,10 +2671,13 @@ impl World {
             &s.lt_bond_rest,
             &s.lt_bond_stiff,
             &s.lt_bond_damp,
+            &s.lt_bond_rest_cos,
             &gpu.cell_hash,
         );
         gpu.cells.queue().submit(Some(encoder.finish()));
+        gpu.profiler.mark("collision_shader");
         let result = gpu.collision.await_result(n);
+        gpu.profiler.mark("collision_readback");
 
         let max_contacts = crate::MAX_COLLISION_CONTACTS_PER_CELL as usize;
         for i in 0..n {
@@ -2450,11 +2807,13 @@ impl World {
                 let Some(bond) = self.cells[i].bonds[slot] else { continue };
                 if explicit_break {
                     self.cells[i].bonds[slot] = None;
+                    Self::clear_bond_rest_cos_slot(&mut self.cells[i], slot);
                     bonds_broken_this_tick += 1;
                     continue;
                 }
                 let Some(&j_idx) = id_to_idx.get(&bond.other_cell_id) else {
                     self.cells[i].bonds[slot] = None;
+                    Self::clear_bond_rest_cos_slot(&mut self.cells[i], slot);
                     bonds_broken_this_tick += 1;
                     continue;
                 };
@@ -2463,6 +2822,7 @@ impl World {
                 let d = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
                 if d > bond.rest_length * crate::BOND_BREAK_FACTOR || d <= f32::EPSILON {
                     self.cells[i].bonds[slot] = None;
+                    Self::clear_bond_rest_cos_slot(&mut self.cells[i], slot);
                     bonds_broken_this_tick += 1;
                     continue;
                 }
@@ -2599,6 +2959,44 @@ impl World {
                 damping,
                 age_ticks: 0,
             });
+            // Sprint 202: record rest cosines between the new bond and any
+            // existing bonds on each endpoint, for the angle-spring bend
+            // term in `collision.wgsl`. Stored symmetric (`[a][b] = [b][a]`).
+            if dist > 1e-6 {
+                let n_ab = [d_vec[0] / dist, d_vec[1] / dist, d_vec[2] / dist];
+                let n_ba = [-n_ab[0], -n_ab[1], -n_ab[2]];
+                for &(self_idx, new_slot, n_new) in
+                    [(i_a, sa, n_ab), (i_b, sb, n_ba)].iter()
+                {
+                    let pos_self = positions_snapshot[self_idx];
+                    let cell = &mut self.cells[self_idx];
+                    for t in 0..MAX_BONDS_PER_CELL {
+                        if t == new_slot {
+                            continue;
+                        }
+                        let other_id = match cell.bonds[t] {
+                            Some(b) => b.other_cell_id,
+                            None => continue,
+                        };
+                        let Some(&t_idx) = id_to_idx.get(&other_id) else {
+                            continue;
+                        };
+                        let pos_t = positions_snapshot[t_idx];
+                        let dv = crate::min_image_delta(pos_t, pos_self, WORLD_HALF);
+                        let dt2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+                        if dt2 < 1e-12 {
+                            continue;
+                        }
+                        let inv = dt2.sqrt().recip();
+                        let n_t = [dv[0] * inv, dv[1] * inv, dv[2] * inv];
+                        let cos = n_new[0] * n_t[0]
+                            + n_new[1] * n_t[1]
+                            + n_new[2] * n_t[2];
+                        cell.bond_rest_cos[new_slot][t] = cos;
+                        cell.bond_rest_cos[t][new_slot] = cos;
+                    }
+                }
+            }
             // One-shot cost rozdělen na obě cells.
             self.cells[i_a].energy -= BOND_FORMATION_COST;
             self.cells[i_b].energy -= BOND_FORMATION_COST;
@@ -2649,7 +3047,7 @@ impl World {
     /// first-K `victim_attackers`) so `bonded_attacks_gen`,
     /// `solo_attacks_gen`, `swarm_attacks_gen`, `pack_attacks_gen` and
     /// `attack_victims_gen` track real activity instead of staying at zero.
-    fn predate(&mut self) {
+    fn predate(&mut self, rng: &mut impl Rng) {
         let n = self.cells.len();
         if n == 0 {
             return;
@@ -2733,6 +3131,7 @@ impl World {
         }
         // Refresh GPU spatial hash with current (post-resolve_collisions)
         // positions before the predate dispatch.
+        gpu.profiler.resume();
         gpu.cell_hash.dispatch(&s.lt_positions);
         let result = gpu.predate.compute(
             &s.lt_positions,
@@ -2748,6 +3147,7 @@ impl World {
             &gpu.cell_hash,
             params,
         );
+        gpu.profiler.mark("predate");
         // Sprint 186: pack-hunting diagnostics. `attacker_event_count[i]`
         // and `attacker_gain_sum[i]` come from the GPU; bonded vs solo
         // partition uses `cell.n_bonds() >= 1`. Per-victim swarm + pack
@@ -2813,6 +3213,42 @@ impl World {
             }
         }
 
+        // Sprint 196: predation-derived symbiont acquisition. For each
+        // recorded (attacker, victim) hit, when victim is a bearer and
+        // attacker is not, with P_capture the attacker absorbs a copy
+        // (failed-digestion → endosymbiosis pathway). Victim keeps its
+        // symbiont (Symbiont is Copy) so multiple attackers can each
+        // independently roll without ordering dependencies.
+        for victim_idx in 0..n_cells {
+            let count = result.victim_attacker_count[victim_idx];
+            if count == 0 {
+                continue;
+            }
+            let Some(victim_sym) = self.cells[victim_idx].symbiont else {
+                continue;
+            };
+            let base = victim_idx * max_atk;
+            let slots = (count as usize).min(max_atk);
+            for k in 0..slots {
+                let raw = result.victim_attackers[base + k];
+                if raw == 0 {
+                    continue;
+                }
+                let attacker_idx = (raw - 1) as usize;
+                if attacker_idx >= n_cells || attacker_idx == victim_idx {
+                    continue;
+                }
+                if self.cells[attacker_idx].symbiont.is_some() {
+                    continue;
+                }
+                if rng.random::<f32>() < SYMBIONT_CAPTURE_P {
+                    let mut transferred = victim_sym;
+                    transferred.deficit_streak = 0;
+                    self.cells[attacker_idx].symbiont = Some(transferred);
+                }
+            }
+        }
+
         // Sprint 134: attacker `Predation(+gain × scale)` + victim
         // `EscapedAttack(+magnitude)` once `under_attack_streak` clears
         // a damage-free tick. Push events through the per-tick accumulator
@@ -2822,8 +3258,14 @@ impl World {
             let gained = result.energy_delta[i];
             let damage_this_tick = result.damage_delta[i];
 
-            cell.energy += gained;
-            cell.damage_accum += damage_this_tick;
+            // Sprint 201: bearer cells absorb only `(1 − RESIST_FRAC)` of the
+            // predation damage. `gained` is the GPU-computed net (raw_gain −
+            // raw_damage); we add back the resisted portion so net energy
+            // reflects actual harm taken.
+            let resist = cell.damage_resist_factor();
+            let damage_blocked = damage_this_tick * (1.0 - resist);
+            cell.energy += gained + damage_blocked;
+            cell.damage_accum += damage_this_tick * resist;
 
             if cell.escape_cooldown_ticks > 0 {
                 cell.escape_cooldown_ticks -= 1;
@@ -2857,6 +3299,18 @@ impl World {
                 {
                     acc.push(i, RewardKind::EscapedAttack, w_esc);
                     cell.escape_cooldown_ticks = ESCAPE_COOLDOWN_TICKS;
+                } else if cell.under_attack_streak >= 1
+                    && cell.escape_cooldown_ticks == 0
+                {
+                    // ThreatEscaped: brief-encounter survival — took at least
+                    // one tick of damage, then escaped before the persistent
+                    // EscapedAttack threshold. Shares the escape cooldown so
+                    // only one of {EscapedAttack, ThreatEscaped} fires per
+                    // window.
+                    let w_threat = cell.genome.reward_weights
+                        [RewardKind::ThreatEscaped as usize];
+                    acc.push(i, RewardKind::ThreatEscaped, w_threat);
+                    cell.escape_cooldown_ticks = ESCAPE_COOLDOWN_TICKS;
                 }
                 cell.under_attack_streak = 0;
             }
@@ -2878,6 +3332,26 @@ impl World {
                 DEFAULT_STDP_A_PLUS,
                 DEFAULT_STDP_A_MINUS,
             );
+        }
+    }
+
+    /// Sprint 204: bearer cells pay extra body maintenance per tick. CPU post-
+    /// step pass (GPU step shader doesn't read symbiont state). Counterbalance
+    /// to `damage_resist_factor` — without this, bearers fixed at frac ~0.94
+    /// across S201-S203 because damage-resist gave asymmetric benefit. Bearer
+    /// cost creates trade-off: bearers thrive in dangerous niches (resist
+    /// savings > cost), non-bearers thrive in safe niches.
+    ///
+    /// Note: previously this method handled photosynthesis + upkeep + shed
+    /// (S197-S203). After S204 pivot to damage-resist, those mechanics moved
+    /// to apply_hazards / predate as multipliers; this method now just drains
+    /// bearer energy. Photosynthesis constants kept for future re-use.
+    pub(crate) fn apply_symbiont_energy(&mut self, dt: f32) {
+        let drain = SYMBIONT_BODY_COST_PER_SEC * dt;
+        for cell in self.cells.iter_mut() {
+            if cell.symbiont.is_some() {
+                cell.energy -= drain;
+            }
         }
     }
 
@@ -2968,6 +3442,7 @@ impl World {
             // food_hash needs to reflect the current food set — refresh
             // before the eat_food dispatch (predate's hash is keyed on
             // cells, not foods).
+            gpu.profiler.resume();
             gpu.food_hash.dispatch(&s.lt_food_positions);
             let result = gpu.eat_food.compute(
                 &s.lt_positions,
@@ -2982,6 +3457,7 @@ impl World {
                 &gpu.food_hash,
                 params,
             );
+            gpu.profiler.mark("eat_food");
             let sentinel = n_foods as u32;
             (0..n)
                 .map(|i| {
@@ -3015,7 +3491,6 @@ impl World {
                 let donor_state;
                 let donor_lineage;
                 let donor_altruism;
-                let donor_cluster_bonus;
                 {
                     let cell = &mut self.cells[cell_idx];
                     cell.energy += *value;
@@ -3023,20 +3498,24 @@ impl World {
                     donor_state = cell.cell_state;
                     donor_lineage = cell.lineage_id;
                     donor_altruism = cell.genome.altruism_share_frac;
-                    donor_cluster_bonus = cell.genome.cluster_share_bonus;
                 }
                 // Sprint 80: donor's cell_state modulates share fraction.
                 // State≈0 (selfish) → ~0%; state≈1 (altruist) → full rate.
-                // Sprint 187: replace global `self.share_frac` and
-                // `BOND_FOOD_SHARE_CLUSTER_BONUS` with per-genome traits so
-                // selfish vs altruist phenotypes can emerge from selection.
-                // `self.kin_filter` (Sprint 87 Hamilton sweep) still gates
-                // sharing to same-lineage partners when set.
-                let n_bonds = bonds_copy.iter().filter(|b| b.is_some()).count() as f32;
-                let cluster_mult =
-                    1.0 + (n_bonds - 1.0).max(0.0) * donor_cluster_bonus;
+                // Sprint 193: share is conservative + sub-linear. The donor
+                // distributes a FIXED pool `value × altruism × state` split
+                // evenly across its bonded partners, so per-partner share is
+                // `1/n` and total energy injected into a cluster no longer
+                // scales with its size. Pre-S193 each partner received the
+                // full pool times a super-linear `cluster_mult`, making large
+                // clusters a runaway free-energy attractor that swamped any
+                // foraging-skill selection (S193 5×100-gen sweep:
+                // bond_active_frac 0 → 0.93). `self.kin_filter` (Sprint 87
+                // Hamilton sweep) still gates sharing to same-lineage
+                // partners when set.
+                let n_bonds =
+                    bonds_copy.iter().filter(|b| b.is_some()).count() as u32;
                 let share_value =
-                    *value * donor_altruism * donor_state * cluster_mult;
+                    bonded_food_share(*value, donor_altruism, donor_state, n_bonds);
                 if share_value > 0.0 {
                     for bond_opt in bonds_copy.iter() {
                         if let Some(bond) = bond_opt {
@@ -3130,7 +3609,9 @@ impl World {
     /// `self.foods`. Variable allocation stays CPU-side; GPU only does the
     /// rejection work (world_map richness + obstacle mask + cell exclusion).
     fn spawn_food_dispatch(&mut self, rng: &mut impl Rng, budget: usize) {
-        if budget == 0 {
+        if budget == 0 || self.cells.is_empty() {
+            // wgpu refuses zero-sized storage bindings; the food-spawn shader
+            // also has nothing to reject against if the population is dead.
             return;
         }
         let k = budget * crate::MAX_SPAWN_ATTEMPTS;
@@ -3216,7 +3697,12 @@ impl World {
             }
             let brains = gpu.cells.download_brains(n);
             for (cell, brain) in self.cells.iter_mut().zip(brains) {
+                // `download_brains` hardcodes `hidden_n = BRAIN_HIDDEN_DEFAULT`
+                // (it reads only the weight buffer); the evolved topology size
+                // lives in the CPU genome, so preserve it across the replace.
+                let hidden_n = cell.genome.brain.hidden_n;
                 cell.genome.brain = brain;
+                cell.genome.brain.hidden_n = hidden_n;
             }
         }
     }
@@ -3480,7 +3966,7 @@ impl World {
         // Phase 2: remove dead cells. --gpu-full uses swap_remove pattern so
         // GPU brain_weights + xoshiro_state lze udržet in sync přes O(deaths)
         // GPU memcpy operations (žádný full re-upload).
-        {
+        let deaths = {
             let before = self.cells.len();
             let gpu = self.gpu_full.as_ref().unwrap();
             let mut i = 0;
@@ -3496,7 +3982,33 @@ impl World {
                     i += 1;
                 }
             }
-            self.deaths_gen += (before - self.cells.len()) as u64;
+            let deaths = (before - self.cells.len()) as u64;
+            self.deaths_gen += deaths;
+            deaths
+        };
+
+        // Phase 3: prune bonds whose partner was just swap-removed. Without
+        // this the dangling bond survives until the next tick's
+        // `resolve_collisions` pruning, so any end-of-tick snapshot
+        // (inspector, headless dump, checkpoint) would show a bond to a
+        // cell that no longer exists.
+        if deaths > 0 {
+            self.survivor_ids_scratch.clear();
+            self.survivor_ids_scratch
+                .extend(self.cells.iter().map(|c| c.cell_id));
+            let survivors = &self.survivor_ids_scratch;
+            let mut pruned: u64 = 0;
+            for cell in self.cells.iter_mut() {
+                for slot in cell.bonds.iter_mut() {
+                    if let Some(bond) = *slot {
+                        if !survivors.contains(&bond.other_cell_id) {
+                            *slot = None;
+                            pruned += 1;
+                        }
+                    }
+                }
+            }
+            self.bonds_broken_gen += pruned;
         }
         self.foods.extend(new_foods);
     }
@@ -3534,6 +4046,24 @@ pub fn scarcity_factor(generation: u64) -> f32 {
     }
     let t = (generation as f32 / SCARCITY_RAMP_END_GEN as f32).min(1.0);
     1.0 + (SCARCITY_FLOOR - 1.0) * t
+}
+
+/// Sprint 193: per-partner bonded food-share amount. When a bonded cell eats
+/// food worth `value`, it distributes a fixed pool `value × altruism × state`
+/// split evenly across its `n_bonds` partners — so per-partner share is `1/n`
+/// and the total energy injected into a cluster is independent of its size.
+///
+/// Pre-S193 every partner received the full pool scaled by a super-linear
+/// `cluster_mult = 1 + (n−1) × cluster_bonus`, making total energy injected
+/// per food grow ~quadratically with cluster size. That turned "join the
+/// largest cluster" into a runaway attractor that swamped foraging-skill
+/// selection; the S193 scarcity ramp amplified it instead of breaking it
+/// (see `docs/sprints/193-202-environment-pressure.md`).
+pub fn bonded_food_share(value: f32, altruism: f32, state: f32, n_bonds: u32) -> f32 {
+    if n_bonds == 0 {
+        return 0.0;
+    }
+    (value * altruism * state) / n_bonds as f32
 }
 
 /// Rough static FLOP estimate per simulation tick at the given population.

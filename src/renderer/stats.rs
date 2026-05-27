@@ -2,8 +2,14 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use rustc_hash::FxHashSet;
 
-use super::components::{EpochEnded, GenerationEnded, StatsText};
+use super::components::{EpochEnded, GenerationEnded, StatsRoot, StatsText};
 use super::resources::{Clock, FoodDensityFactor, SimWorld};
+
+/// Wall-clock cadence for the stats overlay refresh. The per-cell reduction
+/// below — and especially `sync_vibration_from_gpu`, a full grid GPU readback
+/// behind a `Wait` barrier — is far too heavy to run every frame for a debug
+/// HUD. 10 Hz is plenty for numbers a human reads.
+const STATS_REFRESH_INTERVAL: f32 = 0.1;
 
 pub(super) fn log_clock_events(
     mut generation_ended: MessageReader<GenerationEnded>,
@@ -20,12 +26,31 @@ pub(super) fn log_clock_events(
 pub(super) fn update_stats_overlay(
     clock: Res<Clock>,
     time: Res<Time<Virtual>>,
+    real_time: Res<Time<Real>>,
     density: Res<FoodDensityFactor>,
     diagnostics: Res<DiagnosticsStore>,
-    sim_world: Res<SimWorld>,
+    mut sim_world: ResMut<SimWorld>,
     text: Single<&mut Text, With<StatsText>>,
+    stats_root: Single<&Node, With<StatsRoot>>,
     mut lineages_scratch: Local<FxHashSet<u64>>,
+    mut refresh_accum: Local<f32>,
 ) {
+    // Hidden overlay → nothing reads the reduction or the vibration shadow;
+    // skip the whole system, GPU readback included.
+    if matches!(stats_root.display, Display::None) {
+        return;
+    }
+    *refresh_accum += real_time.delta_secs();
+    if *refresh_accum < STATS_REFRESH_INTERVAL {
+        return;
+    }
+    *refresh_accum = 0.0;
+
+    // Pull the GPU vibration field into the CPU shadow here — this overlay is
+    // its only consumer, so the readback rides the throttle instead of firing
+    // every tick.
+    sim_world.0.sync_vibration_from_gpu();
+
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|d| d.smoothed())

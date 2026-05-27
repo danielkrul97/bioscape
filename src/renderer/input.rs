@@ -15,10 +15,10 @@ use super::gizmos::ShowVibration;
 use super::godmode::{GodMenuRoot, GodMode, GodModeState};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
-    AdhesionMaterials, CellEntityLookups, CellMesh, CellSlotMap, Clock, ContactProgress,
-    CoopFoodResource, EventCalendarResource, FoodDensityFactor, FoodMaterial, FoodMesh,
-    MazeWorld, NextCellId, PheromoneResource, SimRng, SimWorld, SmellResource, SpikeMaterial,
-    SpikeMesh, TickCounter, VibrationResource, WorldExtent, WorldMapResource,
+    AdhesionMaterials, CellEntityLookups, CellEntityPool, CellMesh, CellSlotMap, Clock,
+    ContactProgress, CoopFoodResource, EventCalendarResource, FoodDensityFactor, FoodMaterial,
+    FoodMesh, MazeWorld, NextCellId, PheromoneResource, SimRng, SimWorld, SmellResource,
+    SpikeMaterial, SpikeMesh, TickCounter, VibrationResource, WorldExtent, WorldMapResource,
 };
 use super::resources_gpu::GpuFullPipeline;
 use super::sim_config::SimConfig;
@@ -264,6 +264,7 @@ pub(super) struct RestartRegistries<'w> {
     pub(super) adhesion_materials: ResMut<'w, AdhesionMaterials>,
     pub(super) bio_materials: ResMut<'w, Assets<BioMaterial>>,
     pub(super) slot_map: ResMut<'w, CellSlotMap>,
+    pub(super) pool: ResMut<'w, CellEntityPool>,
     pub(super) next_id: ResMut<'w, NextCellId>,
 }
 
@@ -342,6 +343,12 @@ pub(super) fn restart_simulation(
     sim_res.god.state = GodModeState::Idle;
     registries.slot_map.slot_to_entity.clear();
     registries.slot_map.entity_to_slot.clear();
+    // R-press despawns all CellEntity (including hidden+pooled ones), so any
+    // Entity refs left in `free_cells` are now stale (generation bumped).
+    // The next `sync_simworld_to_cellentity` Grow phase would `pop()` a stale
+    // ref and panic on `insert<CellEntity>`. Clear the pool alongside the
+    // slot_map so the post-restart world starts with a fresh entity pool.
+    registries.pool.free_cells.clear();
 
     let half = extent.as_array();
     commands.insert_resource(SmellResource(SmellField::new(

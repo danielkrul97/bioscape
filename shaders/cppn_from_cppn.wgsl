@@ -33,21 +33,23 @@ const CPPN_INPUTS: u32 = 7u;
 const CPPN_OUTPUTS: u32 = 2u;
 const CPPN_LINK_EXISTS_THRESHOLD: f32 = 0.0;
 
-const BRAIN_INPUTS_SENSORY: u32 = 39u;  // Wave 2: 27 + 2 bond inbox + 4 vibration + 6 whisker
-const BRAIN_INPUTS: u32 = 84u;          // + 45 recurrent
+const BRAIN_INPUTS_SENSORY: u32 = 41u;  // S198: + 2 symbiont (has + deficit_norm)
+const BRAIN_INPUTS: u32 = 86u;          // + 45 recurrent
 const BRAIN_HIDDEN: u32 = 45u;
-const BRAIN_OUTPUTS: u32 = 14u;         // 12 motor/morph + 2 bond message
+const BRAIN_OUTPUTS: u32 = 15u;         // 12 motor/morph + 2 bond message + 1 vibration emit
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3780u;
-const W2_OFFSET: u32 = 3825u;
-const B2_OFFSET: u32 = 4455u;
-const WEIGHTS_PER_CELL: u32 = 4469u;
+const B1_OFFSET: u32 = 3870u;
+const W2_OFFSET: u32 = 3915u;
+const B2_OFFSET: u32 = 4590u;
+const WEIGHTS_PER_CELL: u32 = 4605u;
+const VIBRATION_EMIT_OUTPUT: u32 = 14u;
+const INNATE_VIBRATION_EMIT_BIAS: f32 = -2.0;
 
-const NUM_W1: u32 = 3780u;     // BRAIN_HIDDEN × BRAIN_INPUTS
+const NUM_W1: u32 = 3870u;     // BRAIN_HIDDEN × BRAIN_INPUTS
 const NUM_B1: u32 = 45u;       // BRAIN_HIDDEN
-const NUM_W2: u32 = 630u;      // BRAIN_OUTPUTS × BRAIN_HIDDEN
-const NUM_B2: u32 = 14u;       // BRAIN_OUTPUTS
-const QUERIES_PER_CHILD: u32 = 4469u; // NUM_W1 + NUM_B1 + NUM_W2 + NUM_B2
+const NUM_W2: u32 = 675u;      // BRAIN_OUTPUTS × BRAIN_HIDDEN
+const NUM_B2: u32 = 15u;       // BRAIN_OUTPUTS
+const QUERIES_PER_CHILD: u32 = 4605u; // NUM_W1 + NUM_B1 + NUM_W2 + NUM_B2
 
 struct Params {
     num_children: u32,
@@ -134,23 +136,19 @@ fn cppn_forward(cell_idx: u32, inputs: array<f32, 7>) -> vec2<f32> {
     let offsets_base = cell_idx * CPPN_LINK_OFFSETS_PER_CELL;
     let cell_meta = cppn_meta[cell_idx];
     let num_nodes = cell_meta.x;
+    // `cell_meta.z` carries the precomputed max_layer (CPU-side `pack`).
+    // Replaces the per-query O(num_nodes) scan over `cppn_nodes`.
+    let max_layer = cell_meta.z;
 
+    // WGSL zero-initializes function-scope `var` arrays — no explicit loop
+    // needed. Inputs immediately overwrite the slots they care about; the
+    // CPPN topological order ensures every `activations[from_id]` read in
+    // the layer pass has been written before.
     var activations: array<f32, 64>;
-    for (var k: u32 = 0u; k < CPPN_MAX_NODES; k = k + 1u) {
-        activations[k] = 0.0;
-    }
     // Inputs occupy nodes[0..CPPN_INPUTS] per `Cppn::random` layout.
     for (var k: u32 = 0u; k < CPPN_INPUTS; k = k + 1u) {
         let n = cppn_nodes[node_base + k];
         activations[n.id] = inputs[k];
-    }
-
-    var max_layer: u32 = 0u;
-    for (var k: u32 = 0u; k < num_nodes; k = k + 1u) {
-        let n = cppn_nodes[node_base + k];
-        if (n.layer > max_layer) {
-            max_layer = n.layer;
-        }
     }
 
     for (var layer: u32 = 1u; layer <= max_layer; layer = layer + 1u) {
@@ -243,6 +241,12 @@ fn cppn_from_cppn(@builtin(global_invocation_id) gid: vec3<u32>) {
     var value: f32 = 0.0;
     if (is_bias) {
         value = out.x * 0.5;
+        // Vibration emit: default silent — bias the b2[14] slot strongly
+        // negative so rectified output starts at 0. Mirrors CPU
+        // `Brain::from_cppn`'s post-jitter bias addition.
+        if (write_offset == B2_OFFSET + VIBRATION_EMIT_OUTPUT) {
+            value = value + INNATE_VIBRATION_EMIT_BIAS;
+        }
     } else if (out.y >= CPPN_LINK_EXISTS_THRESHOLD) {
         value = out.x;
     }

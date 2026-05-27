@@ -48,6 +48,16 @@ cargo build --release --bin headless
 
 The CSV contains per-generation stats: pop, lineages, body morphology, predation events, brain adoption metrics, and more.
 
+**Per-cell JSON dumps (opt-in):**
+
+```bash
+# Periodic + final dump to a directory. Off by default.
+./target/release/headless 0 200 /tmp/run.csv \
+    --dump-dir /tmp/run_dumps --dump-every 50 --dump-top 5 --dump-final-top 50
+```
+
+Layout: `<dir>/gen_NNNNNN/manifest.json` (population summary of all alive cells: `cell_id`, `lineage_id`, `age`, `energy`, `position`, `bond_count`, `adhesion_type`, …) plus full `cell_<id>_age<a>_lin<l>.json` for the top-K (selected by age desc, energy desc tiebreak). A `final/` directory is written at end-of-run with `--dump-final-top` cells. Cells in the summary carry a `has_full_dump` flag so a reader can scan the manifest for distribution stats without loading every full JSON. Same serializer drives the renderer inspector's "Save…" / "Copy" actions (`src/json_export.rs`).
+
 ## Documentation
 
 A scientific-context survey for the project (in Czech, accessible to laypeople too) lives in [`docs/`](docs/README.md):

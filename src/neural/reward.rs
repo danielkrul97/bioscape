@@ -19,6 +19,19 @@ pub enum RewardKind {
     Damage,
     BondFormed,
     MateSignalAccepted,
+    /// First cognitive-task reward: fires when a cell transitions out of a
+    /// hazard zone after being damaged by it last tick. Rewards the
+    /// sensing+motor decision (Hebbian credit assigned to the brain rule
+    /// that produced the escape) — not the demographic survival outcome.
+    HazardAvoided,
+    /// Brief-encounter variant of `EscapedAttack`: fires when a cell took at
+    /// least one tick of predation damage (under_attack_streak >= 1) and
+    /// then escapes (damage = 0 this tick) WITHOUT crossing the longer
+    /// `ESCAPE_STREAK_THRESHOLD` that gates `EscapedAttack`. Captures
+    /// near-miss survival of a predator approach. Shares the escape
+    /// cooldown with `EscapedAttack` — only one of the two fires per
+    /// cooldown window.
+    ThreatEscaped,
 }
 
 #[derive(Debug, Clone, Copy)]

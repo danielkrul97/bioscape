@@ -110,7 +110,9 @@ pub fn make_mating_child(
     cell_id: u64,
 ) -> Cell {
     let mut child = make_mating_child_no_brain(parent_a, parent_b, rng, cell_id);
-    child.genome.brain = Brain::from_cppn(&child.genome.cppn);
+    // `make_mating_child_no_brain` carries the inherited+mutated `hidden_n`
+    // in the placeholder brain; preserve it through CPPN materialisation.
+    child.genome.brain = Brain::from_cppn(&child.genome.cppn, child.genome.brain.hidden_n);
     child
 }
 
@@ -166,6 +168,40 @@ pub fn make_mating_child_no_brain(
         None => mid_pos,
     };
     let child_phenotype = Phenotype::from_genome(&child_genome);
+    // Sprint 196: symbiont vertical inheritance. Passes from a bearer parent
+    // with probability SYMBIONT_INHERIT_P (~0.95) — the < 1.0 cap models
+    // imperfect maternal transmission, one of three Sprint 196 loss channels
+    // (alongside host death and attacker-already-bears predation skip). When
+    // both parents are bearers, pick uniformly (no maternal/paternal
+    // distinction in this sim). Symbiont genome mutates via MUTATION_CONFIG
+    // independently of host genome, opening a second evolutionary axis.
+    let child_symbiont: Option<Symbiont> = match (
+        parent_a.symbiont.as_ref(),
+        parent_b.symbiont.as_ref(),
+    ) {
+        (None, None) => None,
+        (Some(donor), None) | (None, Some(donor)) => {
+            if rng.random::<f32>() < SYMBIONT_INHERIT_P {
+                Some(Symbiont::new(
+                    donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
+                    donor.lineage_id,
+                ))
+            } else {
+                None
+            }
+        }
+        (Some(a_sym), Some(b_sym)) => {
+            if rng.random::<f32>() < SYMBIONT_INHERIT_P {
+                let donor = if rng.random::<bool>() { a_sym } else { b_sym };
+                Some(Symbiont::new(
+                    donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
+                    donor.lineage_id,
+                ))
+            } else {
+                None
+            }
+        }
+    };
     Cell {
         position: pos,
         velocity: [
@@ -196,6 +232,7 @@ pub fn make_mating_child_no_brain(
         // Sprint 66: child startuje bez bondů (čistý slate). Bondy se vytvoří
         // podle vlastního chování dítěte, neinheritují se po rodičích.
         bonds: [None; MAX_BONDS_PER_CELL],
+        bond_rest_cos: [[0.0; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL],
         // Sprint 80: cell_state se DĚDÍ (mid-parent + uniform noise σ ≈
         // CELL_STATE_INHERIT_NOISE), na rozdíl od bondů. Tím vzniká
         // fenotypová paměť přes generace bez genetické změny — lineage
@@ -210,12 +247,16 @@ pub fn make_mating_child_no_brain(
         // the child's CPU and GPU brownian streams agree from tick 0.
         xoshiro_state: Xoshiro128PlusPlus::from_cell_id(cell_id),
         last_whisker_distances: [1.0; WHISKER_COUNT],
+        whisker_deflection: [0.0; WHISKER_COUNT],
+        whisker_deflection_vel: [0.0; WHISKER_COUNT],
         novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
         novelty_head: 0,
         under_attack_streak: 0,
         escape_cooldown_ticks: 0,
+        was_in_hazard_last_tick: false,
         phenotype: child_phenotype,
         genome: child_genome,
+        symbiont: child_symbiont,
     }
 }
 

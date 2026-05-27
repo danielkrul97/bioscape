@@ -48,6 +48,28 @@ pub const WHISKER_COUNT: usize = 6;
 /// speed).
 pub const WHISKER_RANGE: f32 = 90.0;
 
+/// Sprint 195 — whisker mechanical model. Each whisker is a driven damped
+/// harmonic oscillator: `accel = STIFFNESS·(target − deflection) −
+/// DAMPING·velocity`, integrated with semi-implicit Euler at the fixed sim
+/// step `dt = 1/60`. `target = 1 − raw_raycast_distance`, so a near wall
+/// pushes the shaft and it overshoots / rings / settles instead of snapping.
+///
+/// Spring constant (1/s²). Natural frequency ω = √STIFFNESS ≈ 19 rad/s
+/// (~3 Hz). Stays well inside semi-implicit Euler's stability budget at
+/// dt=1/60 (`STIFFNESS·dt² ≈ 0.1`); raising it eats that budget.
+pub const WHISKER_STIFFNESS: f32 = 360.0;
+
+/// Damping coefficient (1/s). Underdamped (`DAMPING < 2·√STIFFNESS ≈ 37.9`)
+/// so the whisker visibly rings before settling in ~0.2–0.5 s.
+pub const WHISKER_DAMPING: f32 = 11.0;
+
+/// Transduction noise amplitude added to the sensed whisker value, in
+/// normalized deflection units. Deterministic per `(cell, tick, whisker)`
+/// — see `whisker_noise`.
+pub const WHISKER_NOISE_AMPLITUDE: f32 = 0.03;
+// NOTE: the three constants above are mirrored as hardcoded literals in
+// `shaders/sensor_gather.wgsl` — keep them in sync.
+
 /// Eligibility-trace decay per second. Hebbian update changes from
 /// instantaneous `Δw = lr · reward · pre · post` (1-tick myopic) to trace-
 /// based: `e[i,j] *= decay; e[i,j] += pre · post; w[i,j] += lr · reward · e[i,j]`.

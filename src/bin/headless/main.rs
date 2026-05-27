@@ -22,12 +22,14 @@ use std::path::Path;
 use std::time::Instant;
 
 mod csv;
+mod dump;
 use bioscape::sim as world;
 
 #[cfg(test)]
 mod world_tests;
 
 use csv::*;
+use dump::{DumpConfig, RunMeta};
 use world::*;
 
 #[derive(Parser, Debug)]
@@ -114,6 +116,33 @@ struct Cli {
     /// observe Izhikevich niche dynamics from tick 1.
     #[arg(long, value_name = "FRAC", default_value_t = 0.0)]
     initial_izhikevich_frac: f32,
+
+    /// Enable per-generation + end-of-run JSON dumps to DIR. Off by default
+    /// (no I/O). Layout: `<DIR>/gen_<NNNNNN>/manifest.json + top-K cell
+    /// JSONs` and `<DIR>/final/...`. See `bin/headless/dump.rs`.
+    #[arg(long, value_name = "DIR")]
+    dump_dir: Option<String>,
+
+    /// Period in generations between periodic dumps (requires --dump-dir).
+    /// 0 disables periodic dumps (final-only mode).
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    dump_every: u64,
+
+    /// Top-K cells per periodic dump (by age desc, energy desc tiebreak).
+    #[arg(long, value_name = "K", default_value_t = 5)]
+    dump_top: usize,
+
+    /// Top-K cells for the final end-of-run dump (typically larger than
+    /// --dump-top for richer post-mortem analysis).
+    #[arg(long, value_name = "K", default_value_t = 50)]
+    dump_final_top: usize,
+
+    /// Arm the per-shader GPU profiler: each dispatch in the `--gpu-full`
+    /// tick path is followed by a blocking `poll(Wait)`, attributing wall
+    /// time to a named bucket. Serializes the pipeline (no pipelining
+    /// exists anyway); prints a sorted µs/tick table at end of run.
+    #[arg(long)]
+    gpu_profile: bool,
 }
 
 fn parse_maze_lenient(s: &str) -> MazeDifficulty {
@@ -177,6 +206,12 @@ fn main() {
     let shocks_mean_gens = cli.shocks_mean_gens;
     let save_path = cli.save;
     let load_path = cli.load;
+    let dump_cfg = cli.dump_dir.as_ref().map(|d| DumpConfig {
+        dir: std::path::PathBuf::from(d),
+        every: cli.dump_every,
+        periodic_top_k: cli.dump_top,
+        final_top_k: cli.dump_final_top,
+    });
     let share_frac_override = cli.share_frac;
     let kin_filter = cli.kin;
     let pred_gain_override = cli.pred_gain;
@@ -344,12 +379,15 @@ fn main() {
     {
         let cap = initial_cells.max(max_population).max(64);
         let field_sources_cap = (food_target(1.0 + CYCLE_AMPLITUDE) + max_population) * 2;
-        match world.init_gpu_full() {
+        match world.init_gpu_full_profiled(cli.gpu_profile) {
             Ok(()) => {
                 eprintln!(
                     "gpu-full: brain + Hebbian + Brownian + Field + SensorGather + PopulateInputs + Motor + Step (cap {} cells, {} field sources)",
                     cap, field_sources_cap
                 );
+                if cli.gpu_profile {
+                    eprintln!("gpu-profile: armed (per-shader serialize-and-time)");
+                }
             }
             Err(e) => {
                 // Wave N: no CPU fallback. GPU is the only compute path —
@@ -364,7 +402,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac,vib_emit_avg,vib_amp_avg,vib_grad_mag_avg,gain_mech_avg,gain_mech_dev,maze_active,maze_in_goal_frac,maze_unique_reach_frac,maze_first_reach_total,lr_avg,lr_std,decay_avg,decay_std,w_norm_avg,neural_spike_frac,izhikevich_frac,repro_avg,repro_std,birth_avg,birth_std,altruism_avg,altruism_std,cluster_bonus_avg,cluster_bonus_std,attack_gate_avg,attack_gate_std,size_ratio_avg,size_ratio_std,defense_avg,defense_std,rw_eatfood_avg,rw_novelty_avg,rw_predation_avg,rw_escape_avg,rw_damage_avg,rw_bondformed_avg,rw_mating_avg"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac,vib_emit_avg,vib_amp_avg,vib_grad_mag_avg,gain_mech_avg,gain_mech_dev,maze_active,maze_in_goal_frac,maze_unique_reach_frac,maze_first_reach_total,lr_avg,lr_std,decay_avg,decay_std,w_norm_avg,neural_spike_frac,izhikevich_frac,repro_avg,repro_std,birth_avg,birth_std,altruism_avg,altruism_std,cluster_bonus_avg,cluster_bonus_std,attack_gate_avg,attack_gate_std,size_ratio_avg,size_ratio_std,defense_avg,defense_std,rw_eatfood_avg,rw_novelty_avg,rw_predation_avg,rw_escape_avg,rw_damage_avg,rw_bondformed_avg,rw_mating_avg,brain_w1_rank_avg,hidden_n_avg,hidden_n_max,rw_hazard_avoided_avg,rw_threat_escaped_avg,sym_count,sym_fraction,sym_lineage_count,sym_z_avg,sym_deficit_avg,sym_sheds,vib_emit_active_avg"
     )
     .unwrap();
     write_stats(&mut log, &world, 0.0).unwrap();
@@ -401,6 +439,22 @@ fn main() {
         world.events.events.len()
     );
 
+    let run_meta = RunMeta {
+        seed,
+        map_seed,
+        maze_label: initial_maze_difficulty.map(|d| d.label().to_string()),
+    };
+    if let Some(cfg) = dump_cfg.as_ref() {
+        if let Err(e) = std::fs::create_dir_all(&cfg.dir) {
+            eprintln!("dump: cannot create {:?}: {e}", cfg.dir);
+            std::process::exit(1);
+        }
+        eprintln!(
+            "dump: enabled dir={:?} every={} top={} final_top={}",
+            cfg.dir, cfg.every, cfg.periodic_top_k, cfg.final_top_k
+        );
+    }
+
     let start = Instant::now();
     let mut gen_start = Instant::now();
     let mut gen_ticks = 0_u64;
@@ -422,6 +476,19 @@ fn main() {
             // so the per-gen CSV write samples real values, not zeros.
             world.sync_vibration_from_gpu();
             write_stats(&mut log, &world, tps).unwrap();
+            if let Some(cfg) = dump_cfg.as_ref() {
+                match dump::maybe_dump_generation(&world, &run_meta, cfg, world.clock.generation) {
+                    Ok(Some(path)) => eprintln!(
+                        "dump: gen {} → {:?} (top-{})",
+                        world.clock.generation, path, cfg.periodic_top_k
+                    ),
+                    Ok(None) => {}
+                    Err(e) => eprintln!(
+                        "dump: gen {} failed: {e}",
+                        world.clock.generation
+                    ),
+                }
+            }
             // Sprint 126: reset burst_accum aby každá generace měřila vlastní
             // tick-to-tick variance. Bez resetu by hodnoty monotonně rostly.
             for cell in &mut world.cells {
@@ -465,6 +532,7 @@ fn main() {
             world.deaths_gen = 0;
             world.fertile_ticks_gen = 0;
             world.predation_events_gen = 0;
+            world.sym_sheds_gen = 0;
             // Sprint 66: bond formation/break per-gen counters.
             world.bonds_formed_gen = 0;
             world.bonds_broken_gen = 0;
@@ -503,6 +571,22 @@ fn main() {
         }
     }
 
+    if let Some(cfg) = dump_cfg.as_ref() {
+        if world.cells.is_empty() {
+            eprintln!("dump: final skipped (population extinct)");
+        } else {
+            match dump::dump_final(&world, &run_meta, cfg) {
+                Ok(path) => eprintln!(
+                    "dump: final → {:?} (top-{} of {} alive)",
+                    path,
+                    cfg.final_top_k.min(world.cells.len()),
+                    world.cells.len()
+                ),
+                Err(e) => eprintln!("dump: final failed: {e}"),
+            }
+        }
+    }
+
     let elapsed = start.elapsed();
     let ticks_per_sec = world.clock.tick as f32 / elapsed.as_secs_f32().max(1e-3);
     eprintln!(
@@ -513,4 +597,10 @@ fn main() {
         ticks_per_sec,
         world.cells.len()
     );
+
+    if cli.gpu_profile {
+        if let Some(gpu) = world.gpu_full.as_ref() {
+            eprint!("{}", gpu.profiler.report());
+        }
+    }
 }

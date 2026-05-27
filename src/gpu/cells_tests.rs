@@ -285,7 +285,7 @@ fn cells_gpu_upload_positions_roundtrip_via_full_batch() {
     cells.upload_positions(&positions);
     cells.upload_velocities(&velocities);
     cells.upload_age_cooldown(&ages, &cooldowns);
-    cells.upload_metadata(&energies, &headings, &pitches, &damages, &max_speeds, &eff_radii);
+    cells.upload_metadata(&energies, &headings, &pitches, &damages, &max_speeds, &eff_radii, &eff_radii);
     cells.upload_angular_pitch(&angulars, &pitch_vels);
 
     let mut inputs_out = Vec::new();
@@ -443,7 +443,7 @@ fn cells_gpu_upload_metadata_roundtrip_via_full_batch() {
     let damages: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
     let max_speeds = vec![60.0; n];
     let eff_radii = vec![5.0; n];
-    cells.upload_metadata(&energies, &headings, &pitches, &damages, &max_speeds, &eff_radii);
+    cells.upload_metadata(&energies, &headings, &pitches, &damages, &max_speeds, &eff_radii, &eff_radii);
     let positions = vec![[0.0_f32; 3]; n];
     let velocities = vec![[0.0_f32; 3]; n];
     let ages = vec![0u32; n];
@@ -564,6 +564,7 @@ fn cells_gpu_age_cooldown_roundtrip_via_full_batch() {
         &vec![0.0_f32; n],
         &vec![0.0_f32; n],
         &vec![60.0_f32; n],
+        &vec![5.0_f32; n],
         &vec![5.0_f32; n],
     );
     cells.upload_angular_pitch(&vec![0.0_f32; n], &vec![0.0_f32; n]);

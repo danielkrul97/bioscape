@@ -9,10 +9,10 @@
 // Workgroup_size 64 = one thread per cell; no inter-cell weight sharing
 // → no atomics needed (weights are per-cell).
 
-const BRAIN_INPUTS: u32 = 84u;
+const BRAIN_INPUTS: u32 = 86u;
 const BRAIN_HIDDEN: u32 = 45u;
 const W1_OFFSET: u32 = 0u;
-const WEIGHTS_PER_CELL: u32 = 4469u;
+const WEIGHTS_PER_CELL: u32 = 4605u;
 const NEURON_MODEL_IZHIKEVICH: u32 = 1u;
 
 struct Params {
@@ -52,26 +52,28 @@ fn stdp_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w1_base = cell * WEIGHTS_PER_CELL + W1_OFFSET;
 
     // LTP: post-spike this tick → walk pre, add a_plus × pre_trace.
+    // Branchless mask: spike_mask = 1.0 iff this neuron fired at `tick`.
+    // Folds the divergent `continue` into a multiplicative coefficient so
+    // every warp lane runs the same control flow (matches stdp_step's
+    // `select(0.0, 1.0, …)` pattern).
     for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
-        if (post_spike_times[hid_off + h] != tick) {
-            continue;
-        }
+        let post_mask = select(0.0, 1.0, post_spike_times[hid_off + h] == tick);
+        let coef = a_plus * post_mask;
         let row_base = w1_base + h * BRAIN_INPUTS;
         for (var j: u32 = 0u; j < BRAIN_INPUTS; j = j + 1u) {
             brain_weights[row_base + j] =
-                brain_weights[row_base + j] + a_plus * pre_trace[in_off + j];
+                brain_weights[row_base + j] + coef * pre_trace[in_off + j];
         }
     }
 
     // LTD: pre-spike this tick → walk post, subtract a_minus × post_trace.
     for (var j: u32 = 0u; j < BRAIN_INPUTS; j = j + 1u) {
-        if (pre_spike_times[in_off + j] != tick) {
-            continue;
-        }
+        let pre_mask = select(0.0, 1.0, pre_spike_times[in_off + j] == tick);
+        let coef = a_minus * pre_mask;
         for (var h: u32 = 0u; h < BRAIN_HIDDEN; h = h + 1u) {
             let row_base = w1_base + h * BRAIN_INPUTS;
             brain_weights[row_base + j] =
-                brain_weights[row_base + j] - a_minus * post_trace[hid_off + h];
+                brain_weights[row_base + j] - coef * post_trace[hid_off + h];
         }
     }
 }

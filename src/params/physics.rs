@@ -85,3 +85,53 @@ pub const COLLISION_RESTITUTION: f32 = 0.0;
 /// takže food drift k dnu = postupný „benthic deposit". 8 units/sec ~ 4 sec
 /// průchod celé z-vrstvy (z=2).
 pub const FOOD_SINK_RATE: f32 = 8.0;
+
+/// Sprint 202 — inertial mass. `mass = body_l × body_w × body_h × DENSITY`.
+/// Replaces the pre-S202 mass proxy `effective_radius = (l+w+h)/3` used by
+/// `motor.wgsl` and treated as 1.0 elsewhere. DENSITY = 0.1 keeps the typical
+/// cell mass (body ≈ 3³ = 27 → mass ≈ 2.7) within an order of magnitude of
+/// the pre-S202 motor inertia coefficient so brain outputs that worked at the
+/// old scale still produce comparable accelerations. Selection now sees a
+/// cubic size penalty on responsiveness rather than linear, which is the
+/// real-physics behavior the pre-S202 linear scaling was an approximation of.
+pub const MASS_DENSITY: f32 = 0.1;
+
+/// Sprint 202 — bulk-flow advection of diffusion fields (smell, pheromone,
+/// vibration, thermal perturbation). Curl-noise vector field generated at
+/// world init, advects field values upwind each diffuse step. Peak speed in
+/// world units / sec — kept much smaller than typical cell `max_speed` (~100)
+/// so flow biases scent trails without dragging cells.
+pub const FLOW_MAGNITUDE: f32 = 8.0;
+/// Spatial wavelength factor of the curl-noise flow pattern. Larger = bigger
+/// gyres, smaller = turbulent finer eddies. `FLOW_SCALE = 0.003` → wavelength
+/// ≈ 1/0.003 ≈ 330 world units, comparable to half the smaller world extent
+/// so cells see large-scale gyres rather than per-tick noise.
+pub const FLOW_SCALE: f32 = 0.003;
+
+/// Sprint 202 — bond bending stiffness. Angle-spring between two bonds
+/// sharing the same cell. Per (slot_a, slot_b) pair, rest angle is captured
+/// at the moment the second bond forms; bend force pulls the bond pair back
+/// toward that rest cosine. Conservative — stronger than this caused
+/// oscillation in cluster geometry during testing.
+pub const BOND_BENDING_STIFFNESS: f32 = 0.4;
+/// Angular damping along the same pair. Critically damped at √(4·k) for a
+/// unit-mass system; below that = underdamped (visible cluster wobble).
+pub const BOND_BENDING_DAMPING: f32 = 0.6;
+
+/// Sprint 202 — thermal advection perturbation. Magnitude (sim-units, same as
+/// `THERMAL_*`) of warm-patch sources injected into a 3D perturbation field
+/// that diffuses + advects with the same `FLOW` vector field as the smell /
+/// pheromone channels. `step.wgsl` samples the perturbation at cell position
+/// and adds it to the analytic `temperature_at_z` base so warm currents can
+/// reach down into cold strata and vice versa.
+pub const THERMAL_PERTURBATION_AMP: f32 = 3.0;
+/// Number of warm patch sources injected per generation cycle. Sparse — the
+/// field's advection is what carries them across the world, density doesn't
+/// need to be high.
+pub const THERMAL_PERTURBATION_SOURCES_PER_GEN: usize = 16;
+/// Decay rate of the thermal perturbation field (1/s). Slower than smell
+/// (0.3) — temperature carries further than scent.
+pub const THERMAL_PERTURBATION_DECAY: f32 = 0.1;
+/// Diffusion coefficient for the thermal perturbation field. Must stay
+/// < 1/6 for stability of the 7-point Jacobi stencil.
+pub const THERMAL_PERTURBATION_DIFFUSION: f32 = 0.12;

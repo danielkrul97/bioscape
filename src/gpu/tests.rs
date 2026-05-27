@@ -410,7 +410,7 @@ fn motor_gpu_matches_cpu() {
     let pitches: Vec<f32> = cells.iter().map(|c| c.pitch).collect();
     let max_speeds: Vec<f32> = cells.iter().map(|c| c.genome.max_speed).collect();
     let turn_rates: Vec<f32> = cells.iter().map(|c| c.genome.turn_rate).collect();
-    let eff_radii: Vec<f32> = cells.iter().map(|c| c.phenotype.effective_radius()).collect();
+    let masses: Vec<f32> = cells.iter().map(|c| c.phenotype.mass()).collect();
     let velocities_in: Vec<[f32; 3]> = cells.iter().map(|c| c.velocity).collect();
     let angular_in: Vec<f32> = cells.iter().map(|c| c.angular_velocity).collect();
     let pitch_vel_in: Vec<f32> = cells.iter().map(|c| c.pitch_velocity).collect();
@@ -420,7 +420,7 @@ fn motor_gpu_matches_cpu() {
         Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
     };
     let (gpu_v, gpu_a, gpu_p) = gpu.compute(
-        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &eff_radii,
+        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &masses,
         &velocities_in, &angular_in, &pitch_vel_in, dt, DRAG_COEFFICIENT,
     );
 
@@ -559,6 +559,10 @@ fn sensor_gather_gpu_matches_cpu() {
     // raycast. Tests don't care, pass zeros (params.maze_active = 0 skips it).
     let test_headings = vec![0.0_f32; positions.len()];
     let test_pitches = vec![0.0_f32; positions.len()];
+    // Sprint 195: whisker spring-damper state buffer. params.maze_active = 0
+    // here gates the filter off, so the contents stay irrelevant — the bind
+    // group still requires binding 18.
+    let test_whisker_state = crate::test_helpers::whisker_state_buf(&ctx.device, n);
     let rows = sensor.compute(
         &positions,
         &eff_radii,
@@ -580,6 +584,7 @@ fn sensor_gather_gpu_matches_cpu() {
         // — vibration_grad/amp in returned rows will mirror smell, which is
         // outside the assertion surface.
         &smell_gpu,
+        &test_whisker_state,
         params,
     );
 
@@ -1393,7 +1398,7 @@ fn cppn_from_cppn_gpu_matches_cpu() {
         cppn = cppn.mutate(&mut rng, &CPPN_MUTATION_CONFIG);
     }
 
-    let cpu_brain = Brain::from_cppn(&cppn);
+    let cpu_brain = Brain::from_cppn(&cppn, BRAIN_HIDDEN_DEFAULT as u32);
 
     let cells_gpu = CellsGpu::with_context(&ctx, 1);
     let mut cppn_gpu = CppnGpu::with_context(&ctx, 1);

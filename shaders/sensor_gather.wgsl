@@ -47,6 +47,12 @@ struct SensorParams {
     maze_active: u32,
     maze_res_x: u32,
     maze_res_y: u32,
+    // Sprint 195: current sim tick — seeds the whisker transduction noise.
+    // _pad rounds the uniform struct to 80 bytes (mirrors SensorParamsGpu).
+    tick: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SensorParams;
@@ -76,6 +82,10 @@ struct SensorParams {
 // 21..26 via populate_inputs.wgsl.
 @group(0) @binding(16) var<storage, read> pheromone_grid_ch1: array<u32>;
 @group(0) @binding(17) var<storage, read> pheromone_grid_ch2: array<u32>;
+// Sprint 195: per-cell whisker spring-damper state, 12 f32 per cell,
+// layout [deflection0..6, velocity0..6]. Persistent across ticks (owned
+// by CellsGpu::whisker_state_buf), mutated in place below.
+@group(0) @binding(18) var<storage, read_write> whisker_state: array<f32>;
 
 // Toroidal minimum-image displacement (used for both x and y).
 fn min_image_xy(d: f32, half: f32) -> f32 {
@@ -83,6 +93,21 @@ fn min_image_xy(d: f32, half: f32) -> f32 {
     if (d > half) { return d - w; }
     if (d < -half) { return d + w; }
     return d;
+}
+
+// Sprint 195: deterministic stateless transduction noise for the whisker
+// spring-damper model. Mirrors `obstacles::whisker_noise` with identical
+// integer arithmetic (WGSL u32 ops wrap by default). Returns [-1, 1).
+fn whisker_noise(cell_index: u32, tick: u32, whisker_k: u32) -> f32 {
+    var h: u32 = cell_index * 0x9E3779B9u;
+    h = h ^ (tick * 0x85EBCA6Bu);
+    h = h ^ (whisker_k * 0xC2B2AE35u);
+    h = h ^ (h >> 16u);
+    h = h * 0x7FEB352Du;
+    h = h ^ (h >> 15u);
+    h = h * 0x846CA68Bu;
+    h = h ^ (h >> 16u);
+    return f32(h >> 8u) / 8388608.0 - 1.0;
 }
 
 // Wave 6: single-direction whisker raycast in xy. Mirrors one ray of
@@ -120,34 +145,74 @@ fn whisker_distance(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
 }
 
 // Wave 5: xy raycast against the maze obstacle mask. Mirror of
-// `ObstacleField::raycast_blocked` — uniform-step sampling at half-voxel
-// pitch. Returns true if any voxel between `origin` and `target` is
-// occupied. Caller MUST check `params.maze_active != 0u` first; this
-// helper assumes it.
+// `ObstacleField::raycast_blocked`. Caller MUST check `params.maze_active
+// != 0u` first; this helper assumes it.
+//
+// Amanatides–Woo voxel traversal (DDA): each voxel along the ray is
+// visited exactly once. Pre-S188 uniform-step sampling at half-voxel
+// pitch oversampled by ~2× and used `sqrt(d²)` per call as an early-out
+// — the squared-length check below makes that sqrt unnecessary.
 fn raycast_blocked(origin: vec3<f32>, tgt: vec3<f32>) -> bool {
     let dx = tgt.x - origin.x;
     let dy = tgt.y - origin.y;
-    let dist = sqrt(dx * dx + dy * dy);
-    if (dist < 1e-3) {
+    let d2 = dx * dx + dy * dy;
+    if (d2 < 1e-6) {
         return false;
     }
     let nx = i32(params.maze_res_x);
     let ny = i32(params.maze_res_y);
     let cs_x = (2.0 * params.world_half_x) / f32(params.maze_res_x);
     let cs_y = (2.0 * params.world_half_y) / f32(params.maze_res_y);
-    let step = min(cs_x, cs_y) * 0.5;
-    let n_steps = u32(ceil(dist / step));
-    if (n_steps <= 1u) {
-        return false;
+    let inv_cs_x = 1.0 / cs_x;
+    let inv_cs_y = 1.0 / cs_y;
+
+    let ox = origin.x + params.world_half_x;
+    let oy = origin.y + params.world_half_y;
+    let tx = tgt.x + params.world_half_x;
+    let ty = tgt.y + params.world_half_y;
+    var xi = i32(floor(ox * inv_cs_x));
+    var yi = i32(floor(oy * inv_cs_y));
+    let xi_end = i32(floor(tx * inv_cs_x));
+    let yi_end = i32(floor(ty * inv_cs_y));
+
+    let step_x = select(-1, 1, dx >= 0.0);
+    let step_y = select(-1, 1, dy >= 0.0);
+
+    // t_max_{x,y} = parametric ray distance to next voxel boundary on each
+    // axis (t ∈ [0, 1] where 0 = origin, 1 = target). t_delta_{x,y} = the
+    // increment after stepping one voxel along that axis.
+    let big: f32 = 1.0e30;
+    var t_max_x: f32 = big;
+    var t_delta_x: f32 = big;
+    if (abs(dx) > 1e-20) {
+        let inv_dx = 1.0 / dx;
+        let next_bx = (f32(xi) + select(0.0, 1.0, dx > 0.0)) * cs_x;
+        t_max_x = (next_bx - ox) * inv_dx;
+        t_delta_x = abs(cs_x * inv_dx);
     }
-    for (var k: u32 = 1u; k < n_steps; k = k + 1u) {
-        let t = f32(k) * step / dist;
-        let px = origin.x + dx * t;
-        let py = origin.y + dy * t;
-        let xi = i32(floor((px + params.world_half_x) / cs_x));
-        let yi = i32(floor((py + params.world_half_y) / cs_y));
+    var t_max_y: f32 = big;
+    var t_delta_y: f32 = big;
+    if (abs(dy) > 1e-20) {
+        let inv_dy = 1.0 / dy;
+        let next_by = (f32(yi) + select(0.0, 1.0, dy > 0.0)) * cs_y;
+        t_max_y = (next_by - oy) * inv_dy;
+        t_delta_y = abs(cs_y * inv_dy);
+    }
+
+    let max_steps = nx + ny + 2;
+    for (var k: i32 = 0; k < max_steps; k = k + 1) {
+        if (xi == xi_end && yi == yi_end) {
+            return false;
+        }
+        if (t_max_x < t_max_y) {
+            xi = xi + step_x;
+            t_max_x = t_max_x + t_delta_x;
+        } else {
+            yi = yi + step_y;
+            t_max_y = t_max_y + t_delta_y;
+        }
         if (xi < 0 || xi >= nx || yi < 0 || yi >= ny) {
-            return true; // outside bounds = solid in maze mode
+            return true;
         }
         let idx = u32(yi) * params.maze_res_x + u32(xi);
         if (maze_mask[idx] != 0u) {
@@ -257,13 +322,38 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Fused outer loop: each (dx,dy,dz) resolves one bucket id, then both
     // hashes are queried at that bucket. Halves bucket-coord overhead.
-    for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-        let bz = clamp(center.z + dz, 0, GRID_NZ - 1);
+    // z is clamped (not toroidal) and GRID_NZ is tiny (4): iterate the
+    // distinct bz planes directly. The old `dz in -r_cells..=r_cells` +
+    // `clamp` rescanned boundary planes whenever r_cells reached a z edge
+    // — wasted bucket walks plus a neighbors_count inflated by the rescan.
+    let bz_lo = max(center.z - r_cells, 0);
+    let bz_hi = min(center.z + r_cells, GRID_NZ - 1);
+    // Corner-bucket cull: the (2·r_cells+1)³ cube circumscribes the vision
+    // sphere, so ~⅓ of its buckets lie entirely beyond `vr`. A bucket at
+    // offset (dx,dy,dz) is at least `max(|·|-1,0)` buckets away on each
+    // axis from any point in the centre bucket — if that lower bound
+    // exceeds `vr` the bucket cannot hold an in-vision cell or food, so it
+    // is skipped. Conservative: never culls a reachable bucket → no
+    // behaviour change.
+    let vr_cells = vr / params.hash_cell_size;
+    let vr_cells_2 = vr_cells * vr_cells;
+    for (var bz = bz_lo; bz <= bz_hi; bz = bz + 1) {
+        let z_term = f32(max(abs(bz - center.z) - 1, 0));
+        let z_contrib = z_term * z_term;
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
+            let y_term = f32(max(abs(dy) - 1, 0));
+            let zy_contrib = z_contrib + y_term * y_term;
+            if (zy_contrib > vr_cells_2) {
+                continue;
+            }
             var by = center.y + dy;
             if (by < 0) { by = by + GRID_NY; }
             else if (by >= GRID_NY) { by = by - GRID_NY; }
             for (var dx = -r_cells; dx <= r_cells; dx = dx + 1) {
+                let x_term = f32(max(abs(dx) - 1, 0));
+                if (zy_contrib + x_term * x_term > vr_cells_2) {
+                    continue;
+                }
                 var bx = center.x + dx;
                 if (bx < 0) { bx = bx + GRID_NX; }
                 else if (bx >= GRID_NX) { bx = bx - GRID_NX; }
@@ -411,6 +501,34 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
         // ±z directions always clear (xy-only walls); skip raycast.
     }
 
+    // Sprint 195: whisker spring-damper. The raycast value is the wall-
+    // imposed target deflection (target = 1 - raw); each whisker is a driven
+    // damped oscillator that overshoots / rings / settles. (defl, vel) state
+    // persists per cell in `whisker_state` (12 f32/cell). Gated on
+    // maze_active so non-maze runs keep the neutral 1.0 signal exactly.
+    // Mirrors the CPU integrator in `World::update_whiskers`.
+    var raw = array<f32, 6>(whisker0, whisker1, whisker2, whisker3, whisker4, whisker5);
+    var sensed = raw;
+    if (params.maze_active != 0u) {
+        let whisker_stiffness: f32 = 360.0; // mirrors lib::WHISKER_STIFFNESS
+        let whisker_damping: f32 = 11.0;    // mirrors lib::WHISKER_DAMPING
+        let whisker_noise_amp: f32 = 0.03;  // mirrors lib::WHISKER_NOISE_AMPLITUDE
+        let whisker_dt: f32 = 1.0 / 60.0;
+        let wbase = i * 12u;
+        for (var k: u32 = 0u; k < 6u; k = k + 1u) {
+            let tgt = 1.0 - raw[k];
+            var defl = whisker_state[wbase + k];
+            var vel = whisker_state[wbase + 6u + k];
+            let accel = whisker_stiffness * (tgt - defl) - whisker_damping * vel;
+            vel = vel + accel * whisker_dt;
+            defl = defl + vel * whisker_dt;
+            whisker_state[wbase + k] = defl;
+            whisker_state[wbase + 6u + k] = vel;
+            let noise = whisker_noise(i, params.tick, k) * whisker_noise_amp;
+            sensed[k] = clamp(clamp(1.0 - defl, 0.0, 1.0) + noise, 0.0, 1.0);
+        }
+    }
+
     let off = i * 31u;
     output[off + 0u] = best_food_dx;
     output[off + 1u] = best_food_dy;
@@ -431,12 +549,12 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     output[off + 16u] = vibration_grad.y;
     output[off + 17u] = vibration_grad.z;
     output[off + 18u] = vibration_amp;
-    output[off + 19u] = whisker0;
-    output[off + 20u] = whisker1;
-    output[off + 21u] = whisker2;
-    output[off + 22u] = whisker3;
-    output[off + 23u] = whisker4;
-    output[off + 24u] = whisker5;
+    output[off + 19u] = sensed[0];
+    output[off + 20u] = sensed[1];
+    output[off + 21u] = sensed[2];
+    output[off + 22u] = sensed[3];
+    output[off + 23u] = sensed[4];
+    output[off + 24u] = sensed[5];
     // Wave L: ch1/ch2 pheromone gradients. populate_inputs maps these to
     // brain inputs 21..26.
     output[off + 25u] = pheromone_grad_ch1.x;

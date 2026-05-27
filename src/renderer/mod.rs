@@ -5,6 +5,8 @@ use bioscape::{
 };
 use std::path::PathBuf;
 
+#[cfg(feature = "audio")]
+mod audio;
 mod camera;
 mod components;
 mod config;
@@ -80,6 +82,9 @@ pub fn run() {
     // + JSON export. Pulls in `EguiPlugin` automatically.
     app.add_plugins(inspector::InspectorPlugin);
 
+    #[cfg(feature = "audio")]
+    app.add_plugins(audio::BioscapeAudioPlugin);
+
     // FrameTimeDiagnosticsPlugin runs unconditionally so the stats overlay
     // can show FPS — its overhead is just a few timestamps per frame. The
     // verbose log spam and custom per-system diagnostics stay behind `--diag`.
@@ -95,6 +100,7 @@ pub fn run() {
     // schedule diverge from the headless run for any non-default seed.
 
     app.init_resource::<gizmos::ShowVibration>()
+        .init_resource::<ShowWhiskers>()
         .init_resource::<TickCounter>()
         // Sprint 36: clear color matchnut s HIGH richness color z `world_map_image`.
         // Sprint 88: white → ocean blue. Match s DistanceFog color tak aby
@@ -172,6 +178,7 @@ pub fn run() {
                 screencast_capture,
             ),
         )
+        .add_systems(Update, (toggle_whiskers, draw_whiskers, sync_symbionts))
         // God-mode pipeline runs before camera input so RMB orbit suppression
         // takes effect on the same tick as the press. Order inside the chain:
         // handle button hits first, then run the RMB state machine, then close

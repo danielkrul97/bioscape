@@ -36,14 +36,14 @@
 // convergence to a 14+11 bipolar split (one cluster +0.72, other
 // −0.83) reasserted itself within ~6000 ticks even after S188-S191.
 
-const BRAIN_INPUTS: u32 = 84u;       // Wave 2: 27 + 2 bond inbox + 4 vibration + 6 whisker + 45 recurrent
+const BRAIN_INPUTS: u32 = 86u;       // S198: + 2 symbiont (has + deficit_norm)
 const BRAIN_HIDDEN: u32 = 45u;
-const BRAIN_OUTPUTS: u32 = 14u;      // 12 motor/morph + 2 bond message
+const BRAIN_OUTPUTS: u32 = 15u;      // 12 motor/morph + 2 bond message + 1 vibration emit
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3780u;        // BRAIN_HIDDEN * BRAIN_INPUTS
-const W2_OFFSET: u32 = 3825u;        // B1_OFFSET + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 4455u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
-const WEIGHTS_PER_CELL: u32 = 4469u; // B2_OFFSET + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 3870u;        // BRAIN_HIDDEN * BRAIN_INPUTS
+const W2_OFFSET: u32 = 3915u;        // B1_OFFSET + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 4590u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
+const WEIGHTS_PER_CELL: u32 = 4605u; // B2_OFFSET + BRAIN_OUTPUTS
 
 struct Params {
     num_cells: u32,
@@ -128,13 +128,18 @@ fn forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the term is 0 and the path collapses to pre-S192 behaviour.
     let alpha = params.lateral_inhibition_alpha;
     if (alpha > 0.0 && h_n > 1u) {
+        // Cache softplus per neuron so the second pass doesn't recompute
+        // (45 × log+exp saved per cell per tick).
+        var sp_cache: array<f32, BRAIN_HIDDEN>;
         var sp_sum: f32 = 0.0;
         for (var h: u32 = 0u; h < h_n; h = h + 1u) {
-            sp_sum = sp_sum + softplus(pre_hid[h]);
+            let sp = softplus(pre_hid[h]);
+            sp_cache[h] = sp;
+            sp_sum = sp_sum + sp;
         }
         let inv_others = 1.0 / f32(h_n - 1u);
         for (var h: u32 = 0u; h < h_n; h = h + 1u) {
-            let others = sp_sum - softplus(pre_hid[h]);
+            let others = sp_sum - sp_cache[h];
             pre_hid[h] = pre_hid[h] - alpha * others * inv_others;
         }
     }

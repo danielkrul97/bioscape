@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bioscape::{spike_direction, CELL_RADIUS, MIN_SPIKE_LENGTH};
 
-use super::super::components::{CellEntity, SpikeEntity};
+use super::super::components::{CellEntity, Pooled, SpikeEntity};
 
 /// Spike thickness as a fraction of CELL_RADIUS — controls cone radius.
 /// Length comes from `phenotype.spikes[slot].length` directly (sim units).
@@ -18,7 +18,7 @@ const SPIKE_VISIBLE_MIN: f32 = MIN_SPIKE_LENGTH + 0.05;
 /// - length below threshold
 pub(crate) fn sync_spikes(
     mut spikes: Query<(&SpikeEntity, &mut Transform, &mut Visibility)>,
-    cells: Query<(&CellEntity, &Visibility), Without<SpikeEntity>>,
+    cells: Query<(&CellEntity, &Visibility), (Without<SpikeEntity>, Without<Pooled>)>,
 ) {
     for (spike, mut transform, mut vis) in &mut spikes {
         let Ok((cell, owner_vis)) = cells.get(spike.owner) else {

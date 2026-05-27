@@ -3,7 +3,7 @@
 use bioscape::sim::{World, EDGE_FRAC_THRESHOLD};
 
 use bioscape::{
-    Cell, EventCalendar, SpatialGrid, BRAIN_RECURRENT, GRID_CELL_SIZE,
+    Cell, EventCalendar, SpatialGrid, BRAIN_INPUTS_SENSORY, BRAIN_RECURRENT, GRID_CELL_SIZE,
     N_PHEROMONE_CHANNELS, TICKS_PER_GENERATION, WORLD_HALF,
 };
 use std::io::{BufWriter, Write};
@@ -45,7 +45,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
             //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
             //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000,0,0.00,0,0.000,0.000,0,0.0000,0,0.0000,0.00,0,0.0000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -101,6 +101,12 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let mut corner_count = 0_u64;
     let mut lineages: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut oldest_age: u64 = 0;
+    // Sprint 196: symbiont diagnostics — bearer count, distinct symbiont
+    // lineage richness, and (computed after the loop) bearer fraction.
+    let mut sym_count: u64 = 0;
+    let mut sym_lineages: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut sym_z_sum = 0.0_f64;
+    let mut sym_deficit_sum = 0.0_f64;
     // Sprint 67 bond/adhesion diagnostics: per-cell aggregates pro CSV.
     let mut bond_signal_sum = 0.0_f64;
     let mut total_bonds = 0_u64;
@@ -166,11 +172,13 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     // the brain actually saw this tick (sample + gradient at each cell's
     // position), plus the population's mean emission rate.
     let mut vib_emit_sum = 0.0_f64;
+    let mut vib_emit_active_sum = 0.0_f64;
     let mut vib_amp_sum = 0.0_f64;
     let mut vib_grad_mag_sum = 0.0_f64;
     for c in &world.cells {
         let pos = c.position;
         vib_emit_sum += bioscape::vibration_emit_for_cell(c) as f64;
+        vib_emit_active_sum += bioscape::vibration_active_emit_for_cell(c) as f64;
         vib_amp_sum += world.vibration.sample(pos) as f64;
         let g = world
             .vibration
@@ -178,6 +186,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         vib_grad_mag_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
     }
     let vib_emit_m = if cell_count > 0 { vib_emit_sum / cell_count as f64 } else { 0.0 };
+    let vib_emit_active_m = if cell_count > 0 { vib_emit_active_sum / cell_count as f64 } else { 0.0 };
     let vib_amp_m = if cell_count > 0 { vib_amp_sum / cell_count as f64 } else { 0.0 };
     let vib_grad_mag_m = if cell_count > 0 { vib_grad_mag_sum / cell_count as f64 } else { 0.0 };
     // Sprint 107: speciation distance diagnostic. Sample N pairs random,
@@ -325,6 +334,16 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         state_sumsq += cs * cs;
         if cs > 0.6 {
             altruist_count += 1;
+        }
+        if let Some(sym) = c.symbiont.as_ref() {
+            sym_count += 1;
+            sym_lineages.insert(sym.lineage_id);
+            if WORLD_HALF[2] > 0.0 {
+                let half_z = WORLD_HALF[2] as f64;
+                sym_z_sum += ((c.position[2] as f64 + half_z) / (2.0 * half_z))
+                    .clamp(0.0, 1.0);
+            }
+            sym_deficit_sum += sym.deficit_streak as f64;
         }
     }
     let nf = n as f64;
@@ -572,9 +591,34 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     } else {
         0.0
     };
+    // Mean effective rank of the hidden layer's input weights. The
+    // environment-pressure decade asks "does evolution use brain capacity";
+    // every other column is a behavioural proxy — this is the only one that
+    // measures the capacity directly. 1.0 = rank-1 collapse (every hidden
+    // neuron the same receptive field), → hidden_n = fully decorrelated.
+    let w1_eff_rank = w1_effective_rank_avg(&world.cells);
+    // Brain topology size. `hidden_n` (active hidden-neuron count) is now an
+    // inherited + mutated genome gene — was hardcoded `BRAIN_HIDDEN_DEFAULT`.
+    // These columns show whether selection grows or shrinks the hidden layer.
+    let hidden_n_sum: u64 = world
+        .cells
+        .iter()
+        .map(|c| c.genome.brain.hidden_n as u64)
+        .sum();
+    let hidden_n_avg = hidden_n_sum as f64 / nf;
+    let hidden_n_max = world
+        .cells
+        .iter()
+        .map(|c| c.genome.brain.hidden_n)
+        .max()
+        .unwrap_or(0);
+    let sym_fraction = if n > 0 { sym_count as f64 / nf } else { 0.0 };
+    let sym_lineage_count = sym_lineages.len() as u64;
+    let sym_z_avg = if sym_count > 0 { sym_z_sum / sym_count as f64 } else { 0.0 };
+    let sym_deficit_avg = if sym_count > 0 { sym_deficit_sum / sym_count as f64 } else { 0.0 };
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{:.3},{:.3},{},{:.4},{},{:.4},{:.2},{},{:.4}",
         world.clock.generation,
         n,
         spd_m,
@@ -721,6 +765,22 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         rw_means[4], // Damage
         rw_means[5], // BondFormed
         rw_means[6], // MateSignalAccepted
+        w1_eff_rank,
+        hidden_n_avg,
+        hidden_n_max,
+        rw_means[7], // HazardAvoided
+        rw_means[8], // ThreatEscaped
+        // Sprint 196: endosymbiosis diagnostics.
+        sym_count,
+        sym_fraction,
+        sym_lineage_count,
+        sym_z_avg,
+        sym_deficit_avg,
+        world.sym_sheds_gen,
+        // Brain-controlled vibration emit (rectified last_outputs[14] ×
+        // MAX_ACTIVE_EMIT, averaged over the population). Compare with
+        // `vib_emit_m` (total) — passive component = total − active.
+        vib_emit_active_m,
     )
 }
 
@@ -797,6 +857,53 @@ fn w1_row_norm_avg(cells: &[Cell]) -> f64 {
     } else {
         sum / count as f64
     }
+}
+
+/// Mean participation ratio (effective rank) of `w1` across the population.
+/// Per cell `PR = (Σ‖rowᵢ‖²)² / Σᵢⱼ(rowᵢ·rowⱼ)²` over the active rows
+/// `[0, hidden_n)` and active columns `[0, BRAIN_INPUTS_SENSORY + hidden_n)`
+/// — dead-zone recurrent slots hold CPPN garbage on fresh cells and would
+/// poison the dot products. The identity `PR = trace(G)² / ‖G‖_F²` for the
+/// Gram matrix `G = W Wᵀ` yields the effective rank from pairwise dot
+/// products alone, no SVD. `PR = 1` ⇒ rank-1 collapse (every hidden neuron
+/// shares one receptive field); `PR → hidden_n` ⇒ fully decorrelated.
+fn w1_effective_rank_avg(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0_f64;
+    for cell in cells {
+        let h_n = cell.genome.brain.hidden_n as usize;
+        if h_n == 0 {
+            continue;
+        }
+        let active = BRAIN_INPUTS_SENSORY + h_n;
+        let w1 = &cell.genome.brain.w1;
+        let mut trace = 0.0_f64;
+        let mut frob_sq = 0.0_f64;
+        for i in 0..h_n {
+            let row_i = &w1[i];
+            // Diagonal: G_ii = ‖rowᵢ‖².
+            let g_ii: f64 = row_i[..active]
+                .iter()
+                .map(|v| (*v as f64) * (*v as f64))
+                .sum();
+            trace += g_ii;
+            frob_sq += g_ii * g_ii;
+            // Off-diagonal pairs counted twice (G symmetric).
+            for j in (i + 1)..h_n {
+                let row_j = &w1[j];
+                let g_ij: f64 = (0..active)
+                    .map(|k| row_i[k] as f64 * row_j[k] as f64)
+                    .sum();
+                frob_sq += 2.0 * g_ij * g_ij;
+            }
+        }
+        if frob_sq > 1e-12 {
+            sum += (trace * trace) / frob_sq;
+        }
+    }
+    sum / cells.len() as f64
 }
 
 /// Sprint 111: aktivní shock summary pro CSV. Vrací `(count, hazard_intensity_max)`,

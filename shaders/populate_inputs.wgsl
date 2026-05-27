@@ -27,8 +27,8 @@ struct Params {
     phero_norm_gain: f32,
     damage_norm_gain: f32,
     density_norm: f32,
-    vibration_norm_gain: f32,    // V7: tanh gain on slots 29..32
-    _pad0: u32,
+    vibration_amp_gain: f32,     // tanh gain on slot 32 (amplitude)
+    vibration_grad_gain: f32,    // tanh gain on slots 29..31 (gradient — needs ~100× more than amp)
     _pad1: u32,                  // S187: was reproduce_threshold (now per-cell)
 }
 
@@ -47,6 +47,12 @@ struct Params {
 @group(0) @binding(12) var<storage, read> bonded_inbox: array<f32>;          // n × N_BOND_MSG_CHANNELS
 // Sprint 187: per-cell reproduce threshold (was a uniform Params field).
 @group(0) @binding(13) var<storage, read> reproduce_at_energies: array<f32>; // n
+// Sprint 198: per-cell symbiont state. `has` = 0 or 1, `deficit` = streak ticks.
+@group(0) @binding(14) var<storage, read> symbiont_has: array<u32>;          // n
+@group(0) @binding(15) var<storage, read> symbiont_deficit: array<u32>;      // n
+// Threshold below which a bearer hasn't been shed yet — must match
+// `bioscape::SYMBIONT_UPKEEP_DEFICIT_TICKS` (600 in S197/S198).
+const SYMBIONT_UPKEEP_DEFICIT_TICKS: f32 = 600.0;
 
 fn forward_vector(yaw: f32, pitch: f32) -> vec3<f32> {
     let cy = cos(yaw);
@@ -189,10 +195,10 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the vibration FieldGpu directly, mirroring smell/pheromone semantics
     // (tanh-normalize through the per-channel gain so saturation behaviour
     // matches `lib::populate_brain_inputs`).
-    last_inputs[inputs_off + 29u] = tanh_fast(vib_grad_x * params.vibration_norm_gain);
-    last_inputs[inputs_off + 30u] = tanh_fast(vib_grad_y * params.vibration_norm_gain);
-    last_inputs[inputs_off + 31u] = tanh_fast(vib_grad_z * params.vibration_norm_gain);
-    last_inputs[inputs_off + 32u] = tanh_fast(vib_amp    * params.vibration_norm_gain);
+    last_inputs[inputs_off + 29u] = tanh_fast(vib_grad_x * params.vibration_grad_gain);
+    last_inputs[inputs_off + 30u] = tanh_fast(vib_grad_y * params.vibration_grad_gain);
+    last_inputs[inputs_off + 31u] = tanh_fast(vib_grad_z * params.vibration_grad_gain);
+    last_inputs[inputs_off + 32u] = tanh_fast(vib_amp    * params.vibration_amp_gain);
 
     // Wave 6: whisker raycast slots 33..38. sensor_gather.wgsl writes
     // normalized free-distances at sensor_off + 19..25; map [0, 1] →
@@ -204,6 +210,15 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     last_inputs[inputs_off + 36u] = sensor_output[sensor_off + 22u] * 2.0 - 1.0;
     last_inputs[inputs_off + 37u] = sensor_output[sensor_off + 23u] * 2.0 - 1.0;
     last_inputs[inputs_off + 38u] = sensor_output[sensor_off + 24u] * 2.0 - 1.0;
+
+    // S198: symbiont brain integration slots [39..41]. has = 0/1 binary;
+    // deficit normalised by SYMBIONT_UPKEEP_DEFICIT_TICKS so it stays in [0, 1].
+    last_inputs[inputs_off + 39u] = f32(symbiont_has[i]);
+    last_inputs[inputs_off + 40u] = clamp(
+        f32(symbiont_deficit[i]) / SYMBIONT_UPKEEP_DEFICIT_TICKS,
+        0.0,
+        1.0,
+    );
 
     // Sprint 30: damage_accum reset after consume.
     damage_accums[i] = 0.0;

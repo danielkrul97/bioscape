@@ -25,6 +25,28 @@ pub struct Bond {
     pub age_ticks: u32,
 }
 
+/// Sprint 196: per-host endosymbiont passenger. Carries its own full `Genome`
+/// so it can co-evolve independently of the host (mitochondria-style: separate
+/// genetic lineage living inside the host). `lineage_id` uses a counter
+/// independent from host lineages and stays stable across predation transfer;
+/// `age` is reset at reproduction (offspring symbiont = fresh copy) and
+/// persists across transfer events. Sprint 196 only plumbs data and
+/// inheritance — no shader reads the symbiont yet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Symbiont {
+    pub genome: Genome,
+    pub lineage_id: u64,
+    pub age: u64,
+    #[serde(default)]
+    pub deficit_streak: u32,
+}
+
+impl Symbiont {
+    pub fn new(genome: Genome, lineage_id: u64) -> Self {
+        Self { genome, lineage_id, age: 0, deficit_streak: 0 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Cell {
     pub position: [f32; 3],
@@ -95,6 +117,14 @@ pub struct Cell {
     /// Persistent spring bonds. Fixed-size array of `Option<Bond>` so `Cell`
     /// stays `Copy` and there are no per-cell heap allocations.
     pub bonds: [Option<Bond>; MAX_BONDS_PER_CELL],
+    /// Sprint 202: rest cosine for every pair of bond slots, captured at the
+    /// moment the second bond of the pair forms. `bond_rest_cos[a][b] = cos`
+    /// where `cos` is the angle between bond `a` and bond `b` as seen from
+    /// this cell at formation time. Symmetric matrix (`[a][b] == [b][a]`);
+    /// diagonal and rows/cols of empty slots are unused (the shader skips
+    /// inactive bonds). Cleared per slot when a bond breaks.
+    #[serde(default = "default_bond_rest_cos")]
+    pub bond_rest_cos: [[f32; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL],
     /// Bistable cell state in `[0, 1]`. Not in the genome — inherited from
     /// the parent with noise, acting as phenotypic memory across generations.
     /// Positive feedback around 0.5 plus a `n_bonds()` bias produces two
@@ -120,15 +150,23 @@ pub struct Cell {
     /// older saves overwrite on first `apply_brownian` re-seed.
     #[serde(default)]
     pub xoshiro_state: Xoshiro128PlusPlus,
-    /// Wave 2: whisker raycast results from the previous tick. Populated by
-    /// a pre-brain-act pass (`update_whiskers` in headless, separate system
-    /// in renderer); read by `populate_brain_inputs` into slots [33..39].
-    /// Stored on the cell to avoid plumbing `&ObstacleField` through every
-    /// sensor-gather call site (and to keep the sensor gather system param
-    /// count under Bevy's 16-cap). Defaults to all-ones (no walls) so when
-    /// the maze is off the brain reads neutral whisker signal.
+    /// Sensed whisker signal from the previous tick — the spring-damper
+    /// model's `sensed_k = clamp(1 − deflection, 0, 1) + noise`, NOT the raw
+    /// raycast distance (Sprint 195). Populated by `update_whiskers`; read by
+    /// `populate_brain_inputs` into slots [33..39] and by the renderer
+    /// whisker overlay. Defaults to all-ones (no walls) so when the maze is
+    /// off the brain reads neutral whisker signal.
     #[serde(default = "default_whiskers")]
     pub last_whisker_distances: [f32; WHISKER_COUNT],
+    /// Sprint 195: per-whisker spring-damper state — `deflection` (the bent
+    /// angle, 0 = straight) and its time derivative. Driven by wall proximity
+    /// (`target = 1 − raw_raycast`), integrated semi-implicit Euler each tick
+    /// in `update_whiskers`. May overshoot below 0 / above 1 (ringing). The
+    /// GPU full pipeline keeps the equivalent state in `whisker_state_buf`.
+    #[serde(default = "default_whiskers_zero")]
+    pub whisker_deflection: [f32; WHISKER_COUNT],
+    #[serde(default = "default_whiskers_zero")]
+    pub whisker_deflection_vel: [f32; WHISKER_COUNT],
     /// Wave 2 episodic novelty: ring buffer of recently visited
     /// `NOVELTY_GRID_CELL_SIZE`-bucketed voxel indices. New entries push out
     /// the oldest. `novelty_head` is the next-write slot index. When the
@@ -152,12 +190,27 @@ pub struct Cell {
     /// other tick.
     #[serde(default)]
     pub escape_cooldown_ticks: u16,
+    /// Tracks "was in a hazard zone (taking drain) on the previous tick" so
+    /// `apply_hazards` can detect the transition-out event and push a
+    /// `RewardKind::HazardAvoided` reward — credits the sensing+motor
+    /// decision that produced the escape, not just demographic survival.
+    #[serde(default)]
+    pub was_in_hazard_last_tick: bool,
     pub phenotype: Phenotype,
     pub genome: Genome,
+    /// Sprint 196: endosymbiont passenger. `None` for the bulk of cells; the
+    /// bearer fraction at init is `SYMBIONT_INIT_FRACTION` and changes only
+    /// at reproduction (P_inherit) and predation transfer (P_capture).
+    #[serde(default)]
+    pub symbiont: Option<Symbiont>,
 }
 
 fn default_whiskers() -> [f32; WHISKER_COUNT] {
     [1.0; WHISKER_COUNT]
+}
+
+fn default_whiskers_zero() -> [f32; WHISKER_COUNT] {
+    [0.0; WHISKER_COUNT]
 }
 
 fn default_novelty_history() -> [u32; NOVELTY_HISTORY_LEN] {
@@ -214,6 +267,19 @@ impl Cell {
         self.bonds.iter().filter(|b| b.is_some()).count() as u32
     }
 
+    /// Sprint 201: incoming-damage multiplier. Bearer cells take only
+    /// `(1 - SYMBIONT_DAMAGE_RESIST_FRAC)` of each damage event — applied at
+    /// hazards, predation hits, and maze wall bumps. Non-bearers see no
+    /// reduction (multiplier = 1.0).
+    #[inline]
+    pub fn damage_resist_factor(&self) -> f32 {
+        if self.symbiont.is_some() {
+            1.0 - SYMBIONT_DAMAGE_RESIST_FRAC
+        } else {
+            1.0
+        }
+    }
+
     pub fn from_genome(
         rng: &mut impl Rng,
         genome: Genome,
@@ -264,6 +330,7 @@ impl Cell {
             reproduce_cooldown_ticks: 0,
             cell_id,
             bonds: [None; MAX_BONDS_PER_CELL],
+            bond_rest_cos: [[0.0; MAX_BONDS_PER_CELL]; MAX_BONDS_PER_CELL],
             // Kick around 0.5 (the unstable fixed point of the feedback)
             // so cells don't get stuck in the neutral zone at spawn. The
             // RNG draw is appended at the end so earlier draws retain
@@ -275,12 +342,16 @@ impl Cell {
             // lockstep as long as both initialize from the same cell_id.
             xoshiro_state: Xoshiro128PlusPlus::from_cell_id(cell_id),
             last_whisker_distances: [1.0; WHISKER_COUNT],
+            whisker_deflection: [0.0; WHISKER_COUNT],
+            whisker_deflection_vel: [0.0; WHISKER_COUNT],
             novelty_history: [u32::MAX; NOVELTY_HISTORY_LEN],
             novelty_head: 0,
             under_attack_streak: 0,
             escape_cooldown_ticks: 0,
+            was_in_hazard_last_tick: false,
             phenotype,
             genome,
+            symbiont: None,
         }
     }
 
@@ -336,6 +407,9 @@ impl Cell {
         // Aging + cooldown decrement run before energy costs so the age ramp
         // sees the post-increment age.
         self.age = self.age.saturating_add(1);
+        if let Some(s) = self.symbiont.as_mut() {
+            s.age = s.age.saturating_add(1);
+        }
         if self.reproduce_cooldown_ticks > 0 {
             self.reproduce_cooldown_ticks -= 1;
         }
@@ -361,6 +435,9 @@ impl Cell {
         obstacles: Option<&ObstacleField>,
     ) {
         self.age = self.age.saturating_add(1);
+        if let Some(s) = self.symbiont.as_mut() {
+            s.age = s.age.saturating_add(1);
+        }
         if self.reproduce_cooldown_ticks > 0 {
             self.reproduce_cooldown_ticks -= 1;
         }
@@ -489,6 +566,8 @@ impl Cell {
         self.energy -= dev * dev * physics.thermal_optimum_penalty * dt;
         let total_sensor_gain: f32 = self.genome.sensor_gains.iter().sum();
         self.energy -= total_sensor_gain * SENSOR_GAIN_COST * dt_eff;
+        let active_vib_emit = self.last_outputs[VIBRATION_EMIT_OUTPUT].max(0.0) * MAX_ACTIVE_EMIT;
+        self.energy -= active_vib_emit * VIBRATION_EMIT_COST * dt_eff;
     }
 
     /// XY uses toroidal wrap (cylinder topology), Z reflects. Reflective XY
@@ -571,7 +650,7 @@ impl Cell {
                 self.velocity[1] -= v_dot_n * ny;
             }
         }
-        self.damage_accum += MAZE_WALL_BUMP_DAMAGE;
+        self.damage_accum += MAZE_WALL_BUMP_DAMAGE * self.damage_resist_factor();
         true
     }
 
@@ -595,11 +674,13 @@ impl Cell {
     /// pitch_velocity. Reads `outputs[0] = turn`, `[1] = thrust`,
     /// `[7] = pitch`.
     pub fn apply_brain_motor(&mut self, outputs: &[f32; BRAIN_OUTPUTS], dt: f32) {
-        // F=ma with `mass = effective_radius` (arithmetic mean of body axes),
-        // not full `volume()`. Volume scaled inertia too aggressively for
-        // untrained brains and led to mass extinction in early smokes; the
-        // mean keeps inertia-by-size scaling without the cubic cost shock.
-        let mass = self.phenotype.effective_radius().max(0.01);
+        // Sprint 202: F=ma with `mass = volume × MASS_DENSITY`. Pre-S202 used
+        // `effective_radius` (linear scaling with size) as a mass proxy after
+        // a full-volume attempt killed untrained populations; the new
+        // `MASS_DENSITY = 0.1` keeps a typical 3³ cell at mass ≈ 2.7,
+        // matching the pre-S202 motor scale at typical size while restoring
+        // proper cubic dependence at the extremes.
+        let mass = self.phenotype.mass();
         let turn_rate = self.genome.turn_rate;
         let max_speed = self.genome.max_speed;
         let turn_signal = outputs[0];
@@ -805,7 +886,9 @@ impl Cell {
     /// in 2D mode so the stream state stays in lockstep regardless of
     /// `world_half_z`).
     pub fn apply_brownian(&mut self, sqrt_dt: f32, world_half_z: f32) {
-        let scale = THERMAL_NOISE * sqrt_dt;
+        // Sprint 202: brownian kicks scale as 1/√mass (equipartition).
+        let inv_sqrt_mass = self.phenotype.mass().sqrt().recip();
+        let scale = THERMAL_NOISE * sqrt_dt * inv_sqrt_mass;
         let (gx, gy) = self.xoshiro_state.next_gaussian_pair();
         self.velocity[0] += gx * scale;
         self.velocity[1] += gy * scale;

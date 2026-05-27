@@ -124,6 +124,13 @@ impl Phenotype {
         self.body_length * self.body_width * self.body_height
     }
 
+    /// Sprint 202 — inertial mass (`volume × MASS_DENSITY`). Replaces the
+    /// pre-S202 mass proxy `effective_radius` in motor, collision-bond, and
+    /// brownian phases. See `params::physics::MASS_DENSITY` for tuning notes.
+    pub fn mass(&self) -> f32 {
+        (self.volume() * MASS_DENSITY).max(0.01)
+    }
+
     /// Applies the four morph signals from the brain to body dimensions.
     /// Signals below `MORPH_ACTIVATION_THRESHOLD` in absolute value are
     /// dead-zoned to zero so untrained random-brain noise doesn't drift the

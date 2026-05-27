@@ -17,14 +17,14 @@
 //   3. hidden = 2 × spike_count / IZH_SUBSTEPS − 1 (maps to [-1, +1]).
 //   4. L2 matvec + tanh → outputs.
 
-const BRAIN_INPUTS: u32 = 84u;
+const BRAIN_INPUTS: u32 = 86u;
 const BRAIN_HIDDEN: u32 = 45u;
-const BRAIN_OUTPUTS: u32 = 14u;
+const BRAIN_OUTPUTS: u32 = 15u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3780u;
-const W2_OFFSET: u32 = 3825u;
-const B2_OFFSET: u32 = 4455u;
-const WEIGHTS_PER_CELL: u32 = 4469u;
+const B1_OFFSET: u32 = 3870u;
+const W2_OFFSET: u32 = 3915u;
+const B2_OFFSET: u32 = 4590u;
+const WEIGHTS_PER_CELL: u32 = 4605u;
 
 const IZH_A: f32 = 0.02;
 const IZH_B: f32 = 0.2;
@@ -91,6 +91,10 @@ var<workgroup> norm_inv_std: f32;
 // injection current. Same mechanism as `brain_forward.wgsl`, but here
 // the inhibition reshapes the input current to the Izhikevich ODE.
 var<workgroup> softplus_sum: f32;
+// Sprint 192: per-neuron softplus cache so the inhibition apply doesn't
+// recompute softplus a second time (lane 0 sum + per-thread subtract both
+// read from this).
+var<workgroup> sp_cache: array<f32, BRAIN_HIDDEN>;
 
 @compute @workgroup_size(64)
 fn forward_izhikevich(
@@ -155,16 +159,24 @@ fn forward_izhikevich(
     // trajectories are byte-identical until an explicit alpha bump.
     let alpha = params.lateral_inhibition_alpha;
     if (alpha > 0.0 && h_n > 1u) {
+        // Each neuron-thread writes its own softplus into the cache, lane 0
+        // sums, then each thread reads `sum - own_sp` — softplus is computed
+        // exactly once per neuron per tick (pre-S192 had each lane recompute
+        // its softplus inside the apply step).
+        if (tid < h_n) {
+            sp_cache[tid] = softplus(current_shared[tid]);
+        }
+        workgroupBarrier();
         if (tid == 0u) {
             var sp: f32 = 0.0;
             for (var h: u32 = 0u; h < h_n; h = h + 1u) {
-                sp = sp + softplus(current_shared[h]);
+                sp = sp + sp_cache[h];
             }
             softplus_sum = sp;
         }
         workgroupBarrier();
         if (tid < h_n) {
-            let others = softplus_sum - softplus(current_shared[tid]);
+            let others = softplus_sum - sp_cache[tid];
             let inv_others = 1.0 / f32(h_n - 1u);
             current_shared[tid] = current_shared[tid] - alpha * others * inv_others;
         }
@@ -184,7 +196,9 @@ fn forward_izhikevich(
         var spike_count: u32 = 0u;
         let injection = current_shared[tid];
         for (var step: u32 = 0u; step < IZH_SUBSTEPS; step = step + 1u) {
-            let dv = 0.04 * v * v + 5.0 * v + 140.0 - u + injection;
+            // 0.04 v² + 5 v factored as v(0.04 v + 5) — same FLOPs but lets
+            // the compiler emit a clean fma chain instead of split mul+add.
+            let dv = v * (0.04 * v + 5.0) + 140.0 - u + injection;
             let du = IZH_A * (IZH_B * v - u);
             let v_new = v + dv * IZH_DT_PER_SUBSTEP_MS;
             let u_new = u + du * IZH_DT_PER_SUBSTEP_MS;

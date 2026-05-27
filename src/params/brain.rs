@@ -54,9 +54,19 @@ pub const N_BOND_MSG_CHANNELS: usize = 2;
 // [0, 1] (1 = clear, 0 = wall touching). Shifts BRAIN_INPUTS_SENSORY 33→39
 // and BRAIN_INPUTS 78→84. CHECKPOINT_VERSION bumped — pre-V9 brain weights
 // don't match the new w1 matrix shape and re-init from CPPN at next reproduce.
+//
+// Sprint 198 endosymbiosis brain integration (slots [39..41]): 2 symbiont
+// passenger inputs — has_symbiont (0 or 1) and deficit_norm (deficit_streak
+// / SYMBIONT_UPKEEP_DEFICIT_TICKS, clamped to [0, 1]). Lets the brain
+// correlate motor outputs with bearer status — without these, the host
+// can't evolve to swim toward upper z to keep its symbiont alive.
+// Shifts BRAIN_INPUTS_SENSORY 39→41, BRAIN_INPUTS 84→86. CHECKPOINT_VERSION
+// bumped to V9 — pre-V8 brain weight matrices don't match the new w1 shape.
+/// Per-host symbiont brain inputs: `has_symbiont` + `deficit_norm`.
+pub const N_SYMBIONT_INPUTS: usize = 2;
 pub const BRAIN_INPUTS_SENSORY: usize =
     27 + N_BOND_MSG_CHANNELS + crate::params::vibration::N_VIBRATION_INPUTS
-        + crate::params::maze::WHISKER_COUNT;
+        + crate::params::maze::WHISKER_COUNT + N_SYMBIONT_INPUTS;
 // Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
 // hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
 // w1 z 28×8=224 na 36×16=576 weights (2.6×).
@@ -119,7 +129,10 @@ pub const BRAIN_INPUTS: usize = BRAIN_INPUTS_SENSORY + BRAIN_RECURRENT;
 // Sloty 12..14 = bond message emit (N_BOND_MSG_CHANNELS). Brain forward
 // generuje raw signal v [-1, 1] (tanh); recipient sensor čte tyto hodnoty
 // z partnerova last_outputs.
-pub const BRAIN_OUTPUTS: usize = 12 + N_BOND_MSG_CHANNELS;
+// Slot 14 = active vibration emit (rectified, added to passive motion emit).
+// See `params/vibration.rs::{VIBRATION_EMIT_OUTPUT, MAX_ACTIVE_EMIT,
+// VIBRATION_EMIT_COST}` and `vibration_emit_for_cell`.
+pub const BRAIN_OUTPUTS: usize = 12 + N_BOND_MSG_CHANNELS + 1;
 /// Inicializační bias na thrust output bin v `Brain::random`. Bez něj má ~½
 /// random brainů thrust output blízko nuly (cell se sotva hýbe), což vytvářelo
 /// hluboké bottlenecky v ranných generacích. Po prvním selekčním tlaku evoluce
@@ -146,3 +159,10 @@ pub const INNATE_ATTACK_BIAS: f32 = 0.4;
 /// emituje signal nad threshold by default; selekce pak negativně tuní
 /// (cells co nechtějí bondovat učí brain weights pull dolů).
 pub const INNATE_BOND_BIAS: f32 = 2.5;
+/// Vibration emit bias (b2[14]). Strongly negative so random brains default
+/// to silence — without this every fresh cell would emit ~0.3 × MAX_ACTIVE
+/// from gen 0, saturating the field, drowning the gradient signal, and
+/// burning energy with no selective justification. Selection has to pull
+/// the bias positive (or build positive weight pathways from hidden units)
+/// before active emission turns on. tanh(-2.0) ≈ -0.96, rectified to 0.
+pub const INNATE_VIBRATION_EMIT_BIAS: f32 = -2.0;

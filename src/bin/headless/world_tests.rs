@@ -7,7 +7,9 @@ use bioscape::{
     SMELL_GRID_RES, SMELL_GRID_RES_Z, TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_FOOD_AMP,
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
 };
-use bioscape::sim::{food_multiplier, food_target, hazard_drain, scarcity_factor};
+use bioscape::sim::{
+    bonded_food_share, food_multiplier, food_target, hazard_drain, scarcity_factor,
+};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::path::PathBuf;
@@ -135,6 +137,39 @@ fn scarcity_factor_is_monotonically_non_increasing() {
         assert!(next <= prev + FLT_EPS, "regression at gen {gen}: {prev} -> {next}");
         prev = next;
     }
+}
+
+#[test]
+fn bonded_food_share_zero_bonds_is_zero() {
+    assert_eq!(bonded_food_share(20.0, 2.5, 1.0, 0), 0.0);
+}
+
+#[test]
+fn bonded_food_share_dilutes_with_cluster_size() {
+    let one = bonded_food_share(20.0, 2.5, 1.0, 1);
+    let two = bonded_food_share(20.0, 2.5, 1.0, 2);
+    let six = bonded_food_share(20.0, 2.5, 1.0, 6);
+    assert!(two < one, "n=2 ({two}) should be less than n=1 ({one})");
+    assert!(six < two, "n=6 ({six}) should be less than n=2 ({two})");
+}
+
+#[test]
+fn bonded_food_share_total_injected_is_cluster_size_invariant() {
+    // n × per-partner == the donor's pool, regardless of n — the conservative
+    // property S193 introduced. Pre-S193 the total scaled super-linearly.
+    let pool = 20.0 * 2.5 * 1.0;
+    for n in 1..=6u32 {
+        let total = bonded_food_share(20.0, 2.5, 1.0, n) * n as f32;
+        assert!(approx_eq(total, pool, FLT_EPS), "n={n}: total {total} != pool {pool}");
+    }
+}
+
+#[test]
+fn bonded_food_share_scales_linearly_with_altruism_and_state() {
+    let base = bonded_food_share(20.0, 1.0, 1.0, 2);
+    assert!(approx_eq(bonded_food_share(20.0, 2.0, 1.0, 2), base * 2.0, FLT_EPS));
+    assert!(approx_eq(bonded_food_share(20.0, 1.0, 0.5, 2), base * 0.5, FLT_EPS));
+    assert!(approx_eq(bonded_food_share(20.0, 0.0, 1.0, 2), 0.0, FLT_EPS));
 }
 
 #[test]
@@ -1067,4 +1102,95 @@ fn tick_chain_determinism_across_two_independent_runs() {
     assert_eq!(a.foods.len(), b.foods.len());
     assert_eq!(a.cells.len(), b.cells.len());
     assert_eq!(a.coop_foods.len(), b.coop_foods.len());
+}
+
+#[test]
+fn refresh_active_events_matches_full_scan() {
+    use bioscape::events::ShockScheduleConfig;
+
+    let cfg = ShockScheduleConfig {
+        mean_gens_between: 20,
+        ..Default::default()
+    };
+    let calendar = EventCalendar::generate(0xDEAD_BEEF, &cfg, 10_000);
+    assert!(
+        calendar.events.len() > 100,
+        "expected a dense calendar for the test (got {} events)",
+        calendar.events.len()
+    );
+
+    let mut world = fresh_world(7);
+    world.events = calendar.clone();
+
+    for gen in (0..2_000u64).step_by(7) {
+        world.clock.generation = gen;
+        world.refresh_active_events();
+
+        let mut expected_hazard: Vec<&ShockEvent> = calendar
+            .events
+            .iter()
+            .filter(|e| {
+                let end = e.start_gen.saturating_add(e.duration_gen as u64);
+                e.kind == ShockKind::HazardPulse && gen >= e.start_gen && gen < end
+            })
+            .collect();
+        let mut expected_climate: Vec<&ShockEvent> = calendar
+            .events
+            .iter()
+            .filter(|e| {
+                let end = e.start_gen.saturating_add(e.duration_gen as u64);
+                e.kind == ShockKind::ClimateShift && gen >= e.start_gen && gen < end
+            })
+            .collect();
+        expected_hazard.sort_by_key(|e| e.start_gen);
+        expected_climate.sort_by_key(|e| e.start_gen);
+
+        let mut got_hazard: Vec<&ShockEvent> = world.active_hazard_events.iter().collect();
+        let mut got_climate: Vec<&ShockEvent> = world.active_climate_events.iter().collect();
+        got_hazard.sort_by_key(|e| e.start_gen);
+        got_climate.sort_by_key(|e| e.start_gen);
+
+        assert_eq!(
+            got_hazard.len(),
+            expected_hazard.len(),
+            "hazard count mismatch at gen {}",
+            gen
+        );
+        for (a, b) in got_hazard.iter().zip(expected_hazard.iter()) {
+            assert_eq!(a.start_gen, b.start_gen, "hazard start_gen mismatch at gen {}", gen);
+            assert_eq!(a.duration_gen, b.duration_gen);
+        }
+        assert_eq!(got_climate.len(), expected_climate.len(), "climate count at gen {}", gen);
+        for (a, b) in got_climate.iter().zip(expected_climate.iter()) {
+            assert_eq!(a.start_gen, b.start_gen, "climate start_gen mismatch at gen {}", gen);
+            assert_eq!(a.duration_gen, b.duration_gen);
+        }
+    }
+}
+
+#[test]
+fn refresh_active_events_cursor_monotone() {
+    use bioscape::events::ShockScheduleConfig;
+
+    let cfg = ShockScheduleConfig {
+        mean_gens_between: 20,
+        ..Default::default()
+    };
+    let calendar = EventCalendar::generate(123, &cfg, 5_000);
+    let mut world = fresh_world(8);
+    world.events = calendar;
+
+    let mut prev_cursor = 0usize;
+    for gen in 0..1_000u64 {
+        world.clock.generation = gen;
+        world.refresh_active_events();
+        assert!(
+            world.first_live_event_idx >= prev_cursor,
+            "cursor regressed at gen {}: {} < {}",
+            gen,
+            world.first_live_event_idx,
+            prev_cursor
+        );
+        prev_cursor = world.first_live_event_idx;
+    }
 }

@@ -1,10 +1,13 @@
 // Per-cell motor update — mirrors CPU `Cell::apply_brain_motor`. Reads
 // brain output slots 0 (turn), 1 (thrust), 7 (pitch); the remaining slots
-// are written by other consumers. Mass = `effective_radius` (the arithmetic
-// mean of the three body axes), not full volume — smoke-tuned for inertia
-// scaling without quadratic cost shock on untrained brains.
+// are written by other consumers.
+//
+// Sprint 202: `mass = volume × MASS_DENSITY` (the host fills `masses` from
+// `Phenotype::mass()`). Pre-S202 binding 6 carried `effective_radius` as a
+// mass proxy — the cubic dependence on size now matches real-physics
+// inertia instead of the linear approximation.
 
-const BRAIN_OUTPUTS: u32 = 14u; // 12 motor/morph + 2 bond message (V7)
+const BRAIN_OUTPUTS: u32 = 15u; // 12 motor/morph + 2 bond message + 1 vibration emit
 
 struct Params {
     num_cells: u32,
@@ -19,7 +22,7 @@ struct Params {
 @group(0) @binding(3) var<storage, read> pitches: array<f32>;
 @group(0) @binding(4) var<storage, read> max_speeds: array<f32>;
 @group(0) @binding(5) var<storage, read> turn_rates: array<f32>;
-@group(0) @binding(6) var<storage, read> effective_radii: array<f32>;
+@group(0) @binding(6) var<storage, read> masses: array<f32>;
 @group(0) @binding(7) var<storage, read_write> velocities: array<f32>;
 @group(0) @binding(8) var<storage, read_write> angular_velocities: array<f32>;
 @group(0) @binding(9) var<storage, read_write> pitch_velocities: array<f32>;
@@ -35,7 +38,7 @@ fn motor(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_cells) {
         return;
     }
-    let mass = max(effective_radii[i], 0.01);
+    let mass = max(masses[i], 0.01);
     let inv_mass = 1.0 / mass;
     let turn_rate = turn_rates[i];
     let max_speed = max_speeds[i];
@@ -44,13 +47,11 @@ fn motor(@builtin(global_invocation_id) gid: vec3<u32>) {
     let thrust_norm = (outputs_in[i * BRAIN_OUTPUTS + 1u] + 1.0) * 0.5;
     let pitch_signal = outputs_in[i * BRAIN_OUTPUTS + 7u];
 
-    let ang_acc = turn_signal * turn_rate * inv_mass;
-    angular_velocities[i] = angular_velocities[i] + ang_acc * dt;
-    let pitch_acc = pitch_signal * turn_rate * inv_mass;
-    pitch_velocities[i] = pitch_velocities[i] + pitch_acc * dt;
+    let turn_scale = turn_rate * inv_mass;
+    angular_velocities[i] = angular_velocities[i] + turn_signal * turn_scale * dt;
+    pitch_velocities[i] = pitch_velocities[i] + pitch_signal * turn_scale * dt;
 
-    let a_max = params.drag_coefficient * max_speed * max_speed * inv_mass;
-    let a_dt = thrust_norm * a_max * dt;
+    let a_dt = thrust_norm * params.drag_coefficient * max_speed * max_speed * inv_mass * dt;
     let fwd = forward_vector(headings[i], pitches[i]);
     velocities[i * 3u + 0u] = velocities[i * 3u + 0u] + a_dt * fwd.x;
     velocities[i * 3u + 1u] = velocities[i * 3u + 1u] + a_dt * fwd.y;

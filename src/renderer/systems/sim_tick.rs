@@ -8,11 +8,11 @@
 use bevy::prelude::*;
 use bioscape::{N_PHEROMONE_CHANNELS, SPIKE_SLOTS};
 
-use super::super::components::{CellEntity, SpikeEntity};
+use super::super::components::{CellEntity, Pooled, SpikeEntity, SymbiontMarker};
 use super::super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::super::resources::{
     AdhesionMaterials, CellEntityPool, CellMesh, CellSlotMap, SimRng, SimWorld, SpikeMaterial,
-    SpikeMesh,
+    SpikeMesh, SymbiontMaterial, SymbiontMesh,
 };
 
 pub(crate) fn sim_tick(
@@ -21,12 +21,9 @@ pub(crate) fn sim_tick(
 ) {
     let rng = &mut sim_rng.0;
     let gen_ended = sim_world.0.tick(rng);
-    // Sprint 183+: keep the CPU vibration shadow current so the stats
-    // overlay can sample it without per-frame GPU readback. `tick` is
-    // 60 Hz so this download adds ~few ms/tick — acceptable for renderer
-    // diagnostics. Headless skips this because it samples vibration only
-    // at gen-end (`sync_vibration_from_gpu` directly).
-    sim_world.0.sync_vibration_from_gpu();
+    // The CPU vibration shadow is refreshed lazily by `update_stats_overlay`
+    // (its only consumer) — a per-tick GPU grid readback here meant a full
+    // `Wait` barrier spent feeding a throttled debug HUD.
 
     // Parity with headless `main.rs` post-tick cleanup: at the boundary
     // of a finished generation, reset the per-gen counters that the
@@ -39,6 +36,7 @@ pub(crate) fn sim_tick(
         world.deaths_gen = 0;
         world.fertile_ticks_gen = 0;
         world.predation_events_gen = 0;
+        world.sym_sheds_gen = 0;
         world.bonds_formed_gen = 0;
         world.bonds_broken_gen = 0;
         world.bonded_attacks_gen = 0;
@@ -90,6 +88,8 @@ pub(crate) fn sync_simworld_to_cellentity(
     cell_mesh: Res<CellMesh>,
     spike_mesh: Res<SpikeMesh>,
     spike_material: Res<SpikeMaterial>,
+    symbiont_mesh: Res<SymbiontMesh>,
+    symbiont_material: Res<SymbiontMaterial>,
     mut adhesion_materials: ResMut<AdhesionMaterials>,
     mut bio_materials: ResMut<Assets<BioMaterial>>,
     mut commands: Commands,
@@ -100,12 +100,16 @@ pub(crate) fn sync_simworld_to_cellentity(
     let target_len = world_cells.len();
 
     if current_len > target_len {
-        // Shrink: hide + pool, don't despawn.
+        // Shrink: hide + pool, don't despawn. `Pooled` marker keeps the
+        // stale CellEntity data out of gizmo / transform queries (otherwise
+        // bonds / whiskers / vibration rings render at the dead cell's old
+        // position until recycle).
         for slot in (target_len..current_len).rev() {
             let entity = slot_map.slot_to_entity[slot];
             commands
                 .entity(entity)
-                .insert(Visibility::Hidden);
+                .insert(Visibility::Hidden)
+                .insert(Pooled);
             slot_map.entity_to_slot.remove(&entity);
             pool.free_cells.push(entity);
         }
@@ -126,14 +130,15 @@ pub(crate) fn sync_simworld_to_cellentity(
             let entity = if let Some(recycled) = pool.free_cells.pop() {
                 // Recycle: refresh CellEntity data, swap material (adhesion
                 // type of the new tenant likely differs), refresh transform,
-                // unhide. Spike children survive — their `owner` id is
-                // stable, only the `CellEntity` payload changed.
+                // unhide, clear `Pooled` marker. Spike children survive —
+                // their `owner` id is stable, only `CellEntity` changed.
                 commands
                     .entity(recycled)
                     .insert(CellEntity(*cell))
                     .insert(MeshMaterial3d(material))
                     .insert(transform)
-                    .insert(Visibility::Visible);
+                    .insert(Visibility::Visible)
+                    .remove::<Pooled>();
                 recycled
             } else {
                 // Pool empty (startup or under cap): spawn fresh entity +
@@ -155,6 +160,13 @@ pub(crate) fn sync_simworld_to_cellentity(
                         Visibility::Hidden,
                     ));
                 }
+                commands.spawn((
+                    SymbiontMarker { owner: entity },
+                    Mesh3d(symbiont_mesh.0.clone()),
+                    MeshMaterial3d(symbiont_material.0.clone()),
+                    Transform::default(),
+                    Visibility::Hidden,
+                ));
                 entity
             };
             slot_map.allocate(entity);

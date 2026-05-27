@@ -316,16 +316,7 @@ impl ObstacleField {
         heading: f32,
         pitch: f32,
     ) -> [f32; WHISKER_COUNT] {
-        let fwd = crate::forward_vector(heading, pitch);
-        let right = [-heading.sin(), heading.cos(), 0.0];
-        let dirs: [[f32; 3]; WHISKER_COUNT] = [
-            fwd,
-            [-fwd[0], -fwd[1], -fwd[2]],
-            right,
-            [-right[0], -right[1], -right[2]],
-            [0.0, 0.0, 1.0],
-            [0.0, 0.0, -1.0],
-        ];
+        let dirs = whisker_directions(heading, pitch);
         let cs = self.voxel_size();
         let step = cs[0].min(cs[1]) * 0.5;
         let n_steps = (WHISKER_RANGE / step).ceil() as usize;
@@ -379,6 +370,56 @@ impl ObstacleField {
         }
         mask
     }
+}
+
+/// The six body-frame whisker ray directions — forward, back, right, left,
+/// up, down — as unit vectors in world frame. Shared by
+/// `ObstacleField::whisker_distances` (the raycast) and the renderer's
+/// whisker overlay so the two cannot drift out of order.
+pub fn whisker_directions(heading: f32, pitch: f32) -> [[f32; 3]; WHISKER_COUNT] {
+    let fwd = crate::forward_vector(heading, pitch);
+    let right = [-heading.sin(), heading.cos(), 0.0];
+    [
+        fwd,
+        [-fwd[0], -fwd[1], -fwd[2]],
+        right,
+        [-right[0], -right[1], -right[2]],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ]
+}
+
+/// Sprint 195 — deterministic stateless transduction noise for the whisker
+/// spring-damper model. Hashes `(cell_index, tick, whisker_k)` to `[-1, 1]`.
+/// Stateless (no RNG buffer, no reproduction reset); mirrored with identical
+/// integer arithmetic in `shaders/sensor_gather.wgsl` so the CPU and GPU
+/// whisker paths stay in bit-comparable parity.
+pub fn whisker_noise(cell_index: u32, tick: u32, whisker_k: u32) -> f32 {
+    let mut h = cell_index.wrapping_mul(0x9E37_79B9);
+    h ^= tick.wrapping_mul(0x85EB_CA6B);
+    h ^= whisker_k.wrapping_mul(0xC2B2_AE35);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846C_A68B);
+    h ^= h >> 16;
+    // Top 24 bits → [-1, 1).
+    (h >> 8) as f32 / 8_388_608.0 - 1.0
+}
+
+/// Sprint 195 — one semi-implicit Euler step of the whisker spring-damper
+/// for a single whisker. `raw` is the raycast free-distance ∈ [0, 1]; the
+/// wall-imposed target deflection is `1 − raw`. Mutates `(deflection,
+/// velocity)` in place and returns the sensed value `clamp(1 − deflection)
+/// + noise`. Mirrors the per-whisker body in `shaders/sensor_gather.wgsl`
+/// — `dt` is the fixed sim step `1/60` on both sides.
+pub fn whisker_step(deflection: &mut f32, velocity: &mut f32, raw: f32, noise: f32) -> f32 {
+    let dt = 1.0_f32 / 60.0;
+    let target = 1.0 - raw;
+    let accel = WHISKER_STIFFNESS * (target - *deflection) - WHISKER_DAMPING * *velocity;
+    *velocity += accel * dt;
+    *deflection += *velocity * dt;
+    ((1.0 - *deflection).clamp(0.0, 1.0) + noise).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]

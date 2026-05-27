@@ -11,7 +11,11 @@ struct ScaleParams {
     num_cells: u32,
     cap: f32,
     decay: f32,
+    gs_strength: f32,
+    floor: f32,
     _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// Sprint 138 homeostatic synaptic scaling pass. Runs every
@@ -67,6 +71,16 @@ impl SynapticScaleGpu {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ];
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("synaptic-scale-bgl"),
@@ -99,7 +113,16 @@ impl SynapticScaleGpu {
         })
     }
 
-    pub fn dispatch(&self, cells_gpu: &CellsGpu, n: usize, cap: f32, decay: f32) {
+    pub fn dispatch(
+        &self,
+        cells_gpu: &CellsGpu,
+        n: usize,
+        cap: f32,
+        decay: f32,
+        gs_strength: f32,
+        floor: f32,
+        hidden_n: &wgpu::Buffer,
+    ) {
         if n == 0 {
             return;
         }
@@ -107,6 +130,8 @@ impl SynapticScaleGpu {
             num_cells: n as u32,
             cap,
             decay,
+            gs_strength,
+            floor,
             ..ScaleParams::default()
         };
         self.queue
@@ -122,6 +147,10 @@ impl SynapticScaleGpu {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: cells_gpu.brain_weights_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: hidden_n.as_entire_binding(),
                 },
             ],
         });

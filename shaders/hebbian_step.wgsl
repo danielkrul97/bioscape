@@ -13,17 +13,17 @@
 // 1 cell = 1 thread, so every thread re-read the full input+hidden vectors
 // from global storage on every (h, in) outer iteration.
 
-const BRAIN_INPUTS: u32 = 84u;       // 27 + 2 bond inbox + 4 vibration + 6 whisker + 45 recurrent
+const BRAIN_INPUTS: u32 = 86u;       // 27 + 2 bond inbox + 4 vibration + 6 whisker + 45 recurrent
 const BRAIN_HIDDEN: u32 = 45u;
-const BRAIN_OUTPUTS: u32 = 14u;      // 12 motor/morph + 2 bond message
+const BRAIN_OUTPUTS: u32 = 15u;      // 12 motor/morph + 2 bond message + 1 vibration emit
 // Trace buffer layout mirrors brain_weights: w1 first (rows × inputs), then
 // w2 (rows × hidden). Bias slots are present (so the same WEIGHTS_PER_CELL
 // stride works) but always zero — caller MUST NOT rely on traces for biases.
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3780u;        // BRAIN_HIDDEN * BRAIN_INPUTS
-const W2_OFFSET: u32 = 3825u;        // B1_OFFSET + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 4455u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
-const WEIGHTS_PER_CELL: u32 = 4469u; // B2_OFFSET + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 3870u;        // BRAIN_HIDDEN * BRAIN_INPUTS
+const W2_OFFSET: u32 = 3915u;        // B1_OFFSET + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 4590u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
+const WEIGHTS_PER_CELL: u32 = 4605u; // B2_OFFSET + BRAIN_OUTPUTS
 
 const WG_SIZE: u32 = 64u;
 

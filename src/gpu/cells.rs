@@ -43,6 +43,11 @@ pub struct CellsGpu {
     /// b1/b2 slots stay at zero (biases ride on activations at reward time).
     /// Initialized to zero so first step starts clean.
     brain_traces_buf: wgpu::Buffer,
+    /// Sprint 195: per-cell whisker spring-damper state — 12 f32 per cell,
+    /// layout `[deflection0..6, velocity0..6]`. Persistent across ticks,
+    /// mutated in place by `sensor_gather.wgsl`. Zeroed on allocation and on
+    /// every slot recycle (`reset_persistent_brain_state_at`).
+    whisker_state_buf: wgpu::Buffer,
     velocities_buf: wgpu::Buffer,
     xoshiro_state_buf: wgpu::Buffer,
     rewards_buf: wgpu::Buffer,
@@ -61,6 +66,14 @@ pub struct CellsGpu {
     /// uploaded from genome every reproduce phase so newborns track their
     /// per-cell threshold from tick 0.
     reproduce_at_energies_buf: wgpu::Buffer,
+    /// Sprint 198: per-cell symbiont presence flag (0 = no symbiont, 1 = has).
+    /// Read by `populate_inputs.wgsl` for brain input slot 39 (has_symbiont).
+    /// Default fill = 0; CPU uploads each tick before the brain pass.
+    symbiont_has_buf: wgpu::Buffer,
+    /// Sprint 198: per-cell `symbiont.deficit_streak` (u32 ticks). Read by
+    /// `populate_inputs.wgsl`; divided by SYMBIONT_UPKEEP_DEFICIT_TICKS in the
+    /// shader to normalize to [0, 1] for brain input slot 40 (deficit_norm).
+    symbiont_deficit_buf: wgpu::Buffer,
     /// Sprint 145: per-cell, per-hidden-neuron Izhikevich membrane
     /// potential `v`. Layout: `[capacity × BRAIN_HIDDEN]` f32, row-major
     /// (cell i hidden h at index `i * BRAIN_HIDDEN + h`). Initialised at
@@ -102,6 +115,10 @@ pub struct CellsGpu {
     damage_accum_buf: wgpu::Buffer,
     max_speed_buf: wgpu::Buffer,
     eff_radius_buf: wgpu::Buffer,
+    /// Sprint 202: inertial mass (`volume × MASS_DENSITY`). Replaces the
+    /// pre-S202 use of `effective_radius` as a mass proxy in motor /
+    /// collision / brownian shaders.
+    mass_buf: wgpu::Buffer,
     /// Bond-mediated communication inbox per cell, written each tick from CPU
     /// (mean of bonded peers' last_outputs message channels). Read by
     /// populate_inputs shader into brain inputs slots [27..29].
@@ -181,6 +198,11 @@ impl CellsGpu {
             0,
             &vec![0u8; (n * (BRAIN_WEIGHTS_PER_CELL as u64) * f) as usize],
         );
+        // Sprint 195: whisker spring-damper state, 12 f32 per cell
+        // (deflection ×6, velocity ×6). Zeroed so the first sensor_gather
+        // dispatch starts every whisker at rest (deflection 0 = straight).
+        let whisker_state_buf = mk("cells-whisker-state", n * 12 * f, stor_dst_src);
+        queue.write_buffer(&whisker_state_buf, 0, &vec![0u8; (n * 12 * f) as usize]);
         let velocities_buf = mk("cells-velocities", n * 3 * f, stor_dst_src);
         let xoshiro_state_buf = mk("cells-xoshiro", n * 4 * 4, stor_dst_src);
         let rewards_buf = mk(
@@ -213,6 +235,24 @@ impl CellsGpu {
             &reproduce_at_energies_buf,
             0,
             bytemuck::cast_slice(&default_repro_fill),
+        );
+        // Sprint 198: symbiont state buffers. Both default-filled to zero so
+        // a population with no bearers reads has=0, deficit=0 on every cell.
+        let u32_size = std::mem::size_of::<u32>() as u64;
+        let symbiont_has_buf =
+            mk("cells-symbiont-has", n * u32_size, stor_dst_src);
+        let symbiont_deficit_buf =
+            mk("cells-symbiont-deficit", n * u32_size, stor_dst_src);
+        let default_zero_u32 = vec![0u32; capacity];
+        queue.write_buffer(
+            &symbiont_has_buf,
+            0,
+            bytemuck::cast_slice(&default_zero_u32),
+        );
+        queue.write_buffer(
+            &symbiont_deficit_buf,
+            0,
+            bytemuck::cast_slice(&default_zero_u32),
         );
         // Sprint 145: Izhikevich (v, u) buffers, sized like `last_hidden`.
         // Initial fill at resting potential / zero recovery so any cell
@@ -286,6 +326,10 @@ impl CellsGpu {
         let damage_accum_buf = mk("cells-damage", n * f, stor_dst_src);
         let max_speed_buf = mk("cells-max-speed", n * f, stor_dst_src);
         let eff_radius_buf = mk("cells-eff-radius", n * f, stor_dst_src);
+        // Sprint 202: inertial mass = volume × MASS_DENSITY. Uploaded
+        // alongside eff_radii each tick; consumed by motor / collision /
+        // brownian shaders.
+        let mass_buf = mk("cells-mass", n * f, stor_dst_src);
         let bonded_inbox_buf = mk(
             "cells-bonded-inbox",
             n * (N_BOND_MSG_CHANNELS as u64) * f,
@@ -337,12 +381,15 @@ impl CellsGpu {
             last_outputs_buf,
             brain_weights_buf,
             brain_traces_buf,
+            whisker_state_buf,
             velocities_buf,
             xoshiro_state_buf,
             rewards_buf,
             learning_rates_buf,
             trace_decays_buf,
             reproduce_at_energies_buf,
+            symbiont_has_buf,
+            symbiont_deficit_buf,
             membrane_buf,
             recovery_buf,
             neuron_models_buf,
@@ -356,6 +403,7 @@ impl CellsGpu {
             damage_accum_buf,
             max_speed_buf,
             eff_radius_buf,
+            mass_buf,
             bonded_inbox_buf,
             turn_rate_buf,
             angular_velocity_buf,
@@ -405,12 +453,16 @@ impl CellsGpu {
     pub fn brain_weights_buffer(&self) -> &wgpu::Buffer { &self.brain_weights_buf }
     /// Wave 7: per-cell eligibility-trace buffer (parallel to brain weights).
     pub fn brain_traces_buffer(&self) -> &wgpu::Buffer { &self.brain_traces_buf }
+    /// Sprint 195: per-cell whisker spring-damper state (12 f32/cell).
+    pub fn whisker_state_buffer(&self) -> &wgpu::Buffer { &self.whisker_state_buf }
     pub fn velocities_buffer(&self) -> &wgpu::Buffer { &self.velocities_buf }
     pub fn xoshiro_state_buffer(&self) -> &wgpu::Buffer { &self.xoshiro_state_buf }
     pub fn rewards_buffer(&self) -> &wgpu::Buffer { &self.rewards_buf }
     pub fn learning_rates_buffer(&self) -> &wgpu::Buffer { &self.learning_rates_buf }
     pub fn trace_decays_buffer(&self) -> &wgpu::Buffer { &self.trace_decays_buf }
     pub fn reproduce_at_energies_buffer(&self) -> &wgpu::Buffer { &self.reproduce_at_energies_buf }
+    pub fn symbiont_has_buffer(&self) -> &wgpu::Buffer { &self.symbiont_has_buf }
+    pub fn symbiont_deficit_buffer(&self) -> &wgpu::Buffer { &self.symbiont_deficit_buf }
     pub fn membrane_buffer(&self) -> &wgpu::Buffer { &self.membrane_buf }
     pub fn recovery_buffer(&self) -> &wgpu::Buffer { &self.recovery_buf }
     pub fn neuron_models_buffer(&self) -> &wgpu::Buffer { &self.neuron_models_buf }
@@ -425,6 +477,7 @@ impl CellsGpu {
     pub fn damage_accum_buffer(&self) -> &wgpu::Buffer { &self.damage_accum_buf }
     pub fn max_speed_buffer(&self) -> &wgpu::Buffer { &self.max_speed_buf }
     pub fn eff_radius_buffer(&self) -> &wgpu::Buffer { &self.eff_radius_buf }
+    pub fn mass_buffer(&self) -> &wgpu::Buffer { &self.mass_buf }
     pub fn bonded_inbox_buffer(&self) -> &wgpu::Buffer { &self.bonded_inbox_buf }
     /// Motor accessors. `turn_rate` is read-only; angular/pitch velocities
     /// are read-write.
@@ -822,18 +875,21 @@ impl CellsGpu {
         damage_accums: &[f32],
         max_speeds: &[f32],
         eff_radii: &[f32],
+        masses: &[f32],
     ) {
         debug_assert_eq!(energies.len(), headings.len());
         debug_assert_eq!(energies.len(), pitches.len());
         debug_assert_eq!(energies.len(), damage_accums.len());
         debug_assert_eq!(energies.len(), max_speeds.len());
         debug_assert_eq!(energies.len(), eff_radii.len());
+        debug_assert_eq!(energies.len(), masses.len());
         self.queue.write_buffer(&self.energy_buf, 0, bytemuck::cast_slice(energies));
         self.queue.write_buffer(&self.heading_buf, 0, bytemuck::cast_slice(headings));
         self.queue.write_buffer(&self.pitch_buf, 0, bytemuck::cast_slice(pitches));
         self.queue.write_buffer(&self.damage_accum_buf, 0, bytemuck::cast_slice(damage_accums));
         self.queue.write_buffer(&self.max_speed_buf, 0, bytemuck::cast_slice(max_speeds));
         self.queue.write_buffer(&self.eff_radius_buf, 0, bytemuck::cast_slice(eff_radii));
+        self.queue.write_buffer(&self.mass_buf, 0, bytemuck::cast_slice(masses));
     }
 
     /// Uploaduje brain weights pro N cells. Volá se na sim init + po reproduce
@@ -977,6 +1033,17 @@ impl CellsGpu {
         );
     }
 
+    /// Sprint 198: full-population upload of symbiont state. `has[i]` = 1 if
+    /// cell i is a bearer, 0 otherwise. `deficit[i]` = bearer's `deficit_streak`,
+    /// 0 for non-bearers. Called from `World::tick` before the brain dispatch.
+    pub fn upload_symbiont_state(&self, has: &[u32], deficit: &[u32]) {
+        assert_eq!(has.len(), deficit.len());
+        self.queue
+            .write_buffer(&self.symbiont_has_buf, 0, bytemuck::cast_slice(has));
+        self.queue
+            .write_buffer(&self.symbiont_deficit_buf, 0, bytemuck::cast_slice(deficit));
+    }
+
     /// Sprint 137: write the rates for a single slot. Used by post-swap_to
     /// path so the moved cell's gene-encoded rates land in its new slot
     /// without re-uploading the entire population.
@@ -1091,6 +1158,14 @@ impl CellsGpu {
             &self.post_trace_buf,
             (slot * hidden_bytes) as u64,
             &zeros[..hidden_bytes],
+        );
+        // Sprint 195: clear the whisker spring-damper state so a recycled
+        // slot doesn't inherit the previous occupant's ringing whiskers.
+        let whisker_bytes = 12 * f;
+        self.queue.write_buffer(
+            &self.whisker_state_buf,
+            (slot * whisker_bytes) as u64,
+            &zeros[..whisker_bytes],
         );
     }
 

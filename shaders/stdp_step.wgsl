@@ -5,14 +5,16 @@
 //
 // Perceptron cells are early-exited.
 
-const BRAIN_INPUTS: u32 = 84u;
+const BRAIN_INPUTS: u32 = 86u;
 const BRAIN_HIDDEN: u32 = 45u;
 const NEURON_MODEL_IZHIKEVICH: u32 = 1u;
 
 struct Params {
     num_cells: u32,
     tick: u32,
-    tau_ticks: f32,
+    // CPU computes `decay = exp(-1 / max(1, tau_ticks))` once per tick and
+    // uploads here — saves one `exp` per cell per tick (was per-shader).
+    decay: f32,
     _pad0: u32,
 }
 
@@ -32,8 +34,7 @@ fn stdp_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (neuron_models[cell] != NEURON_MODEL_IZHIKEVICH) {
         return;
     }
-    let tau = max(1.0, params.tau_ticks);
-    let decay = exp(-1.0 / tau);
+    let decay = params.decay;
     let tick = params.tick;
     let in_off = cell * BRAIN_INPUTS;
     let hid_off = cell * BRAIN_HIDDEN;
