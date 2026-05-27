@@ -6,6 +6,7 @@
 //!   F1            — pause / resume
 //!   F2            — single step (when paused)
 //!   F4 / F5       — halve / double steps-per-frame
+//!   F8            — toggle Rock / Temperature colouring
 //!   R             — restart simulation from initial state (same seed)
 //!   LMB drag      — orbit camera (horizontal = yaw, vertical = pitch)
 //!   Scroll wheel  — zoom in / out
@@ -17,6 +18,8 @@
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bioscape::planet::diagnostics::{principal_moments, total_energy, ScalarDiagnostics};
+use bioscape::planet::init::TemperatureProfile;
+use bioscape::planet::world::primary_radius;
 use bioscape::planet::{init, PlanetConfig, PlanetShape, PlanetWorld};
 use clap::Parser;
 use rand::rngs::StdRng;
@@ -66,6 +69,13 @@ struct Cli {
     /// Initial steps per render frame.
     #[arg(long, default_value_t = 4)]
     steps_per_frame: u32,
+    /// Sprint 206 — initial temperature profile.
+    #[arg(long, value_enum, default_value_t = TemperatureProfile::Uniform)]
+    init_temp_profile: TemperatureProfile,
+    #[arg(long, default_value_t = 0.01)]
+    init_temp_core: f32,
+    #[arg(long, default_value_t = 0.01)]
+    init_temp_surface: f32,
 }
 
 #[derive(Resource)]
@@ -79,6 +89,11 @@ struct Sim {
 #[derive(Component)]
 struct ParticleIdx(usize);
 
+/// Per-particle override stored at spawn so the F8 Rock→Temperature
+/// toggle can flip back without re-randomising the original palette.
+#[derive(Component)]
+struct RockMaterial(Handle<StandardMaterial>);
+
 #[derive(Component)]
 struct HudText;
 
@@ -87,6 +102,26 @@ struct CameraOrbit {
     yaw: f32,
     pitch: f32,
     distance: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ColorMode {
+    #[default]
+    Rock,
+    Temperature,
+}
+
+#[derive(Resource, Default)]
+struct ViewState {
+    mode: ColorMode,
+}
+
+/// Pre-baked 16-step viridis-like ramp used when the viewer is in
+/// `ColorMode::Temperature`. Per-frame work is a bucket lookup + handle
+/// swap; Bevy then batches by handle so the draw call count stays low.
+#[derive(Resource)]
+struct ThermalPalette {
+    handles: Vec<Handle<StandardMaterial>>,
 }
 
 fn main() {
@@ -98,6 +133,7 @@ fn main() {
             pitch: 0.45,
             distance: 4.5,
         })
+        .insert_resource(ViewState::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Bioscape — Torus Planet".into(),
@@ -145,6 +181,13 @@ fn setup(
 
     let mut world = PlanetWorld::new(config.clone());
     world.particles = init::generate(&config);
+    init::apply_temperature_profile(
+        &mut world.particles,
+        cli.init_temp_profile,
+        cli.init_temp_core,
+        cli.init_temp_surface,
+        primary_radius(&config),
+    );
 
     if let Err(e) = world.init_gpu_full() {
         eprintln!("gpu init failed: {e}");
@@ -202,14 +245,9 @@ fn setup(
     let mut viz_rng = StdRng::seed_from_u64(cli.seed.wrapping_add(0xA5_A5_5A_5A));
     for (i, pos) in world.particles.positions.iter().enumerate() {
         let material = material_pool[viz_rng.random_range(0..material_pool.len())].clone();
-        // Independent log-uniform scale per axis → ellipsoid silhouette.
-        // Range exp(±0.35) ≈ [0.70, 1.42]; aspect ratios up to ~2:1
-        // emerge naturally, mimicking water-tumbled pebble proportions.
         let sx = (viz_rng.random_range(-0.35..0.35) as f32).exp();
         let sy = (viz_rng.random_range(-0.35..0.35) as f32).exp();
         let sz = (viz_rng.random_range(-0.35..0.35) as f32).exp();
-        // Random orientation so neighbouring ellipsoids don't share the
-        // same long-axis direction (would otherwise look like crystals).
         let axis = Vec3::new(
             viz_rng.random_range(-1.0..1.0),
             viz_rng.random_range(-1.0..1.0),
@@ -220,6 +258,7 @@ fn setup(
         let angle: f32 = viz_rng.random_range(0.0..std::f32::consts::TAU);
         commands.spawn((
             ParticleIdx(i),
+            RockMaterial(material.clone()),
             Mesh3d(sphere_mesh.clone()),
             MeshMaterial3d(material),
             Transform {
@@ -229,6 +268,24 @@ fn setup(
             },
         ));
     }
+
+    // Pre-build the 16-step thermal ramp (blue → cyan → green → yellow → red).
+    let thermal_handles: Vec<Handle<StandardMaterial>> = (0..16)
+        .map(|k| {
+            let f = k as f32 / 15.0;
+            let rgb = viridis_like(f);
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(rgb[0], rgb[1], rgb[2]),
+                metallic: 0.0,
+                perceptual_roughness: 0.6,
+                emissive: LinearRgba::new(rgb[0] * 0.4, rgb[1] * 0.4, rgb[2] * 0.4, 1.0),
+                ..default()
+            })
+        })
+        .collect();
+    commands.insert_resource(ThermalPalette {
+        handles: thermal_handles,
+    });
 
     commands.spawn((
         Camera3d::default(),
@@ -270,7 +327,11 @@ fn setup(
     });
 }
 
-fn handle_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>) {
+fn handle_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut sim: ResMut<Sim>,
+    mut view: ResMut<ViewState>,
+) {
     if keys.just_pressed(KeyCode::F1) {
         sim.paused = !sim.paused;
         eprintln!("paused = {}", sim.paused);
@@ -289,10 +350,48 @@ fn handle_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>) {
         sim.steps_per_frame = (sim.steps_per_frame * 2).min(512);
         eprintln!("steps_per_frame = {}", sim.steps_per_frame);
     }
+    if keys.just_pressed(KeyCode::F8) {
+        view.mode = match view.mode {
+            ColorMode::Rock => ColorMode::Temperature,
+            ColorMode::Temperature => ColorMode::Rock,
+        };
+        eprintln!(
+            "color mode = {}",
+            if view.mode == ColorMode::Rock { "Rock" } else { "Temperature" }
+        );
+    }
     if keys.just_pressed(KeyCode::KeyR) {
         sim.world.reset();
         eprintln!("simulation reset (tick = 0, time = 0)");
     }
+}
+
+/// Smooth viridis-like ramp via piecewise-linear segments on key
+/// breakpoints. Avoids a 256-entry lookup table at the cost of a few
+/// extra branches; visually indistinguishable for the 16-step palette.
+fn viridis_like(f: f32) -> [f32; 3] {
+    let f = f.clamp(0.0, 1.0);
+    let stops: [(f32, [f32; 3]); 5] = [
+        (0.00, [0.267, 0.005, 0.329]),
+        (0.25, [0.231, 0.318, 0.546]),
+        (0.50, [0.128, 0.567, 0.551]),
+        (0.75, [0.478, 0.821, 0.318]),
+        (1.00, [0.993, 0.906, 0.144]),
+    ];
+    for i in 0..stops.len() - 1 {
+        let (a_t, a_c) = stops[i];
+        let (b_t, b_c) = stops[i + 1];
+        if f <= b_t {
+            let span = (b_t - a_t).max(1e-30);
+            let u = (f - a_t) / span;
+            return [
+                a_c[0] + (b_c[0] - a_c[0]) * u,
+                a_c[1] + (b_c[1] - a_c[1]) * u,
+                a_c[2] + (b_c[2] - a_c[2]) * u,
+            ];
+        }
+    }
+    stops.last().unwrap().1
 }
 
 fn tick_simulation(mut sim: ResMut<Sim>) {
@@ -306,10 +405,58 @@ fn tick_simulation(mut sim: ResMut<Sim>) {
     sim.world.download_state();
 }
 
-fn sync_particles(sim: Res<Sim>, mut q: Query<(&ParticleIdx, &mut Transform)>) {
-    for (idx, mut transform) in &mut q {
+fn sync_particles(
+    sim: Res<Sim>,
+    view: Res<ViewState>,
+    palette: Option<Res<ThermalPalette>>,
+    mut q: Query<(
+        &ParticleIdx,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+        &RockMaterial,
+    )>,
+) {
+    // For thermal mode, autoscale min/max of u per frame so the ramp
+    // always shows full contrast. Cheap O(N) but only once per frame.
+    let (t_lo, t_hi) = if view.mode == ColorMode::Temperature {
+        let energies = &sim.world.particles.internal_energies;
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &u in energies {
+            if u < lo { lo = u; }
+            if u > hi { hi = u; }
+        }
+        if !lo.is_finite() || !hi.is_finite() || hi - lo < 1e-9 {
+            lo = 0.0;
+            hi = 1.0;
+        }
+        (lo, hi)
+    } else {
+        (0.0, 1.0)
+    };
+
+    for (idx, mut transform, mut mat, rock) in &mut q {
         let p = &sim.world.particles.positions[idx.0];
         transform.translation = Vec3::new(p[0], p[1], p[2]);
+        match view.mode {
+            ColorMode::Rock => {
+                if mat.0 != rock.0 {
+                    mat.0 = rock.0.clone();
+                }
+            }
+            ColorMode::Temperature => {
+                if let Some(pal) = &palette {
+                    let u_i = sim.world.particles.internal_energies[idx.0];
+                    let f = ((u_i - t_lo) / (t_hi - t_lo)).clamp(0.0, 1.0);
+                    let bucket = ((f * (pal.handles.len() as f32 - 1.0)).round() as usize)
+                        .min(pal.handles.len() - 1);
+                    let new_handle = &pal.handles[bucket];
+                    if mat.0 != *new_handle {
+                        mat.0 = new_handle.clone();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -369,23 +516,33 @@ fn orbit_camera(
     }
 }
 
-fn update_hud(sim: Res<Sim>, mut q: Query<&mut Text, With<HudText>>) {
+fn update_hud(
+    sim: Res<Sim>,
+    view: Res<ViewState>,
+    mut q: Query<&mut Text, With<HudText>>,
+) {
     let particles = &sim.world.particles;
     let scalar = ScalarDiagnostics::compute(particles);
     let (ke, pe, e) = total_energy(particles, sim.world.config.g_const, sim.world.config.softening);
     let mom = principal_moments(particles);
     let axis_ac = mom[0] / mom[2].max(1e-30);
+    let mode_name = if view.mode == ColorMode::Rock { "Rock" } else { "Temperature" };
 
     let text = format!(
-        "tick: {}\ntime: {:.3} ({:.3} t_ff)\nsteps/frame: {}\npaused: {}\nKE: {:.4}\nPE: {:.4}\nE:  {:.4}\nLz: {:.4}\nI: [{:.3}, {:.3}, {:.3}]\na/c: {:.3}\nN: {}",
+        "tick: {}\ntime: {:.3} ({:.3} t_ff)\nsteps/frame: {}\npaused: {}\ncolor: {} (F8)\nKE: {:.4}\nPE: {:.4}\nU:  {:.4}\nE+U: {:.4}\nT̄: {:.4}\nT_min: {:.4}\nT_max: {:.4}\nLz: {:.4}\nI: [{:.3}, {:.3}, {:.3}]\na/c: {:.3}\nN: {}",
         sim.world.tick,
         sim.world.time,
         sim.world.time / sim.t_ff,
         sim.steps_per_frame,
         sim.paused,
+        mode_name,
         ke,
         pe,
-        e,
+        scalar.internal_energy,
+        e + scalar.internal_energy,
+        scalar.mean_temperature,
+        scalar.min_temperature,
+        scalar.max_temperature,
         scalar.angular_momentum_z,
         mom[0],
         mom[1],
