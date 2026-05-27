@@ -118,6 +118,23 @@ pub fn shape_max_extent(config: &PlanetConfig) -> f32 {
     }
 }
 
+/// Initial mean density `M / V` for the configured shape — analytic
+/// volume, no SPH kernel involved. Used by the radiation pass to pick
+/// a surface threshold (`ρ < frac · ρ_mean ⇒ surface`).
+pub fn shape_volume(config: &PlanetConfig) -> f32 {
+    let pi = std::f32::consts::PI;
+    match config.shape {
+        PlanetShape::Torus => 2.0 * pi * pi * config.r_major * config.r_minor * config.r_minor,
+        PlanetShape::Cube => config.cube_side.powi(3),
+        PlanetShape::Pancake => pi * config.pancake_radius * config.pancake_radius * config.pancake_height,
+    }
+}
+
+pub fn rho_mean_init(config: &PlanetConfig) -> f32 {
+    let v = shape_volume(config).max(1e-30);
+    config.total_mass / v
+}
+
 pub struct PlanetWorld {
     pub particles: Particles,
     pub config: PlanetConfig,
@@ -139,11 +156,16 @@ pub struct PlanetWorld {
     /// `init_gpu_full` from torus extent + 100 % slack so post-collapse
     /// particles still land in the hash grid.
     pub world_half: f32,
+    /// Sprint 205: initial mean density (analytic `M/V`). Constant for
+    /// the run; reused every tick as the radiation pass's surface
+    /// threshold via `ρ < frac · ρ_mean_init`.
+    pub rho_mean_init: f32,
 }
 
 impl PlanetWorld {
     pub fn new(config: PlanetConfig) -> Self {
         let n = config.n_particles;
+        let rho_mean = rho_mean_init(&config);
         Self {
             particles: Particles::with_capacity(n),
             config,
@@ -157,6 +179,7 @@ impl PlanetWorld {
             thermal_integrate: None,
             thermal_conduction: None,
             world_half: 2.5,
+            rho_mean_init: rho_mean,
         }
     }
 
@@ -261,7 +284,7 @@ impl PlanetWorld {
             self.config.visc_beta,
         );
         thermal_conduction.dispatch(n);
-        thermal_integrate.dispatch(n, dt);
+        thermal_integrate.dispatch(n, dt, self.rho_mean_init);
         gpu.kick(n, 0.5 * dt);
 
         self.tick += 1;

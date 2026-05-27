@@ -19,7 +19,15 @@ struct ThermalParams {
     dt: f32,
     u_min: f32,
     u_max: f32,
+    inv_cv: f32,
+    sigma: f32,
+    emissivity: f32,
+    t_space: f32,
+    rho_surface: f32,
+    max_rad_frac: f32,
     pad_a0: f32,
+    pad_a1: f32,
+    pad_a2: f32,
 }
 
 pub struct ThermalIntegrateGpu {
@@ -38,12 +46,12 @@ impl ThermalIntegrateGpu {
                 include_str!("../../../shaders/planet_thermal_integrate.wgsl").into(),
             ),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..3)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..4)
             .map(|i| {
-                let ty = if i == 0 {
-                    wgpu::BufferBindingType::Uniform
-                } else {
-                    wgpu::BufferBindingType::Storage { read_only: false }
+                let ty = match i {
+                    0 => wgpu::BufferBindingType::Uniform,
+                    1 | 2 => wgpu::BufferBindingType::Storage { read_only: false },
+                    _ => wgpu::BufferBindingType::Storage { read_only: true },
                 };
                 wgpu::BindGroupLayoutEntry {
                     binding: i,
@@ -88,6 +96,7 @@ impl ThermalIntegrateGpu {
                 wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: gpu.internal_energies_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: gpu.du_dt_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: gpu.densities_buffer().as_entire_binding() },
             ],
         });
 
@@ -99,7 +108,7 @@ impl ThermalIntegrateGpu {
         })
     }
 
-    pub fn dispatch(&self, n: usize, dt: f32) {
+    pub fn dispatch(&self, n: usize, dt: f32, rho_mean_init: f32) {
         if n == 0 {
             return;
         }
@@ -108,6 +117,12 @@ impl ThermalIntegrateGpu {
             dt,
             u_min: thermal::U_MIN,
             u_max: thermal::U_MAX,
+            inv_cv: 1.0 / thermal::HEAT_CAPACITY_CV,
+            sigma: thermal::STEFAN_BOLTZMANN_SIGMA,
+            emissivity: thermal::RADIATION_EMISSIVITY,
+            t_space: thermal::SPACE_TEMPERATURE,
+            rho_surface: rho_mean_init * thermal::SURFACE_DENSITY_FRAC,
+            max_rad_frac: thermal::RADIATION_MAX_FRAC,
             ..ThermalParams::default()
         };
         self.ctx
