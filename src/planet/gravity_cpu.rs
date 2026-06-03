@@ -38,23 +38,37 @@ pub fn compute_acceleration(particles: &mut Particles, g: f32, softening: f32) {
 
 /// Total gravitational potential energy with Plummer softening:
 /// `U = -G/2 · Σ_{i ≠ j} m_i m_j / √(|r_ij|² + ε²)`.
+///
+/// O(N²). Parallelised over `i` with rayon, but summed deterministically:
+/// each `i` reduces its own `j > i` tail sequentially, the per-`i` partials
+/// are collected in index order, then folded in order — so the result is
+/// bit-stable run-to-run (the diagnostic CSV stays reproducible) despite the
+/// parallel map.
 pub fn potential_energy(particles: &Particles, g: f32, softening: f32) -> f64 {
+    use rayon::prelude::*;
     let n = particles.len();
     let eps2 = (softening * softening) as f64;
-    let mut u = 0.0_f64;
-    for i in 0..n {
-        let xi = particles.positions[i];
-        let mi = particles.masses[i] as f64;
-        for j in (i + 1)..n {
-            let xj = particles.positions[j];
-            let dx = (xj[0] - xi[0]) as f64;
-            let dy = (xj[1] - xi[1]) as f64;
-            let dz = (xj[2] - xi[2]) as f64;
-            let r = (dx * dx + dy * dy + dz * dz + eps2).sqrt();
-            u -= (g as f64) * mi * (particles.masses[j] as f64) / r;
-        }
-    }
-    u
+    let g = g as f64;
+    let positions = &particles.positions;
+    let masses = &particles.masses;
+    let partials: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let xi = positions[i];
+            let mi = masses[i] as f64;
+            let mut ui = 0.0_f64;
+            for j in (i + 1)..n {
+                let xj = positions[j];
+                let dx = (xj[0] - xi[0]) as f64;
+                let dy = (xj[1] - xi[1]) as f64;
+                let dz = (xj[2] - xi[2]) as f64;
+                let r = (dx * dx + dy * dy + dz * dz + eps2).sqrt();
+                ui -= g * mi * (masses[j] as f64) / r;
+            }
+            ui
+        })
+        .collect();
+    partials.iter().sum()
 }
 
 #[cfg(test)]

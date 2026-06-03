@@ -26,6 +26,11 @@ pub struct ScalarDiagnostics {
     /// hot anomalies that could drive runaway radiation.
     pub min_temperature: f32,
     pub max_temperature: f32,
+    /// Sprint 230: mass-weighted mean solid fraction `Σ m φ / Σ m` and the
+    /// mass fraction that is fully solid (`φ > 0.5`). Track the melt/freeze
+    /// state of the body.
+    pub mean_phase_frac: f64,
+    pub solid_mass_frac: f64,
 }
 
 impl ScalarDiagnostics {
@@ -36,8 +41,11 @@ impl ScalarDiagnostics {
         let mut u_sum = 0.0_f64;
         let mut t_min = f32::INFINITY;
         let mut t_max = f32::NEG_INFINITY;
+        let mut t_sum = 0.0_f64;
+        let mut phi_sum = 0.0_f64;
+        let mut solid_sum = 0.0_f64;
         let have_u = particles.internal_energies.len() == particles.positions.len();
-        let cv_f32 = crate::planet::thermal::HEAT_CAPACITY_CV;
+        let have_phi = particles.phase_fracs.len() == particles.positions.len();
         for (i, ((p, v), &m)) in particles
             .positions
             .iter()
@@ -55,21 +63,28 @@ impl ScalarDiagnostics {
             if have_u {
                 let u_i = particles.internal_energies[i];
                 u_sum += m64 * u_i as f64;
-                let t_i = u_i / cv_f32;
+                // Sensible temperature via the enthalpy map so the melt
+                // plateau is reflected in min/max/mean T (S223).
+                let t_i = crate::planet::thermal::sensible_temperature_of(u_i);
+                t_sum += m64 * t_i as f64;
                 if t_i < t_min { t_min = t_i; }
                 if t_i > t_max { t_max = t_i; }
+            }
+            if have_phi {
+                let phi = particles.phase_fracs[i] as f64;
+                phi_sum += m64 * phi;
+                if phi > 0.5 {
+                    solid_sum += m64;
+                }
             }
         }
         if !have_u {
             t_min = 0.0;
             t_max = 0.0;
         }
-        let cv = cv_f32 as f64;
-        let mean_t = if m_sum > 0.0 && cv > 0.0 {
-            u_sum / (m_sum * cv)
-        } else {
-            0.0
-        };
+        let mean_t = if m_sum > 0.0 { t_sum / m_sum } else { 0.0 };
+        let mean_phi = if m_sum > 0.0 { phi_sum / m_sum } else { 0.0 };
+        let solid_frac = if m_sum > 0.0 { solid_sum / m_sum } else { 0.0 };
         Self {
             total_mass: m_sum,
             kinetic_energy: t_kin,
@@ -78,8 +93,77 @@ impl ScalarDiagnostics {
             mean_temperature: mean_t,
             min_temperature: t_min,
             max_temperature: t_max,
+            mean_phase_frac: mean_phi,
+            solid_mass_frac: solid_frac,
         }
     }
+}
+
+/// Count emergent solid "blocks": connected components of the
+/// solid-fraction graph. Nodes are particles with `φ > 0.5`; two solid
+/// particles are linked when within `link_factor · ½(h_i + h_j)`. Returns
+/// `(n_blocks, largest_block_size)`. O(N²) — for diagnostic cadence, not
+/// the hot loop.
+pub fn count_solid_blocks(particles: &Particles, link_factor: f32) -> (usize, usize) {
+    let n = particles.positions.len();
+    if particles.phase_fracs.len() != n {
+        return (0, 0);
+    }
+    let solid: Vec<usize> = (0..n).filter(|&i| particles.phase_fracs[i] > 0.5).collect();
+    let m = solid.len();
+    if m == 0 {
+        return (0, 0);
+    }
+    // Find linked (a, b) pairs in parallel — each `a` scans its `b > a` tail.
+    // Collected in `a` order; union-find then runs sequentially. Connected-
+    // component sizes are invariant to union order, so the result is
+    // deterministic regardless of how rayon schedules the search.
+    use rayon::prelude::*;
+    let solid_ref = &solid;
+    let positions = &particles.positions;
+    let h = &particles.smoothing_lengths;
+    let pairs: Vec<(usize, usize)> = (0..m)
+        .into_par_iter()
+        .flat_map_iter(|a| {
+            let i = solid_ref[a];
+            let xi = positions[i];
+            let hi = h[i];
+            (a + 1..m).filter_map(move |b| {
+                let j = solid_ref[b];
+                let xj = positions[j];
+                let hj = h[j];
+                let dx = xi[0] - xj[0];
+                let dy = xi[1] - xj[1];
+                let dz = xi[2] - xj[2];
+                let r2 = dx * dx + dy * dy + dz * dz;
+                let link = link_factor * 0.5 * (hi + hj);
+                if r2 <= link * link { Some((a, b)) } else { None }
+            })
+        })
+        .collect();
+
+    let mut parent: Vec<usize> = (0..m).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for (a, b) in pairs {
+        let ra = find(&mut parent, a);
+        let rb = find(&mut parent, b);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    let mut sizes = std::collections::HashMap::new();
+    for a in 0..m {
+        let r = find(&mut parent, a);
+        *sizes.entry(r).or_insert(0usize) += 1;
+    }
+    let largest = sizes.values().copied().max().unwrap_or(0);
+    (sizes.len(), largest)
 }
 
 /// Symmetric 3×3 inertia tensor `I_ab = Σ m (r² δ_ab − r_a r_b)`.
@@ -179,13 +263,16 @@ pub fn total_energy(particles: &Particles, g: f32, softening: f32) -> (f64, f64,
 }
 
 /// CFL-stable timestep estimate. For each particle:
-///   dt_i = C · h_i / (c_s_i + |v_i|)
-/// Reduces to the global minimum. Ideal-gas sound speed
-/// `c_s = √(γ(γ−1) u)`; `eos_k` is accepted for binary compatibility
-/// with the pre-S203 polytropic CLI flag and otherwise ignored.
-pub fn cfl_dt(particles: &Particles, _eos_k: f32, eos_gamma: f32, c_courant: f32) -> f32 {
+///   dt_i = C · h_i / (c_eff_i + |v_i|)
+/// reduced to the global minimum. `c_eff` is the phase-selected sound
+/// speed (`thermal::sound_speed_of`): ideal-gas `√(γ(γ−1)u)` above the
+/// vaporisation energy, condensed Tait `c0√n·(ρ/ρ0)^((n−1)/2)` below.
+/// The condensed branch is the S224 fix — the old gas-only estimate
+/// reported a falsely huge safe dt for cold low-`u` solids (`√(γ(γ−1)u)`
+/// → 0), exactly the stiffest, least stable particles.
+pub fn cfl_dt(particles: &Particles, eos_gamma: f32, rho0: f32, c_courant: f32) -> f32 {
     let have_u = particles.internal_energies.len() == particles.positions.len();
-    let gm1 = eos_gamma - 1.0;
+    let have_rho = particles.densities.len() == particles.positions.len();
     let mut dt_min = f32::INFINITY;
     for (i, (v, &h)) in particles
         .velocities
@@ -199,7 +286,12 @@ pub fn cfl_dt(particles: &Particles, _eos_k: f32, eos_gamma: f32, c_courant: f32
         } else {
             crate::planet::thermal::INITIAL_INTERNAL_ENERGY
         };
-        let c_s = (eos_gamma * gm1 * u).sqrt();
+        let rho = if have_rho {
+            particles.densities[i].max(1e-30)
+        } else {
+            rho0
+        };
+        let c_s = crate::planet::thermal::elastic_sound_speed_of(u, rho, eos_gamma, rho0);
         let denom = c_s + v_mag;
         if denom > 0.0 {
             let dt = c_courant * h / denom;

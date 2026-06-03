@@ -23,7 +23,7 @@ struct DensityParams {
 }
 
 @group(0) @binding(0) var<uniform> params: DensityParams;
-@group(0) @binding(1) var<storage, read> positions: array<f32>;
+@group(0) @binding(1) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> masses: array<f32>;
 @group(0) @binding(3) var<storage, read_write> smoothing_lengths: array<f32>;
 @group(0) @binding(4) var<storage, read_write> densities: array<f32>;
@@ -56,9 +56,9 @@ fn density(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_particles) { return; }
 
     let xi = vec3<f32>(
-        positions[i * 3u + 0u],
-        positions[i * 3u + 1u],
-        positions[i * 3u + 2u],
+        positions[i].x,
+        positions[i].y,
+        positions[i].z,
     );
     let mi = masses[i];
     let h = smoothing_lengths[i];
@@ -78,9 +78,9 @@ fn density(@builtin(global_invocation_id) gid: vec3<u32>) {
                 for (var slot: u32 = start; slot < end; slot = slot + 1u) {
                     let j = sorted_particles[slot];
                     let xj = vec3<f32>(
-                        positions[j * 3u + 0u],
-                        positions[j * 3u + 1u],
-                        positions[j * 3u + 2u],
+                        positions[j].x,
+                        positions[j].y,
+                        positions[j].z,
                     );
                     let d = xj - xi;
                     let r = sqrt(dot(d, d));

@@ -28,7 +28,7 @@ struct Params {
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> positions: array<f32>;
+@group(0) @binding(1) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> counts: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> offsets: array<u32>;
 @group(0) @binding(4) var<storage, read_write> sorted_particles: array<u32>;
@@ -48,9 +48,9 @@ fn count(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.num_particles) { return; }
     let pos = vec3<f32>(
-        positions[i * 3u + 0u],
-        positions[i * 3u + 1u],
-        positions[i * 3u + 2u],
+        positions[i].x,
+        positions[i].y,
+        positions[i].z,
     );
     let b = bucket_id_of(pos);
     atomicAdd(&counts[b], 1u);
@@ -104,9 +104,9 @@ fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.num_particles) { return; }
     let pos = vec3<f32>(
-        positions[i * 3u + 0u],
-        positions[i * 3u + 1u],
-        positions[i * 3u + 2u],
+        positions[i].x,
+        positions[i].y,
+        positions[i].z,
     );
     let b = bucket_id_of(pos);
     let local = atomicAdd(&counts[b], 1u);

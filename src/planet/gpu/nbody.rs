@@ -107,7 +107,8 @@ impl NBodyGpu {
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
-        let positions_buf = mk("planet-nbody-pos", n * 3 * f, stor);
+        // positions are vec4-packed (16-byte stride) to match planet_nbody.wgsl.
+        let positions_buf = mk("planet-nbody-pos", n * 4 * f, stor);
         let masses_buf = mk("planet-nbody-mass", n * f, stor);
         let accelerations_buf = mk("planet-nbody-acc", n * 3 * f, stor);
         let accelerations_rb = mk("planet-nbody-acc-rb", n * 3 * f, read);
@@ -165,7 +166,8 @@ impl NBodyGpu {
             eps2: softening * softening,
             ..NBodyParams::default()
         };
-        let pos_flat: Vec<f32> = positions.iter().flatten().copied().collect();
+        // vec4-packed: [x, y, z, 0] per particle (matches the shader binding).
+        let pos_flat: Vec<f32> = positions.iter().flat_map(|p| [p[0], p[1], p[2], 0.0]).collect();
 
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));

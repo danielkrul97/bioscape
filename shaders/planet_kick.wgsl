@@ -12,7 +12,7 @@ struct KickParams {
 }
 
 @group(0) @binding(0) var<uniform> params: KickParams;
-@group(0) @binding(1) var<storage, read_write> velocities: array<f32>;
+@group(0) @binding(1) var<storage, read_write> velocities: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> accelerations: array<f32>;
 
 @compute @workgroup_size(64)
@@ -20,7 +20,7 @@ fn kick(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.num_particles) { return; }
     let h = params.dt_half;
-    velocities[i * 3u + 0u] = velocities[i * 3u + 0u] + h * accelerations[i * 3u + 0u];
-    velocities[i * 3u + 1u] = velocities[i * 3u + 1u] + h * accelerations[i * 3u + 1u];
-    velocities[i * 3u + 2u] = velocities[i * 3u + 2u] + h * accelerations[i * 3u + 2u];
+    velocities[i].x = velocities[i].x + h * accelerations[i * 3u + 0u];
+    velocities[i].y = velocities[i].y + h * accelerations[i * 3u + 1u];
+    velocities[i].z = velocities[i].z + h * accelerations[i * 3u + 2u];
 }

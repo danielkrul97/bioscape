@@ -32,10 +32,13 @@ struct ConductionParams {
     cell_size: f32,
     kappa: f32,
     inv_cv: f32,
+    t_m: f32,
+    l: f32,
+    pad_b0: f32, pad_b1: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: ConductionParams;
-@group(0) @binding(1) var<storage, read> positions: array<f32>;
+@group(0) @binding(1) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> masses: array<f32>;
 @group(0) @binding(3) var<storage, read> smoothing_lengths: array<f32>;
 @group(0) @binding(4) var<storage, read> densities: array<f32>;
@@ -43,6 +46,7 @@ struct ConductionParams {
 @group(0) @binding(6) var<storage, read_write> du_dt: array<f32>;
 @group(0) @binding(7) var<storage, read> hash_offsets: array<u32>;
 @group(0) @binding(8) var<storage, read> sorted_particles: array<u32>;
+@group(0) @binding(9) var<storage, read> mat_t_m: array<f32>;
 
 fn bucket_xyz(pos: vec3<f32>) -> vec3<i32> {
     let bx = i32(floor(pos.x / params.cell_size)) + HALF_N;
@@ -61,14 +65,17 @@ fn thermal_conduction(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_particles) { return; }
 
     let xi = vec3<f32>(
-        positions[i * 3u + 0u],
-        positions[i * 3u + 1u],
-        positions[i * 3u + 2u],
+        positions[i].x,
+        positions[i].y,
+        positions[i].z,
     );
     let hi = smoothing_lengths[i];
     let rho_i = max(densities[i], 1e-30);
     let u_i = max(internal_energies[i], U_MIN);
-    let t_i = u_i * params.inv_cv;
+    // Sensible temperature via the enthalpy map: two particles both in the
+    // melt band sit at T_m ⇒ no flux between them, so the latent plateau
+    // is respected by conduction. Was `u_i * inv_cv` pre-S223.
+    let t_i = phase_of(u_i, mat_t_m[i], params.l).t;
 
     // Uniform-material: κ_ij = 2 κ.
     let two_kappa = 2.0 * params.kappa;
@@ -91,9 +98,9 @@ fn thermal_conduction(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let j = sorted_particles[slot];
                     if (j == i) { continue; }
                     let xj = vec3<f32>(
-                        positions[j * 3u + 0u],
-                        positions[j * 3u + 1u],
-                        positions[j * 3u + 2u],
+                        positions[j].x,
+                        positions[j].y,
+                        positions[j].z,
                     );
                     let dvec = xi - xj;
                     let r2 = dot(dvec, dvec);
@@ -117,7 +124,7 @@ fn thermal_conduction(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let mj = masses[j];
                     let rho_j = max(densities[j], 1e-30);
                     let u_j = max(internal_energies[j], U_MIN);
-                    let t_j = u_j * params.inv_cv;
+                    let t_j = phase_of(u_j, mat_t_m[j], params.l).t;
 
                     du_cond = du_cond + mj * two_kappa * (t_i - t_j) * f_ij
                         / (rho_i * rho_j);

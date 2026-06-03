@@ -19,6 +19,7 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bioscape::planet::diagnostics::{principal_moments, total_energy, ScalarDiagnostics};
 use bioscape::planet::init::TemperatureProfile;
+use bioscape::planet::thermal::phase_of;
 use bioscape::planet::world::primary_radius;
 use bioscape::planet::{init, PlanetConfig, PlanetShape, PlanetWorld};
 use clap::Parser;
@@ -76,6 +77,32 @@ struct Cli {
     init_temp_core: f32,
     #[arg(long, default_value_t = 0.01)]
     init_temp_surface: f32,
+    /// Sprint 231 — elastic sub-steps per outer step (>1 for stiff solids).
+    #[arg(long, default_value_t = 1)]
+    n_substeps: u32,
+    /// Sprint 231 — shear modulus G0 (rigidity). Crank up with --n-substeps.
+    #[arg(long, default_value_t = bioscape::planet::thermal::SHEAR_MODULUS_G0)]
+    shear_modulus: f32,
+    /// Sprint 231 — condensed reference sound speed c0 (bulk stiffness).
+    #[arg(long, default_value_t = bioscape::planet::thermal::TAIT_REF_SOUND_SPEED_C0)]
+    tait_c0: f32,
+    /// Sprint 231 — Tait exponent n.
+    #[arg(long, default_value_t = bioscape::planet::thermal::TAIT_EXPONENT_N)]
+    tait_exponent: f32,
+    /// Sprint 231 — von Mises yield strength Y0.
+    #[arg(long, default_value_t = bioscape::planet::thermal::YIELD_STRENGTH_Y0)]
+    yield_strength: f32,
+    /// Sprint 232 — core material radius as a fraction of the primary radius
+    /// (0 = single material). Particles inside get the core material.
+    #[arg(long, default_value_t = 0.0)]
+    core_radius_frac: f32,
+    /// Sprint 232 — core reference density as a multiple of the mean density
+    /// (>1 = denser, differentiates inward).
+    #[arg(long, default_value_t = 2.0)]
+    core_rho0_mult: f32,
+    /// Sprint 232 — core melt temperature T_m (higher = refractory).
+    #[arg(long, default_value_t = 0.5)]
+    core_t_m: f32,
 }
 
 #[derive(Resource)]
@@ -84,6 +111,18 @@ struct Sim {
     paused: bool,
     steps_per_frame: u32,
     t_ff: f32,
+    /// Frame counter used to throttle the full-state readback that
+    /// feeds HUD diagnostics (KE / PE / Lz). The render hot path
+    /// only pulls positions (+ thermal) every frame; the rest comes
+    /// from a heavier `download_state` every `hud_period` frames.
+    hud_counter: u32,
+    /// How often (in frames) to refresh full GPU state for the HUD.
+    /// 15 ≈ 4 Hz at 60 fps — smooth enough for energy diagnostics
+    /// without paying the 6-buffer readback cost every frame.
+    hud_period: u32,
+    /// Set when a full `download_state` lands; `update_hud` only recomputes
+    /// its O(N²) energy/inertia diagnostics on those frames, not every frame.
+    hud_dirty: bool,
 }
 
 #[derive(Component)]
@@ -109,11 +148,23 @@ enum ColorMode {
     Rock,
     #[default]
     Temperature,
+    /// Sprint 230: colour by solid fraction φ (liquid → solid) so melting
+    /// and emergent blocks are visible. φ is already in [0,1]; the thermal
+    /// palette is reused directly with no autoscale.
+    Phase,
 }
 
 #[derive(Resource, Default)]
 struct ViewState {
     mode: ColorMode,
+}
+
+fn color_mode_label(mode: ColorMode) -> &'static str {
+    match mode {
+        ColorMode::Rock => "Rock",
+        ColorMode::Temperature => "Temperature",
+        ColorMode::Phase => "Phase",
+    }
 }
 
 /// Pre-baked 16-step viridis-like ramp used when the viewer is in
@@ -177,6 +228,11 @@ fn setup(
     config.softening = cli.softening;
     config.visc_alpha = cli.visc_alpha;
     config.visc_beta = cli.visc_beta;
+    config.n_substeps = cli.n_substeps;
+    config.shear_modulus = cli.shear_modulus;
+    config.tait_c0 = cli.tait_c0;
+    config.tait_exponent = cli.tait_exponent;
+    config.yield_strength = cli.yield_strength;
     config.omega = init::omega_from_frac(&config, cli.omega_frac);
 
     let mut world = PlanetWorld::new(config.clone());
@@ -188,6 +244,15 @@ fn setup(
         cli.init_temp_surface,
         primary_radius(&config),
     );
+    if cli.core_radius_frac > 0.0 {
+        let rho_mean = bioscape::planet::world::rho_mean_init(&config);
+        init::assign_core_material(
+            &mut world.particles,
+            cli.core_radius_frac * primary_radius(&config),
+            cli.core_rho0_mult * rho_mean,
+            cli.core_t_m,
+        );
+    }
 
     if let Err(e) = world.init_gpu_full() {
         eprintln!("gpu init failed: {e}");
@@ -324,6 +389,9 @@ fn setup(
         paused: false,
         steps_per_frame: cli.steps_per_frame,
         t_ff,
+        hud_counter: 0,
+        hud_period: 15,
+        hud_dirty: true,
     });
 }
 
@@ -340,7 +408,10 @@ fn handle_input(
         for _ in 0..sim.steps_per_frame {
             sim.world.tick_sph();
         }
+        // Single-step path stays a full readback so the HUD reflects
+        // the post-step state immediately, no throttling.
         sim.world.download_state();
+        sim.hud_dirty = true;
     }
     if keys.just_pressed(KeyCode::F4) {
         sim.steps_per_frame = (sim.steps_per_frame / 2).max(1);
@@ -353,12 +424,10 @@ fn handle_input(
     if keys.just_pressed(KeyCode::F8) {
         view.mode = match view.mode {
             ColorMode::Rock => ColorMode::Temperature,
-            ColorMode::Temperature => ColorMode::Rock,
+            ColorMode::Temperature => ColorMode::Phase,
+            ColorMode::Phase => ColorMode::Rock,
         };
-        eprintln!(
-            "color mode = {}",
-            if view.mode == ColorMode::Rock { "Rock" } else { "Temperature" }
-        );
+        eprintln!("color mode = {}", color_mode_label(view.mode));
     }
     if keys.just_pressed(KeyCode::KeyR) {
         sim.world.reset();
@@ -394,7 +463,7 @@ fn viridis_like(f: f32) -> [f32; 3] {
     stops.last().unwrap().1
 }
 
-fn tick_simulation(mut sim: ResMut<Sim>) {
+fn tick_simulation(mut sim: ResMut<Sim>, view: Res<ViewState>) {
     if sim.paused {
         return;
     }
@@ -402,7 +471,19 @@ fn tick_simulation(mut sim: ResMut<Sim>) {
     for _ in 0..steps {
         sim.world.tick_sph();
     }
-    sim.world.download_state();
+    // Hot-path readback: positions every frame, plus internal energies
+    // when colouring by temperature. The full 6-buffer state (needed
+    // for HUD energy/momentum diagnostics) is pulled at `hud_period`.
+    sim.hud_counter = sim.hud_counter.wrapping_add(1);
+    // Temperature and Phase both need the internal energies pulled back
+    // (Phase derives φ from u on the CPU via `phase_of`).
+    let want_temp = view.mode != ColorMode::Rock;
+    if sim.hud_period > 0 && sim.hud_counter % sim.hud_period == 0 {
+        sim.world.download_state();
+        sim.hud_dirty = true;
+    } else {
+        sim.world.download_for_render(want_temp);
+    }
 }
 
 fn sync_particles(
@@ -435,18 +516,27 @@ fn sync_particles(
         (0.0, 1.0)
     };
 
-    for (idx, mut transform, mut mat, rock) in &mut q {
-        let p = &sim.world.particles.positions[idx.0];
+    let mode = view.mode;
+    let pal_ref = palette.as_deref();
+    let positions = &sim.world.particles.positions;
+    let energies = &sim.world.particles.internal_energies;
+
+    // Parallelise across N entities — pure per-entity work, no shared
+    // mutation. par_iter_mut spreads it over Bevy's task pool, which
+    // is multi-core by default. At N=10k the loop body is light, but
+    // the wall clock saving on a 4–8 core CPU still adds up.
+    q.par_iter_mut().for_each(|(idx, mut transform, mut mat, rock)| {
+        let p = &positions[idx.0];
         transform.translation = Vec3::new(p[0], p[1], p[2]);
-        match view.mode {
+        match mode {
             ColorMode::Rock => {
                 if mat.0 != rock.0 {
                     mat.0 = rock.0.clone();
                 }
             }
             ColorMode::Temperature => {
-                if let Some(pal) = &palette {
-                    let u_i = sim.world.particles.internal_energies[idx.0];
+                if let Some(pal) = pal_ref {
+                    let u_i = energies[idx.0];
                     let f = ((u_i - t_lo) / (t_hi - t_lo)).clamp(0.0, 1.0);
                     let bucket = ((f * (pal.handles.len() as f32 - 1.0)).round() as usize)
                         .min(pal.handles.len() - 1);
@@ -456,8 +546,20 @@ fn sync_particles(
                     }
                 }
             }
+            ColorMode::Phase => {
+                if let Some(pal) = pal_ref {
+                    // φ ∈ [0,1] already: low = molten, high = solid.
+                    let f = phase_of(energies[idx.0]).phi.clamp(0.0, 1.0);
+                    let bucket = ((f * (pal.handles.len() as f32 - 1.0)).round() as usize)
+                        .min(pal.handles.len() - 1);
+                    let new_handle = &pal.handles[bucket];
+                    if mat.0 != *new_handle {
+                        mat.0 = new_handle.clone();
+                    }
+                }
+            }
         }
-    }
+    });
 }
 
 fn orbit_camera(
@@ -517,16 +619,22 @@ fn orbit_camera(
 }
 
 fn update_hud(
-    sim: Res<Sim>,
+    mut sim: ResMut<Sim>,
     view: Res<ViewState>,
     mut q: Query<&mut Text, With<HudText>>,
 ) {
+    // Recompute the O(N²) energy/inertia diagnostics only when a fresh full
+    // readback landed (every hud_period frames / on single-step), not every
+    // frame — the Text component keeps its last value in between.
+    if !sim.hud_dirty {
+        return;
+    }
     let particles = &sim.world.particles;
     let scalar = ScalarDiagnostics::compute(particles);
     let (ke, pe, e) = total_energy(particles, sim.world.config.g_const, sim.world.config.softening);
     let mom = principal_moments(particles);
     let axis_ac = mom[0] / mom[2].max(1e-30);
-    let mode_name = if view.mode == ColorMode::Rock { "Rock" } else { "Temperature" };
+    let mode_name = color_mode_label(view.mode);
 
     let text = format!(
         "tick: {}\ntime: {:.3} ({:.3} t_ff)\nsteps/frame: {}\npaused: {}\ncolor: {} (F8)\nKE: {:.4}\nPE: {:.4}\nU:  {:.4}\nE+U: {:.4}\nT̄: {:.4}\nT_min: {:.4}\nT_max: {:.4}\nLz: {:.4}\nI: [{:.3}, {:.3}, {:.3}]\na/c: {:.3}\nN: {}",
@@ -550,6 +658,7 @@ fn update_hud(
         axis_ac,
         sim.world.particles.len(),
     );
+    sim.hud_dirty = false;
     if let Ok(mut t) = q.single_mut() {
         *t = Text::new(text);
     }

@@ -116,8 +116,25 @@ pub fn torus_uniform(config: &PlanetConfig) -> Particles {
         let last = particles.len() - 1;
         particles.smoothing_lengths[last] = h_init;
         particles.densities[last] = rho_mean;
+        particles.mat_rho0[last] = rho_mean;
     }
     particles
+}
+
+/// Sprint 232 — assign a distinct material to particles within `radius`
+/// of the origin: Tait reference density `rho0` and melt temperature `t_m`.
+/// Sets up a differentiated body (e.g. a dense refractory core inside a
+/// lighter, lower-melting crust). Particles outside keep their generator
+/// defaults.
+pub fn assign_core_material(particles: &mut Particles, radius: f32, rho0: f32, t_m: f32) {
+    let r2_max = radius * radius;
+    for i in 0..particles.positions.len() {
+        let p = particles.positions[i];
+        if p[0] * p[0] + p[1] * p[1] + p[2] * p[2] <= r2_max {
+            particles.mat_rho0[i] = rho0;
+            particles.mat_t_m[i] = t_m;
+        }
+    }
 }
 
 /// Set `config.omega` from a fraction of the critical Keplerian rate
@@ -170,6 +187,7 @@ pub fn cube_uniform(config: &PlanetConfig) -> Particles {
         let last = particles.len() - 1;
         particles.smoothing_lengths[last] = h_init;
         particles.densities[last] = rho_mean;
+        particles.mat_rho0[last] = rho_mean;
     }
     particles
 }
@@ -210,6 +228,7 @@ pub fn pancake_uniform(config: &PlanetConfig) -> Particles {
         let last = particles.len() - 1;
         particles.smoothing_lengths[last] = h_init;
         particles.densities[last] = rho_mean;
+        particles.mat_rho0[last] = rho_mean;
     }
     particles
 }

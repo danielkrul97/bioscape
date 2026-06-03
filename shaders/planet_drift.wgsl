@@ -9,15 +9,15 @@ struct DriftParams {
 }
 
 @group(0) @binding(0) var<uniform> params: DriftParams;
-@group(0) @binding(1) var<storage, read_write> positions: array<f32>;
-@group(0) @binding(2) var<storage, read> velocities: array<f32>;
+@group(0) @binding(1) var<storage, read_write> positions: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> velocities: array<vec4<f32>>;
 
 @compute @workgroup_size(64)
 fn drift(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.num_particles) { return; }
     let dt = params.dt;
-    positions[i * 3u + 0u] = positions[i * 3u + 0u] + dt * velocities[i * 3u + 0u];
-    positions[i * 3u + 1u] = positions[i * 3u + 1u] + dt * velocities[i * 3u + 1u];
-    positions[i * 3u + 2u] = positions[i * 3u + 2u] + dt * velocities[i * 3u + 2u];
+    positions[i].x = positions[i].x + dt * velocities[i].x;
+    positions[i].y = positions[i].y + dt * velocities[i].y;
+    positions[i].z = positions[i].z + dt * velocities[i].z;
 }

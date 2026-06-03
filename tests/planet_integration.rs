@@ -279,6 +279,732 @@ fn generate_dispatcher_routes_correctly() {
     }
 }
 
+/// Build a cubic lattice, impose a velocity field `vel_fn(pos)`, run the
+/// Bonet–Lok gradient correction + Jaumann stress rate once (with S = 0),
+/// and return `(positions, ds_dt[6N])`. Shared by the S225 stress oracles.
+fn run_stress_rate_on_lattice(
+    ctx: &std::sync::Arc<GpuContext>,
+    vel_fn: impl Fn([f32; 3]) -> [f32; 3],
+) -> (Vec<[f32; 3]>, Vec<f32>) {
+    let n_side = 16usize;
+    let dx = 1.0_f32 / n_side as f32;
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    for iz in 0..n_side {
+        for iy in 0..n_side {
+            for ix in 0..n_side {
+                positions.push([
+                    -0.5 + (ix as f32 + 0.5) * dx,
+                    -0.5 + (iy as f32 + 0.5) * dx,
+                    -0.5 + (iz as f32 + 0.5) * dx,
+                ]);
+            }
+        }
+    }
+    let n = positions.len();
+    let velocities: Vec<[f32; 3]> = positions.iter().map(|&p| vel_fn(p)).collect();
+    let masses = vec![1.0_f32; n];
+    let densities = vec![1.0_f32; n]; // Bonet–Lok correction is V_j-scale invariant
+    let smoothing = vec![dx; n]; // 2h = 2·dx < cell_size ⇒ full 3×3×3 coverage
+
+    let gpu = bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(ctx), n).unwrap();
+    gpu.upload_state(&positions, &velocities, &masses);
+    gpu.upload_smoothing_lengths(&smoothing);
+    gpu.upload_densities(&densities);
+    gpu.upload_internal_energies(&vec![0.01_f32; n]); // cold ⇒ φ = 1 ⇒ G = G0
+    gpu.clear_dev_stress(n);
+    let hash = bioscape::planet::gpu::SpatialHashGpu::new(
+        std::sync::Arc::clone(ctx),
+        n,
+        2.5,
+        gpu.positions_buffer(),
+    )
+    .unwrap();
+    hash.rebuild(n);
+    let gc = bioscape::planet::gpu::GradCorrectionGpu::new(std::sync::Arc::clone(ctx), &gpu, &hash).unwrap();
+    let sr = bioscape::planet::gpu::StressRateGpu::new(std::sync::Arc::clone(ctx), &gpu, &hash).unwrap();
+    gc.dispatch(n);
+    sr.dispatch(n);
+    (positions, gpu.download_ds_dt(n))
+}
+
+/// Bonet–Lok-corrected velocity gradient reproduces a linear shear field
+/// exactly: for `v = (γy, 0, 0)` the stress rate is `dS/dt = 2G·dev(ε̇)`,
+/// i.e. `dSxy = G·γ` and every other component ≈ 0.
+#[test]
+fn gpu_stress_rate_linear_shear_matches_analytic() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_stress_rate_linear_shear: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let gamma = 0.1_f32;
+    let g0 = bioscape::planet::thermal::SHEAR_MODULUS_G0;
+    let (positions, ds) = run_stress_rate_on_lattice(&ctx, |p| [gamma * p[1], 0.0, 0.0]);
+    let expect_sxy = g0 * gamma;
+    let mut max_sxy_err = 0.0_f32;
+    let mut max_other = 0.0_f32;
+    let mut count = 0;
+    for (i, p) in positions.iter().enumerate() {
+        if p[0] * p[0] + p[1] * p[1] + p[2] * p[2] > 0.25 * 0.25 {
+            continue; // interior only (boundary kernels are truncated)
+        }
+        count += 1;
+        let b = i * 6;
+        max_sxy_err = max_sxy_err.max((ds[b + 3] - expect_sxy).abs());
+        for &k in &[0usize, 1, 2, 4, 5] {
+            max_other = max_other.max(ds[b + k].abs());
+        }
+    }
+    eprintln!("interior={count} dSxy err={max_sxy_err:.5} (expect {expect_sxy}), max other={max_other:.5}");
+    assert!(count > 50, "too few interior particles");
+    assert!(max_sxy_err < 0.1 * expect_sxy, "dSxy off by {max_sxy_err}");
+    assert!(max_other < 0.1 * expect_sxy, "spurious off-shear rate {max_other}");
+}
+
+/// Rigid-rotation objectivity: for `v = ω × x` the strain rate is zero, so
+/// the corrected stress rate must vanish (no spurious stress in a rotating
+/// solid). This is the property the Bonet–Lok correction exists to ensure.
+#[test]
+fn gpu_stress_rate_rigid_rotation_objective() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_stress_rate_rigid_rotation: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let omega = 0.5_f32;
+    let (positions, ds) = run_stress_rate_on_lattice(&ctx, |p| [-omega * p[1], omega * p[0], 0.0]);
+    let mut max_rate = 0.0_f32;
+    let mut count = 0;
+    for (i, p) in positions.iter().enumerate() {
+        if p[0] * p[0] + p[1] * p[1] + p[2] * p[2] > 0.25 * 0.25 {
+            continue;
+        }
+        count += 1;
+        for k in 0..6 {
+            max_rate = max_rate.max(ds[i * 6 + k].abs());
+        }
+    }
+    eprintln!("rigid-rotation max |dS/dt| (interior) = {max_rate:.6} (G·ω = {})", omega);
+    assert!(count > 50);
+    // Without Bonet–Lok this would be O(G·ω) ≈ 0.5; with it, ~machine noise.
+    assert!(max_rate < 0.02, "spurious stress under rigid rotation: {max_rate}");
+}
+
+/// Artificial-stress eigensolve: for σ = S with S_xy = 1 (P = 0), the only
+/// tensile principal stress is +1 along (1,1,0)/√2, so the principal-frame
+/// R̂ = −ε·(that projector)/ρ² = −ε/2·[[1,1,0],[1,1,0],[0,0,0]]. This checks
+/// the Jacobi eigensolve + back-rotation, not just a diagonal shortcut.
+#[test]
+fn gpu_artificial_stress_principal_frame() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_artificial_stress_principal_frame: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let eps = bioscape::planet::thermal::ARTIFICIAL_STRESS_EPSILON;
+    let n = 4usize;
+    let gpu = bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(&ctx), 64).unwrap();
+    gpu.upload_densities(&vec![1.0_f32; n]); // ρ = ρ0 ⇒ P = 0 ⇒ σ = S
+    gpu.upload_internal_energies(&vec![0.01_f32; n]); // cold ⇒ φ = 1
+    let mut s = vec![0.0_f32; n * 6];
+    for i in 0..n {
+        s[i * 6 + 3] = 1.0; // S_xy
+    }
+    gpu.upload_dev_stress(&s);
+    let asg = bioscape::planet::gpu::ArtificialStressGpu::new(std::sync::Arc::clone(&ctx), &gpu).unwrap();
+    asg.dispatch(n, 1.0, 5.0 / 3.0);
+    let r = gpu.download_art_stress(n);
+    let expect = -eps * 0.5;
+    for i in 0..n {
+        let b = i * 6;
+        assert!((r[b + 0] - expect).abs() < 1e-3, "R̂xx {} != {expect}", r[b + 0]);
+        assert!((r[b + 1] - expect).abs() < 1e-3, "R̂yy {} != {expect}", r[b + 1]);
+        assert!((r[b + 3] - expect).abs() < 1e-3, "R̂xy {} != {expect}", r[b + 3]);
+        assert!(r[b + 2].abs() < 1e-3 && r[b + 4].abs() < 1e-3 && r[b + 5].abs() < 1e-3);
+    }
+}
+
+/// Cohesion signature across phases at low density (ρ < ρ0): cold solid and
+/// molten condensed matter are both under tension (P < 0) and pull together
+/// (the melt fuses), while a hot gas has positive pressure and pushes apart.
+/// (art_stress is zero here, isolating the EoS tension that supplies cohesion.)
+#[test]
+fn gpu_cohesion_cold_pair_attracts() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_cohesion_cold_pair_attracts: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let n = 2usize;
+    let setup = |u: f32, rho: f32| -> [[f32; 3]; 2] {
+        let gpu =
+            bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(&ctx), 64).unwrap();
+        gpu.upload_state(&[[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]], &[[0.0; 3]; 2], &[1.0; 2]);
+        gpu.upload_smoothing_lengths(&[0.3; 2]);
+        gpu.upload_densities(&[rho; 2]);
+        gpu.upload_internal_energies(&[u; 2]);
+        gpu.clear_dev_stress(n);
+        ctx.queue
+            .write_buffer(gpu.accelerations_buffer(), 0, bytemuck::cast_slice(&vec![0.0_f32; n * 3]));
+        let hash = bioscape::planet::gpu::SpatialHashGpu::new(
+            std::sync::Arc::clone(&ctx),
+            64,
+            2.5,
+            gpu.positions_buffer(),
+        )
+        .unwrap();
+        hash.rebuild(n);
+        let eos = bioscape::planet::gpu::EosGpu::new(std::sync::Arc::clone(&ctx), &gpu).unwrap();
+        eos.dispatch(n, 5.0 / 3.0);
+        let f = bioscape::planet::gpu::SphForceGpu::new(std::sync::Arc::clone(&ctx), &gpu, &hash).unwrap();
+        f.dispatch(n, 1.0, 5.0 / 3.0, 1.0, 2.0); // rho0 = 1.0
+        let a = gpu.download_accelerations(n);
+        [a[0], a[1]]
+    };
+    let cold = setup(0.05, 0.3); // cold solid, stretched (ρ < ρ0) ⇒ tension
+    assert!(
+        cold[0][0] > 1e-4 && cold[1][0] < -1e-4,
+        "cold solid pair should cohere (attract): {cold:?}"
+    );
+    let molten = setup(1.0, 0.3); // molten condensed (φ=0) ⇒ melt cohesion ⇒ fuses
+    assert!(
+        molten[0][0] > 1e-4 && molten[1][0] < -1e-4,
+        "molten pair should cohere/fuse (melt cohesion): {molten:?}"
+    );
+    let hot = setup(10.0, 0.3); // hot gas (u ≥ u_vap) ⇒ positive pressure
+    assert!(
+        hot[0][0] < -1e-4 && hot[1][0] > 1e-4,
+        "hot gas pair should repel: {hot:?}"
+    );
+}
+
+/// von Mises return mapping: an over-yield stress is projected back onto
+/// the yield surface (σ_vm = Y0) in a solid, and forced to zero in a
+/// liquid (φ = 0 ⇒ Y = 0) — the remelt relaxation mechanism.
+#[test]
+fn gpu_stress_integrate_von_mises_yield_and_remelt() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_stress_integrate_von_mises: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let y0 = bioscape::planet::thermal::YIELD_STRENGTH_Y0;
+    let n = 4usize;
+    let gpu = bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(&ctx), 64).unwrap();
+    let si = bioscape::planet::gpu::StressIntegrateGpu::new(std::sync::Arc::clone(&ctx), &gpu).unwrap();
+    // Over-yield S_xy = 1.0 (σ_vm = √3 > Y0). ds_dt is zero-initialised, so
+    // the integrator applies only the von Mises projection.
+    let mut s = vec![0.0_f32; n * 6];
+    for i in 0..n {
+        s[i * 6 + 3] = 1.0;
+    }
+
+    // Solid (cold u ⇒ φ = 1 ⇒ Y = Y0): clamp to the yield surface.
+    gpu.upload_dev_stress(&s);
+    gpu.upload_internal_energies(&vec![0.01_f32; n]);
+    si.dispatch(n, 1e-3);
+    let solid = gpu.download_dev_stress(n);
+    for i in 0..n {
+        let vm = (3.0 * solid[i * 6 + 3] * solid[i * 6 + 3]).sqrt();
+        assert!((vm - y0).abs() < 1e-3, "solid von Mises not clamped to Y0: {vm}");
+    }
+
+    // Liquid (hot u ⇒ φ = 0 ⇒ Y = 0): stress forced to zero (remelt).
+    gpu.upload_dev_stress(&s);
+    gpu.upload_internal_energies(&vec![10.0_f32; n]);
+    si.dispatch(n, 1e-3);
+    let liquid = gpu.download_dev_stress(n);
+    for i in 0..n {
+        assert!(
+            liquid[i * 6 + 3].abs() < 1e-5,
+            "molten stress not relaxed: {}",
+            liquid[i * 6 + 3]
+        );
+    }
+}
+
+/// The deviatoric stress contraction conserves momentum: an imposed
+/// uniform `S_xy` on a pair produces equal-and-opposite transverse forces.
+#[test]
+fn gpu_sph_force_deviatoric_newton_third_law() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_sph_force_deviatoric: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let n = 2usize;
+    let gpu = bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(&ctx), 64).unwrap();
+    gpu.upload_state(&[[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]], &[[0.0; 3]; 2], &[1.0; 2]);
+    gpu.upload_smoothing_lengths(&[0.3; 2]);
+    gpu.upload_densities(&[1.0; 2]);
+    gpu.upload_internal_energies(&[10.0; 2]); // gas branch ⇒ isotropic P symmetric
+    // Uniform deviatoric stress S_xy = 0.5 on both, packed [xx,yy,zz,xy,xz,yz].
+    gpu.upload_dev_stress(&[0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0]);
+    ctx.queue
+        .write_buffer(gpu.accelerations_buffer(), 0, bytemuck::cast_slice(&vec![0.0_f32; n * 3]));
+    let hash = bioscape::planet::gpu::SpatialHashGpu::new(
+        std::sync::Arc::clone(&ctx),
+        64,
+        2.5,
+        gpu.positions_buffer(),
+    )
+    .unwrap();
+    hash.rebuild(n);
+    let f = bioscape::planet::gpu::SphForceGpu::new(std::sync::Arc::clone(&ctx), &gpu, &hash).unwrap();
+    f.dispatch(n, 1.0, 5.0 / 3.0, 1.0, 2.0);
+    let a = gpu.download_accelerations(n);
+    eprintln!("deviatoric pair: a0={:?} a1={:?}", a[0], a[1]);
+    for d in 0..3 {
+        assert!(
+            (a[0][d] + a[1][d]).abs() < 1e-3,
+            "Newton 3rd violated in axis {d}: {} + {}",
+            a[0][d],
+            a[1][d]
+        );
+    }
+    // S_xy with the pair on the x-axis produces a transverse (y) force.
+    assert!(
+        a[0][1].abs() > 1e-3 && a[1][1].abs() > 1e-3,
+        "deviatoric S_xy should produce a transverse force: {:?} {:?}",
+        a[0],
+        a[1]
+    );
+}
+
+/// A cold solid torus run with stress coupling stays finite, develops
+/// deviatoric stress (the solid resists deformation), and does not collapse
+/// to a point — the elastic CFL holds in the soft (path A) regime.
+#[test]
+fn gpu_elastic_solid_resists_and_stays_finite() {
+    if GpuContext::new().is_err() {
+        eprintln!("skip gpu_elastic_solid_resists: no GPU adapter");
+        return;
+    }
+    let cfg = PlanetConfig {
+        n_particles: 2_000,
+        r_major: 1.0,
+        r_minor: 0.2,
+        total_mass: 1.0,
+        omega: 0.3,
+        seed: 9,
+        dt: 1e-3,
+        ..PlanetConfig::default()
+    };
+    let mut w = PlanetWorld::new(cfg.clone());
+    w.particles = torus_uniform(&cfg); // cold u = 0.01 ⇒ solid (φ = 1)
+    w.init_gpu_full().expect("gpu init");
+    for _ in 0..100 {
+        w.tick_sph();
+    }
+    w.download_state();
+    let n = w.particles.len();
+    for v in &w.particles.positions {
+        for c in v {
+            assert!(c.is_finite(), "position not finite: {c}");
+        }
+    }
+    let s = w.gpu_state.as_ref().unwrap().download_dev_stress(n);
+    let max_s = s.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+    assert!(max_s.is_finite() && max_s > 1e-4, "solid developed no stress: max|S|={max_s}");
+    let max_r = w
+        .particles
+        .positions
+        .iter()
+        .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
+        .fold(0.0_f32, f32::max);
+    eprintln!("elastic solid: max|S|={max_s:.4}, max_r={max_r:.3}");
+    assert!(max_r > 0.4, "solid collapsed to a point: max_r={max_r}");
+}
+
+/// Path C (S231): a stiff solid violates the elastic CFL at the fixed
+/// outer `dt` with a single step (blows up), but the operator-split inner
+/// sub-cycling keeps it stable AND it carries large deviatoric stress
+/// (a genuinely rigid block, not slush).
+#[test]
+fn gpu_stiff_solid_needs_substepping() {
+    if GpuContext::new().is_err() {
+        eprintln!("skip gpu_stiff_solid_needs_substepping: no GPU adapter");
+        return;
+    }
+    let run = |n_sub: u32, dt: f32, stiff: bool| -> (bool, f32, f32, f32) {
+        let (g0, c0, y0) = if stiff { (200.0, 8.0, 100.0) } else {
+            (
+                bioscape::planet::thermal::SHEAR_MODULUS_G0,
+                bioscape::planet::thermal::TAIT_REF_SOUND_SPEED_C0,
+                bioscape::planet::thermal::YIELD_STRENGTH_Y0,
+            )
+        };
+        let cfg = PlanetConfig {
+            n_particles: 1_500,
+            r_major: 1.0,
+            r_minor: 0.2,
+            total_mass: 1.0,
+            omega: 0.3,
+            seed: 31,
+            dt,
+            shear_modulus: g0,
+            tait_c0: c0,
+            tait_exponent: if stiff { 4.0 } else { bioscape::planet::thermal::TAIT_EXPONENT_N },
+            yield_strength: y0,
+            n_substeps: n_sub,
+            ..PlanetConfig::default()
+        };
+        let mut w = PlanetWorld::new(cfg.clone());
+        w.particles = torus_uniform(&cfg);
+        w.init_gpu_full().expect("gpu init");
+        for _ in 0..60 {
+            w.tick_sph();
+        }
+        w.download_state();
+        let n = w.particles.len();
+        let mut finite = true;
+        let mut max_r = 0.0_f32;
+        let mut max_v = 0.0_f32;
+        for (p, v) in w.particles.positions.iter().zip(&w.particles.velocities) {
+            for d in 0..3 {
+                if !p[d].is_finite() || !v[d].is_finite() {
+                    finite = false;
+                }
+            }
+            max_r = max_r.max((p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt());
+            max_v = max_v.max((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+        }
+        let max_s = w
+            .gpu_state
+            .as_ref()
+            .unwrap()
+            .download_dev_stress(n)
+            .iter()
+            .fold(0.0_f32, |m, &x| m.max(x.abs()));
+        (finite, max_r, max_v, max_s)
+    };
+
+    // Rigidity (at dt where both are stable): the sub-cycled stiff solid
+    // carries far more deviatoric stress than the soft baseline.
+    let (fin_stiff, r_stiff, _, s_stiff) = run(10, 1e-3, true);
+    let (_, _, _, s_soft) = run(1, 1e-3, false);
+    assert!(fin_stiff && r_stiff < 5.0, "stiff sub-cycled run unstable: finite={fin_stiff} r={r_stiff}");
+    assert!(
+        s_stiff > 5.0 && s_stiff > 5.0 * s_soft.max(1e-6),
+        "stiff solid should be far more rigid than soft: max|S| stiff={s_stiff} soft={s_soft}"
+    );
+
+    // Necessity + sufficiency: at an outer dt that violates the bulk acoustic
+    // CFL (c0·dt/h ≈ 1.6 > 1), a single step blows up but sub-cycling — which
+    // advances the stiff physics on dt/n_sub while gravity stays outer —
+    // stays stable and bounded.
+    let (fin_sub, r_sub, v_sub, _) = run(20, 1e-2, true);
+    let (fin1, r1, v1, _) = run(1, 1e-2, true);
+    eprintln!(
+        "rigidity: max|S| stiff={s_stiff:.2} vs soft={s_soft:.3}; \
+         dt=1e-2 n_sub=20 finite={fin_sub} r={r_sub:.2} v={v_sub:.2}; n_sub=1 finite={fin1} r={r1:.2} v={v1:.2}"
+    );
+    assert!(fin_sub && r_sub < 20.0, "sub-cycling should stabilise the CFL-violating dt: finite={fin_sub} r={r_sub}");
+    assert!(
+        !fin1 || r1 > 100.0 || v1 > 500.0,
+        "single step at the CFL-violating dt should be unstable: finite={fin1} r={r1} v={v1}"
+    );
+}
+
+/// The sub-stepped integration path is deterministic (byte-identical reruns).
+#[test]
+fn gpu_substepped_tick_deterministic() {
+    if GpuContext::new().is_err() {
+        eprintln!("skip gpu_substepped_tick_deterministic: no GPU adapter");
+        return;
+    }
+    let cfg = PlanetConfig {
+        n_particles: 1_200,
+        r_major: 1.0,
+        r_minor: 0.2,
+        total_mass: 1.0,
+        omega: 0.3,
+        seed: 32,
+        dt: 1e-3,
+        shear_modulus: 50.0,
+        tait_c0: 3.0,
+        tait_exponent: 4.0,
+        yield_strength: 25.0,
+        n_substeps: 4,
+        ..PlanetConfig::default()
+    };
+    let run = || {
+        let mut w = PlanetWorld::new(cfg.clone());
+        w.particles = torus_uniform(&cfg);
+        w.init_gpu_full().expect("gpu init");
+        for _ in 0..20 {
+            w.tick_sph();
+        }
+        w.download_state();
+        (w.particles.positions.clone(), w.particles.velocities.clone())
+    };
+    let (p1, v1) = run();
+    let (p2, v2) = run();
+    assert_eq!(p1, p2, "sub-stepped positions not byte-identical");
+    assert_eq!(v1, v2, "sub-stepped velocities not byte-identical");
+}
+
+/// Block detection: a cold solid body is one large connected block; once
+/// fully molten there are no solid blocks. The two-sided melt+block signature.
+#[test]
+fn gpu_block_detection_solid_vs_molten() {
+    if GpuContext::new().is_err() {
+        eprintln!("skip gpu_block_detection: no GPU adapter");
+        return;
+    }
+    use bioscape::planet::diagnostics::count_solid_blocks;
+    use bioscape::planet::thermal::{LATENT_HEAT_FUSION_L as L, MELT_TEMPERATURE_T_M as TM};
+    let cfg = PlanetConfig {
+        n_particles: 1_500,
+        r_major: 1.0,
+        r_minor: 0.2,
+        total_mass: 1.0,
+        omega: 0.3,
+        seed: 21,
+        dt: 1e-3,
+        ..PlanetConfig::default()
+    };
+    let mut w = PlanetWorld::new(cfg.clone());
+    w.particles = torus_uniform(&cfg);
+    w.init_gpu_full().expect("gpu init");
+    let n = w.particles.len();
+    for _ in 0..30 {
+        w.tick_sph();
+    }
+    w.download_state();
+    let (n_blocks, largest) = count_solid_blocks(&w.particles, 1.5);
+    eprintln!("cold solid: {n_blocks} block(s), largest = {largest}/{n}");
+    assert!(n_blocks >= 1, "cold solid should form at least one block");
+    assert!(
+        largest as f32 > 0.5 * n as f32,
+        "most of the solid should be one connected block: {largest}/{n}"
+    );
+
+    // Melt everything ⇒ no solid blocks.
+    w.gpu_state
+        .as_ref()
+        .unwrap()
+        .upload_internal_energies(&vec![TM + L + 0.5; n]);
+    for _ in 0..5 {
+        w.tick_sph();
+    }
+    w.download_state();
+    let (_, largest_molten) = count_solid_blocks(&w.particles, 1.5);
+    eprintln!("molten: largest block = {largest_molten}/{n}");
+    assert!(
+        (largest_molten as f32) < 0.05 * n as f32,
+        "molten body should have no solid block: {largest_molten}/{n}"
+    );
+}
+
+/// Full remelt cycle: a cold solid develops deviatoric stress; once heated
+/// past the liquidus (φ → 0) the von Mises yield (Y = Y0·φ² → 0) dissolves
+/// that stress within a few ticks and the body reverts to a fluid.
+#[test]
+fn gpu_remelt_dissolves_stress() {
+    if GpuContext::new().is_err() {
+        eprintln!("skip gpu_remelt_dissolves_stress: no GPU adapter");
+        return;
+    }
+    use bioscape::planet::thermal::{LATENT_HEAT_FUSION_L as L, MELT_TEMPERATURE_T_M as TM};
+    let cfg = PlanetConfig {
+        n_particles: 2_000,
+        r_major: 1.0,
+        r_minor: 0.2,
+        total_mass: 1.0,
+        omega: 0.3,
+        seed: 13,
+        dt: 1e-3,
+        ..PlanetConfig::default()
+    };
+    let mut w = PlanetWorld::new(cfg.clone());
+    w.particles = torus_uniform(&cfg); // cold ⇒ solid
+    w.init_gpu_full().expect("gpu init");
+    let n = w.particles.len();
+    for _ in 0..50 {
+        w.tick_sph();
+    }
+    let max_s_solid = w
+        .gpu_state
+        .as_ref()
+        .unwrap()
+        .download_dev_stress(n)
+        .iter()
+        .fold(0.0_f32, |m, &x| m.max(x.abs()));
+    assert!(max_s_solid > 1e-3, "cold solid developed no stress: {max_s_solid}");
+
+    // Melt everything: u well above the liquidus ⇒ φ = 0.
+    let hot = vec![TM + L + 0.5; n];
+    w.gpu_state.as_ref().unwrap().upload_internal_energies(&hot);
+    for _ in 0..5 {
+        w.tick_sph();
+    }
+    w.download_state();
+    let max_s_liquid = w
+        .gpu_state
+        .as_ref()
+        .unwrap()
+        .download_dev_stress(n)
+        .iter()
+        .fold(0.0_f32, |m, &x| m.max(x.abs()));
+    let mean_phi =
+        w.particles.phase_fracs.iter().sum::<f32>() / n as f32;
+    eprintln!("remelt: max|S| solid={max_s_solid:.4} → liquid={max_s_liquid:.6}, mean φ={mean_phi:.4}");
+    assert!(mean_phi < 0.05, "particles did not melt: mean φ={mean_phi}");
+    assert!(
+        max_s_liquid < 0.1 * max_s_solid,
+        "remelt did not dissolve the stress: {max_s_liquid} vs {max_s_solid}"
+    );
+}
+
+/// Multi-material (S232): at a single uniform energy, a refractory core
+/// (high T_m) stays solid while the surrounding volatile crust (default,
+/// lower T_m) melts — heterogeneous melting driven by per-particle T_m.
+#[test]
+fn gpu_multimaterial_heterogeneous_melting() {
+    if GpuContext::new().is_err() {
+        eprintln!("skip gpu_multimaterial_heterogeneous_melting: no GPU adapter");
+        return;
+    }
+    let cfg = PlanetConfig {
+        shape: PlanetShape::Cube,
+        n_particles: 3_000,
+        cube_side: 1.0,
+        total_mass: 1.0,
+        omega: 0.0,
+        seed: 41,
+        dt: 1e-3,
+        ..PlanetConfig::default()
+    };
+    let mut w = PlanetWorld::new(cfg.clone());
+    w.particles = cube_uniform(&cfg);
+    let n = w.particles.len();
+    // Energy between the crust liquidus (0.45) and the core solidus (0.50):
+    // crust melts, refractory core stays solid.
+    for e in &mut w.particles.internal_energies {
+        *e = 0.48;
+    }
+    // Refractory, denser core (T_m = 0.5, ρ0 = 2) within r < 0.3.
+    bioscape::planet::init::assign_core_material(&mut w.particles, 0.3, 2.0, 0.5);
+    w.init_gpu_full().expect("gpu init");
+    w.download_state();
+
+    let (mut core_phi, mut core_n, mut crust_phi, mut crust_n) = (0.0_f32, 0, 0.0_f32, 0);
+    for i in 0..n {
+        let p = w.particles.positions[i];
+        let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if r < 0.25 {
+            core_phi += w.particles.phase_fracs[i];
+            core_n += 1;
+        } else if r > 0.4 {
+            crust_phi += w.particles.phase_fracs[i];
+            crust_n += 1;
+        }
+    }
+    let core_mean = core_phi / core_n.max(1) as f32;
+    let crust_mean = crust_phi / crust_n.max(1) as f32;
+    eprintln!("heterogeneous melt: refractory core φ={core_mean:.3}, volatile crust φ={crust_mean:.3}");
+    assert!(core_n > 20 && crust_n > 20, "too few particles per region");
+    assert!(core_mean > 0.9, "refractory core should stay solid: φ={core_mean}");
+    assert!(crust_mean < 0.1, "volatile crust should melt: φ={crust_mean}");
+}
+
+/// Per-particle ρ0 controls the EoS: at the SAME actual density, a low-ρ0
+/// material is compressed (P > 0, repels) while a high-ρ0 material is below
+/// its reference (P < 0, attracts) — the driver of gravitational differentiation.
+#[test]
+fn gpu_multimaterial_rho0_controls_eos() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_multimaterial_rho0_controls_eos: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let pair = |rho0_mat: f32| -> [[f32; 3]; 2] {
+        let n = 2usize;
+        let gpu = bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(&ctx), 64).unwrap();
+        gpu.upload_state(&[[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]], &[[0.0; 3]; 2], &[1.0; 2]);
+        gpu.upload_smoothing_lengths(&[0.3; 2]);
+        gpu.upload_densities(&[1.5; 2]); // same actual density for both materials
+        gpu.upload_internal_energies(&[0.05; 2]); // cold ⇒ condensed branch
+        gpu.upload_materials(&[rho0_mat; 2], &[bioscape::planet::thermal::MELT_TEMPERATURE_T_M; 2]);
+        gpu.clear_dev_stress(n);
+        ctx.queue
+            .write_buffer(gpu.accelerations_buffer(), 0, bytemuck::cast_slice(&vec![0.0_f32; n * 3]));
+        let hash = bioscape::planet::gpu::SpatialHashGpu::new(
+            std::sync::Arc::clone(&ctx),
+            64,
+            2.5,
+            gpu.positions_buffer(),
+        )
+        .unwrap();
+        hash.rebuild(n);
+        let eos = bioscape::planet::gpu::EosGpu::new(std::sync::Arc::clone(&ctx), &gpu).unwrap();
+        eos.dispatch(n, 5.0 / 3.0);
+        let f = bioscape::planet::gpu::SphForceGpu::new(std::sync::Arc::clone(&ctx), &gpu, &hash).unwrap();
+        f.dispatch(n, 1.0, 5.0 / 3.0, 1.0, 2.0);
+        let a = gpu.download_accelerations(n);
+        [a[0], a[1]]
+    };
+    let low = pair(1.0); // ρ=1.5 > ρ0 ⇒ compressed ⇒ repel
+    assert!(
+        low[0][0] < -1e-4 && low[1][0] > 1e-4,
+        "low-ρ0 material at ρ>ρ0 should repel: {low:?}"
+    );
+    let high = pair(3.0); // ρ=1.5 < ρ0 ⇒ under reference ⇒ tension ⇒ attract
+    assert!(
+        high[0][0] > 1e-4 && high[1][0] < -1e-4,
+        "high-ρ0 material at ρ<ρ0 should cohere/attract (drives sinking): {high:?}"
+    );
+}
+
+/// A two-material body integrates deterministically (byte-identical reruns).
+#[test]
+fn gpu_multimaterial_deterministic() {
+    if GpuContext::new().is_err() {
+        eprintln!("skip gpu_multimaterial_deterministic: no GPU adapter");
+        return;
+    }
+    let cfg = PlanetConfig {
+        shape: PlanetShape::Cube,
+        n_particles: 1_500,
+        cube_side: 1.0,
+        total_mass: 1.0,
+        omega: 0.0,
+        seed: 42,
+        dt: 1e-3,
+        ..PlanetConfig::default()
+    };
+    let run = || {
+        let mut w = PlanetWorld::new(cfg.clone());
+        w.particles = cube_uniform(&cfg);
+        bioscape::planet::init::assign_core_material(&mut w.particles, 0.3, 2.0, 0.5);
+        w.init_gpu_full().expect("gpu init");
+        for _ in 0..25 {
+            w.tick_sph();
+        }
+        w.download_state();
+        (w.particles.positions.clone(), w.particles.velocities.clone())
+    };
+    let (p1, v1) = run();
+    let (p2, v2) = run();
+    assert_eq!(p1, p2, "multi-material positions not byte-identical");
+    assert_eq!(v1, v2, "multi-material velocities not byte-identical");
+}
+
 fn kepler_acc(pos: [f32; 3]) -> [f32; 3] {
     let r2 = pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2];
     let r = r2.sqrt();
@@ -427,6 +1153,11 @@ fn run_sph_force_pair(
     gpu.upload_state(&positions, &velocities, &masses);
     gpu.upload_smoothing_lengths(&smoothing);
     gpu.upload_densities(&densities_init);
+    // u above the vaporisation energy ⇒ ideal-gas branch, so these pair
+    // tests exercise the EoS reduction (gas branch == pre-S224 ideal gas).
+    gpu.upload_internal_energies(&vec![10.0_f32; n]);
+    gpu.upload_materials(&vec![1.0_f32; n], &vec![bioscape::planet::thermal::MELT_TEMPERATURE_T_M; n]);
+    gpu.clear_dev_stress(n); // S = 0 ⇒ deviatoric term off (reduction)
     let zero_acc: Vec<f32> = vec![0.0; n * 3];
     ctx.queue
         .write_buffer(gpu.accelerations_buffer(), 0, bytemuck::cast_slice(&zero_acc));
@@ -440,6 +1171,11 @@ fn run_sph_force_pair(
     .expect("hash");
     hash.rebuild(n);
 
+    // EoS precompute (pressure/sound speed) must run before sph_force, which
+    // now reads those buffers instead of recomputing the EoS per pair.
+    let eos = bioscape::planet::gpu::EosGpu::new(std::sync::Arc::clone(ctx), &gpu).expect("eos");
+    eos.dispatch(n, 5.0 / 3.0);
+
     let sph_force = bioscape::planet::gpu::SphForceGpu::new(
         std::sync::Arc::clone(ctx),
         &gpu,
@@ -450,6 +1186,112 @@ fn run_sph_force_pair(
 
     let acc = gpu.download_accelerations(n);
     [acc[0], acc[1]]
+}
+
+/// Condensed Tait branch: compression (`ρ > ρ0`) pushes apart, pressure
+/// vanishes at `ρ = ρ0`, a stretched solid (`ρ < ρ0`, φ=1) is under tension
+/// and coheres (attracts), while a stretched liquid (φ=0) is clamped to
+/// `P ≥ 0` (no tension → cavitates).
+#[test]
+fn gpu_condensed_eos_compression_and_tension() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_condensed_eos: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let n = 2usize;
+    let setup = |u: f32, rho: f32| -> [[f32; 3]; 2] {
+        let gpu =
+            bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(&ctx), 64).unwrap();
+        gpu.upload_state(&[[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]], &[[0.0; 3]; 2], &[1.0; 2]);
+        gpu.upload_smoothing_lengths(&[0.3; 2]);
+        gpu.upload_densities(&[rho; 2]);
+        gpu.upload_internal_energies(&[u; 2]);
+        gpu.clear_dev_stress(n);
+        ctx.queue
+            .write_buffer(gpu.accelerations_buffer(), 0, bytemuck::cast_slice(&vec![0.0_f32; n * 3]));
+        let hash = bioscape::planet::gpu::SpatialHashGpu::new(
+            std::sync::Arc::clone(&ctx),
+            64,
+            2.5,
+            gpu.positions_buffer(),
+        )
+        .unwrap();
+        hash.rebuild(n);
+        let eos = bioscape::planet::gpu::EosGpu::new(std::sync::Arc::clone(&ctx), &gpu).unwrap();
+        eos.dispatch(n, 5.0 / 3.0);
+        let f = bioscape::planet::gpu::SphForceGpu::new(
+            std::sync::Arc::clone(&ctx),
+            &gpu,
+            &hash,
+        )
+        .unwrap();
+        f.dispatch(n, 1.0, 5.0 / 3.0, 1.0, 2.0); // rho0 = 1.0
+        let a = gpu.download_accelerations(n);
+        [a[0], a[1]]
+    };
+    let compressed = setup(0.05, 2.0);
+    assert!(
+        compressed[0][0] < -1e-4 && compressed[1][0] > 1e-4,
+        "compression (ρ>ρ0) should repel: {compressed:?}"
+    );
+    let at_ref = setup(0.05, 1.0);
+    assert!(at_ref[0][0].abs() < 1e-4, "P should vanish at ρ0: {at_ref:?}");
+    // Cold solid stretched ⇒ tension ⇒ cohesion (attracts).
+    let solid_stretched = setup(0.05, 0.5);
+    assert!(
+        solid_stretched[0][0] > 1e-4 && solid_stretched[1][0] < -1e-4,
+        "stretched solid should cohere under tension: {solid_stretched:?}"
+    );
+    // Melt cohesion: a stretched liquid (φ=0) now coheres (attracts) instead
+    // of cavitating at P=0 — molten matter fuses — but more weakly than the
+    // solid at the same density (floor drops to MELT_COHESION_FRAC·P_tens).
+    let liquid_stretched = setup(1.0, 0.5);
+    assert!(
+        liquid_stretched[0][0] > 1e-4 && liquid_stretched[1][0] < -1e-4,
+        "molten matter should cohere/fuse under tension: {liquid_stretched:?}"
+    );
+    assert!(
+        liquid_stretched[0][0] < solid_stretched[0][0],
+        "melt cohesion must be weaker than solid: melt={} solid={}",
+        liquid_stretched[0][0],
+        solid_stretched[0][0]
+    );
+}
+
+/// The generalised CFL must see the condensed sound speed (~c0√n) for a
+/// cold solid, not the near-zero ideal-gas `√(γ(γ−1)u)` that the old
+/// estimate reported.
+#[test]
+fn cfl_dt_uses_condensed_sound_speed() {
+    let cfg = PlanetConfig {
+        n_particles: 1_000,
+        r_major: 1.0,
+        r_minor: 0.2,
+        total_mass: 1.0,
+        omega: 0.0,
+        seed: 3,
+        ..PlanetConfig::default()
+    };
+    let mut p = torus_uniform(&cfg);
+    for u in &mut p.internal_energies {
+        *u = 0.05; // cold solid, well below the melt point
+    }
+    let rho0 = bioscape::planet::world::rho_mean_init(&cfg);
+    let c_courant = 0.3_f32;
+    let dt = bioscape::planet::diagnostics::cfl_dt(&p, cfg.eos_gamma, rho0, c_courant);
+    assert!(dt.is_finite() && dt > 0.0, "cfl dt = {dt}");
+    // Particles are at rest, ρ ≈ ρ0, so c_eff = c_courant·h/dt should land
+    // near c0·√n ≈ 1.73 — proving the condensed branch drives the CFL.
+    let h = p.smoothing_lengths[0];
+    let c_eff = c_courant * h / dt;
+    eprintln!("cold-solid CFL dt = {dt:.5}, implied c_eff = {c_eff:.3}");
+    assert!(
+        c_eff > 1.0 && c_eff < 3.0,
+        "implied sound speed {c_eff} not in the condensed range (~1.73)"
+    );
 }
 
 #[test]
@@ -839,7 +1681,8 @@ fn cfl_dt_finite_for_torus_init() {
         ..PlanetConfig::default()
     };
     let p = torus_uniform(&cfg);
-    let dt = bioscape::planet::diagnostics::cfl_dt(&p, cfg.eos_k, cfg.eos_gamma, 0.3);
+    let rho0 = bioscape::planet::world::rho_mean_init(&cfg);
+    let dt = bioscape::planet::diagnostics::cfl_dt(&p, cfg.eos_gamma, rho0, 0.3);
     assert!(dt.is_finite() && dt > 0.0, "cfl dt = {dt}");
     eprintln!("torus init CFL dt = {dt:.5}");
 }
@@ -857,4 +1700,227 @@ fn world_tick_advances_clock_and_state() {
     let p1 = w.particles.positions[0];
     let moved = (p1[0] - p0[0]).abs() + (p1[1] - p0[1]).abs() + (p1[2] - p0[2]).abs();
     assert!(moved > 0.0, "particles should move under self-gravity");
+}
+
+// --- S223a: determinism harness + phase map ------------------------------
+
+/// Hard determinism gate. Two independent runs of the full SPH+gravity
+/// tick loop from the same seed must produce bit-identical state. This
+/// guards the byte-identity invariant every melting/fusion sprint relies
+/// on (S223–S230 reduce to a no-op when their physics is disabled, so any
+/// non-determinism they introduce shows up here first).
+#[test]
+fn gpu_planet_tick_deterministic_rerun() {
+    if GpuContext::new().is_err() {
+        eprintln!("skip gpu_planet_tick_deterministic_rerun: no GPU adapter");
+        return;
+    }
+    let cfg = PlanetConfig {
+        n_particles: 1_500,
+        r_major: 1.0,
+        r_minor: 0.2,
+        total_mass: 1.0,
+        omega: 0.5,
+        seed: 23,
+        dt: 1e-3,
+        ..PlanetConfig::default()
+    };
+    let run = || {
+        let mut w = PlanetWorld::new(cfg.clone());
+        w.particles = torus_uniform(&cfg);
+        w.init_gpu_full().expect("gpu init");
+        for _ in 0..30 {
+            w.tick_sph();
+        }
+        w.download_state();
+        (
+            w.particles.positions.clone(),
+            w.particles.velocities.clone(),
+            w.particles.internal_energies.clone(),
+        )
+    };
+    let (p1, v1, u1) = run();
+    let (p2, v2, u2) = run();
+    assert_eq!(p1, p2, "positions not byte-identical across reruns");
+    assert_eq!(v1, v2, "velocities not byte-identical across reruns");
+    assert_eq!(u1, u2, "internal energies not byte-identical across reruns");
+}
+
+/// Enthalpy phase map: temperature plateaus at `T_m` across the melt band
+/// while the solid fraction sweeps 1 → 0, and the map is continuous.
+#[test]
+fn phase_map_plateau_and_monotone() {
+    use bioscape::planet::thermal::{
+        phase_of, LATENT_HEAT_FUSION_L as L, MELT_TEMPERATURE_T_M as TM,
+    };
+    // Cold solid: T == u, fully solid.
+    let cold = phase_of(0.5 * TM);
+    assert!((cold.t - 0.5 * TM).abs() < 1e-6 && (cold.phi - 1.0).abs() < 1e-6);
+
+    // Across the band: T pinned at T_m, phi strictly decreasing 1 → 0.
+    let u_sol = TM;
+    let u_liq = TM + L;
+    let mut last_phi = 1.0_f32;
+    for k in 0..=10 {
+        let u = u_sol + (k as f32 / 10.0) * L;
+        let p = phase_of(u);
+        assert!((p.t - TM).abs() < 1e-4, "T not on plateau at u={u}: {}", p.t);
+        assert!(p.phi <= last_phi + 1e-6, "phi not monotone");
+        last_phi = p.phi;
+    }
+    assert!((phase_of(u_sol).phi - 1.0).abs() < 1e-4);
+    assert!(phase_of(u_liq - 1e-4).phi < 1e-3);
+
+    // Hot liquid: phi == 0, T rises again above the plateau.
+    let hot = phase_of(u_liq + 0.2);
+    assert!(hot.phi.abs() < 1e-6 && (hot.t - (TM + 0.2)).abs() < 1e-4);
+
+    // Continuity of T at both knots.
+    let eps = 1e-4;
+    assert!((phase_of(u_sol - eps).t - phase_of(u_sol + eps).t).abs() < 1e-3);
+    assert!((phase_of(u_liq - eps).t - phase_of(u_liq + eps).t).abs() < 1e-3);
+}
+
+/// Single-source guarantee: the WGSL `phase_of` (concatenated from
+/// planet_phase_common.wgsl) must agree with the Rust mirror across a
+/// grid spanning solid → mush → liquid.
+#[test]
+fn gpu_phase_map_matches_cpu() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_phase_map_matches_cpu: no GPU adapter ({e})");
+            return;
+        }
+    };
+    use bioscape::planet::thermal::{
+        phase_of, LATENT_HEAT_FUSION_L as L, MELT_TEMPERATURE_T_M as TM,
+    };
+    let n = 64usize;
+    let u_max = TM + L + 0.3;
+    let us: Vec<f32> = (0..n)
+        .map(|i| u_max * (i as f32) / ((n - 1) as f32))
+        .collect();
+    let gpu = bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(&ctx), n).unwrap();
+    gpu.upload_internal_energies(&us);
+    let phase = bioscape::planet::gpu::PhaseGpu::new(std::sync::Arc::clone(&ctx), &gpu).unwrap();
+    phase.dispatch(n);
+    let phi_gpu = gpu.download_phase_fracs(n);
+    for (i, &u) in us.iter().enumerate() {
+        let expect = phase_of(u).phi;
+        assert!(
+            (phi_gpu[i] - expect).abs() < 1e-5,
+            "phase_of mismatch at u={u}: gpu={} cpu={}",
+            phi_gpu[i],
+            expect
+        );
+    }
+}
+
+/// The latent plateau must be respected by conduction: two particles both
+/// inside the melt band sit at T_m, so the heat flux between them is zero.
+/// A control pair straddling the solidus conducts.
+#[test]
+fn gpu_conduction_plateau_no_intra_band_flux() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("skip gpu_conduction_plateau: no GPU adapter ({e})");
+            return;
+        }
+    };
+    use bioscape::planet::thermal::{LATENT_HEAT_FUSION_L as L, MELT_TEMPERATURE_T_M as TM};
+    let n = 2usize;
+    let setup = |u: [f32; 2]| -> Vec<f32> {
+        let gpu =
+            bioscape::planet::gpu::PlanetGpu::new(std::sync::Arc::clone(&ctx), 64).unwrap();
+        gpu.upload_state(&[[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]], &[[0.0; 3]; 2], &[1.0; 2]);
+        gpu.upload_smoothing_lengths(&[0.3; 2]);
+        gpu.upload_densities(&[1.0; 2]);
+        gpu.upload_internal_energies(&u);
+        gpu.clear_du_dt(n);
+        let hash = bioscape::planet::gpu::SpatialHashGpu::new(
+            std::sync::Arc::clone(&ctx),
+            64,
+            2.5,
+            gpu.positions_buffer(),
+        )
+        .unwrap();
+        hash.rebuild(n);
+        let cond = bioscape::planet::gpu::ThermalConductionGpu::new(
+            std::sync::Arc::clone(&ctx),
+            &gpu,
+            &hash,
+        )
+        .unwrap();
+        cond.dispatch(n);
+        gpu.download_du_dt(n)
+    };
+    // Both mushy (different u, same T = T_m): no flux.
+    let band = setup([TM + 0.25 * L, TM + 0.75 * L]);
+    assert!(
+        band[0].abs() < 1e-5 && band[1].abs() < 1e-5,
+        "intra-band conduction should vanish, got {band:?}"
+    );
+    // Across the solidus (cold solid ↔ mush at T_m): real flux.
+    let grad = setup([0.5 * TM, TM + 0.5 * L]);
+    assert!(
+        grad[0].abs() > 1e-6 || grad[1].abs() > 1e-6,
+        "expected conduction across the gradient, got {grad:?}"
+    );
+}
+
+/// End-to-end: the GPU `phase_frac` buffer downloaded into `Particles`
+/// matches `phase_of(u)` elementwise and spans the full [0,1] range when
+/// the initial energy field crosses the melt band.
+#[test]
+fn gpu_phase_frac_spans_and_matches_u() {
+    let ctx = match GpuContext::new() {
+        Ok(_) => (),
+        Err(e) => {
+            eprintln!("skip gpu_phase_frac_spans_and_matches_u: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let _ = ctx;
+    use bioscape::planet::thermal::{
+        phase_of, LATENT_HEAT_FUSION_L as L, MELT_TEMPERATURE_T_M as TM,
+    };
+    let cfg = PlanetConfig {
+        n_particles: 1_000,
+        r_major: 1.0,
+        r_minor: 0.2,
+        total_mass: 1.0,
+        omega: 0.0,
+        seed: 5,
+        dt: 1e-3,
+        ..PlanetConfig::default()
+    };
+    let mut w = PlanetWorld::new(cfg.clone());
+    w.particles = torus_uniform(&cfg);
+    let n = w.particles.len();
+    let u_hi = TM + L + 0.3;
+    for i in 0..n {
+        w.particles.internal_energies[i] = u_hi * (i as f32) / ((n - 1) as f32);
+    }
+    w.init_gpu_full().expect("gpu init");
+    w.download_state();
+
+    let mut min_phi = 1.0_f32;
+    let mut max_phi = 0.0_f32;
+    for i in 0..n {
+        let u = w.particles.internal_energies[i];
+        let expect = phase_of(u).phi;
+        assert!(
+            (w.particles.phase_fracs[i] - expect).abs() < 1e-4,
+            "phi vs phase_of(u) mismatch at {i}: {} vs {}",
+            w.particles.phase_fracs[i],
+            expect
+        );
+        assert!(w.particles.phase_fracs[i] >= -1e-6 && w.particles.phase_fracs[i] <= 1.0 + 1e-6);
+        min_phi = min_phi.min(w.particles.phase_fracs[i]);
+        max_phi = max_phi.max(w.particles.phase_fracs[i]);
+    }
+    assert!(min_phi < 0.01, "expected fully-molten particles, min_phi={min_phi}");
+    assert!(max_phi > 0.99, "expected fully-solid particles, max_phi={max_phi}");
 }

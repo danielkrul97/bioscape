@@ -19,6 +19,16 @@ pub struct Particles {
     /// thermodynamic state (viscous heating, adiabatic work, conduction,
     /// radiation). `T = u / HEAT_CAPACITY_CV`.
     pub internal_energies: Vec<f32>,
+    /// Sprint 223: per-particle solid fraction `phi ∈ [0, 1]` from the
+    /// enthalpy phase map. CPU-readable cache; refreshed from the GPU
+    /// `phase_frac` buffer on `download_state`.
+    pub phase_fracs: Vec<f32>,
+    /// Sprint 232: per-particle material reference density `ρ0` (Tait EoS
+    /// reference). Heavier material (higher ρ0) differentiates inward.
+    pub mat_rho0: Vec<f32>,
+    /// Sprint 232: per-particle melt temperature `T_m`. Different materials
+    /// melt at different `u`, so a heated mix melts heterogeneously.
+    pub mat_t_m: Vec<f32>,
 }
 
 impl Particles {
@@ -31,6 +41,9 @@ impl Particles {
             smoothing_lengths: Vec::with_capacity(n),
             densities: Vec::with_capacity(n),
             internal_energies: Vec::with_capacity(n),
+            phase_fracs: Vec::with_capacity(n),
+            mat_rho0: Vec::with_capacity(n),
+            mat_t_m: Vec::with_capacity(n),
         }
     }
 
@@ -50,6 +63,12 @@ impl Particles {
         self.smoothing_lengths.push(0.0);
         self.densities.push(0.0);
         self.internal_energies.push(crate::planet::thermal::INITIAL_INTERNAL_ENERGY);
+        // Cold start (u below the solidus) ⇒ fully solid; the GPU phase
+        // pass recomputes from `u` each tick, so this is just the seed.
+        self.phase_fracs.push(1.0);
+        // Material defaults; the init generators overwrite per-particle.
+        self.mat_rho0.push(1.0);
+        self.mat_t_m.push(crate::planet::thermal::MELT_TEMPERATURE_T_M);
     }
 
     pub fn clear(&mut self) {
@@ -60,6 +79,9 @@ impl Particles {
         self.smoothing_lengths.clear();
         self.densities.clear();
         self.internal_energies.clear();
+        self.phase_fracs.clear();
+        self.mat_rho0.clear();
+        self.mat_t_m.clear();
     }
 
     pub fn total_mass(&self) -> f64 {

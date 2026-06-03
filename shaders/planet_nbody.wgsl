@@ -20,7 +20,7 @@ struct NBodyParams {
 }
 
 @group(0) @binding(0) var<uniform> params: NBodyParams;
-@group(0) @binding(1) var<storage, read> positions: array<f32>;
+@group(0) @binding(1) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> masses: array<f32>;
 @group(0) @binding(3) var<storage, read_write> accelerations: array<f32>;
 
@@ -41,9 +41,9 @@ fn nbody(
 
     var xi = vec3<f32>(0.0);
     if (i_valid) {
-        xi.x = positions[i * 3u + 0u];
-        xi.y = positions[i * 3u + 1u];
-        xi.z = positions[i * 3u + 2u];
+        xi.x = positions[i].x;
+        xi.y = positions[i].y;
+        xi.z = positions[i].z;
     }
 
     var ax = 0.0;
@@ -57,9 +57,9 @@ fn nbody(
         let j_global = tile * TILE + l;
         if (j_global < n) {
             shared_pm[l] = vec4<f32>(
-                positions[j_global * 3u + 0u],
-                positions[j_global * 3u + 1u],
-                positions[j_global * 3u + 2u],
+                positions[j_global].x,
+                positions[j_global].y,
+                positions[j_global].z,
                 masses[j_global],
             );
         } else {

@@ -11,7 +11,7 @@
 //! `--shape pancake`; the size flag set switches per shape.
 
 use bioscape::planet::diagnostics::{
-    inertia_tensor, principal_moments, total_energy, ScalarDiagnostics,
+    count_solid_blocks, inertia_tensor, principal_moments, total_energy, ScalarDiagnostics,
 };
 use bioscape::planet::init::TemperatureProfile;
 use bioscape::planet::world::primary_radius;
@@ -118,6 +118,32 @@ struct Cli {
     /// Ignored when `--init-temp-profile uniform`.
     #[arg(long, default_value_t = 0.01)]
     init_temp_surface: f32,
+
+    /// Sprint 231 — elastic sub-steps per outer step (>1 for stiff solids).
+    #[arg(long, default_value_t = 1)]
+    n_substeps: u32,
+    /// Sprint 231 — shear modulus G0 (rigidity).
+    #[arg(long, default_value_t = bioscape::planet::thermal::SHEAR_MODULUS_G0)]
+    shear_modulus: f32,
+    /// Sprint 231 — condensed reference sound speed c0.
+    #[arg(long, default_value_t = bioscape::planet::thermal::TAIT_REF_SOUND_SPEED_C0)]
+    tait_c0: f32,
+    /// Sprint 231 — Tait exponent n.
+    #[arg(long, default_value_t = bioscape::planet::thermal::TAIT_EXPONENT_N)]
+    tait_exponent: f32,
+    /// Sprint 231 — von Mises yield strength Y0.
+    #[arg(long, default_value_t = bioscape::planet::thermal::YIELD_STRENGTH_Y0)]
+    yield_strength: f32,
+    /// Sprint 232 — core material radius as a fraction of the primary radius
+    /// (0 = single material).
+    #[arg(long, default_value_t = 0.0)]
+    core_radius_frac: f32,
+    /// Sprint 232 — core reference density as a multiple of the mean density.
+    #[arg(long, default_value_t = 2.0)]
+    core_rho0_mult: f32,
+    /// Sprint 232 — core melt temperature T_m (higher = refractory).
+    #[arg(long, default_value_t = 0.5)]
+    core_t_m: f32,
 }
 
 fn main() {
@@ -142,6 +168,11 @@ fn main() {
     config.softening = cli.softening;
     config.visc_alpha = cli.visc_alpha;
     config.visc_beta = cli.visc_beta;
+    config.n_substeps = cli.n_substeps;
+    config.shear_modulus = cli.shear_modulus;
+    config.tait_c0 = cli.tait_c0;
+    config.tait_exponent = cli.tait_exponent;
+    config.yield_strength = cli.yield_strength;
     config.omega = init::omega_from_frac(&config, cli.omega_frac);
 
     let mut world = PlanetWorld::new(config.clone());
@@ -153,6 +184,15 @@ fn main() {
         cli.init_temp_surface,
         primary_radius(&config),
     );
+    if cli.core_radius_frac > 0.0 {
+        let rho_mean = bioscape::planet::world::rho_mean_init(&config);
+        init::assign_core_material(
+            &mut world.particles,
+            cli.core_radius_frac * primary_radius(&config),
+            cli.core_rho0_mult * rho_mean,
+            cli.core_t_m,
+        );
+    }
     let t_ff = world.t_ff();
     let n_steps = ((cli.t_end * t_ff) / cli.dt).ceil() as u64;
 
@@ -189,7 +229,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "tick,time,t_over_t_ff,mass,ke,pe,e_total,u_total,e_full,mean_t,min_t,max_t,drift_pct,lz,i_a,i_b,i_c,axis_a_over_c,axis_b_over_c,max_radius"
+        "tick,time,t_over_t_ff,mass,ke,pe,e_total,u_total,e_full,mean_t,min_t,max_t,drift_pct,lz,i_a,i_b,i_c,axis_a_over_c,axis_b_over_c,max_radius,mean_phi,solid_frac,largest_block"
     )
     .unwrap();
 
@@ -281,8 +321,16 @@ struct ProfileBuckets {
     drift: f64,
     hash: f64,
     density: f64,
+    eos: f64,
+    grad_corr: f64,
+    stress_rate: f64,
+    stress_integ: f64,
+    art_stress: f64,
     nbody: f64,
     sph_force: f64,
+    conduction: f64,
+    thermal_integ: f64,
+    phase: f64,
     kick2: f64,
 }
 
@@ -293,7 +341,15 @@ impl ProfileBuckets {
             ("nbody (O(N²))", self.nbody),
             ("hash rebuild", self.hash),
             ("density", self.density),
-            ("sph_force (P+ν)", self.sph_force),
+            ("eos (P, c_s)", self.eos),
+            ("grad_correction", self.grad_corr),
+            ("stress_rate", self.stress_rate),
+            ("stress_integrate", self.stress_integ),
+            ("artificial_stress", self.art_stress),
+            ("sph_force (P+ν+S)", self.sph_force),
+            ("thermal_conduction", self.conduction),
+            ("thermal_integrate", self.thermal_integ),
+            ("phase", self.phase),
             ("kick₁", self.kick1),
             ("kick₂", self.kick2),
             ("drift", self.drift),
@@ -339,11 +395,19 @@ fn tick_sph_profiled(world: &mut PlanetWorld, p: &mut ProfileBuckets) {
     let gpu = world.gpu_state.as_ref().unwrap();
     let hash = world.hash.as_ref().unwrap();
     let density = world.density.as_ref().unwrap();
+    let eos = world.eos.as_ref().unwrap();
+    let grad_correction = world.grad_correction.as_ref().unwrap();
+    let stress_rate = world.stress_rate.as_ref().unwrap();
+    let stress_integrate = world.stress_integrate.as_ref().unwrap();
+    let artificial_stress = world.artificial_stress.as_ref().unwrap();
     let sph_force = world.sph_force.as_ref().unwrap();
+    let thermal_conduction = world.thermal_conduction.as_ref().unwrap();
+    let thermal_integrate = world.thermal_integrate.as_ref().unwrap();
+    let phase = world.phase.as_ref().unwrap();
     let dt = world.config.dt;
     let g = world.config.g_const;
     let eps = world.config.softening;
-    let k = world.config.eos_k;
+    let rho0 = world.rho_mean_init;
     let gamma = world.config.eos_gamma;
     let alpha = world.config.visc_alpha;
     let beta = world.config.visc_beta;
@@ -357,12 +421,24 @@ fn tick_sph_profiled(world: &mut PlanetWorld, p: &mut ProfileBuckets) {
         }};
     }
 
+    // Mirrors PlanetWorld::tick_sph exactly (minus the every-64-tick grid
+    // resize): one submit + poll(Wait) per pass so each stage is timed in
+    // isolation. Serialised — absolute µs are inflated and inter-pass overlap
+    // is removed, so read the %-split rather than the wall clock.
     timed!(p.kick1, { gpu.kick(n, 0.5 * dt); });
     timed!(p.drift, { gpu.drift(n, dt); });
     timed!(p.hash, { hash.rebuild(n); });
     timed!(p.density, { density.dispatch(n); });
+    timed!(p.eos, { eos.dispatch(n, gamma); });
+    timed!(p.grad_corr, { grad_correction.dispatch(n); });
+    timed!(p.stress_rate, { stress_rate.dispatch(n); });
+    timed!(p.stress_integ, { stress_integrate.dispatch(n, dt); });
+    timed!(p.art_stress, { artificial_stress.dispatch(n, rho0, gamma); });
     timed!(p.nbody, { gpu.compute_accelerations(n, g, eps); });
-    timed!(p.sph_force, { sph_force.dispatch(n, k, gamma, alpha, beta); });
+    timed!(p.sph_force, { sph_force.dispatch(n, rho0, gamma, alpha, beta); });
+    timed!(p.conduction, { thermal_conduction.dispatch(n); });
+    timed!(p.thermal_integ, { thermal_integrate.dispatch(n, dt, rho0); });
+    timed!(p.phase, { phase.dispatch(n); });
     timed!(p.kick2, { gpu.kick(n, 0.5 * dt); });
 
     world.tick += 1;
@@ -402,6 +478,9 @@ fn write_diag<W: Write>(
     let mean_t = scalar.mean_temperature;
     let min_t = scalar.min_temperature;
     let max_t = scalar.max_temperature;
+    let mean_phi = scalar.mean_phase_frac;
+    let solid_frac = scalar.solid_mass_frac;
+    let (_, largest_block) = count_solid_blocks(particles, 1.5);
     let e_full = e_total + u_total;
     let drift = if e_full_init.abs() > 1e-30 {
         (e_full - e_full_init) / e_full_init.abs()
@@ -410,7 +489,7 @@ fn write_diag<W: Write>(
     };
     writeln!(
         log,
-        "{tick},{time:.6},{:.6},{:.6},{ke:.6},{pe:.6},{e_total:.6},{u_total:.6},{e_full:.6},{mean_t:.6},{min_t:.6},{max_t:.6},{drift:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{max_r:.6}",
+        "{tick},{time:.6},{:.6},{:.6},{ke:.6},{pe:.6},{e_total:.6},{u_total:.6},{e_full:.6},{mean_t:.6},{min_t:.6},{max_t:.6},{drift:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{max_r:.6},{mean_phi:.6},{solid_frac:.6},{largest_block}",
         time / t_ff,
         scalar.total_mass,
         scalar.angular_momentum_z,

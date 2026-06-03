@@ -167,6 +167,14 @@ impl SpatialHashGpu {
         0.75 * self.cell_size()
     }
 
+    /// Adaptive resize: adopt a new world half-extent so the fixed 32³ grid
+    /// tracks the collapsing body. `cell_size()` / `max_supported_h()` derive
+    /// from it; the `cell_size` arg is accepted only to share one call shape
+    /// with the other passes (it must equal `2·world_half/GRID_N`).
+    pub fn set_grid(&mut self, world_half: f32, _cell_size: f32) {
+        self.world_half = world_half;
+    }
+
     pub fn counts_buffer(&self) -> &wgpu::Buffer {
         &self.counts_buf
     }
@@ -181,6 +189,22 @@ impl SpatialHashGpu {
         if n == 0 {
             return;
         }
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("planet-hash-encoder"),
+            });
+        self.encode_rebuild(&mut encoder, n);
+        self.ctx.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Record the 4-pass counting-sort rebuild on a caller-owned encoder
+    /// so multiple pipelines can share one `queue.submit`.
+    pub fn encode_rebuild(&self, encoder: &mut wgpu::CommandEncoder, n: usize) {
+        if n == 0 {
+            return;
+        }
         let params = HashParams {
             num_particles: n as u32,
             world_half: self.world_half,
@@ -191,11 +215,6 @@ impl SpatialHashGpu {
             .queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
-        let device = &self.ctx.device;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("planet-hash-encoder"),
-        });
-        // Zero counts before count pass.
         encoder.clear_buffer(&self.counts_buf, 0, None);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -236,7 +255,6 @@ impl SpatialHashGpu {
             let wg = (NUM_BUCKETS + 63) / 64;
             pass.dispatch_workgroups(wg, 1, 1);
         }
-        self.ctx.queue.submit(Some(encoder.finish()));
     }
 
     pub fn download_offsets(&self) -> Vec<u32> {

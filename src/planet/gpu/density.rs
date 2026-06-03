@@ -124,7 +124,31 @@ impl DensityGpu {
         })
     }
 
+    /// Adaptive resize: adopt a new grid so the `bucket_xyz` lookup matches
+    /// the hash. `h_max`/`h_min` track `cell_size` exactly as in `new`.
+    pub fn set_grid(&mut self, world_half: f32, cell_size: f32) {
+        self.world_half = world_half;
+        self.cell_size = cell_size;
+        self.h_max = 0.75 * cell_size;
+        self.h_min = 0.01 * cell_size;
+    }
+
     pub fn dispatch(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("planet-density-encoder"),
+            });
+        self.encode(&mut encoder, n);
+        self.ctx.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Record one density pass on a caller-owned encoder.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder, n: usize) {
         if n == 0 {
             return;
         }
@@ -139,24 +163,14 @@ impl DensityGpu {
         self.ctx
             .queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-
-        let mut encoder = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("planet-density-encoder"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("planet-density-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            let wg = ((n as u32) + 63) / 64;
-            pass.dispatch_workgroups(wg, 1, 1);
-        }
-        self.ctx.queue.submit(Some(encoder.finish()));
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("planet-density-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        let wg = ((n as u32) + 63) / 64;
+        pass.dispatch_workgroups(wg, 1, 1);
     }
 }
 
