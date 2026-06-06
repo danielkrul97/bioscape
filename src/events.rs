@@ -273,10 +273,7 @@ pub fn hazard_shock_multiplier(
                 // wireframe sphere drawn by `draw_hazard_pulse_gizmos`.
                 let center3 = [center[0], center[1], 0.0];
                 let d_vec = min_image_delta(center3, pos, world_half);
-                let dist = (d_vec[0] * d_vec[0]
-                    + d_vec[1] * d_vec[1]
-                    + d_vec[2] * d_vec[2])
-                    .sqrt();
+                let dist = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
                 if dist >= radius {
                     0.0
                 } else {

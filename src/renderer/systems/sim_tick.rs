@@ -8,17 +8,14 @@
 use bevy::prelude::*;
 use bioscape::{N_PHEROMONE_CHANNELS, SPIKE_SLOTS};
 
-use super::super::components::{CellEntity, Pooled, SpikeEntity, SymbiontMarker};
+use super::super::components::{CellEntity, Pooled, SpikeEntity};
 use super::super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::super::resources::{
     AdhesionMaterials, CellEntityPool, CellMesh, CellSlotMap, SimRng, SimWorld, SpikeMaterial,
-    SpikeMesh, SymbiontMaterial, SymbiontMesh,
+    SpikeMesh,
 };
 
-pub(crate) fn sim_tick(
-    mut sim_world: ResMut<SimWorld>,
-    mut sim_rng: ResMut<SimRng>,
-) {
+pub(crate) fn sim_tick(mut sim_world: ResMut<SimWorld>, mut sim_rng: ResMut<SimRng>) {
     let rng = &mut sim_rng.0;
     let gen_ended = sim_world.0.tick(rng);
     // The CPU vibration shadow is refreshed lazily by `update_stats_overlay`
@@ -36,7 +33,6 @@ pub(crate) fn sim_tick(
         world.deaths_gen = 0;
         world.fertile_ticks_gen = 0;
         world.predation_events_gen = 0;
-        world.sym_sheds_gen = 0;
         world.bonds_formed_gen = 0;
         world.bonds_broken_gen = 0;
         world.bonded_attacks_gen = 0;
@@ -88,8 +84,6 @@ pub(crate) fn sync_simworld_to_cellentity(
     cell_mesh: Res<CellMesh>,
     spike_mesh: Res<SpikeMesh>,
     spike_material: Res<SpikeMaterial>,
-    symbiont_mesh: Res<SymbiontMesh>,
-    symbiont_material: Res<SymbiontMaterial>,
     mut adhesion_materials: ResMut<AdhesionMaterials>,
     mut bio_materials: ResMut<Assets<BioMaterial>>,
     mut commands: Commands,
@@ -153,20 +147,16 @@ pub(crate) fn sync_simworld_to_cellentity(
                     .id();
                 for s in 0..SPIKE_SLOTS as u8 {
                     commands.spawn((
-                        SpikeEntity { owner: entity, slot: s },
+                        SpikeEntity {
+                            owner: entity,
+                            slot: s,
+                        },
                         Mesh3d(spike_mesh.0.clone()),
                         MeshMaterial3d(spike_material.0.clone()),
                         Transform::default(),
                         Visibility::Hidden,
                     ));
                 }
-                commands.spawn((
-                    SymbiontMarker { owner: entity },
-                    Mesh3d(symbiont_mesh.0.clone()),
-                    MeshMaterial3d(symbiont_material.0.clone()),
-                    Transform::default(),
-                    Visibility::Hidden,
-                ));
                 entity
             };
             slot_map.allocate(entity);

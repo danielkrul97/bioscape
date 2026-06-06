@@ -2,8 +2,7 @@ use super::*;
 
 use bioscape::test_helpers::base_cell;
 use bioscape::{
-    EventCalendar, ShockEvent, ShockKind, BRAIN_HIDDEN, BRAIN_INPUTS, MATING_RADIUS,
-    WORLD_MAP_SEED,
+    EventCalendar, ShockEvent, ShockKind, BRAIN_HIDDEN, BRAIN_INPUTS, MATING_RADIUS, WORLD_MAP_SEED,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -138,7 +137,9 @@ fn attack_entropy_single_cell_is_zero() {
 #[test]
 fn attack_entropy_uniform_eight_bins_reaches_max_entropy() {
     let mut cells = Vec::new();
-    let bin_centers = [-0.875_f32, -0.625, -0.375, -0.125, 0.125, 0.375, 0.625, 0.875];
+    let bin_centers = [
+        -0.875_f32, -0.625, -0.375, -0.125, 0.125, 0.375, 0.625, 0.875,
+    ];
     for &v in &bin_centers {
         let mut c = base_cell();
         c.last_outputs[6] = v;
@@ -211,6 +212,75 @@ fn w1_frobenius_std_scales_correctly_for_known_values() {
     let cells = vec![a, b];
     let std = w1_frobenius_std(&cells);
     assert!((std - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn normalized_shannon_uniform_is_one() {
+    let hist = [3_u64; 8];
+    assert!((normalized_shannon(&hist) - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn normalized_shannon_single_bin_is_zero() {
+    let hist = [0_u64, 5, 0, 0];
+    assert_eq!(normalized_shannon(&hist), 0.0);
+}
+
+#[test]
+fn normalized_shannon_empty_is_zero() {
+    let hist = [0_u64; 8];
+    assert_eq!(normalized_shannon(&hist), 0.0);
+}
+
+#[test]
+fn behavioral_entropy_empty_is_zero() {
+    let cells: Vec<bioscape::Cell> = Vec::new();
+    assert_eq!(behavioral_entropy(&cells), 0.0);
+}
+
+#[test]
+fn behavioral_entropy_monoculture_is_zero() {
+    let mut cells = Vec::new();
+    for _ in 0..32 {
+        let mut c = base_cell();
+        c.genome.carnivore_score = 0.5;
+        c.genome.vision_fov = 1.0;
+        cells.push(c);
+    }
+    assert_eq!(behavioral_entropy(&cells), 0.0);
+}
+
+#[test]
+fn behavioral_entropy_spread_is_positive() {
+    let mut cells = Vec::new();
+    for k in 0..4 {
+        let mut c = base_cell();
+        c.genome.carnivore_score = (k as f32 + 0.5) / 4.0;
+        cells.push(c);
+    }
+    assert!(behavioral_entropy(&cells) > 0.0);
+}
+
+#[test]
+fn empty_and_populated_rows_have_same_column_count() {
+    let world = fresh_world(7);
+    let mut full = Vec::new();
+    write_stats(&mut Cursor::new(&mut full), &world, 0.0).unwrap();
+    let mut empty_world = fresh_world(7);
+    empty_world.cells.clear();
+    let mut empty = Vec::new();
+    write_stats(&mut Cursor::new(&mut empty), &empty_world, 0.0).unwrap();
+    let n_full = String::from_utf8(full)
+        .unwrap()
+        .trim_end()
+        .split(',')
+        .count();
+    let n_empty = String::from_utf8(empty)
+        .unwrap()
+        .trim_end()
+        .split(',')
+        .count();
+    assert_eq!(n_full, n_empty);
 }
 
 #[test]

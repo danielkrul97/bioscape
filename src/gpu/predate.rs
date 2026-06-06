@@ -3,8 +3,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::*;
 use super::*;
+use crate::*;
 
 // GPU predate — runs the herd_count and attack compute passes. Multi-attacker
 // → victim drain accumulates into `damage_delta` as fixed-point integers
@@ -33,7 +33,9 @@ pub struct PredateParamsGpu {
     pub spike_dot_threshold: f32,
     pub spike_bonus: f32,
     pub dilution_k: f32,
-    pub _pad0: u32,
+    /// S213: per-cell bond slot count, mirrors `MAX_BONDS_PER_CELL`. Drives the
+    /// attacker's bond-partner scan for tissue (kin) predation exclusion.
+    pub bonds_per_cell: u32,
     pub world_half_x: f32,
     pub world_half_y: f32,
     pub _pad1: u32,
@@ -109,6 +111,9 @@ pub struct PredateGpu {
     /// `BOND_DEFENSE_CAP` partners). Shader applies
     /// `max(1.0 − defense_pool[j], defense_floor)` to drain + gain.
     defense_pool_buf: wgpu::Buffer,
+    /// Axis C: per-cell lineage id (low 32 bits) for same-lineage (clonal
+    /// organism) predation exclusion.
+    lineage_ids_buf: wgpu::Buffer,
     herd_rb: wgpu::Buffer,
     energy_gain_rb: wgpu::Buffer,
     damage_rb: wgpu::Buffer,
@@ -139,17 +144,18 @@ impl PredateGpu {
             label: Some("predate"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/predate.wgsl").into()),
         });
-        // 21 bindings (S187 added 3 per-cell aggression buffers): 1 uniform +
-        // 20 storage. Read-only: 1..=7, 11..=12, 18..=20 (per-cell aggression).
+        // 23 bindings: 1 uniform + 22 storage. Read-only: 1..=7, 11..=12,
+        // 18..=20 (per-cell aggression), 21 (bond_partner_idx), 22 (lineage_ids).
         // Read_write: 8 (herd_counts), 9..=10 (energy/damage atomic), 13..=16
         // (Sprint 186 diagnostics), 17 (bucket min radius).
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..21)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..23)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
                 } else if (1..=7).contains(&i)
                     || (11..=12).contains(&i)
                     || (18..=20).contains(&i)
+                    || (21..=22).contains(&i)
                 {
                     wgpu::BufferBindingType::Storage { read_only: true }
                 } else {
@@ -176,14 +182,15 @@ impl PredateGpu {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline_bucket_min = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("predate-bucket-min-pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("bucket_min_radius"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let pipeline_bucket_min =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("predate-bucket-min-pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("bucket_min_radius"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let pipeline_herd = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("predate-herd-pipeline"),
             layout: Some(&pipeline_layout),
@@ -216,8 +223,9 @@ impl PredateGpu {
             })
         };
         let stor_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let stor_dst_src =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let stor_dst_src = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let pos_buf = mk("predate-pos", n * 3 * f, stor_dst);
         let eff_radii_buf = mk("predate-eff", n * f, stor_dst);
@@ -232,15 +240,12 @@ impl PredateGpu {
         let spike_counts_buf = mk("predate-spike-counts", n * f, stor_dst);
         let pitches_buf = mk("predate-pitches", n * f, stor_dst);
         let attack_gates_buf = mk("predate-attack-gates", n * f, stor_dst);
-        let predation_size_ratios_buf =
-            mk("predate-predation-size-ratios", n * f, stor_dst);
+        let predation_size_ratios_buf = mk("predate-predation-size-ratios", n * f, stor_dst);
         let defense_pool_buf = mk("predate-defense-pool", n * f, stor_dst);
-        let attacker_event_count_buf =
-            mk("predate-attacker-event-count", n * f, stor_dst_src);
-        let attacker_gain_sum_buf =
-            mk("predate-attacker-gain-sum", n * f, stor_dst_src);
-        let victim_attacker_count_buf =
-            mk("predate-victim-attacker-count", n * f, stor_dst_src);
+        let lineage_ids_buf = mk("predate-lineage-ids", n * f, stor_dst);
+        let attacker_event_count_buf = mk("predate-attacker-event-count", n * f, stor_dst_src);
+        let attacker_gain_sum_buf = mk("predate-attacker-gain-sum", n * f, stor_dst_src);
+        let victim_attacker_count_buf = mk("predate-victim-attacker-count", n * f, stor_dst_src);
         let victim_attackers_buf = mk(
             "predate-victim-attackers",
             n * MAX_ATTACKERS_PER_VICTIM as u64 * f,
@@ -249,20 +254,13 @@ impl PredateGpu {
         // NUM_BUCKETS = GRID_NX * GRID_NY * GRID_NZ = 64 * 32 * 4 = 8192.
         // Keep in sync with the const in `predate.wgsl` / `spatial_hash.wgsl`.
         const NUM_BUCKETS: u64 = 8192;
-        let bucket_min_radius_buf = mk(
-            "predate-bucket-min-radius",
-            NUM_BUCKETS * f,
-            stor_dst,
-        );
+        let bucket_min_radius_buf = mk("predate-bucket-min-radius", NUM_BUCKETS * f, stor_dst);
         let herd_rb = mk("predate-herd-rb", n * f, read);
         let energy_gain_rb = mk("predate-energy-gain-rb", n * f, read);
         let damage_rb = mk("predate-damage-rb", n * f, read);
-        let attacker_event_count_rb =
-            mk("predate-attacker-event-count-rb", n * f, read);
-        let attacker_gain_sum_rb =
-            mk("predate-attacker-gain-sum-rb", n * f, read);
-        let victim_attacker_count_rb =
-            mk("predate-victim-attacker-count-rb", n * f, read);
+        let attacker_event_count_rb = mk("predate-attacker-event-count-rb", n * f, read);
+        let attacker_gain_sum_rb = mk("predate-attacker-gain-sum-rb", n * f, read);
+        let victim_attacker_count_rb = mk("predate-victim-attacker-count-rb", n * f, read);
         let victim_attackers_rb = mk(
             "predate-victim-attackers-rb",
             n * MAX_ATTACKERS_PER_VICTIM as u64 * f,
@@ -296,6 +294,7 @@ impl PredateGpu {
             attack_gates_buf,
             predation_size_ratios_buf,
             defense_pool_buf,
+            lineage_ids_buf,
             herd_rb,
             energy_gain_rb,
             damage_rb,
@@ -328,7 +327,9 @@ impl PredateGpu {
         attack_gates: &[f32],
         predation_size_ratios: &[f32],
         defense_pool: &[f32],
+        lineage_ids: &[u32],
         cell_hash: &SpatialHashGpu,
+        bond_partner_idx_buf: &wgpu::Buffer,
         params: PredateParamsGpu,
     ) -> PredateResult {
         let n = positions.len();
@@ -339,6 +340,7 @@ impl PredateGpu {
         assert_eq!(attack_gates.len(), n);
         assert_eq!(predation_size_ratios.len(), n);
         assert_eq!(defense_pool.len(), n);
+        assert_eq!(lineage_ids.len(), n);
         if n == 0 {
             return PredateResult {
                 herd_counts: Vec::new(),
@@ -364,8 +366,10 @@ impl PredateGpu {
         // start from clean slate per dispatch).
         let zero_bytes = vec![0u8; (n * 4) as usize];
         self.queue.write_buffer(&self.herd_buf, 0, &zero_bytes);
-        self.queue.write_buffer(&self.energy_gain_buf, 0, &zero_bytes);
-        self.queue.write_buffer(&self.damage_delta_buf, 0, &zero_bytes);
+        self.queue
+            .write_buffer(&self.energy_gain_buf, 0, &zero_bytes);
+        self.queue
+            .write_buffer(&self.damage_delta_buf, 0, &zero_bytes);
         // Sprint 186: per-attacker / per-victim diagnostics zero-init.
         self.queue
             .write_buffer(&self.attacker_event_count_buf, 0, &zero_bytes);
@@ -414,38 +418,113 @@ impl PredateGpu {
             0,
             bytemuck::cast_slice(defense_pool),
         );
+        self.queue
+            .write_buffer(&self.lineage_ids_buf, 0, bytemuck::cast_slice(lineage_ids));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("predate-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.pos_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.eff_radii_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.headings_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.spikes_packed_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.attack_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: cell_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: cell_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.herd_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.energy_gain_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: self.damage_delta_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.spike_counts_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: self.pitches_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.attacker_event_count_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.attacker_gain_sum_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: self.victim_attacker_count_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: self.victim_attackers_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 17, resource: self.bucket_min_radius_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 18, resource: self.attack_gates_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 19, resource: self.predation_size_ratios_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 20, resource: self.defense_pool_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.pos_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.eff_radii_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.headings_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.spikes_packed_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.attack_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: cell_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: cell_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.herd_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.energy_gain_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: self.damage_delta_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.spike_counts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: self.pitches_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: self.attacker_event_count_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: self.attacker_gain_sum_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: self.victim_attacker_count_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: self.victim_attackers_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: self.bucket_min_radius_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: self.attack_gates_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: self.predation_size_ratios_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 20,
+                    resource: self.defense_pool_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 21,
+                    resource: bond_partner_idx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 22,
+                    resource: self.lineage_ids_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("predate-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("predate-encoder"),
+            });
         let workgroups = ((n as u32) + 63) / 64;
         // NUM_BUCKETS = 8192 → 128 workgroups of 64 threads each.
         const NUM_BUCKETS_WG: u32 = 8192 / 64;
@@ -525,7 +604,9 @@ impl PredateGpu {
         ags.map_async(wgpu::MapMode::Read, |_| {});
         vac.map_async(wgpu::MapMode::Read, |_| {});
         va.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
 
         let attacker_event_count: Vec<u32> =
             bytemuck::cast_slice::<u8, u32>(&aec.get_mapped_range()).to_vec();
@@ -533,8 +614,7 @@ impl PredateGpu {
         // GPU now writes only the per-attacker self_gain (`energy_gain`) and
         // per-victim drain (`damage_delta`). Net per-cell `energy_delta` is
         // derived host-side so the shader can skip its second CAS smyčka.
-        let energy_gain: Vec<f32> =
-            bytemuck::cast_slice::<u8, f32>(&e.get_mapped_range()).to_vec();
+        let energy_gain: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&e.get_mapped_range()).to_vec();
         let damage_delta: Vec<f32> = bytemuck::cast_slice::<u8, u32>(&d.get_mapped_range())
             .iter()
             .map(|&fixed| fixed as f32 / DAMAGE_FIXED_SCALE)
@@ -565,4 +645,3 @@ impl PredateGpu {
         res
     }
 }
-

@@ -177,9 +177,7 @@ fn brain_meta_row(ui: &mut egui::Ui, cell: &Cell) {
             ui.separator();
             ui.label(format!(
                 "STDP A±: {:+.3} / {:+.3}, τ {:.1}t",
-                cell.genome.stdp_a_plus,
-                cell.genome.stdp_a_minus,
-                cell.genome.stdp_tau_ticks
+                cell.genome.stdp_a_plus, cell.genome.stdp_a_minus, cell.genome.stdp_tau_ticks
             ));
         }
     });
@@ -221,18 +219,12 @@ fn metadata_sections(ui: &mut egui::Ui, cell: &Cell) {
                 cell.velocity[0], cell.velocity[1], cell.velocity[2]
             ),
         );
-        let speed = (cell.velocity[0].powi(2)
-            + cell.velocity[1].powi(2)
-            + cell.velocity[2].powi(2))
-        .sqrt();
+        let speed =
+            (cell.velocity[0].powi(2) + cell.velocity[1].powi(2) + cell.velocity[2].powi(2)).sqrt();
         kv(ui, "|velocity|", format!("{:.2}", speed));
         kv(ui, "heading (rad)", format!("{:.3}", cell.heading));
         kv(ui, "pitch (rad)", format!("{:.3}", cell.pitch));
-        kv(
-            ui,
-            "angular vel",
-            format!("{:.3}", cell.angular_velocity),
-        );
+        kv(ui, "angular vel", format!("{:.3}", cell.angular_velocity));
         kv(ui, "pitch vel", format!("{:.3}", cell.pitch_velocity));
     });
 
@@ -259,9 +251,7 @@ fn metadata_sections(ui: &mut egui::Ui, cell: &Cell) {
             "body L×W×H",
             format!(
                 "{:.2} × {:.2} × {:.2}",
-                cell.phenotype.body_length,
-                cell.phenotype.body_width,
-                cell.phenotype.body_height
+                cell.phenotype.body_length, cell.phenotype.body_width, cell.phenotype.body_height
             ),
         );
         kv(
@@ -274,11 +264,7 @@ fn metadata_sections(ui: &mut egui::Ui, cell: &Cell) {
             "shell thickness",
             format!("{:.3}", cell.phenotype.shell_thickness),
         );
-        kv(
-            ui,
-            "spike_count",
-            format!("{}", cell.phenotype.spike_count),
-        );
+        kv(ui, "spike_count", format!("{}", cell.phenotype.spike_count));
         for i in 0..(cell.phenotype.spike_count.min(5) as usize) {
             let s = cell.phenotype.spikes[i];
             ui.label(format!(
@@ -379,15 +365,11 @@ fn status_label(ui: &mut egui::Ui, status: &SaveStatus) {
             } else {
                 format!("saved → {}", path.display())
             };
-            ui.label(
-                egui::RichText::new(display)
-                    .color(egui::Color32::from_rgb(110, 200, 130)),
-            );
+            ui.label(egui::RichText::new(display).color(egui::Color32::from_rgb(110, 200, 130)));
         }
         SaveStatus::Cancelled => {
             ui.label(
-                egui::RichText::new("save cancelled")
-                    .color(egui::Color32::from_rgb(200, 180, 110)),
+                egui::RichText::new("save cancelled").color(egui::Color32::from_rgb(200, 180, 110)),
             );
         }
         SaveStatus::Failed(msg) => {

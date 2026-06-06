@@ -98,27 +98,15 @@ pub(super) fn draw_vibration_gizmos(
     const RING_MIN_R: f32 = 1.0;
     const RING_MAX_R: f32 = 25.0;
     for cell in &cells {
-        let pos = Vec3::new(
-            cell.0.position[0],
-            cell.0.position[1],
-            cell.0.position[2],
-        );
-        let amp = vibration
-            .0
-            .sample([pos.x, pos.y, pos.z])
-            .max(0.0)
-            .min(1.0);
+        let pos = Vec3::new(cell.0.position[0], cell.0.position[1], cell.0.position[2]);
+        let amp = vibration.0.sample([pos.x, pos.y, pos.z]).max(0.0).min(1.0);
         let r = (amp * VIZ_AMP_SCALE).clamp(RING_MIN_R, RING_MAX_R);
         // Teal — distinct from bond hue (variable) and cell_state line
         // (blue↔red). Brightness scales with amplitude so faint background
         // rings don't drown the loud spots.
         let intensity = (amp * VIZ_AMP_SCALE).clamp(0.2, 2.0);
         let color = Color::linear_rgba(0.2 * intensity, 0.9 * intensity, 1.0 * intensity, 1.0);
-        gizmos.circle(
-            Isometry3d::from_translation(pos),
-            r,
-            color,
-        );
+        gizmos.circle(Isometry3d::from_translation(pos), r, color);
     }
 }
 
@@ -172,11 +160,7 @@ pub(super) fn draw_hazard_pulse_gizmos(
             let r = (phase * radius).max(0.01);
             let alpha = (1.0 - phase) * env;
             let gw = 1.5 * alpha;
-            gizmos.sphere(
-                iso,
-                r,
-                Color::linear_rgba(gw, 0.35 * gw, 0.10 * gw, 1.0),
-            );
+            gizmos.sphere(iso, r, Color::linear_rgba(gw, 0.35 * gw, 0.10 * gw, 1.0));
         }
     }
 }

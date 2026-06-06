@@ -131,8 +131,10 @@ fn write_dump(
     fs::create_dir_all(subdir)?;
 
     let top_indices = select_top_k(&world.cells, top_k);
-    let top_id_set: std::collections::HashSet<u64> =
-        top_indices.iter().map(|&i| world.cells[i].cell_id).collect();
+    let top_id_set: std::collections::HashSet<u64> = top_indices
+        .iter()
+        .map(|&i| world.cells[i].cell_id)
+        .collect();
 
     let cells_summary: Vec<CellSummary> = world
         .cells
@@ -273,10 +275,7 @@ fn select_top_k(cells: &[Cell], k: usize) -> Vec<usize> {
         let ca = &cells[a];
         let cb = &cells[b];
         match cb.age.cmp(&ca.age) {
-            Ordering::Equal => cb
-                .energy
-                .partial_cmp(&ca.energy)
-                .unwrap_or(Ordering::Equal),
+            Ordering::Equal => cb.energy.partial_cmp(&ca.energy).unwrap_or(Ordering::Equal),
             other => other,
         }
     });
@@ -335,12 +334,12 @@ mod tests {
         let mut cell = make_cell(&mut rng, 42, 100, 5.0);
         cell.genome.brain.hidden_n = 5;
         cell.last_hidden = [0.0; bioscape::BRAIN_HIDDEN];
-        cell.last_hidden[0] = 0.99;   // sat
-        cell.last_hidden[1] = -0.97;  // sat
-        cell.last_hidden[2] = 0.5;    // active
-        cell.last_hidden[3] = 0.01;   // dead
-        cell.last_hidden[4] = -0.02;  // dead
-        // index 5+ ignored (outside hidden_n)
+        cell.last_hidden[0] = 0.99; // sat
+        cell.last_hidden[1] = -0.97; // sat
+        cell.last_hidden[2] = 0.5; // active
+        cell.last_hidden[3] = 0.01; // dead
+        cell.last_hidden[4] = -0.02; // dead
+                                     // index 5+ ignored (outside hidden_n)
         cell.last_hidden[6] = 0.99;
 
         let s = BrainStats::compute(&cell);

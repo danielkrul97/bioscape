@@ -1,8 +1,6 @@
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::prelude::*;
-use bioscape::{
-    SimClock, FIXED_TIMESTEP_HZ, GENERATIONS_PER_EPOCH, TICKS_PER_GENERATION,
-};
+use bioscape::{SimClock, FIXED_TIMESTEP_HZ, GENERATIONS_PER_EPOCH, TICKS_PER_GENERATION};
 use std::path::PathBuf;
 
 #[cfg(feature = "audio")]
@@ -45,6 +43,12 @@ pub fn run() {
     // overhead). `add_measurement` v existujících systémech zůstává unconditional
     // — pokud diag není registrovaný, je no-op.
     let want_diag = std::env::args().any(|a| a == "--diag");
+    // Profiling levers (env-gated, default off): NO_VSYNC uncaps the Fifo
+    // present cap so frame_time reflects real work instead of the 60 Hz vblank
+    // wait; NO_GIZMOS unschedules the per-cell debug-line systems so an A/B run
+    // attributes their cost.
+    let no_vsync = std::env::var("BIOSCAPE_NO_VSYNC").is_ok();
+    let no_gizmos = std::env::var("BIOSCAPE_NO_GIZMOS").is_ok();
     // Sprint 97 follow-up: in-process screencast (Bevy `Screenshot` API).
     // CLI: `--screencast=<dir>[,fps,duration_secs]` — fps default 1, duration
     // default 300s (= 5 min). PNG sequence; assemble s ffmpeg ven.
@@ -58,7 +62,10 @@ pub fn run() {
             ScreencastConfig {
                 dir: PathBuf::from(parts[0]),
                 interval_secs: parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.0_f32),
-                duration_secs: parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(300.0_f32),
+                duration_secs: parts
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(300.0_f32),
                 started_at: None,
                 last_capture: 0.0,
                 frame_idx: 0,
@@ -69,6 +76,11 @@ pub fn run() {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "Bioscape".into(),
+            present_mode: if no_vsync {
+                bevy::window::PresentMode::AutoNoVsync
+            } else {
+                bevy::window::PresentMode::Fifo
+            },
             ..default()
         }),
         ..default()
@@ -125,7 +137,10 @@ pub fn run() {
         .init_resource::<MazeWorld>()
         .add_message::<GenerationEnded>()
         .add_message::<EpochEnded>()
-        .add_systems(Startup, (setup_time_cap, setup, setup_stats_overlay).chain())
+        .add_systems(
+            Startup,
+            (setup_time_cap, setup, setup_stats_overlay).chain(),
+        )
         // Sprint 178: minimal FixedUpdate chain — shared `sim_tick` is now
         // canonical. Legacy renderer tick systems (~25 functions across
         // `brains.rs`, `brains_gpu.rs`, `collisions.rs`, `fields.rs`,
@@ -164,10 +179,6 @@ pub fn run() {
                 update_orbit_camera_transform,
                 sync_transforms,
                 sync_spikes,
-                draw_bond_gizmos,
-                draw_cell_state_gizmos,
-                draw_vibration_gizmos,
-                draw_hazard_pulse_gizmos,
                 toggle_vibration_overlay,
                 toggle_maze_world,
                 log_clock_events,
@@ -178,7 +189,7 @@ pub fn run() {
                 screencast_capture,
             ),
         )
-        .add_systems(Update, (toggle_whiskers, draw_whiskers, sync_symbionts))
+        .add_systems(Update, toggle_whiskers)
         // God-mode pipeline runs before camera input so RMB orbit suppression
         // takes effect on the same tick as the press. Order inside the chain:
         // handle button hits first, then run the RMB state machine, then close
@@ -195,6 +206,18 @@ pub fn run() {
                 .before(camera_orbit_input),
         )
         .add_systems(Update, restart_simulation);
+    if !no_gizmos {
+        app.add_systems(
+            Update,
+            (
+                draw_bond_gizmos,
+                draw_cell_state_gizmos,
+                draw_vibration_gizmos,
+                draw_hazard_pulse_gizmos,
+                draw_whiskers,
+            ),
+        );
+    }
     if let Some(cfg) = screencast_cfg {
         let _ = std::fs::create_dir_all(&cfg.dir);
         eprintln!(
@@ -205,7 +228,6 @@ pub fn run() {
     }
     app.run();
 }
-
 
 #[cfg(test)]
 mod tests;

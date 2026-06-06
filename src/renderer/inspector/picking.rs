@@ -53,10 +53,7 @@ pub(super) fn hover_cell(
         .map(|idx| sim_world.0.cells[idx].cell_id);
 }
 
-pub(super) fn clear_on_escape(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut selected: ResMut<SelectedCell>,
-) {
+pub(super) fn clear_on_escape(keys: Res<ButtonInput<KeyCode>>, mut selected: ResMut<SelectedCell>) {
     if keys.just_pressed(KeyCode::Escape) && selected.is_active() {
         selected.clear();
     }

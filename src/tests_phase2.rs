@@ -138,48 +138,6 @@ fn step_drains_energy_proportional_to_vision_radius() {
 }
 
 #[test]
-fn step_thermal_penalty_drains_when_temp_offset_from_optimum() {
-    let mut hot_optimum = base_cell();
-    hot_optimum.genome.thermal_optimum = THERMAL_TOP;
-    let mut cold_optimum = base_cell();
-    cold_optimum.genome.thermal_optimum = THERMAL_BOTTOM;
-    let cfg = PhysicsConfig {
-        drag: 0.0,
-        angular_drag: 0.0,
-        energy_cost_per_v_sq: 0.0,
-        angular_energy_cost: 0.0,
-        vision_cost_per_radius: 0.0,
-        body_cost_factor: 0.0,
-        thermal_optimum_penalty: 1.0,
-    };
-    let half = [1000.0, 1000.0, 50.0];
-    // Both at top — warm. cold_optimum cell penalized; hot_optimum not.
-    hot_optimum.position = [0.0, 0.0, 50.0];
-    cold_optimum.position = [0.0, 0.0, 50.0];
-    hot_optimum.step(1.0, half, 0, 0, &cfg);
-    cold_optimum.step(1.0, half, 0, 0, &cfg);
-    assert!(
-        cold_optimum.energy < hot_optimum.energy,
-        "cell with mismatched thermal optimum should drain more"
-    );
-}
-
-#[test]
-fn step_sensor_gain_drain_proportional_to_sum() {
-    let mut a = base_cell();
-    a.genome.sensor_gains = [0.0; N_SENSOR_CATEGORIES];
-    let mut b = base_cell();
-    b.genome.sensor_gains = [1.0; N_SENSOR_CATEGORIES];
-    let cfg = no_drag_physics(0.0, 0.0);
-    let half = [1000.0, 1000.0, 0.0];
-    a.step(1.0, half, 0, 0, &cfg);
-    b.step(1.0, half, 0, 0, &cfg);
-    let drain_a = 100.0 - a.energy;
-    let drain_b = 100.0 - b.energy;
-    assert!(drain_b > drain_a, "non-zero gains should drain more");
-}
-
-#[test]
 fn apply_morph_zero_outputs_no_phenotype_change() {
     let mut c = base_cell();
     let pre_l = c.phenotype.body_length;
@@ -342,6 +300,9 @@ fn aggressive_cfg() -> MutationConfig {
         sigma_reproduce_at_energy: 100.0,
         sigma_birth_energy: 100.0,
         sigma_altruism_share_frac: 100.0,
+        sigma_sexual_pref: 100.0,
+        sigma_bond_inherit_pref: 0.0,
+        sigma_division_angle: 0.0,
         sigma_cluster_share_bonus: 100.0,
         sigma_attack_gate: 100.0,
         sigma_predation_size_ratio: 100.0,
@@ -474,6 +435,21 @@ fn mutate_spike_count_zero_rate_keeps_value() {
     for _ in 0..50 {
         let m = g.mutate(&mut rng, &cfg);
         assert_eq!(m.spike_count, 3);
+    }
+}
+
+#[test]
+fn sexual_pref_mutation_stays_in_unit_range() {
+    let mut rng = StdRng::seed_from_u64(0x5E1);
+    let mut g = dummy_genome();
+    g.sexual_pref = 0.99;
+    for _ in 0..200 {
+        g = g.mutate_no_brain(&mut rng, &MUTATION_CONFIG);
+        assert!(
+            (0.0..=1.0).contains(&g.sexual_pref),
+            "out of range: {}",
+            g.sexual_pref
+        );
     }
 }
 

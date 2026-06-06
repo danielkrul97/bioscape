@@ -1,4 +1,4 @@
-use core::f32::consts::TAU;
+use core::f32::consts::{PI, TAU};
 
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,13 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // hidden-neuron count). Random direction — an unbiased walk that
     // selection biases. ~3 % lands roughly one step per lineage every
     // ~30 gens, slow enough for selection to evaluate each topology size.
+    // Sprint 212 considered 0.03 → 0.05 (the 100-gen run left `hidden_n_avg`
+    // flat), but reverted: a faster *unbiased* walk only churns the topology —
+    // without upward selection it doesn't ratchet up, it just adds variance.
+    // The neuron-count axis needs demand (S207/S209 making neurons pay), not a
+    // faster mutation rate. (The bump also broke the mutate draw-accounting
+    // tests in tests_phase2 — the hidden_n walk outcome feeds from_cppn's
+    // hidden_n-dependent jitter draw count.)
     hidden_n_step_rate: 0.03,
     // ~1.7 % FOV range / gen — slower than body genes so evolution finds an
     // optimum before drifting into MIN_VISION_FOV.
@@ -75,6 +82,12 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // selection signal is indirect (via cluster survival) and needs more
     // exploration per generation to find local fitness gradients.
     sigma_altruism_share_frac: 0.1,
+    // S213: ~2 % of [0, 1] per gen — let the sexual-vs-asexual preference drift.
+    sigma_sexual_pref: 0.02,
+    // S213: ~2 % of [0, 1] per gen — drift the division bond-inheritance prob.
+    sigma_bond_inherit_pref: 0.02,
+    // Axis C: heritable division polarity (oriented division → body-plans).
+    sigma_division_angle: SIGMA_DIVISION_ANGLE,
     // ~2 % of [0, 1] per gen.
     sigma_cluster_share_bonus: 0.02,
     // ~5 % of [0, 1] per gen — wider than other plasticity genes because
@@ -90,15 +103,15 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
     // ~2 % of MAX per kind per gen. Per-slot so different reward kinds can
     // drift at independent rates if a future sprint wants asymmetric tuning.
     sigma_reward_weights: [
-        0.04,   // EatFood (MAX 2.0)
-        0.002,  // Novelty (MAX 0.1)
-        0.016,  // Predation (MAX 0.8)
-        0.012,  // EscapedAttack (MAX 0.6)
-        0.004,  // Damage (MAX 0.2)
-        0.024,  // BondFormed (MAX 1.2)
-        0.020,  // MateSignalAccepted (MAX 1.0)
-        0.012,  // HazardAvoided (MAX 0.6) — same magnitude as EscapedAttack
-        0.004,  // ThreatEscaped (MAX 0.2) — ~2% of range, scaled with halved default
+        0.04,  // EatFood (MAX 2.0)
+        0.002, // Novelty (MAX 0.1)
+        0.016, // Predation (MAX 0.8)
+        0.012, // EscapedAttack (MAX 0.6)
+        0.004, // Damage (MAX 0.2)
+        0.024, // BondFormed (MAX 1.2)
+        0.020, // MateSignalAccepted (MAX 1.0)
+        0.012, // HazardAvoided (MAX 0.6) — same magnitude as EscapedAttack
+        0.004, // ThreatEscaped (MAX 0.2) — ~2% of range, scaled with halved default
     ],
 };
 
@@ -178,6 +191,12 @@ pub struct MutationConfig {
     /// Sprint 187: gaussian sigma for `altruism_share_frac` (donor's
     /// per-partner share rate). Zero = no drift, no RNG draw.
     pub sigma_altruism_share_frac: f32,
+    /// S213: gaussian sigma for `sexual_pref` (sexual-vs-asexual tendency).
+    pub sigma_sexual_pref: f32,
+    /// S213: gaussian sigma for `bond_inherit_pref` (division bond-inherit prob).
+    pub sigma_bond_inherit_pref: f32,
+    /// Axis C: gaussian sigma for `division_angle` (oriented-division polarity).
+    pub sigma_division_angle: f32,
     /// Sprint 187: gaussian sigma for `cluster_share_bonus` (per-bond
     /// share amplifier).
     pub sigma_cluster_share_bonus: f32,
@@ -329,6 +348,25 @@ pub struct Genome {
     /// `altruism_share_frac`, defensive instead of nutritional).
     #[serde(default = "default_defense_contribution")]
     pub defense_contribution: f32,
+    /// S213: facultative reproduction preference ∈ [0,1] — probability a fertile
+    /// cell seeks sexual reproduction (crossover with a mate) vs dividing
+    /// asexually (clonal copy). 1.0 = obligate sexual (pre-S213 behaviour, and
+    /// the serde default for old checkpoints); 0.0 = always divide. Lets
+    /// evolution reveal whether sex or division wins in this environment.
+    #[serde(default = "default_sexual_pref")]
+    pub sexual_pref: f32,
+    /// S213: probability an asexual-division daughter inherits a spring bond to
+    /// its parent (heritable multicellularity). 0 = daughter disperses free,
+    /// 1 = always stays bonded. Effective only when `DIVISION_INHERITS_BOND`.
+    /// serde default 0.0 = pre-feature behaviour for old checkpoints.
+    #[serde(default = "default_bond_inherit_pref")]
+    pub bond_inherit_pref: f32,
+    /// Axis C: heritable division polarity — angle (rad, relative to the
+    /// parent's heading) at which an inheriting division daughter buds off.
+    /// Lets a lineage evolve a body-build rule (bud forward → chains, sideways
+    /// → sheets). serde default 0.0 = bud along heading.
+    #[serde(default = "default_division_angle")]
+    pub division_angle: f32,
     /// Sprint 187: per-genome reward sensitivity weights. Multiplies the
     /// magnitude of each `RewardKind` event before the eligibility-trace
     /// integration. Models "dopamine-like" inter-lineage variation in
@@ -409,6 +447,18 @@ pub fn default_birth_energy() -> f32 {
 
 pub fn default_altruism_share_frac() -> f32 {
     BOND_FOOD_SHARE_FRAC
+}
+
+pub fn default_sexual_pref() -> f32 {
+    1.0
+}
+
+pub fn default_bond_inherit_pref() -> f32 {
+    0.0
+}
+
+pub fn default_division_angle() -> f32 {
+    0.0
 }
 
 pub fn default_cluster_share_bonus() -> f32 {
@@ -517,6 +567,17 @@ impl Genome {
             // sustained polymorphism is the signal of negative frequency-
             // dependent selection (cheater-vs-altruist balance).
             altruism_share_frac: rng.random_range(0.0..3.0),
+            // S213: uniform so gen-0 spans the full sexual..asexual spectrum.
+            sexual_pref: rng.random_range(0.0..1.0),
+            // S213: gen-0 starts low — full-spectrum init crashes the early
+            // population (forced clustering → cannibalism faster than selection
+            // can react). Starting near zero keeps gen-0 ≈ the healthy
+            // dispersing baseline; mutation+selection grow it only where
+            // heritable multicellularity actually pays.
+            bond_inherit_pref: rng.random_range(0.0..0.1),
+            // Axis C: uniform full circle — gen-0 lineages explore all bud
+            // directions; only matters once bond_inherit_pref is selected up.
+            division_angle: rng.random_range(-PI..PI),
             cluster_share_bonus: rng.random_range(0.0..0.5),
             // Gen-0 attackers span trigger-happy (0.05) to deliberate (0.4).
             // Wider than ATTACK_THRESHOLD=0.15 baseline so hawk/dove split
@@ -656,8 +717,7 @@ impl Genome {
                 self.thermal_optimum
             },
             carnivore_score: if cfg.sigma_carnivore_score > 0.0 {
-                (self.carnivore_score + gaussian(rng) * cfg.sigma_carnivore_score)
-                    .clamp(0.0, 1.0)
+                (self.carnivore_score + gaussian(rng) * cfg.sigma_carnivore_score).clamp(0.0, 1.0)
             } else {
                 self.carnivore_score
             },
@@ -708,8 +768,7 @@ impl Genome {
             },
             // Sprint 144: flip neuron model with low rate, short-circuited
             // so a zero rate skips the RNG draw (byte-identical baseline).
-            neuron_model: if cfg.model_flip_rate > 0.0
-                && rng.random::<f32>() < cfg.model_flip_rate
+            neuron_model: if cfg.model_flip_rate > 0.0 && rng.random::<f32>() < cfg.model_flip_rate
             {
                 match self.neuron_model {
                     NeuronModel::Perceptron => NeuronModel::Izhikevich,
@@ -752,6 +811,22 @@ impl Genome {
                     .clamp(MIN_ALTRUISM_SHARE_FRAC, MAX_ALTRUISM_SHARE_FRAC)
             } else {
                 self.altruism_share_frac
+            },
+            sexual_pref: if cfg.sigma_sexual_pref > 0.0 {
+                (self.sexual_pref + gaussian(rng) * cfg.sigma_sexual_pref).clamp(0.0, 1.0)
+            } else {
+                self.sexual_pref
+            },
+            bond_inherit_pref: if cfg.sigma_bond_inherit_pref > 0.0 {
+                (self.bond_inherit_pref + gaussian(rng) * cfg.sigma_bond_inherit_pref)
+                    .clamp(0.0, 1.0)
+            } else {
+                self.bond_inherit_pref
+            },
+            division_angle: if cfg.sigma_division_angle > 0.0 {
+                wrap_pi(self.division_angle + gaussian(rng) * cfg.sigma_division_angle)
+            } else {
+                self.division_angle
             },
             cluster_share_bonus: if cfg.sigma_cluster_share_bonus > 0.0 {
                 (self.cluster_share_bonus + gaussian(rng) * cfg.sigma_cluster_share_bonus)
@@ -801,13 +876,41 @@ impl Genome {
     pub fn crossover(a: &Genome, b: &Genome, rng: &mut impl Rng) -> Genome {
         let child_cppn = Cppn::crossover(&a.cppn, &b.cppn, rng);
         Genome {
-            max_speed: if rng.random::<bool>() { a.max_speed } else { b.max_speed },
-            color_hue: if rng.random::<bool>() { a.color_hue } else { b.color_hue },
-            vision_radius: if rng.random::<bool>() { a.vision_radius } else { b.vision_radius },
-            turn_rate: if rng.random::<bool>() { a.turn_rate } else { b.turn_rate },
-            body_length: if rng.random::<bool>() { a.body_length } else { b.body_length },
-            body_width: if rng.random::<bool>() { a.body_width } else { b.body_width },
-            body_height: if rng.random::<bool>() { a.body_height } else { b.body_height },
+            max_speed: if rng.random::<bool>() {
+                a.max_speed
+            } else {
+                b.max_speed
+            },
+            color_hue: if rng.random::<bool>() {
+                a.color_hue
+            } else {
+                b.color_hue
+            },
+            vision_radius: if rng.random::<bool>() {
+                a.vision_radius
+            } else {
+                b.vision_radius
+            },
+            turn_rate: if rng.random::<bool>() {
+                a.turn_rate
+            } else {
+                b.turn_rate
+            },
+            body_length: if rng.random::<bool>() {
+                a.body_length
+            } else {
+                b.body_length
+            },
+            body_width: if rng.random::<bool>() {
+                a.body_width
+            } else {
+                b.body_width
+            },
+            body_height: if rng.random::<bool>() {
+                a.body_height
+            } else {
+                b.body_height
+            },
             spikes: {
                 let mut spikes = [Spike::ZERO; SPIKE_SLOTS];
                 // Slot 0 length keeps the original single-spike crossover
@@ -838,7 +941,8 @@ impl Genome {
                     b.spikes[0].elevation_offset,
                     rng,
                 );
-                spikes[0].complexity = pick_f32(a.spikes[0].complexity, b.spikes[0].complexity, rng);
+                spikes[0].complexity =
+                    pick_f32(a.spikes[0].complexity, b.spikes[0].complexity, rng);
                 for i in 1..SPIKE_SLOTS {
                     spikes[i].length = pick_f32(a.spikes[i].length, b.spikes[i].length, rng);
                     spikes[i].azimuth_offset =
@@ -860,10 +964,26 @@ impl Genome {
             } else {
                 b.spike_count
             },
-            shell_thickness: if rng.random::<bool>() { a.shell_thickness } else { b.shell_thickness },
-            adhesion_type: if rng.random::<bool>() { a.adhesion_type } else { b.adhesion_type },
-            bond_stiffness: if rng.random::<bool>() { a.bond_stiffness } else { b.bond_stiffness },
-            bond_damping: if rng.random::<bool>() { a.bond_damping } else { b.bond_damping },
+            shell_thickness: if rng.random::<bool>() {
+                a.shell_thickness
+            } else {
+                b.shell_thickness
+            },
+            adhesion_type: if rng.random::<bool>() {
+                a.adhesion_type
+            } else {
+                b.adhesion_type
+            },
+            bond_stiffness: if rng.random::<bool>() {
+                a.bond_stiffness
+            } else {
+                b.bond_stiffness
+            },
+            bond_damping: if rng.random::<bool>() {
+                a.bond_damping
+            } else {
+                b.bond_damping
+            },
             vision_fov: if a.vision_fov == b.vision_fov {
                 a.vision_fov
             } else if rng.random::<bool>() {
@@ -979,6 +1099,27 @@ impl Genome {
             } else {
                 b.altruism_share_frac
             },
+            sexual_pref: if a.sexual_pref == b.sexual_pref {
+                a.sexual_pref
+            } else if rng.random::<bool>() {
+                a.sexual_pref
+            } else {
+                b.sexual_pref
+            },
+            bond_inherit_pref: if a.bond_inherit_pref == b.bond_inherit_pref {
+                a.bond_inherit_pref
+            } else if rng.random::<bool>() {
+                a.bond_inherit_pref
+            } else {
+                b.bond_inherit_pref
+            },
+            division_angle: if a.division_angle == b.division_angle {
+                a.division_angle
+            } else if rng.random::<bool>() {
+                a.division_angle
+            } else {
+                b.division_angle
+            },
             cluster_share_bonus: if a.cluster_share_bonus == b.cluster_share_bonus {
                 a.cluster_share_bonus
             } else if rng.random::<bool>() {
@@ -1023,6 +1164,11 @@ impl Genome {
         }
         .clamp_birth_energy()
     }
+}
+
+/// Wrap an angle to [-π, π).
+fn wrap_pi(a: f32) -> f32 {
+    (a + PI).rem_euclid(TAU) - PI
 }
 
 pub fn gaussian(rng: &mut impl Rng) -> f32 {

@@ -177,7 +177,9 @@ pub(super) fn god_mode_input(
         GodModeState::Idle => {
             if buttons.just_pressed(MouseButton::Right) {
                 if let Some(c) = cursor {
-                    god.state = GodModeState::RmbPressed { press_screen_pos: c };
+                    god.state = GodModeState::RmbPressed {
+                        press_screen_pos: c,
+                    };
                 }
             }
         }
@@ -187,9 +189,7 @@ pub(super) fn god_mode_input(
                 let release = cursor.unwrap_or(press_screen_pos);
                 let moved = release.distance(press_screen_pos);
                 if moved <= CLICK_DRAG_THRESHOLD_PX {
-                    if let Some(world_pos) =
-                        cursor_to_world(window, camera, camera_transform)
-                    {
+                    if let Some(world_pos) = cursor_to_world(window, camera, camera_transform) {
                         spawn_menu(window.size(), release, &mut commands);
                         god.state = GodModeState::MenuOpen { world_pos };
                         return;
@@ -289,13 +289,7 @@ pub(super) fn god_mode_handle_action(
             registries.next_cell_id.0 += 1;
             // Brand new lineage — distinct from any existing one.
             let lineage_id = cell_id;
-            let mut cell = Cell::random(
-                &mut rng,
-                half,
-                lineage_id,
-                clock.0.generation,
-                cell_id,
-            );
+            let mut cell = Cell::random(&mut rng, half, lineage_id, clock.0.generation, cell_id);
             cell.position = [world_pos.x, world_pos.y, world_pos.z];
             let mat = adhesion_material(
                 &mut registries.adhesion_materials,
@@ -317,7 +311,10 @@ pub(super) fn god_mode_handle_action(
                 .id();
             for slot in 0..SPIKE_SLOTS as u8 {
                 commands.spawn((
-                    SpikeEntity { owner: entity, slot },
+                    SpikeEntity {
+                        owner: entity,
+                        slot,
+                    },
                     Mesh3d(assets.spike_mesh.0.clone()),
                     MeshMaterial3d(assets.spike_material.0.clone()),
                     Transform::default(),
@@ -351,11 +348,7 @@ pub(super) fn god_mode_handle_action(
             for dx in -1..=1 {
                 for dy in -1..=1 {
                     let p = [pos[0] + dx as f32 * 6.0, pos[1] + dy as f32 * 6.0, pos[2]];
-                    SmellField::add_source(
-                        &mut world_state.pheromone.fields[0],
-                        p,
-                        8.0,
-                    );
+                    SmellField::add_source(&mut world_state.pheromone.fields[0], p, 8.0);
                 }
             }
         }
@@ -393,9 +386,7 @@ pub(super) fn close_menu_on_outside_click(
     if !matches!(god.state, GodModeState::MenuOpen { .. }) {
         return;
     }
-    if !buttons.just_pressed(MouseButton::Left)
-        && !buttons.just_pressed(MouseButton::Right)
-    {
+    if !buttons.just_pressed(MouseButton::Left) && !buttons.just_pressed(MouseButton::Right) {
         return;
     }
     // If any button is currently in Pressed/Hovered state, the press is on

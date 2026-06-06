@@ -7,12 +7,9 @@
 //! food count, density factor) to CSV. Reproducible: same seed → identical run.
 
 use bioscape::{
-    EventCalendar, MazeDifficulty,
-    ShockScheduleConfig, CYCLE_AMPLITUDE,
-    INITIAL_CELLS,
-    MATING_RADIUS, MAX_POPULATION,
-    N_PHEROMONE_CHANNELS,
-    TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_SEED,
+    EventCalendar, MazeDifficulty, ShockScheduleConfig, CYCLE_AMPLITUDE, INITIAL_CELLS,
+    MATING_RADIUS, MAX_POPULATION, N_PHEROMONE_CHANNELS, TICKS_PER_GENERATION, WORLD_HALF,
+    WORLD_MAP_SEED,
 };
 use clap::Parser;
 use rand::rngs::StdRng;
@@ -35,7 +32,7 @@ use world::*;
 #[derive(Parser, Debug)]
 #[command(
     name = "headless",
-    about = "Bioscape headless simulator — deterministic, GPU compute mandatory.",
+    about = "Bioscape headless simulator — deterministic, GPU compute mandatory."
 )]
 struct Cli {
     /// RNG seed (deterministic; same seed → identical run).
@@ -149,9 +146,7 @@ fn parse_maze_lenient(s: &str) -> MazeDifficulty {
     match MazeDifficulty::parse(s) {
         Some(d) => d,
         None => {
-            eprintln!(
-                "warning: unknown --maze value '{s}', using medium. Valid: easy|medium|hard"
-            );
+            eprintln!("warning: unknown --maze value '{s}', using medium. Valid: easy|medium|hard");
             MazeDifficulty::Medium
         }
     }
@@ -230,9 +225,7 @@ fn main() {
         );
     }
     if !maze_stages.is_empty() {
-        eprintln!(
-            "info: --maze-stages — same caveat as --maze (see startup info)."
-        );
+        eprintln!("info: --maze-stages — same caveat as --maze (see startup info).");
     }
     let initial_maze_difficulty = if !maze_stages.is_empty() {
         Some(maze_stages[0].0)
@@ -402,7 +395,7 @@ fn main() {
     let mut log = BufWriter::new(file);
     writeln!(
         log,
-        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac,vib_emit_avg,vib_amp_avg,vib_grad_mag_avg,gain_mech_avg,gain_mech_dev,maze_active,maze_in_goal_frac,maze_unique_reach_frac,maze_first_reach_total,lr_avg,lr_std,decay_avg,decay_std,w_norm_avg,neural_spike_frac,izhikevich_frac,repro_avg,repro_std,birth_avg,birth_std,altruism_avg,altruism_std,cluster_bonus_avg,cluster_bonus_std,attack_gate_avg,attack_gate_std,size_ratio_avg,size_ratio_std,defense_avg,defense_std,rw_eatfood_avg,rw_novelty_avg,rw_predation_avg,rw_escape_avg,rw_damage_avg,rw_bondformed_avg,rw_mating_avg,brain_w1_rank_avg,hidden_n_avg,hidden_n_max,rw_hazard_avoided_avg,rw_threat_escaped_avg,sym_count,sym_fraction,sym_lineage_count,sym_z_avg,sym_deficit_avg,sym_sheds,vib_emit_active_avg"
+        "gen,cells,spd_avg,spd_dev,vis_avg,vis_dev,len_avg,wid_avg,hgt_avg,asp_avg,asp_dev,spk_avg,spk_max,food,density,lineages,oldest,ph_emit_ch0_avg,ph_emit_ch1_avg,ph_emit_ch2_avg,ph_emit_ch0_dev,ph_emit_ch1_dev,ph_emit_ch2_dev,ph_burst_score_ch0,ph_burst_score_ch1,ph_burst_score_ch2,abs_x,abs_y,edge_frac,corner_frac,mean_x,mean_y,energy_avg,births,deaths,fertile_ticks,atk_emit,predation_events,recurrent_io,nn_dist_avg,density_avg,density_dev,dmg_avg,noise_avg,bonds_formed,bonds_broken,mean_bond_count,bond_active_frac,bond_signal_avg,adhesion_entropy,bond_stiff_avg,bond_damp_avg,state_avg,state_dev,altruist_frac,fov_avg,fov_dev,temp_avg,topt_avg,topt_dev,carnivore_avg,gain_vis_avg,gain_chem_avg,gain_def_avg,gain_vis_dev,gain_chem_dev,gain_def_dev,cppn_compat,shock_active_count,shock_hazard_intensity_max,shock_climate_offset,shock_food_factor,lineage_count,behavioral_entropy_attack,weight_diversity_w1_norm,spike_count_avg,spike_complexity_avg,spike_total_length_avg,ticks_per_sec,coop_food_solved,coop_food_failed,coop_food_arrivals_avg,bonded_attack_eff,swarm_attack_frac,pack_attack_frac,vib_emit_avg,vib_amp_avg,vib_grad_mag_avg,gain_mech_avg,gain_mech_dev,maze_active,maze_in_goal_frac,maze_unique_reach_frac,maze_first_reach_total,lr_avg,lr_std,decay_avg,decay_std,w_norm_avg,neural_spike_frac,izhikevich_frac,repro_avg,repro_std,birth_avg,birth_std,altruism_avg,altruism_std,cluster_bonus_avg,cluster_bonus_std,attack_gate_avg,attack_gate_std,size_ratio_avg,size_ratio_std,defense_avg,defense_std,rw_eatfood_avg,rw_novelty_avg,rw_predation_avg,rw_escape_avg,rw_damage_avg,rw_bondformed_avg,rw_mating_avg,brain_w1_rank_avg,hidden_n_avg,hidden_n_max,rw_hazard_avoided_avg,rw_threat_escaped_avg,vib_emit_active_avg,complexity_floor,cppn_nodes_avg,cppn_links_avg,behavioral_entropy,species_count,elite_coverage,sexual_pref_avg,bond_inherit_pref_avg,cluster_size_max,morphogen_max"
     )
     .unwrap();
     write_stats(&mut log, &world, 0.0).unwrap();
@@ -419,7 +412,10 @@ fn main() {
         bsum += world.map.sample(p) as f64;
     }
     let noise_baseline = bsum / baseline_samples as f64;
-    eprintln!("noise_baseline (uniform-position mean over map): {:.4}", noise_baseline);
+    eprintln!(
+        "noise_baseline (uniform-position mean over map): {:.4}",
+        noise_baseline
+    );
 
     eprintln!(
         "headless: seed={} map_seed={} mating_radius={} max_gens={} out={} initial_cells={} initial_food={} max_pop={} threads={}",
@@ -483,10 +479,7 @@ fn main() {
                         world.clock.generation, path, cfg.periodic_top_k
                     ),
                     Ok(None) => {}
-                    Err(e) => eprintln!(
-                        "dump: gen {} failed: {e}",
-                        world.clock.generation
-                    ),
+                    Err(e) => eprintln!("dump: gen {} failed: {e}", world.clock.generation),
                 }
             }
             // Sprint 126: reset burst_accum aby každá generace měřila vlastní
@@ -532,7 +525,6 @@ fn main() {
             world.deaths_gen = 0;
             world.fertile_ticks_gen = 0;
             world.predation_events_gen = 0;
-            world.sym_sheds_gen = 0;
             // Sprint 66: bond formation/break per-gen counters.
             world.bonds_formed_gen = 0;
             world.bonds_broken_gen = 0;

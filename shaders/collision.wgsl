@@ -39,7 +39,10 @@ struct CollisionParams {
     // in `params::physics`.
     bond_bend_stiffness: f32,
     bond_bend_damping: f32,
-    _pad1: u32,
+    // Sprint 202 hotfix: stability ceiling on dt/mass for the bond spring +
+    // damper + bending impulse (`crate::DT_OVER_M_BOND_MAX`). Dividing by the
+    // 0.01 mass floor pushed small/stiff cells past the explicit-Euler limit.
+    dt_over_m_bond_max: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: CollisionParams;
@@ -69,6 +72,16 @@ struct CollisionParams {
 // between bond slot `a` and slot `b` on cell `i`, captured at the moment
 // the second bond formed. `b > a` is canonical; `b <= a` slots are unused.
 @group(0) @binding(17) var<storage, read> bond_rest_cos: array<f32>;
+// Sprint 203: per-cell heading + body dims for the oriented-ellipsoid contact
+// radius. Pitch is ignored (clamped ±15°, negligible for the collision
+// footprint). `headings[j]` / `body_dims[j*3..]` give the neighbor's ellipsoid.
+@group(0) @binding(18) var<storage, read> headings: array<f32>;
+@group(0) @binding(19) var<storage, read> body_dims: array<f32>;
+
+// Fixed upper bound for the per-thread bond stack arrays in the bending pass.
+// WGSL array sizes must be compile-time; this must stay ≥ params.bonds_per_cell
+// (= Rust MAX_BONDS_PER_CELL). Runtime loops are bounded by params.bonds_per_cell.
+const BOND_SLOTS: u32 = 10u;
 
 fn min_image_xy(d: f32, half: f32) -> f32 {
     let w = 2.0 * half;
@@ -92,6 +105,21 @@ fn bucket_coords_of(pos: vec3<f32>) -> vec3<i32> {
     );
 }
 
+// Ellipsoid support radius along unit direction `n` (world frame). Body axes:
+// x = body_length (heading-forward), y = body_width (right), z = body_height
+// (up); pitch ignored. For an isotropic body (l=w=h=s) returns s, so pair_r
+// reduces to the legacy CELL_RADIUS·(eff_r_i + eff_r_j) sphere test.
+fn ellipsoid_support(n: vec3<f32>, heading: f32, dims: vec3<f32>) -> f32 {
+    let ch = cos(heading);
+    let sh = sin(heading);
+    let n_fwd = n.x * ch + n.y * sh;
+    let n_right = -n.x * sh + n.y * ch;
+    let a = dims.x * n_fwd;
+    let b = dims.y * n_right;
+    let c = dims.z * n.z;
+    return sqrt(a * a + b * b + c * c);
+}
+
 @compute @workgroup_size(64)
 fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -110,7 +138,12 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let r_i = eff_radii[i];
     let crc = params.cell_radius_const;
-    let crc_r_i = crc * r_i;
+    let head_i = headings[i];
+    let dims_i = vec3<f32>(
+        body_dims[i * 3u + 0u],
+        body_dims[i * 3u + 1u],
+        body_dims[i * 3u + 2u],
+    );
     // Sprint 66: search radius covers both collision contact range AND
     // adhesion falloff range. ADHESION_RANGE_FACTOR typically expands
     // the search ~3×, so adhesion neighbors must be reachable.
@@ -131,9 +164,14 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Resolve the center bucket once, walk neighbors via integer ±wrap on xy
     // (z clamped). Replaces the per-iteration `bucket_id_wrapped(ghost_pos)`
     // chain — same pattern as `sensor_gather.wgsl`.
+    // z is clamped (not toroidal) and GRID_NZ is tiny (4): iterate the distinct
+    // bz planes directly. A `dz in -r_cells..=r_cells` + per-iteration `clamp`
+    // rescans boundary planes whenever r_cells reaches a z edge, double-counting
+    // depenetration/adhesion contributions for those neighbors.
     let center = bucket_coords_of(pos_i);
-    for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-        let bz = clamp(center.z + dz, 0, GRID_NZ - 1);
+    let bz_lo = max(center.z - r_cells, 0);
+    let bz_hi = min(center.z + r_cells, GRID_NZ - 1);
+    for (var bz = bz_lo; bz <= bz_hi; bz = bz + 1) {
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
             var by = center.y + dy;
             if (by < 0) { by = by + GRID_NY; }
@@ -147,12 +185,6 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let end = hash_offsets[b + 1u];
                 for (var k = start; k < end; k = k + 1u) {
                     let j = hash_sorted[k];
-                    // No `j == i` guard: same-cell pairs give d² = 0, which the
-                    // `d2 > 0.0` filter below rejects. Skipping the explicit
-                    // check removes one branch per neighbor.
-                    let r_j = eff_radii[j];
-                    let pair_r = crc_r_i + crc * r_j;
-                    let pair_r2 = pair_r * pair_r;
                     let pj = vec3<f32>(
                         positions[j * 3u + 0u],
                         positions[j * 3u + 1u],
@@ -164,7 +196,26 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
                         pos_i.z - pj.z,
                     );
                     let d2 = dot(d, d);
-                    if (d2 < pair_r2 && d2 > 0.0) {
+                    // Same-cell (d²=0) / coincident: skip. Directional pair_r
+                    // needs the separation normal, so compute d before pair_r.
+                    if (d2 <= 0.0) {
+                        continue;
+                    }
+                    let n_dir = d * inverseSqrt(d2);
+                    // Sprint 203: oriented-ellipsoid contact radius — each cell's
+                    // extent along the contact normal is its body-ellipsoid
+                    // support. Isotropic bodies reduce to the legacy sphere test.
+                    let dims_j = vec3<f32>(
+                        body_dims[j * 3u + 0u],
+                        body_dims[j * 3u + 1u],
+                        body_dims[j * 3u + 2u],
+                    );
+                    let pair_r = crc * (
+                        ellipsoid_support(n_dir, head_i, dims_i)
+                        + ellipsoid_support(n_dir, headings[j], dims_j)
+                    );
+                    let pair_r2 = pair_r * pair_r;
+                    if (d2 < pair_r2) {
                         // Algebraically: overlap*0.5/dist = pair_r*0.5/dist - 0.5.
                         // Replaces sqrt + divide with a single rsqrt + fma.
                         let inv_d = inverseSqrt(d2);
@@ -197,7 +248,7 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 contact_partners[base] = j;
                             }
                         }
-                    } else if (d2 > 0.0) {
+                    } else {
                         // Sprint 66 differential adhesion: out-of-contact pairs
                         // get a linear-falloff velocity nudge along ±n. Same-type
                         // attracts (positive coefficient), cross-type repels
@@ -233,14 +284,22 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
     // follow-up pass.
     let bond_base = i * params.bonds_per_cell;
     let inv_mass = 1.0 / max(masses[i], 0.01);
-    let dt_over_m = params.dt * inv_mass;
-    // First pass: collect unit bond directions + cache `dist` for bending.
-    // BPC ≤ 6 (see `MAX_BONDS_PER_CELL`), so a static 6-slot scratch is fine.
-    var bond_dir: array<vec3<f32>, 6>;
-    var bond_active: array<u32, 6>;
-    for (var slot = 0u; slot < 6u; slot = slot + 1u) {
+    // Sprint 202 hotfix: clamp dt/mass to the explicit-Euler stability ceiling.
+    // Dividing the spring+damper impulse by the 0.01 mass floor let small/stiff
+    // cells blow up (k·dt²/m, c·dt/m ≫ stability limit) → overstretch → break.
+    let dt_over_m = min(params.dt * inv_mass, params.dt_over_m_bond_max);
+    // First pass: cache per-bond unit direction (partner → i) and distance for
+    // every geometrically present bond. `bond_present` excludes only missing
+    // (-1) or coincident (d² ≈ 0) partners; overstretched bonds stay present
+    // for the bending pass (so the angle force stays momentum-consistent with
+    // the neighbours), but the spring force below still skips them. BPC ≤ BOND_SLOTS.
+    var bond_dir: array<vec3<f32>, BOND_SLOTS>;
+    var bond_dist: array<f32, BOND_SLOTS>;
+    var bond_present: array<u32, BOND_SLOTS>;
+    for (var slot = 0u; slot < BOND_SLOTS; slot = slot + 1u) {
         bond_dir[slot] = vec3<f32>(0.0, 0.0, 0.0);
-        bond_active[slot] = 0u;
+        bond_dist[slot] = 0.0;
+        bond_present[slot] = 0u;
     }
     for (var slot = 0u; slot < params.bonds_per_cell; slot = slot + 1u) {
         let bond_idx = bond_base + slot;
@@ -265,14 +324,14 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let inv_d = inverseSqrt(d2);
         let dist = d2 * inv_d;
-        let rest = bond_rest[bond_idx];
-        let break_len = rest * params.bond_break_factor;
-        if (dist > break_len) {
-            continue;
-        }
         let n = d * inv_d;
         bond_dir[slot] = n;
-        bond_active[slot] = 1u;
+        bond_dist[slot] = dist;
+        bond_present[slot] = 1u;
+        let rest = bond_rest[bond_idx];
+        if (dist > rest * params.bond_break_factor) {
+            continue;  // overstretched: no spring force, CPU prunes it
+        }
         let extension = dist - rest;
         let stiffness = bond_stiffness[bond_idx];
         let damping = bond_damping[bond_idx];
@@ -286,64 +345,105 @@ fn collision(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v_rel_n = dot(v_rel, n);
         let damp = -damping * v_rel_n;
         // Sprint 192/202: integrate Hookean force over the tick AND divide
-        // by mass (`Δv = F · dt / m`).
+        // by mass (`Δv = F · dt / m`, dt/m clamped above).
         let mag = (spring + damp) * dt_over_m;
         vdx_acc = vdx_acc + mag * n.x;
         vdy_acc = vdy_acc + mag * n.y;
         vdz_acc = vdz_acc + mag * n.z;
     }
 
-    // Sprint 202 bond bending: for each pair of active bonds (a < b), pull
-    // the bond-pair angle back toward the rest cosine recorded at pair
-    // formation. The restoring force on cell i acts along the bisector of
-    // the two bond directions — when `cos(now) > cos(rest)` the angle is
-    // smaller than rest, so push i along (n_a + n_b) (outward) to open it
-    // up; when `cos(now) < cos(rest)` push along -(n_a + n_b) to close it.
-    // Damping uses the time-derivative of the cosine via v_rel projections.
+    // Sprint 202 (rewritten): bond bending as a CONSERVATIVE cosine angle
+    // spring V = ½·K·(cosθ − cos_rest)² between two bonds meeting at a shared
+    // cell, plus a momentum-conserving Rayleigh damping D·d(cosθ)/dt. Forces
+    // come from the exact gradient ∂cosθ/∂p, so the vertex and both arms sum
+    // to zero net force (Newton's third law) — no spurious energy injection,
+    // unlike the pre-rewrite un-normalised-bisector heuristic. Atomics-free:
+    // each cell only writes its OWN impulse, in two roles. `u_*` = unit vector
+    // from the shared vertex toward a cell; `bond_dir` points partner → self,
+    // so the vertex role negates its own dirs while the arm role's own
+    // `bond_dir` already equals u (vertex → self). Vertex + both arms read the
+    // same positions/velocities → identical cosθ, ∂cos/∂p and ċos → the per-
+    // angle forces cancel to fp tolerance.
     if (params.bond_bend_stiffness > 0.0) {
         let bpc = params.bonds_per_cell;
-        let cos_base = i * bpc * bpc;
+        let kk = params.bond_bend_stiffness;
+        let dd = params.bond_bend_damping;
+
+        // Role VERTEX: i is the shared cell; iterate pairs of its own bonds.
+        let cos_base_i = i * bpc * bpc;
         for (var a = 0u; a < bpc; a = a + 1u) {
-            if (bond_active[a] == 0u) { continue; }
-            let n_a = bond_dir[a];
-            // Velocity of bond endpoint a relative to i (along n_a is radial,
-            // perpendicular is tangential). Used by damping below.
-            let bond_idx_a = bond_base + a;
-            let j_a = u32(bond_partner_idx[bond_idx_a]);
-            let vel_j_a = vec3<f32>(
-                velocities[j_a * 3u + 0u],
-                velocities[j_a * 3u + 1u],
-                velocities[j_a * 3u + 2u],
-            );
-            let v_rel_a = vel_i - vel_j_a;
+            if (bond_present[a] == 0u) { continue; }
+            let u_a = -bond_dir[a];               // i → arm a
+            let r_a = bond_dist[a];
+            let pa = u32(bond_partner_idx[bond_base + a]);
+            let vel_a = vec3<f32>(velocities[pa*3u+0u], velocities[pa*3u+1u], velocities[pa*3u+2u]);
             for (var b = a + 1u; b < bpc; b = b + 1u) {
-                if (bond_active[b] == 0u) { continue; }
-                let n_b = bond_dir[b];
-                let cos_now = dot(n_a, n_b);
-                let cos_rest = bond_rest_cos[cos_base + a * bpc + b];
-                let bond_idx_b = bond_base + b;
-                let j_b = u32(bond_partner_idx[bond_idx_b]);
-                let vel_j_b = vec3<f32>(
-                    velocities[j_b * 3u + 0u],
-                    velocities[j_b * 3u + 1u],
-                    velocities[j_b * 3u + 2u],
+                if (bond_present[b] == 0u) { continue; }
+                let u_b = -bond_dir[b];           // i → arm b
+                let r_b = bond_dist[b];
+                let cos_t = dot(u_a, u_b);
+                let ga = (u_b - cos_t * u_a) / r_a;   // ∂cos/∂p_a
+                let gb = (u_a - cos_t * u_b) / r_b;   // ∂cos/∂p_b
+                let pb = u32(bond_partner_idx[bond_base + b]);
+                let vel_b = vec3<f32>(velocities[pb*3u+0u], velocities[pb*3u+1u], velocities[pb*3u+2u]);
+                let cos_dot = dot(ga, vel_a - vel_i) + dot(gb, vel_b - vel_i);
+                let cos_rest = bond_rest_cos[cos_base_i + a * bpc + b];
+                let lam = kk * (cos_t - cos_rest) + dd * cos_dot;
+                // ∂cos/∂p_i = -(ga+gb); F_i = -lam·∂cos/∂p_i = lam·(ga+gb).
+                let f_i = lam * (ga + gb);
+                vdx_acc = vdx_acc + f_i.x * dt_over_m;
+                vdy_acc = vdy_acc + f_i.y * dt_over_m;
+                vdz_acc = vdz_acc + f_i.z * dt_over_m;
+            }
+        }
+
+        // Role ARM: i is an arm of a neighbour v's angle (v; i, b). For each
+        // present bond i→v, scan v's other bonds for siblings b.
+        for (var slot = 0u; slot < bpc; slot = slot + 1u) {
+            if (bond_present[slot] == 0u) { continue; }
+            let v_signed = bond_partner_idx[bond_base + slot];
+            if (v_signed < 0) { continue; }
+            let v = u32(v_signed);
+            let u_vc = bond_dir[slot];            // v → i (this cell is the arm)
+            let r_vc = bond_dist[slot];
+            let v_base = v * bpc;
+            // v's slot pointing back to i — needed for the rest-cos lookup.
+            var slot_vc: u32 = bpc;
+            for (var s = 0u; s < bpc; s = s + 1u) {
+                if (bond_partner_idx[v_base + s] == i32(i)) { slot_vc = s; break; }
+            }
+            if (slot_vc == bpc) { continue; }
+            let pv = vec3<f32>(positions[v*3u+0u], positions[v*3u+1u], positions[v*3u+2u]);
+            let vel_v = vec3<f32>(velocities[v*3u+0u], velocities[v*3u+1u], velocities[v*3u+2u]);
+            let cos_base_v = v * bpc * bpc;
+            for (var s = 0u; s < bpc; s = s + 1u) {
+                if (s == slot_vc) { continue; }
+                let b_signed = bond_partner_idx[v_base + s];
+                if (b_signed < 0) { continue; }
+                let b = u32(b_signed);
+                let pb = vec3<f32>(positions[b*3u+0u], positions[b*3u+1u], positions[b*3u+2u]);
+                let dvb = vec3<f32>(
+                    min_image_xy(pb.x - pv.x, params.world_half_x),
+                    min_image_xy(pb.y - pv.y, params.world_half_y),
+                    pb.z - pv.z,
                 );
-                let v_rel_b = vel_i - vel_j_b;
-                // Time derivative of n_a · n_b approximated from relative
-                // tangential motion at both endpoints.
-                let cos_dot = dot(v_rel_a, n_b) + dot(v_rel_b, n_a);
-                let bend_err = cos_now - cos_rest;
-                let bend_f =
-                    -params.bond_bend_stiffness * bend_err
-                    - params.bond_bend_damping * cos_dot;
-                // Apply along bisector direction (n_a + n_b). When bend_err
-                // is positive (angle too narrow), bend_f is negative → push
-                // i opposite the bisector → opens the angle.
-                let bisector = n_a + n_b;
-                let mag_b = bend_f * dt_over_m;
-                vdx_acc = vdx_acc + mag_b * bisector.x;
-                vdy_acc = vdy_acc + mag_b * bisector.y;
-                vdz_acc = vdz_acc + mag_b * bisector.z;
+                let r_vb2 = dot(dvb, dvb);
+                if (r_vb2 <= 1e-20) { continue; }
+                let inv_vb = inverseSqrt(r_vb2);
+                let r_vb = r_vb2 * inv_vb;
+                let u_vb = dvb * inv_vb;          // v → b
+                let cos_t = dot(u_vc, u_vb);
+                let ga = (u_vb - cos_t * u_vc) / r_vc;   // ∂cos/∂p_i (this arm)
+                let gb = (u_vc - cos_t * u_vb) / r_vb;   // ∂cos/∂p_b
+                let vel_b = vec3<f32>(velocities[b*3u+0u], velocities[b*3u+1u], velocities[b*3u+2u]);
+                let cos_dot = dot(ga, vel_i - vel_v) + dot(gb, vel_b - vel_v);
+                let cos_rest = bond_rest_cos[cos_base_v + slot_vc * bpc + s];
+                let lam = kk * (cos_t - cos_rest) + dd * cos_dot;
+                // F_i = -lam·∂cos/∂p_i = -lam·ga.
+                let f_i = -lam * ga;
+                vdx_acc = vdx_acc + f_i.x * dt_over_m;
+                vdy_acc = vdy_acc + f_i.y * dt_over_m;
+                vdz_acc = vdz_acc + f_i.z * dt_over_m;
             }
         }
     }

@@ -110,12 +110,8 @@ fn spatial_hash_gpu_matches_cpu_buckets() {
     for b in 0..GPU_HASH_NUM_BUCKETS {
         let start = offsets[b] as usize;
         let end = offsets[b + 1] as usize;
-        let gpu_set: std::collections::BTreeSet<u32> =
-            sorted[start..end].iter().copied().collect();
-        let cpu_set = cpu_buckets
-            .get(&(b as u32))
-            .cloned()
-            .unwrap_or_default();
+        let gpu_set: std::collections::BTreeSet<u32> = sorted[start..end].iter().copied().collect();
+        let cpu_set = cpu_buckets.get(&(b as u32)).cloned().unwrap_or_default();
         assert_eq!(
             gpu_set, cpu_set,
             "bucket {b} mismatch: gpu={:?} cpu={:?}",
@@ -171,11 +167,7 @@ fn field_gpu_diffusion_matches_cpu() {
     let gpu_grid = gpu.download();
     assert_eq!(cpu_grid.len(), gpu_grid.len());
     for (i, (a, b)) in cpu_grid.iter().zip(gpu_grid.iter()).enumerate() {
-        assert!(
-            (a - b).abs() < 1e-3,
-            "i={i} cpu={a} gpu={b} diff={}",
-            a - b
-        );
+        assert!((a - b).abs() < 1e-3, "i={i} cpu={a} gpu={b} diff={}", a - b);
     }
 }
 
@@ -203,9 +195,7 @@ fn stats_gpu_matches_cpu_sums() {
             ]
         })
         .collect();
-    let energies: Vec<f32> = (0..n)
-        .map(|_| rng.random_range(0.0_f32..150.0))
-        .collect();
+    let energies: Vec<f32> = (0..n).map(|_| rng.random_range(0.0_f32..150.0)).collect();
 
     let mut gpu = match StatsGpu::new(n) {
         Ok(g) => g,
@@ -232,7 +222,11 @@ fn stats_gpu_matches_cpu_sums() {
     close(gpu_stats.sum_x, cpu_sum_x, cpu_sum_x.abs());
     close(gpu_stats.sum_y, cpu_sum_y, cpu_sum_y.abs());
     close(gpu_stats.sum_z, cpu_sum_z, cpu_sum_z.abs());
-    close(gpu_stats.sum_speed_sq, cpu_sum_speed_sq, cpu_sum_speed_sq.abs());
+    close(
+        gpu_stats.sum_speed_sq,
+        cpu_sum_speed_sq,
+        cpu_sum_speed_sq.abs(),
+    );
     close(gpu_stats.sum_energy, cpu_sum_energy, cpu_sum_energy.abs());
 }
 
@@ -246,7 +240,10 @@ fn brownian_gpu_perturbs_velocity() {
     let n = 256;
     let mut gpu = match BrownianGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let mut velocities = vec![[0.0_f32; 3]; n];
     let mut state: Vec<[u32; 4]> = (0..n)
@@ -293,7 +290,10 @@ fn brownian_gpu_deterministic_across_runs() {
     let n = 64;
     let mut gpu = match BrownianGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let velocities = vec![[0.5_f32, 1.0, -0.3]; n];
     let state: Vec<[u32; 4]> = (0..n).map(|i| [i as u32 + 1, 2, 3, 4]).collect();
@@ -301,8 +301,13 @@ fn brownian_gpu_deterministic_across_runs() {
     let (v2, s2) = gpu.compute(&velocities, &state, 0.3, 1.0 / 60.0, false);
     for i in 0..n {
         for k in 0..3 {
-            assert_eq!(v1[i][k].to_bits(), v2[i][k].to_bits(),
-                "i={i} k={k} not deterministic v1={} v2={}", v1[i][k], v2[i][k]);
+            assert_eq!(
+                v1[i][k].to_bits(),
+                v2[i][k].to_bits(),
+                "i={i} k={k} not deterministic v1={} v2={}",
+                v1[i][k],
+                v2[i][k]
+            );
         }
         for k in 0..4 {
             assert_eq!(s1[i][k], s2[i][k]);
@@ -322,7 +327,9 @@ fn hebbian_gpu_matches_cpu() {
     let last_inputs: Vec<[f32; BRAIN_INPUTS]> = (0..n)
         .map(|_| {
             let mut a = [0.0_f32; BRAIN_INPUTS];
-            for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
+            for v in a.iter_mut() {
+                *v = rng.random_range(-1.0_f32..1.0);
+            }
             a
         })
         .collect();
@@ -335,14 +342,18 @@ fn hebbian_gpu_matches_cpu() {
         .map(|(idx, _)| {
             let mut a = [0.0_f32; BRAIN_HIDDEN];
             let h_n = brains[idx].hidden_n as usize;
-            for v in a[..h_n].iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
+            for v in a[..h_n].iter_mut() {
+                *v = rng.random_range(-1.0_f32..1.0);
+            }
             a
         })
         .collect();
     let last_outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
         .map(|_| {
             let mut a = [0.0_f32; BRAIN_OUTPUTS];
-            for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
+            for v in a.iter_mut() {
+                *v = rng.random_range(-1.0_f32..1.0);
+            }
             a
         })
         .collect();
@@ -350,17 +361,29 @@ fn hebbian_gpu_matches_cpu() {
 
     let mut gpu = match HebbianGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let gpu_brains = gpu.compute(
-        &last_inputs, &last_hidden, &last_outputs, &rewards, &brains, lr,
+        &last_inputs,
+        &last_hidden,
+        &last_outputs,
+        &rewards,
+        &brains,
+        lr,
     );
 
     // CPU equivalent.
     let mut cpu_brains = brains.clone();
     for i in 0..n {
         cpu_brains[i].hebbian_update(
-            &last_inputs[i], &last_hidden[i], &last_outputs[i], rewards[i], lr,
+            &last_inputs[i],
+            &last_hidden[i],
+            &last_outputs[i],
+            rewards[i],
+            lr,
         );
     }
 
@@ -368,8 +391,13 @@ fn hebbian_gpu_matches_cpu() {
         for h in 0..BRAIN_HIDDEN {
             for in_i in 0..BRAIN_INPUTS {
                 let d = (cpu_brains[i].w1[h][in_i] - gpu_brains[i].w1[h][in_i]).abs();
-                assert!(d < 1e-4, "i={i} h={h} in_i={in_i} cpu={} gpu={} d={}",
-                    cpu_brains[i].w1[h][in_i], gpu_brains[i].w1[h][in_i], d);
+                assert!(
+                    d < 1e-4,
+                    "i={i} h={h} in_i={in_i} cpu={} gpu={} d={}",
+                    cpu_brains[i].w1[h][in_i],
+                    gpu_brains[i].w1[h][in_i],
+                    d
+                );
             }
             let d = (cpu_brains[i].b1[h] - gpu_brains[i].b1[h]).abs();
             assert!(d < 1e-4);
@@ -417,11 +445,23 @@ fn motor_gpu_matches_cpu() {
 
     let mut gpu = match MotorGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let (gpu_v, gpu_a, gpu_p) = gpu.compute(
-        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &masses,
-        &velocities_in, &angular_in, &pitch_vel_in, dt, DRAG_COEFFICIENT,
+        &outputs,
+        &headings,
+        &pitches,
+        &max_speeds,
+        &turn_rates,
+        &masses,
+        &velocities_in,
+        &angular_in,
+        &pitch_vel_in,
+        dt,
+        DRAG_COEFFICIENT,
     );
 
     for (i, cell) in cells.iter_mut().enumerate() {
@@ -431,7 +471,13 @@ fn motor_gpu_matches_cpu() {
     for i in 0..n {
         for k in 0..3 {
             let d = (cells[i].velocity[k] - gpu_v[i][k]).abs();
-            assert!(d < 1e-4, "i={i} k={k} cpu={} gpu={} diff={}", cells[i].velocity[k], gpu_v[i][k], d);
+            assert!(
+                d < 1e-4,
+                "i={i} k={k} cpu={} gpu={} diff={}",
+                cells[i].velocity[k],
+                gpu_v[i][k],
+                d
+            );
         }
         assert!((cells[i].angular_velocity - gpu_a[i]).abs() < 1e-4);
         assert!((cells[i].pitch_velocity - gpu_p[i]).abs() < 1e-4);
@@ -538,8 +584,7 @@ fn sensor_gather_gpu_matches_cpu() {
         pheromone_cpu.step(diffusion, decay, dt);
     }
 
-    let mut sensor =
-        SensorGatherGpu::with_context(&ctx, n, nf).expect("SensorGatherGpu init");
+    let mut sensor = SensorGatherGpu::with_context(&ctx, n, nf).expect("SensorGatherGpu init");
     let eps = 4.0_f32;
     let params = SensorParamsGpu {
         hash_cell_size: cell_size,
@@ -676,7 +721,6 @@ fn sensor_gather_gpu_matches_cpu() {
     }
 }
 
-
 /// Sprint 50: predate GPU vs CPU parity. Cluster cells s mixed sizes a
 /// random attack signals; herd_counts + energy_delta + damage_delta v ε
 /// match. Atomic float CAS sumace má ULP drift, tolerance 1e-3 absolute.
@@ -728,9 +772,7 @@ fn predate_gpu_matches_cpu() {
             [
                 rng.random_range(0.0_f32..1.0),
                 rng.random_range(-core::f32::consts::PI..core::f32::consts::PI),
-                rng.random_range(
-                    -core::f32::consts::FRAC_PI_2..core::f32::consts::FRAC_PI_2,
-                ),
+                rng.random_range(-core::f32::consts::FRAC_PI_2..core::f32::consts::FRAC_PI_2),
                 rng.random_range(0.0_f32..1.0),
             ]
         })
@@ -739,9 +781,13 @@ fn predate_gpu_matches_cpu() {
 
     let ctx = match GpuContext::new() {
         Ok(c) => c,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
-    let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
+    let mut hash =
+        SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
     let _ = hash.rebuild(&positions);
     let mut pred = PredateGpu::with_context(&ctx, n).expect("predate init");
     let params = PredateParamsGpu {
@@ -764,6 +810,22 @@ fn predate_gpu_matches_cpu() {
     let attack_gates: Vec<f32> = vec![ATTACK_THRESHOLD; n];
     let size_ratios: Vec<f32> = vec![SIZE_RATIO_THRESHOLD; n];
     let defense_pool: Vec<f32> = vec![0.0; n];
+    // No bonds (all -1) → the kin-exclusion scan finds nothing, so GPU drain
+    // still matches the bond-agnostic CPU brute force below.
+    let mut params = params;
+    params.bonds_per_cell = crate::MAX_BONDS_PER_CELL as u32;
+    let bond_idx: Vec<i32> = vec![-1; n * crate::MAX_BONDS_PER_CELL];
+    let bond_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test-bond-partner-idx"),
+        size: (bond_idx.len() * std::mem::size_of::<i32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue
+        .write_buffer(&bond_buf, 0, bytemuck::cast_slice(&bond_idx));
+    // Distinct lineage per cell → no same-lineage exclusion, matching the
+    // lineage-agnostic CPU brute force below.
+    let lineage_ids: Vec<u32> = (0..n as u32).collect();
     let res = pred.compute(
         &positions,
         &eff_radii,
@@ -775,7 +837,9 @@ fn predate_gpu_matches_cpu() {
         &attack_gates,
         &size_ratios,
         &defense_pool,
+        &lineage_ids,
         &hash,
+        &bond_buf,
         params,
     );
 
@@ -784,7 +848,9 @@ fn predate_gpu_matches_cpu() {
     let herd_r2 = HERD_RADIUS * HERD_RADIUS;
     for i in 0..n {
         for j in 0..n {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let dx = positions[i][0] - positions[j][0];
             let dy = positions[i][1] - positions[j][1];
             let dz = positions[i][2] - positions[j][2];
@@ -812,13 +878,8 @@ fn predate_gpu_matches_cpu() {
             let yaw_s = yaw + spk[1];
             let pit_s = pitch + spk[2];
             let cos_p = pit_s.cos();
-            let dir = [
-                yaw_s.cos() * cos_p,
-                yaw_s.sin() * cos_p,
-                pit_s.sin(),
-            ];
-            let cos_a =
-                dir[0] * to_target[0] + dir[1] * to_target[1] + dir[2] * to_target[2];
+            let dir = [yaw_s.cos() * cos_p, yaw_s.sin() * cos_p, pit_s.sin()];
+            let cos_a = dir[0] * to_target[0] + dir[1] * to_target[1] + dir[2] * to_target[2];
             if cos_a < SPIKE_DOT_THRESHOLD {
                 continue;
             }
@@ -834,12 +895,18 @@ fn predate_gpu_matches_cpu() {
     let mut cpu_events: u32 = 0;
     for i in 0..n {
         let attack = attack_signals[i].max(0.0);
-        if attack <= ATTACK_THRESHOLD { continue; }
+        if attack <= ATTACK_THRESHOLD {
+            continue;
+        }
         let r_i = eff_radii[i];
         for j in 0..n {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let r_j = eff_radii[j];
-            if r_i < SIZE_RATIO_THRESHOLD * r_j { continue; }
+            if r_i < SIZE_RATIO_THRESHOLD * r_j {
+                continue;
+            }
             let pair_r = CELL_RADIUS * (r_i + r_j);
             let pair_r2 = pair_r * pair_r;
             let dx = positions[i][0] - positions[j][0];
@@ -922,6 +989,12 @@ fn collision_gpu_matches_cpu() {
         .collect();
     let eff_radii: Vec<f32> = (0..n).map(|_| rng.random_range(0.7_f32..1.5)).collect();
     let max_axes: Vec<f32> = eff_radii.iter().map(|r| r * 1.2).collect();
+    // Sprint 203: isotropic body dims (l=w=h=eff_r) + zero heading make the
+    // oriented-ellipsoid support reduce to eff_r — i.e. the legacy sphere test,
+    // so these existing parity tests stay valid unchanged. The anisotropic case
+    // is covered by `collision_oriented_ellipsoid_matches_cpu`.
+    let headings = vec![0.0_f32; n];
+    let body_dims: Vec<f32> = eff_radii.iter().flat_map(|&r| [r, r, r]).collect();
     let adhesion_types: Vec<u32> = (0..n)
         .map(|_| rng.random_range(0..ADHESION_TYPE_COUNT) as u32)
         .collect();
@@ -942,24 +1015,38 @@ fn collision_gpu_matches_cpu() {
     let mut bond_rest: Vec<f32> = vec![0.0; n * slots];
     let mut bond_stiffness: Vec<f32> = vec![0.0; n * slots];
     let mut bond_damping: Vec<f32> = vec![0.0; n * slots];
+    // At most one bond per cell: with no shared-vertex angles the conservative
+    // bending pass produces no force, so the spring-only CPU mirror below stays
+    // exact. Angle/bending correctness lives in `bond_bending_conserves_momentum`.
     for i in 0..n {
-        for s in 0..slots {
-            if rng.random::<f32>() < 0.7 { continue; }
-            let mut j = rng.random_range(0..n);
-            if j == i { j = (j + 1) % n; }
-            let idx = i * slots + s;
-            bond_partner_idx[idx] = j as i32;
-            bond_rest[idx] = rng.random_range(5.0_f32..30.0);
-            bond_stiffness[idx] = rng.random_range(0.5_f32..16.0);
-            bond_damping[idx] = rng.random_range(0.0_f32..2.0);
+        if rng.random::<f32>() < 0.6 {
+            continue;
         }
+        let s = rng.random_range(0..slots);
+        let mut j = rng.random_range(0..n);
+        if j == i {
+            j = (j + 1) % n;
+        }
+        let idx = i * slots + s;
+        bond_partner_idx[idx] = j as i32;
+        bond_rest[idx] = rng.random_range(5.0_f32..30.0);
+        bond_stiffness[idx] = rng.random_range(0.5_f32..16.0);
+        bond_damping[idx] = rng.random_range(0.0_f32..2.0);
     }
+    // Sprint 202: per-cell mass (a mix that exercises both the clamped and
+    // unclamped dt/m branch) and zeroed rest cosines for the bending pass.
+    let masses: Vec<f32> = (0..n).map(|_| rng.random_range(0.3_f32..6.0)).collect();
+    let bond_rest_cos: Vec<f32> = vec![0.0; n * slots * slots];
 
     let ctx = match GpuContext::new() {
         Ok(c) => c,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
-    let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
+    let mut hash =
+        SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
     let _ = hash.rebuild(&positions);
     let mut col = CollisionGpu::with_context(
         &ctx,
@@ -978,11 +1065,15 @@ fn collision_gpu_matches_cpu() {
         &velocities,
         &eff_radii,
         &max_axes,
+        &headings,
+        &body_dims,
         &adhesion_types,
         &bond_partner_idx,
         &bond_rest,
         &bond_stiffness,
         &bond_damping,
+        &masses,
+        &bond_rest_cos,
         &hash,
     );
     let gpu_deltas = &result.position_deltas;
@@ -1000,7 +1091,9 @@ fn collision_gpu_matches_cpu() {
     let mut cpu_contacts: Vec<Vec<u32>> = vec![Vec::new(); n];
     for i in 0..n {
         for j in 0..n {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let pair_r = CELL_RADIUS * (eff_radii[i] + eff_radii[j]);
             let pair_r2 = pair_r * pair_r;
             let dx = positions[i][0] - positions[j][0];
@@ -1052,17 +1145,23 @@ fn collision_gpu_matches_cpu() {
         for s in 0..slots {
             let idx = i * slots + s;
             let j_signed = bond_partner_idx[idx];
-            if j_signed < 0 { continue; }
+            if j_signed < 0 {
+                continue;
+            }
             let j = j_signed as usize;
             let dx = positions[i][0] - positions[j][0];
             let dy = positions[i][1] - positions[j][1];
             let dz = positions[i][2] - positions[j][2];
             let d2 = dx * dx + dy * dy + dz * dz;
-            if d2 <= 1e-20 { continue; }
+            if d2 <= 1e-20 {
+                continue;
+            }
             let dist = d2.sqrt();
             let rest = bond_rest[idx];
             let break_len = rest * BOND_BREAK_FACTOR;
-            if dist > break_len { continue; }
+            if dist > break_len {
+                continue;
+            }
             let inv_d = 1.0 / dist;
             let nx = dx * inv_d;
             let ny = dy * inv_d;
@@ -1076,9 +1175,12 @@ fn collision_gpu_matches_cpu() {
             let vrz = velocities[i][2] - velocities[j][2];
             let v_rel_n = vrx * nx + vry * ny + vrz * nz;
             let damp = -damping * v_rel_n;
-            // Sprint 192: integrate Hookean force over the tick — must match
-            // the shader's `(spring + damp) * params.dt` term.
-            let mag = (spring + damp) * (1.0 / crate::FIXED_TIMESTEP_HZ);
+            // Sprint 192/202: integrate over the tick AND divide by mass, with
+            // the same explicit-Euler stability clamp on dt/m as the shader.
+            let inv_mass = 1.0 / masses[i].max(0.01);
+            let dt_over_m =
+                (1.0 / crate::FIXED_TIMESTEP_HZ * inv_mass).min(crate::DT_OVER_M_BOND_MAX);
+            let mag = (spring + damp) * dt_over_m;
             cpu_vel_deltas[i][0] += mag * nx;
             cpu_vel_deltas[i][1] += mag * ny;
             cpu_vel_deltas[i][2] += mag * nz;
@@ -1088,26 +1190,671 @@ fn collision_gpu_matches_cpu() {
     for i in 0..n {
         for k in 0..3 {
             let d = (cpu_deltas[i][k] - gpu_deltas[i][k]).abs();
-            assert!(d < 1e-3, "pos i={i} k={k} cpu={} gpu={} diff={}",
-                cpu_deltas[i][k], gpu_deltas[i][k], d);
+            assert!(
+                d < 1e-3,
+                "pos i={i} k={k} cpu={} gpu={} diff={}",
+                cpu_deltas[i][k],
+                gpu_deltas[i][k],
+                d
+            );
             let dv = (cpu_vel_deltas[i][k] - gpu_vel_deltas[i][k]).abs();
-            assert!(dv < 1e-3, "vel i={i} k={k} cpu={} gpu={} diff={}",
-                cpu_vel_deltas[i][k], gpu_vel_deltas[i][k], dv);
+            assert!(
+                dv < 1e-3,
+                "vel i={i} k={k} cpu={} gpu={} diff={}",
+                cpu_vel_deltas[i][k],
+                gpu_vel_deltas[i][k],
+                dv
+            );
         }
         // Contact events: counts must match exactly. Partner lists are
         // compared as sorted sets — atomicAdd in the shader doesn't
         // guarantee write order across threads.
         let gpu_cnt = result.contact_count[i] as usize;
         let cpu_cnt = cpu_contacts[i].len();
-        assert_eq!(gpu_cnt, cpu_cnt, "contact_count i={i} cpu={cpu_cnt} gpu={gpu_cnt}");
+        assert_eq!(
+            gpu_cnt, cpu_cnt,
+            "contact_count i={i} cpu={cpu_cnt} gpu={gpu_cnt}"
+        );
         let mut gpu_partners: Vec<u32> = (0..gpu_cnt)
             .map(|s| result.contact_partners[i * (max_contacts as usize) + s])
             .collect();
         let mut cpu_partners = cpu_contacts[i].clone();
         gpu_partners.sort_unstable();
         cpu_partners.sort_unstable();
-        assert_eq!(gpu_partners, cpu_partners, "contact partners mismatch i={i}");
+        assert_eq!(
+            gpu_partners, cpu_partners,
+            "contact partners mismatch i={i}"
+        );
     }
+}
+
+/// Sprint 203: oriented-ellipsoid contact radius. Anisotropic body dims +
+/// random heading make `pair_r` depend on the separation direction; this checks
+/// the GPU `ellipsoid_support` against an all-pairs CPU mirror. Dims stay in the
+/// proven [0.7,1.5] band so the per-cell broad-phase search radius still covers
+/// every contributing pair (wider ratios would need a size-aware search bound).
+#[test]
+fn collision_oriented_ellipsoid_matches_cpu() {
+    use crate::{
+        ADHESION_CROSS_TYPE, ADHESION_RANGE_FACTOR, ADHESION_STRENGTH, ADHESION_TYPE_COUNT,
+        BOND_BREAK_FACTOR, CELL_RADIUS, COLLISION_RESTITUTION, MAX_BONDS_PER_CELL,
+    };
+    let mut rng = StdRng::seed_from_u64(2031);
+    let n = 100;
+    let cell_size = 64.0_f32;
+    let positions: Vec<[f32; 3]> = (0..n)
+        .map(|_| {
+            [
+                rng.random_range(-30.0_f32..30.0),
+                rng.random_range(-30.0_f32..30.0),
+                rng.random_range(-1.0_f32..1.0),
+            ]
+        })
+        .collect();
+    let velocities: Vec<[f32; 3]> = (0..n)
+        .map(|_| {
+            [
+                rng.random_range(-5.0_f32..5.0),
+                rng.random_range(-5.0_f32..5.0),
+                rng.random_range(-1.0_f32..1.0),
+            ]
+        })
+        .collect();
+    // Per-axis anisotropy within the proven size band → orientation-dependent
+    // support (aspect ratios up to ~2.1), heading drawn over the full circle.
+    let body_dims3: Vec<[f32; 3]> = (0..n)
+        .map(|_| {
+            [
+                rng.random_range(0.7_f32..1.5),
+                rng.random_range(0.7_f32..1.5),
+                rng.random_range(0.7_f32..1.5),
+            ]
+        })
+        .collect();
+    let headings: Vec<f32> = (0..n)
+        .map(|_| rng.random_range(-core::f32::consts::PI..core::f32::consts::PI))
+        .collect();
+    let eff_radii: Vec<f32> = body_dims3
+        .iter()
+        .map(|d| (d[0] + d[1] + d[2]) / 3.0)
+        .collect();
+    let max_axes: Vec<f32> = body_dims3
+        .iter()
+        .map(|d| d[0].max(d[1]).max(d[2]))
+        .collect();
+    let body_dims: Vec<f32> = body_dims3.iter().flatten().copied().collect();
+    let adhesion_types: Vec<u32> = (0..n)
+        .map(|_| rng.random_range(0..ADHESION_TYPE_COUNT) as u32)
+        .collect();
+    let adhesion = AdhesionParams {
+        strength: ADHESION_STRENGTH,
+        cross_type: ADHESION_CROSS_TYPE,
+        range_factor: ADHESION_RANGE_FACTOR,
+    };
+    let bond_params = BondParams {
+        bonds_per_cell: MAX_BONDS_PER_CELL as u32,
+        break_factor: BOND_BREAK_FACTOR,
+    };
+    let max_contacts: u32 = 32;
+    let slots = MAX_BONDS_PER_CELL;
+    // No bonds — isolate the oriented depenetration / adhesion / contact path.
+    let bond_partner_idx = vec![-1i32; n * slots];
+    let bond_rest = vec![0.0f32; n * slots];
+    let bond_stiffness = vec![0.0f32; n * slots];
+    let bond_damping = vec![0.0f32; n * slots];
+    let masses = vec![1.0f32; n];
+    let bond_rest_cos = vec![0.0f32; n * slots * slots];
+
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let mut hash =
+        SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
+    let _ = hash.rebuild(&positions);
+    let mut col = CollisionGpu::with_context(
+        &ctx,
+        n,
+        cell_size,
+        CELL_RADIUS,
+        COLLISION_RESTITUTION,
+        adhesion,
+        bond_params,
+        max_contacts,
+        [1000.0, 1000.0],
+    )
+    .expect("collision init");
+    let result = col.compute(
+        &positions,
+        &velocities,
+        &eff_radii,
+        &max_axes,
+        &headings,
+        &body_dims,
+        &adhesion_types,
+        &bond_partner_idx,
+        &bond_rest,
+        &bond_stiffness,
+        &bond_damping,
+        &masses,
+        &bond_rest_cos,
+        &hash,
+    );
+    let gpu_deltas = &result.position_deltas;
+    let gpu_vel_deltas = &result.velocity_deltas;
+
+    // Directional ellipsoid support — mirror of `ellipsoid_support` (collision.wgsl).
+    let support = |nrm: [f32; 3], heading: f32, d: [f32; 3]| -> f32 {
+        let (ch, sh) = (heading.cos(), heading.sin());
+        let n_fwd = nrm[0] * ch + nrm[1] * sh;
+        let n_right = -nrm[0] * sh + nrm[1] * ch;
+        let a = d[0] * n_fwd;
+        let b = d[1] * n_right;
+        let c = d[2] * nrm[2];
+        (a * a + b * b + c * c).sqrt()
+    };
+    let damp_coeff = 0.5 * (1.0 - COLLISION_RESTITUTION);
+    let mut cpu_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let mut cpu_vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let mut cpu_contacts: Vec<usize> = vec![0; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let dx = positions[i][0] - positions[j][0];
+            let dy = positions[i][1] - positions[j][1];
+            let dz = positions[i][2] - positions[j][2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 <= 0.0 {
+                continue;
+            }
+            let d = d2.sqrt();
+            let nx = dx / d;
+            let ny = dy / d;
+            let nz = dz / d;
+            let pair_r = CELL_RADIUS
+                * (support([nx, ny, nz], headings[i], body_dims3[i])
+                    + support([nx, ny, nz], headings[j], body_dims3[j]));
+            if d2 < pair_r * pair_r {
+                let overlap = pair_r - d;
+                cpu_deltas[i][0] += nx * overlap * 0.5;
+                cpu_deltas[i][1] += ny * overlap * 0.5;
+                cpu_deltas[i][2] += nz * overlap * 0.5;
+                let vrx = velocities[i][0] - velocities[j][0];
+                let vry = velocities[i][1] - velocities[j][1];
+                let vrz = velocities[i][2] - velocities[j][2];
+                let v_rel_n = vrx * nx + vry * ny + vrz * nz;
+                if v_rel_n < 0.0 {
+                    let damp = -v_rel_n * damp_coeff;
+                    cpu_vel_deltas[i][0] += damp * nx;
+                    cpu_vel_deltas[i][1] += damp * ny;
+                    cpu_vel_deltas[i][2] += damp * nz;
+                }
+                if i < j {
+                    cpu_contacts[i] += 1;
+                }
+            } else {
+                let adhesion_range = pair_r * ADHESION_RANGE_FACTOR;
+                if d2 < adhesion_range * adhesion_range {
+                    let falloff = (adhesion_range - d) / (adhesion_range - pair_r);
+                    let coeff = if adhesion_types[i] == adhesion_types[j] {
+                        ADHESION_STRENGTH
+                    } else {
+                        ADHESION_STRENGTH * ADHESION_CROSS_TYPE
+                    };
+                    let mag = -coeff * falloff;
+                    let inv_d = 1.0 / d;
+                    cpu_vel_deltas[i][0] += mag * dx * inv_d;
+                    cpu_vel_deltas[i][1] += mag * dy * inv_d;
+                    cpu_vel_deltas[i][2] += mag * dz * inv_d;
+                }
+            }
+        }
+    }
+    let mut max_diff = 0.0f32;
+    for i in 0..n {
+        for k in 0..3 {
+            max_diff = max_diff.max((cpu_deltas[i][k] - gpu_deltas[i][k]).abs());
+            max_diff = max_diff.max((cpu_vel_deltas[i][k] - gpu_vel_deltas[i][k]).abs());
+        }
+        assert_eq!(
+            result.contact_count[i] as usize, cpu_contacts[i],
+            "contact count mismatch i={i}"
+        );
+    }
+    assert!(
+        max_diff < 1e-3,
+        "oriented-ellipsoid collision CPU/GPU diverged: max_diff={max_diff}"
+    );
+}
+
+/// Regression: cells clustered in a z-edge hash bucket must not have their
+/// neighbours processed more than once. The neighbour walk clamps `bz` to
+/// `[0, GRID_NZ-1]`; a naive `dz in -r_cells..=r_cells` + `clamp` re-walks the
+/// edge plane (e.g. bz 4→3 and 5→3 both alias bucket 3), tripling depenetration
+/// / adhesion / contact contributions for boundary cells. Here every cell sits
+/// in the top z bucket (z∈[96,100] → bz=3), so any double-walk shows up as a
+/// 2–3× divergence from the all-pairs CPU truth. Passes only with the distinct
+/// `bz_lo..=bz_hi` iteration.
+#[test]
+fn collision_z_edge_no_double_count() {
+    use crate::{
+        ADHESION_CROSS_TYPE, ADHESION_RANGE_FACTOR, ADHESION_STRENGTH, ADHESION_TYPE_COUNT,
+        BOND_BREAK_FACTOR, CELL_RADIUS, COLLISION_RESTITUTION, MAX_BONDS_PER_CELL,
+    };
+    let mut rng = StdRng::seed_from_u64(914);
+    let n = 60;
+    let cell_size = 64.0_f32;
+    // Tight xy cluster (far from the toroidal xy edges so min-image == flat) at
+    // the very top of the z range → all cells land in the edge bucket bz=3.
+    let positions: Vec<[f32; 3]> = (0..n)
+        .map(|_| {
+            [
+                rng.random_range(-15.0_f32..15.0),
+                rng.random_range(-15.0_f32..15.0),
+                rng.random_range(96.0_f32..100.0),
+            ]
+        })
+        .collect();
+    let velocities: Vec<[f32; 3]> = (0..n)
+        .map(|_| {
+            [
+                rng.random_range(-5.0_f32..5.0),
+                rng.random_range(-5.0_f32..5.0),
+                rng.random_range(-1.0_f32..1.0),
+            ]
+        })
+        .collect();
+    let eff_radii: Vec<f32> = (0..n).map(|_| rng.random_range(0.7_f32..1.5)).collect();
+    let max_axes: Vec<f32> = eff_radii.iter().map(|r| r * 1.2).collect();
+    // Sprint 203: isotropic body dims (l=w=h=eff_r) + zero heading make the
+    // oriented-ellipsoid support reduce to eff_r — i.e. the legacy sphere test,
+    // so these existing parity tests stay valid unchanged. The anisotropic case
+    // is covered by `collision_oriented_ellipsoid_matches_cpu`.
+    let headings = vec![0.0_f32; n];
+    let body_dims: Vec<f32> = eff_radii.iter().flat_map(|&r| [r, r, r]).collect();
+    let adhesion_types: Vec<u32> = (0..n)
+        .map(|_| rng.random_range(0..ADHESION_TYPE_COUNT) as u32)
+        .collect();
+    let adhesion = AdhesionParams {
+        strength: ADHESION_STRENGTH,
+        cross_type: ADHESION_CROSS_TYPE,
+        range_factor: ADHESION_RANGE_FACTOR,
+    };
+    let bond_params = BondParams {
+        bonds_per_cell: MAX_BONDS_PER_CELL as u32,
+        break_factor: BOND_BREAK_FACTOR,
+    };
+    let max_contacts: u32 = 32;
+    let slots = MAX_BONDS_PER_CELL;
+    // No bonds — isolate the neighbour-walk so any mismatch is the z rescan.
+    let bond_partner_idx: Vec<i32> = vec![-1; n * slots];
+    let bond_rest: Vec<f32> = vec![0.0; n * slots];
+    let bond_stiffness: Vec<f32> = vec![0.0; n * slots];
+    let bond_damping: Vec<f32> = vec![0.0; n * slots];
+    let masses: Vec<f32> = vec![1.0; n];
+    let bond_rest_cos: Vec<f32> = vec![0.0; n * slots * slots];
+
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let mut hash =
+        SpatialHashGpu::with_context(&ctx, n, cell_size, [1000.0, 1000.0]).expect("hash");
+    let _ = hash.rebuild(&positions);
+    let mut col = CollisionGpu::with_context(
+        &ctx,
+        n,
+        cell_size,
+        CELL_RADIUS,
+        COLLISION_RESTITUTION,
+        adhesion,
+        bond_params,
+        max_contacts,
+        [1000.0, 1000.0],
+    )
+    .expect("collision init");
+    let result = col.compute(
+        &positions,
+        &velocities,
+        &eff_radii,
+        &max_axes,
+        &headings,
+        &body_dims,
+        &adhesion_types,
+        &bond_partner_idx,
+        &bond_rest,
+        &bond_stiffness,
+        &bond_damping,
+        &masses,
+        &bond_rest_cos,
+        &hash,
+    );
+    let gpu_deltas = &result.position_deltas;
+    let gpu_vel_deltas = &result.velocity_deltas;
+
+    let damp_coeff = 0.5 * (1.0 - COLLISION_RESTITUTION);
+    let mut cpu_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let mut cpu_vel_deltas: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let mut cpu_contacts: Vec<usize> = vec![0; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let pair_r = CELL_RADIUS * (eff_radii[i] + eff_radii[j]);
+            let pair_r2 = pair_r * pair_r;
+            let dx = positions[i][0] - positions[j][0];
+            let dy = positions[i][1] - positions[j][1];
+            let dz = positions[i][2] - positions[j][2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 < pair_r2 && d2 > 0.0 {
+                let d = d2.sqrt();
+                let overlap = pair_r - d;
+                let (nx, ny, nz) = (dx / d, dy / d, dz / d);
+                cpu_deltas[i][0] += nx * overlap * 0.5;
+                cpu_deltas[i][1] += ny * overlap * 0.5;
+                cpu_deltas[i][2] += nz * overlap * 0.5;
+                let vrx = velocities[i][0] - velocities[j][0];
+                let vry = velocities[i][1] - velocities[j][1];
+                let vrz = velocities[i][2] - velocities[j][2];
+                let v_rel_n = vrx * nx + vry * ny + vrz * nz;
+                if v_rel_n < 0.0 {
+                    let damp = -v_rel_n * damp_coeff;
+                    cpu_vel_deltas[i][0] += damp * nx;
+                    cpu_vel_deltas[i][1] += damp * ny;
+                    cpu_vel_deltas[i][2] += damp * nz;
+                }
+                if i < j {
+                    cpu_contacts[i] += 1;
+                }
+            } else if d2 > 0.0 {
+                let adhesion_range = pair_r * ADHESION_RANGE_FACTOR;
+                if d2 < adhesion_range * adhesion_range {
+                    let d = d2.sqrt();
+                    let falloff = (adhesion_range - d) / (adhesion_range - pair_r);
+                    let coeff = if adhesion_types[i] == adhesion_types[j] {
+                        ADHESION_STRENGTH
+                    } else {
+                        ADHESION_STRENGTH * ADHESION_CROSS_TYPE
+                    };
+                    let mag = -coeff * falloff;
+                    let inv_d = 1.0 / d;
+                    cpu_vel_deltas[i][0] += mag * dx * inv_d;
+                    cpu_vel_deltas[i][1] += mag * dy * inv_d;
+                    cpu_vel_deltas[i][2] += mag * dz * inv_d;
+                }
+            }
+        }
+    }
+
+    for i in 0..n {
+        for k in 0..3 {
+            let d = (cpu_deltas[i][k] - gpu_deltas[i][k]).abs();
+            assert!(
+                d < 1e-3,
+                "pos i={i} k={k} cpu={} gpu={} diff={}",
+                cpu_deltas[i][k],
+                gpu_deltas[i][k],
+                d
+            );
+            let dv = (cpu_vel_deltas[i][k] - gpu_vel_deltas[i][k]).abs();
+            assert!(
+                dv < 1e-3,
+                "vel i={i} k={k} cpu={} gpu={} diff={}",
+                cpu_vel_deltas[i][k],
+                gpu_vel_deltas[i][k],
+                dv
+            );
+        }
+        let gpu_cnt = result.contact_count[i] as usize;
+        assert_eq!(
+            gpu_cnt, cpu_contacts[i],
+            "contact_count i={i} cpu={} gpu={gpu_cnt} (z-edge double-count)",
+            cpu_contacts[i]
+        );
+    }
+}
+
+/// Sprint 202 (rewritten bending): the conservative cosine angle spring must
+/// (a) apply a restoring impulse when the bond-pair angle differs from its
+/// rest cosine and (b) conserve momentum — vertex + both arms get forces that
+/// sum to zero (Newton's third law), so a free bonded cluster gets no net
+/// velocity kick from bending alone. Vertex c1 at the origin, arms c0 (−x) and
+/// c2 (+y) at distance 10 (beyond adhesion range), zero spring stiffness → the
+/// only force is bending. Current angle 90° (cos 0) vs rest cos 0.5 (60°) →
+/// the angle should narrow.
+#[test]
+fn bond_bending_conserves_momentum() {
+    use crate::{
+        ADHESION_CROSS_TYPE, ADHESION_RANGE_FACTOR, ADHESION_STRENGTH, BOND_BREAK_FACTOR,
+        CELL_RADIUS, COLLISION_RESTITUTION, MAX_BONDS_PER_CELL,
+    };
+    let n = 3usize;
+    let slots = MAX_BONDS_PER_CELL;
+    let dist = 10.0_f32;
+    let positions: Vec<[f32; 3]> = vec![
+        [-dist, 0.0, 0.0], // c0
+        [0.0, 0.0, 0.0],   // c1 (vertex)
+        [0.0, dist, 0.0],  // c2
+    ];
+    let eff_radii = vec![0.3_f32; n];
+    let max_axes: Vec<f32> = eff_radii.iter().map(|r| r * 1.2).collect();
+    // Sprint 203: isotropic body dims (l=w=h=eff_r) + zero heading make the
+    // oriented-ellipsoid support reduce to eff_r — i.e. the legacy sphere test,
+    // so these existing parity tests stay valid unchanged. The anisotropic case
+    // is covered by `collision_oriented_ellipsoid_matches_cpu`.
+    let headings = vec![0.0_f32; n];
+    let body_dims: Vec<f32> = eff_radii.iter().flat_map(|&r| [r, r, r]).collect();
+    let adhesion_types = vec![0u32; n];
+    let masses = vec![1.0_f32; n];
+
+    let mut bond_partner_idx = vec![-1i32; n * slots];
+    let mut bond_rest = vec![0.0f32; n * slots];
+    let bond_stiffness = vec![0.0f32; n * slots]; // no spring force — isolate bending
+    let bond_damping = vec![0.0f32; n * slots];
+    // Mutual bonds: c1.slot0→c0, c1.slot1→c2, c0.slot0→c1, c2.slot0→c1.
+    bond_partner_idx[1 * slots] = 0;
+    bond_partner_idx[1 * slots + 1] = 2;
+    bond_partner_idx[0 * slots] = 1;
+    bond_partner_idx[2 * slots] = 1;
+    for &(c, s) in &[(1usize, 0usize), (1, 1), (0, 0), (2, 0)] {
+        bond_rest[c * slots + s] = dist;
+    }
+    // Rest cosine of the vertex bond pair (c1 slots 0,1) = 0.5, stored symmetric.
+    let mut bond_rest_cos = vec![0.0f32; n * slots * slots];
+    bond_rest_cos[1 * slots * slots + 1] = 0.5; // [c1][slot0][slot1]
+    bond_rest_cos[1 * slots * slots + slots] = 0.5; // [c1][slot1][slot0]
+
+    let velocities = vec![[0.0f32; 3]; n];
+
+    let adhesion = AdhesionParams {
+        strength: ADHESION_STRENGTH,
+        cross_type: ADHESION_CROSS_TYPE,
+        range_factor: ADHESION_RANGE_FACTOR,
+    };
+    let bond_params = BondParams {
+        bonds_per_cell: slots as u32,
+        break_factor: BOND_BREAK_FACTOR,
+    };
+
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let mut hash = SpatialHashGpu::with_context(&ctx, n, 64.0, [1000.0, 1000.0]).expect("hash");
+    let _ = hash.rebuild(&positions);
+    let mut col = CollisionGpu::with_context(
+        &ctx,
+        n,
+        64.0,
+        CELL_RADIUS,
+        COLLISION_RESTITUTION,
+        adhesion,
+        bond_params,
+        32,
+        [1000.0, 1000.0],
+    )
+    .expect("collision init");
+    let res = col.compute(
+        &positions,
+        &velocities,
+        &eff_radii,
+        &max_axes,
+        &headings,
+        &body_dims,
+        &adhesion_types,
+        &bond_partner_idx,
+        &bond_rest,
+        &bond_stiffness,
+        &bond_damping,
+        &masses,
+        &bond_rest_cos,
+        &hash,
+    );
+    let vd = &res.velocity_deltas;
+
+    // Momentum: equal masses + uniform dt/m clamp → Σ vel_delta ≈ 0.
+    for k in 0..3 {
+        let sum = vd[0][k] + vd[1][k] + vd[2][k];
+        assert!(sum.abs() < 1e-6, "bending momentum leak k={k} sum={sum}");
+    }
+    // Bending actually fired (vertex moved).
+    let vmag = (vd[1][0] * vd[1][0] + vd[1][1] * vd[1][1] + vd[1][2] * vd[1][2]).sqrt();
+    assert!(
+        vmag > 1e-5,
+        "bending produced no force (vertex |Δv|={vmag})"
+    );
+    // Restoring direction: rest cos (0.5) > current (0) → angle narrows.
+    // c0 (−x arm) pulled +y; c2 (+y arm) pulled −x.
+    assert!(vd[0][1] > 0.0, "c0 should move +y, got {}", vd[0][1]);
+    assert!(vd[2][0] < 0.0, "c2 should move -x, got {}", vd[2][0]);
+}
+
+/// Sprint 202 regression: a bonded light + stiff pair must stay BOUNDED under
+/// the explicit-Euler bond integration. With `mass = 0.01` (the floor) and
+/// `k = BOND_STIFFNESS` (240), the raw `dt/m` is 1.667, giving `k·dt·(dt/m) ≈
+/// 6.7` — an unstable semi-implicit step that explodes the spring and rips the
+/// bond apart by overstretch ("vazby se rozpadají"). `DT_OVER_M_BOND_MAX`
+/// clamps it back into the stable region. Integrate the pair for 600 ticks and
+/// assert the bond length stays well below the break threshold and finite.
+#[test]
+fn bond_spring_stable_under_low_mass() {
+    use crate::{
+        ADHESION_CROSS_TYPE, ADHESION_RANGE_FACTOR, ADHESION_STRENGTH, BOND_BREAK_FACTOR,
+        BOND_STIFFNESS, CELL_RADIUS, COLLISION_RESTITUTION, FIXED_TIMESTEP_HZ, MAX_BONDS_PER_CELL,
+    };
+    let n = 2usize;
+    let slots = MAX_BONDS_PER_CELL;
+    let dt = 1.0_f32 / FIXED_TIMESTEP_HZ;
+    let rest = 10.0_f32;
+    // Start 10% stretched so the spring is active from tick 0.
+    let mut positions: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0], [rest * 1.1, 0.0, 0.0]];
+    let mut velocities: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+    let eff_radii = vec![0.3_f32; n]; // tiny → no collision/adhesion at dist ~10
+    let max_axes: Vec<f32> = eff_radii.iter().map(|r| r * 1.2).collect();
+    // Sprint 203: isotropic body dims (l=w=h=eff_r) + zero heading make the
+    // oriented-ellipsoid support reduce to eff_r — i.e. the legacy sphere test,
+    // so these existing parity tests stay valid unchanged. The anisotropic case
+    // is covered by `collision_oriented_ellipsoid_matches_cpu`.
+    let headings = vec![0.0_f32; n];
+    let body_dims: Vec<f32> = eff_radii.iter().flat_map(|&r| [r, r, r]).collect();
+    let adhesion_types = vec![0u32; n];
+    let masses = vec![0.01_f32; n]; // the mass floor — worst case for stability
+
+    let mut bond_partner_idx = vec![-1i32; n * slots];
+    let mut bond_rest = vec![0.0f32; n * slots];
+    let mut bond_stiffness = vec![0.0f32; n * slots];
+    let bond_damping = vec![0.0f32; n * slots]; // 0 damping = underdamped worst case
+    bond_partner_idx[0] = 1;
+    bond_partner_idx[slots] = 0;
+    bond_rest[0] = rest;
+    bond_rest[slots] = rest;
+    bond_stiffness[0] = BOND_STIFFNESS;
+    bond_stiffness[slots] = BOND_STIFFNESS;
+    let bond_rest_cos = vec![0.0f32; n * slots * slots];
+
+    let adhesion = AdhesionParams {
+        strength: ADHESION_STRENGTH,
+        cross_type: ADHESION_CROSS_TYPE,
+        range_factor: ADHESION_RANGE_FACTOR,
+    };
+    let bond_params = BondParams {
+        bonds_per_cell: slots as u32,
+        break_factor: BOND_BREAK_FACTOR,
+    };
+
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
+    };
+    let mut hash = SpatialHashGpu::with_context(&ctx, n, 64.0, [1000.0, 1000.0]).expect("hash");
+    let mut col = CollisionGpu::with_context(
+        &ctx,
+        n,
+        64.0,
+        CELL_RADIUS,
+        COLLISION_RESTITUTION,
+        adhesion,
+        bond_params,
+        32,
+        [1000.0, 1000.0],
+    )
+    .expect("collision init");
+
+    let mut max_dist = 0.0_f32;
+    for _ in 0..600 {
+        let _ = hash.rebuild(&positions);
+        let res = col.compute(
+            &positions,
+            &velocities,
+            &eff_radii,
+            &max_axes,
+            &headings,
+            &body_dims,
+            &adhesion_types,
+            &bond_partner_idx,
+            &bond_rest,
+            &bond_stiffness,
+            &bond_damping,
+            &masses,
+            &bond_rest_cos,
+            &hash,
+        );
+        // Semi-implicit Euler, matching the sim: v += Δv, then p += Δp + v·dt.
+        for i in 0..n {
+            for k in 0..3 {
+                velocities[i][k] += res.velocity_deltas[i][k];
+                positions[i][k] += res.position_deltas[i][k] + velocities[i][k] * dt;
+            }
+        }
+        let dx = positions[0][0] - positions[1][0];
+        let dy = positions[0][1] - positions[1][1];
+        let dz = positions[0][2] - positions[1][2];
+        let d = (dx * dx + dy * dy + dz * dz).sqrt();
+        max_dist = max_dist.max(d);
+        assert!(d.is_finite(), "bond length diverged to non-finite ({d})");
+    }
+    // A stable spring oscillates around rest; an unstable one blows past the
+    // break threshold within a few ticks. Require it to stay clear of break.
+    assert!(
+        max_dist < rest * BOND_BREAK_FACTOR,
+        "bond overstretched (max_dist={max_dist}, break at {})",
+        rest * BOND_BREAK_FACTOR
+    );
 }
 
 /// Sprint 50: step GPU vs CPU `Cell::step` parity. Random cells, jeden step
@@ -1169,7 +1916,10 @@ fn step_gpu_matches_cpu() {
 
     let mut gpu = match StepGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let params = StepParamsGpu {
         num_cells: n as u32,
@@ -1204,8 +1954,18 @@ fn step_gpu_matches_cpu() {
         ..StepParamsGpu::default()
     };
     let res = gpu.compute(
-        &positions, &velocities, &headings, &pitches, &angular_velocities,
-        &pitch_velocities, &ages, &cooldowns, &energies, &body_dims, &aux, params,
+        &positions,
+        &velocities,
+        &headings,
+        &pitches,
+        &angular_velocities,
+        &pitch_velocities,
+        &ages,
+        &cooldowns,
+        &energies,
+        &body_dims,
+        &aux,
+        params,
     );
 
     // Sprint 87: GPU step shader nepočítá thermal_optimum penalty
@@ -1228,13 +1988,29 @@ fn step_gpu_matches_cpu() {
         for k in 0..3 {
             let dp = (cells[i].position[k] - res.positions[i][k]).abs();
             let dv = (cells[i].velocity[k] - res.velocities[i][k]).abs();
-            assert!(dp < 1e-3, "i={i} k={k} pos cpu={} gpu={} d={}",
-                cells[i].position[k], res.positions[i][k], dp);
-            assert!(dv < 1e-3, "i={i} k={k} vel cpu={} gpu={} d={}",
-                cells[i].velocity[k], res.velocities[i][k], dv);
+            assert!(
+                dp < 1e-3,
+                "i={i} k={k} pos cpu={} gpu={} d={}",
+                cells[i].position[k],
+                res.positions[i][k],
+                dp
+            );
+            assert!(
+                dv < 1e-3,
+                "i={i} k={k} vel cpu={} gpu={} d={}",
+                cells[i].velocity[k],
+                res.velocities[i][k],
+                dv
+            );
         }
-        assert!((cells[i].heading - res.headings[i]).abs() < 1e-3, "i={i} heading");
-        assert!((cells[i].pitch - res.pitches[i]).abs() < 1e-4, "i={i} pitch");
+        assert!(
+            (cells[i].heading - res.headings[i]).abs() < 1e-3,
+            "i={i} heading"
+        );
+        assert!(
+            (cells[i].pitch - res.pitches[i]).abs() < 1e-4,
+            "i={i} pitch"
+        );
         assert!((cells[i].angular_velocity - res.angular_velocities[i]).abs() < 1e-4);
         assert!((cells[i].pitch_velocity - res.pitch_velocities[i]).abs() < 1e-4);
         assert_eq!(cells[i].age as u32, res.ages[i]);
@@ -1247,7 +2023,6 @@ fn step_gpu_matches_cpu() {
         );
     }
 }
-
 
 /// Sprint 49: ověření že single-workgroup tree reduce zvládá N >> 10k.
 /// Strided loop v shaderu je unbounded; jediné co single-WG hraje roli je
@@ -1320,8 +2095,7 @@ fn gpu_context_shared_across_subsystems() {
     let mut hash_gpu =
         SpatialHashGpu::with_context(&ctx, n, 64.0, [1000.0, 1000.0]).expect("SpatialHashGpu init");
     let mut field_gpu =
-        FieldGpu::with_context(&ctx, [16, 16, 4], [320.0, 320.0, 20.0], 32)
-            .expect("FieldGpu init");
+        FieldGpu::with_context(&ctx, [16, 16, 4], [320.0, 320.0, 20.0], 32).expect("FieldGpu init");
     let mut stats_gpu = StatsGpu::with_context(&ctx, n).expect("StatsGpu init");
 
     let brains: Vec<Brain> = (0..n).map(|_| Brain::random(&mut rng)).collect();
@@ -1413,22 +2187,30 @@ fn cppn_from_cppn_gpu_matches_cpu() {
     for h in 0..BRAIN_HIDDEN {
         for i in 0..BRAIN_INPUTS {
             let d = (cpu_brain.w1[h][i] - gpu_brain.w1[h][i]).abs();
-            if d > max_diff { max_diff = d; }
+            if d > max_diff {
+                max_diff = d;
+            }
         }
     }
     for h in 0..BRAIN_HIDDEN {
         let d = (cpu_brain.b1[h] - gpu_brain.b1[h]).abs();
-        if d > max_diff { max_diff = d; }
+        if d > max_diff {
+            max_diff = d;
+        }
     }
     for o in 0..BRAIN_OUTPUTS {
         for h in 0..BRAIN_HIDDEN {
             let d = (cpu_brain.w2[o][h] - gpu_brain.w2[o][h]).abs();
-            if d > max_diff { max_diff = d; }
+            if d > max_diff {
+                max_diff = d;
+            }
         }
     }
     for o in 0..BRAIN_OUTPUTS {
         let d = (cpu_brain.b2[o] - gpu_brain.b2[o]).abs();
-        if d > max_diff { max_diff = d; }
+        if d > max_diff {
+            max_diff = d;
+        }
     }
     assert!(
         max_diff < 1e-3,

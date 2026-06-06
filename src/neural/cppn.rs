@@ -346,16 +346,19 @@ impl Cppn {
     /// using `f32x8` lanes. Activation functions are applied per-node
     /// (one dispatch, all 8 lanes vectorised). `Brain::from_cppn` chunks its
     /// 4197 weight queries into groups of 8 for ~6× speedup vs scalar.
-    pub fn forward_batch_x8(
-        &self,
-        inputs: &[[f32; CPPN_INPUTS]; 8],
-    ) -> [[f32; CPPN_OUTPUTS]; 8] {
+    pub fn forward_batch_x8(&self, inputs: &[[f32; CPPN_INPUTS]; 8]) -> [[f32; CPPN_OUTPUTS]; 8] {
         let mut activations = [f32x8::ZERO; CPPN_MAX_NODES];
         for i in 0..CPPN_INPUTS {
             if let Some(n) = self.nodes[i] {
                 activations[n.id as usize] = f32x8::new([
-                    inputs[0][i], inputs[1][i], inputs[2][i], inputs[3][i],
-                    inputs[4][i], inputs[5][i], inputs[6][i], inputs[7][i],
+                    inputs[0][i],
+                    inputs[1][i],
+                    inputs[2][i],
+                    inputs[3][i],
+                    inputs[4][i],
+                    inputs[5][i],
+                    inputs[6][i],
+                    inputs[7][i],
                 ]);
             }
         }
@@ -620,8 +623,7 @@ impl Cppn {
     /// Crossover: align matching innovations + nodes by id. Random pick na
     /// matching, inherit from both na disjoint. Cap respektován (CPPN_MAX_*).
     pub fn crossover(a: &Cppn, b: &Cppn, rng: &mut impl Rng) -> Cppn {
-        let mut nodes_map: rustc_hash::FxHashMap<u32, CppnNode> =
-            rustc_hash::FxHashMap::default();
+        let mut nodes_map: rustc_hash::FxHashMap<u32, CppnNode> = rustc_hash::FxHashMap::default();
         for n in a.iter_nodes() {
             nodes_map.insert(n.id, *n);
         }
@@ -639,8 +641,7 @@ impl Cppn {
         let mut sorted_nodes: Vec<CppnNode> = nodes_map.into_values().collect();
         sorted_nodes.sort_by_key(|n| n.id);
 
-        let mut links_map: rustc_hash::FxHashMap<u32, CppnLink> =
-            rustc_hash::FxHashMap::default();
+        let mut links_map: rustc_hash::FxHashMap<u32, CppnLink> = rustc_hash::FxHashMap::default();
         for l in a.iter_links() {
             links_map.insert(l.innovation, *l);
         }
@@ -692,7 +693,7 @@ pub struct CppnMutationConfig {
 }
 
 pub const CPPN_MUTATION_CONFIG: CppnMutationConfig = CppnMutationConfig {
-    weight_rate: 0.8,    // time per child má change weight
+    weight_rate: 0.8, // time per child má change weight
     sigma_weight: 0.5,
     add_node_rate: 0.03, // structural growth, NEAT default ~0.03
     add_link_rate: 0.05, // higher than node — more new connections than nodes

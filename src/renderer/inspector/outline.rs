@@ -68,18 +68,11 @@ pub(super) fn draw_hover_outline(
 
 fn draw_double_ring(gizmos: &mut Gizmos, center: Vec3, radius: f32, color: Color) {
     // XY circle — readable from a top-down camera.
-    gizmos.circle(
-        Isometry3d::from_translation(center),
-        radius,
-        color,
-    );
+    gizmos.circle(Isometry3d::from_translation(center), radius, color);
     // XZ circle — gives a 3D feel when the camera is tilted; `Quat::from_rotation_x(PI/2)`
     // rotates the default XY-plane circle into the XZ plane.
     gizmos.circle(
-        Isometry3d::new(
-            center,
-            Quat::from_rotation_x(core::f32::consts::FRAC_PI_2),
-        ),
+        Isometry3d::new(center, Quat::from_rotation_x(core::f32::consts::FRAC_PI_2)),
         radius,
         color,
     );

@@ -1,14 +1,15 @@
 use super::*;
 
+use bioscape::sim::{
+    bin_unit, bonded_food_share, brain_metabolism_cost, food_multiplier, food_target, hazard_drain,
+    novelty_reproduce_scale, reproduce_threshold, scarcity_factor, species_fitness_share_scale,
+};
 use bioscape::{
-    BOND_FORM_TICKS, CELL_RADIUS, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, EventCalendar, HAZARD_AMP,
-    HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, MATING_RADIUS, N_PHEROMONE_CHANNELS,
-    REPRODUCE_THRESHOLD, SCARCITY_FLOOR, SCARCITY_RAMP_END_GEN, ShockEvent, ShockKind,
+    EventCalendar, ShockEvent, ShockKind, BOND_FORM_TICKS, CELL_RADIUS, CYCLE_AMPLITUDE,
+    CYCLE_GEN_PERIOD, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, MATING_RADIUS,
+    N_PHEROMONE_CHANNELS, REPRODUCE_THRESHOLD, SCARCITY_FLOOR, SCARCITY_RAMP_END_GEN,
     SMELL_GRID_RES, SMELL_GRID_RES_Z, TICKS_PER_GENERATION, WORLD_HALF, WORLD_MAP_FOOD_AMP,
     WORLD_MAP_FOOD_FLOOR, WORLD_MAP_SEED, WORLD_UNITS_PER_FOOD,
-};
-use bioscape::sim::{
-    bonded_food_share, food_multiplier, food_target, hazard_drain, scarcity_factor,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -134,7 +135,10 @@ fn scarcity_factor_is_monotonically_non_increasing() {
     let mut prev = scarcity_factor(0);
     for gen in 1..=SCARCITY_RAMP_END_GEN + 50 {
         let next = scarcity_factor(gen);
-        assert!(next <= prev + FLT_EPS, "regression at gen {gen}: {prev} -> {next}");
+        assert!(
+            next <= prev + FLT_EPS,
+            "regression at gen {gen}: {prev} -> {next}"
+        );
         prev = next;
     }
 }
@@ -142,6 +146,130 @@ fn scarcity_factor_is_monotonically_non_increasing() {
 #[test]
 fn bonded_food_share_zero_bonds_is_zero() {
     assert_eq!(bonded_food_share(20.0, 2.5, 1.0, 0), 0.0);
+}
+
+#[test]
+fn species_fitness_share_scale_neutral_at_zero_pressure() {
+    for sf in [0.0_f32, 0.1, 0.5, 1.0] {
+        assert_eq!(species_fitness_share_scale(0.0, sf), 1.0);
+    }
+}
+
+#[test]
+fn species_fitness_share_scale_monoculture_penalizes() {
+    assert!((species_fitness_share_scale(1.0, 1.0) - 2.0).abs() < 1e-6);
+    assert!((species_fitness_share_scale(2.0, 1.0) - 3.0).abs() < 1e-6);
+}
+
+#[test]
+fn species_fitness_share_scale_grows_with_frequency() {
+    let a = species_fitness_share_scale(1.0, 0.2);
+    let b = species_fitness_share_scale(1.0, 0.6);
+    assert!(b > a, "denser species should pay more: {a} vs {b}");
+    assert!(a >= 1.0);
+}
+
+#[test]
+fn species_fitness_share_scale_rare_species_near_baseline() {
+    // A 5%-of-pop species is barely penalised: 1 + 1·0.05² = 1.0025.
+    let s = species_fitness_share_scale(1.0, 0.05);
+    assert!((s - 1.0025).abs() < 1e-6);
+}
+
+#[test]
+fn novelty_reproduce_scale_neutral_at_zero_weight() {
+    for bf in [0.0_f32, 0.1, 0.5, 1.0] {
+        assert_eq!(novelty_reproduce_scale(0.0, bf), 1.0);
+    }
+}
+
+#[test]
+fn novelty_reproduce_scale_full_bin_is_neutral() {
+    // Whole population in one behavioural bin → no discount.
+    assert!((novelty_reproduce_scale(0.3, 1.0) - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn novelty_reproduce_scale_rare_bin_discounted() {
+    // A near-empty bin pays the full discount: 1 - 0.3·(1 - 0) = 0.7.
+    let s = novelty_reproduce_scale(0.3, 0.0);
+    assert!((s - 0.7).abs() < 1e-6);
+    // Monotone: rarer bins reproduce cheaper.
+    assert!(novelty_reproduce_scale(0.3, 0.1) < novelty_reproduce_scale(0.3, 0.8));
+}
+
+#[test]
+fn brain_metabolism_cost_silent_neurons_are_free() {
+    let hidden = [0.05_f32, -0.08, 0.1, 0.0];
+    assert_eq!(
+        brain_metabolism_cost(&hidden, 4, 0.1, 0.05, 1.0 / 60.0),
+        0.0
+    );
+}
+
+#[test]
+fn brain_metabolism_cost_charges_active_neurons() {
+    // Two neurons at |a| = 0.5, epsilon = 0.1 → util = 2 × 0.4 = 0.8.
+    let hidden = [0.5_f32, -0.5, 0.0, 0.0];
+    let cost = brain_metabolism_cost(&hidden, 4, 0.1, 0.05, 1.0);
+    assert!((cost - 0.05 * 0.8).abs() < 1e-6);
+}
+
+#[test]
+fn brain_metabolism_cost_ignores_inactive_slots() {
+    // hidden_n = 1 → only the first neuron counts, even though later slots are hot.
+    let hidden = [0.5_f32, 0.9, 0.9, 0.9];
+    let cost = brain_metabolism_cost(&hidden, 1, 0.1, 0.05, 1.0);
+    assert!((cost - 0.05 * 0.4).abs() < 1e-6);
+}
+
+#[test]
+fn brain_metabolism_cost_zero_rate_is_free() {
+    let hidden = [0.9_f32; 4];
+    assert_eq!(brain_metabolism_cost(&hidden, 4, 0.1, 0.0, 1.0 / 60.0), 0.0);
+}
+
+#[test]
+fn bin_unit_stays_in_range() {
+    for v in [0.0_f32, 0.3, 0.5, 0.999, 1.0, 2.0, -1.0] {
+        assert!(bin_unit(v, 8) < 8);
+    }
+}
+
+#[test]
+fn bin_unit_separates_low_and_high() {
+    assert!(bin_unit(0.0, 8) < bin_unit(0.9, 8));
+}
+
+// S203 regression: the volume-scaled storage cap can sit below the frequency-
+// scaled reproduction threshold; the threshold must stay reachable so a
+// dominant small-bodied lineage is throttled, not sterilised.
+#[test]
+fn reproduce_threshold_clamped_below_capacity() {
+    // Worst case: max reproduce_at, fully dominant lineage+species, capacity at
+    // the floor. Unclamped this is 250 × 3.0 × 2.5 = 1875, far above the 600 cap.
+    let cap = 600.0;
+    let t = reproduce_threshold(250.0, 1.0, 1.0, 1.0, 100.0, cap);
+    assert!(
+        t < cap,
+        "threshold {t} must be reachable within capacity {cap}"
+    );
+}
+
+#[test]
+fn reproduce_threshold_common_pays_more_than_rare() {
+    let cap = 1920.0;
+    let rare = reproduce_threshold(200.0, 0.1, 0.1, 1.0, 80.0, cap);
+    let common = reproduce_threshold(200.0, 0.8, 0.8, 1.0, 80.0, cap);
+    assert!(common > rare);
+}
+
+#[test]
+fn reproduce_threshold_floored_above_birth_energy() {
+    // Heavy novelty discount must not drop the threshold below birth_energy, or
+    // a parent would die giving birth.
+    let t = reproduce_threshold(80.0, 0.0, 0.0, 0.0, 60.0, 1920.0);
+    assert!(t > 60.0);
 }
 
 #[test]
@@ -160,16 +288,31 @@ fn bonded_food_share_total_injected_is_cluster_size_invariant() {
     let pool = 20.0 * 2.5 * 1.0;
     for n in 1..=6u32 {
         let total = bonded_food_share(20.0, 2.5, 1.0, n) * n as f32;
-        assert!(approx_eq(total, pool, FLT_EPS), "n={n}: total {total} != pool {pool}");
+        assert!(
+            approx_eq(total, pool, FLT_EPS),
+            "n={n}: total {total} != pool {pool}"
+        );
     }
 }
 
 #[test]
 fn bonded_food_share_scales_linearly_with_altruism_and_state() {
     let base = bonded_food_share(20.0, 1.0, 1.0, 2);
-    assert!(approx_eq(bonded_food_share(20.0, 2.0, 1.0, 2), base * 2.0, FLT_EPS));
-    assert!(approx_eq(bonded_food_share(20.0, 1.0, 0.5, 2), base * 0.5, FLT_EPS));
-    assert!(approx_eq(bonded_food_share(20.0, 0.0, 1.0, 2), 0.0, FLT_EPS));
+    assert!(approx_eq(
+        bonded_food_share(20.0, 2.0, 1.0, 2),
+        base * 2.0,
+        FLT_EPS
+    ));
+    assert!(approx_eq(
+        bonded_food_share(20.0, 1.0, 0.5, 2),
+        base * 0.5,
+        FLT_EPS
+    ));
+    assert!(approx_eq(
+        bonded_food_share(20.0, 0.0, 1.0, 2),
+        0.0,
+        FLT_EPS
+    ));
 }
 
 #[test]
@@ -453,7 +596,10 @@ fn edge_frac_threshold_in_unit_range() {
 #[test]
 fn world_new_preallocates_smell_field() {
     let world = small_world(7, 5, 50);
-    assert_eq!(world.smell.resolution, [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]);
+    assert_eq!(
+        world.smell.resolution,
+        [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]
+    );
     assert_eq!(world.smell.world_half, WORLD_HALF);
 }
 
@@ -495,7 +641,11 @@ fn world_new_no_initial_coop_food() {
 #[test]
 fn world_new_share_frac_is_default() {
     let world = small_world(7, 5, 30);
-    assert!(approx_eq(world.share_frac, bioscape::BOND_FOOD_SHARE_FRAC, FLT_EPS));
+    assert!(approx_eq(
+        world.share_frac,
+        bioscape::BOND_FOOD_SHARE_FRAC,
+        FLT_EPS
+    ));
     assert!(!world.kin_filter);
 }
 
@@ -616,7 +766,9 @@ fn climate_offset_with_localized_shock_is_zero_far_from_center() {
         radius: Some(50.0),
     });
     let near = world.climate_offset_at([0.0, 0.0]).abs();
-    let far = world.climate_offset_at([WORLD_HALF[0] - 1.0, WORLD_HALF[1] - 1.0]).abs();
+    let far = world
+        .climate_offset_at([WORLD_HALF[0] - 1.0, WORLD_HALF[1] - 1.0])
+        .abs();
     assert!(near >= far);
 }
 
@@ -810,28 +962,18 @@ fn coop_food_spawn_eventually_creates_node_when_pop_present() {
     let _ = total;
 }
 
-#[test]
-fn coop_food_force_solved_with_three_arrivals_grants_reward() {
-    let mut world = small_world(151, 5, 30);
-    let pos = [0.0, 0.0, 0.0];
-    let mut node = bioscape::CoopFood::new(pos, world.clock.tick);
-    for cell in world.cells.iter_mut().take(3) {
-        cell.position = [pos[0] + 1.0, pos[1] + 1.0, 0.0];
-        node.arrivals.push(cell.cell_id);
-    }
-    world.coop_foods.push(node);
-    let energies_before: Vec<f32> = world.cells.iter().take(3).map(|c| c.energy).collect();
-    let mut rng = StdRng::seed_from_u64(151);
-    world.tick(&mut rng);
-    let any_increased = world.cells.iter().take(3).zip(&energies_before).any(|(c, e)| c.energy > *e);
-    assert!(any_increased || world.coop_food_solved_gen >= 1);
-}
-
+// The S128 coop node trigger is now the complementary-signal handshake, not a
+// raw arrival count — exercised end-to-end via the brain, so the deterministic
+// trigger logic is unit-tested on `coop_handshake_winners` (tests_phase1). Here
+// we only keep the spawn + expiry end-to-end paths (a node with no valid
+// handshake among nearby cells still despawns on its window).
 #[test]
 fn coop_food_node_below_threshold_eventually_expires() {
     let mut world = small_world(157, 5, 30);
     let pos = [50.0, 50.0, 0.0];
-    world.coop_foods.push(bioscape::CoopFood::new(pos, world.clock.tick));
+    world
+        .coop_foods
+        .push(bioscape::CoopFood::new(pos, world.clock.tick));
     let mut rng = StdRng::seed_from_u64(157);
     for _ in 0..(bioscape::COOP_FOOD_TIME_WINDOW_TICKS as u64 + 5) {
         world.tick(&mut rng);
@@ -868,8 +1010,7 @@ fn close_cells_can_form_bonds_over_time() {
     for _ in 0..(BOND_FORM_TICKS as u64 + 5) {
         world.tick(&mut rng);
     }
-    let formed = world.bonds_formed_gen >= 1
-        || world.cells.iter().any(|c| c.n_bonds() > 0);
+    let formed = world.bonds_formed_gen >= 1 || world.cells.iter().any(|c| c.n_bonds() > 0);
     let _ = formed;
 }
 
@@ -890,9 +1031,10 @@ fn manually_attached_dangling_bond_breaks_when_target_dies() {
     world.cells.push(a);
     world.next_cell_id = 1;
     world.tick(&mut rng);
-    let still_dangling = world.cells[0].bonds.iter().any(|b| {
-        b.map(|bd| bd.other_cell_id == 999).unwrap_or(false)
-    });
+    let still_dangling = world.cells[0]
+        .bonds
+        .iter()
+        .any(|b| b.map(|bd| bd.other_cell_id == 999).unwrap_or(false));
     assert!(!still_dangling);
 }
 
@@ -1157,12 +1299,25 @@ fn refresh_active_events_matches_full_scan() {
             gen
         );
         for (a, b) in got_hazard.iter().zip(expected_hazard.iter()) {
-            assert_eq!(a.start_gen, b.start_gen, "hazard start_gen mismatch at gen {}", gen);
+            assert_eq!(
+                a.start_gen, b.start_gen,
+                "hazard start_gen mismatch at gen {}",
+                gen
+            );
             assert_eq!(a.duration_gen, b.duration_gen);
         }
-        assert_eq!(got_climate.len(), expected_climate.len(), "climate count at gen {}", gen);
+        assert_eq!(
+            got_climate.len(),
+            expected_climate.len(),
+            "climate count at gen {}",
+            gen
+        );
         for (a, b) in got_climate.iter().zip(expected_climate.iter()) {
-            assert_eq!(a.start_gen, b.start_gen, "climate start_gen mismatch at gen {}", gen);
+            assert_eq!(
+                a.start_gen, b.start_gen,
+                "climate start_gen mismatch at gen {}",
+                gen
+            );
             assert_eq!(a.duration_gen, b.duration_gen);
         }
     }

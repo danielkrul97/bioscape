@@ -32,7 +32,10 @@ fn brain_eq(a: &Brain, b: &Brain) -> bool {
 
 #[test]
 fn cells_gpu_construct_capacity_one() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 1);
     assert_eq!(cells.capacity(), 1);
     assert_eq!(cells.epoch(), 0);
@@ -40,7 +43,10 @@ fn cells_gpu_construct_capacity_one() {
 
 #[test]
 fn cells_gpu_construct_various_capacities() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     for cap in [1, 4, 16, 64, 256, 1024] {
         let cells = CellsGpu::with_context(&ctx, cap);
         assert_eq!(cells.capacity(), cap);
@@ -49,7 +55,10 @@ fn cells_gpu_construct_various_capacities() {
 
 #[test]
 fn cells_gpu_buffer_accessors_return_distinct_buffers() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 16);
     let inputs_ptr = cells.last_inputs_buffer() as *const _;
     let hidden_ptr = cells.last_hidden_buffer() as *const _;
@@ -64,7 +73,10 @@ fn cells_gpu_buffer_accessors_return_distinct_buffers() {
 
 #[test]
 fn cells_gpu_metadata_buffer_accessors_distinct() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 16);
     let energy_ptr = cells.energy_buffer() as *const _;
     let heading_ptr = cells.heading_buffer() as *const _;
@@ -81,7 +93,10 @@ fn cells_gpu_metadata_buffer_accessors_distinct() {
 
 #[test]
 fn cells_gpu_motor_buffer_accessors_distinct() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 16);
     let turn_ptr = cells.turn_rate_buffer() as *const _;
     let ang_ptr = cells.angular_velocity_buffer() as *const _;
@@ -92,7 +107,10 @@ fn cells_gpu_motor_buffer_accessors_distinct() {
 
 #[test]
 fn cells_gpu_step_buffer_accessors_distinct() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 16);
     let pos_ptr = cells.position_buffer() as *const _;
     let age_ptr = cells.age_buffer() as *const _;
@@ -107,7 +125,10 @@ fn cells_gpu_step_buffer_accessors_distinct() {
 
 #[test]
 fn cells_gpu_device_queue_accessible() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 8);
     let _ = cells.device();
     let _ = cells.queue();
@@ -115,7 +136,10 @@ fn cells_gpu_device_queue_accessible() {
 
 #[test]
 fn cells_gpu_upload_brain_then_download_roundtrip() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 4;
     let cells = CellsGpu::with_context(&ctx, n);
     let mut rng = StdRng::seed_from_u64(101);
@@ -130,7 +154,10 @@ fn cells_gpu_upload_brain_then_download_roundtrip() {
 
 #[test]
 fn cells_gpu_upload_brain_at_overrides_single_slot() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 8;
     let cells = CellsGpu::with_context(&ctx, n);
     let mut rng = StdRng::seed_from_u64(103);
@@ -146,7 +173,10 @@ fn cells_gpu_upload_brain_at_overrides_single_slot() {
 
 #[test]
 fn cells_gpu_download_brain_at_returns_correct_slot() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 4;
     let cells = CellsGpu::with_context(&ctx, n);
     let mut rng = StdRng::seed_from_u64(107);
@@ -160,7 +190,10 @@ fn cells_gpu_download_brain_at_returns_correct_slot() {
 
 #[test]
 fn cells_gpu_upload_velocities_roundtrip() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 16;
     let cells = CellsGpu::with_context(&ctx, n);
     let velocities: Vec<[f32; 3]> = (0..n)
@@ -178,7 +211,10 @@ fn cells_gpu_upload_velocities_roundtrip() {
 
 #[test]
 fn cells_gpu_download_velocities_zero_returns_empty_vec() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 8);
     let downloaded = cells.download_velocities(0);
     assert!(downloaded.is_empty());
@@ -186,7 +222,10 @@ fn cells_gpu_download_velocities_zero_returns_empty_vec() {
 
 #[test]
 fn cells_gpu_download_brains_zero_returns_empty_vec() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 8);
     let downloaded = cells.download_brains(0);
     assert!(downloaded.is_empty());
@@ -194,7 +233,10 @@ fn cells_gpu_download_brains_zero_returns_empty_vec() {
 
 #[test]
 fn cells_gpu_download_hidden_outputs_zero_returns_empty_pair() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 8);
     let (h, o) = cells.download_hidden_outputs(0);
     assert!(h.is_empty());
@@ -203,7 +245,10 @@ fn cells_gpu_download_hidden_outputs_zero_returns_empty_pair() {
 
 #[test]
 fn cells_gpu_download_motor_state_zero_returns_empty_triple() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 8);
     let (v, a, p) = cells.download_motor_state(0);
     assert!(v.is_empty());
@@ -213,7 +258,10 @@ fn cells_gpu_download_motor_state_zero_returns_empty_triple() {
 
 #[test]
 fn cells_gpu_download_brain_motor_batch_zero_returns_empty() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 8);
     let (h, o, v, a, p) = cells.download_brain_motor_batch(0);
     assert!(h.is_empty());
@@ -225,7 +273,10 @@ fn cells_gpu_download_brain_motor_batch_zero_returns_empty() {
 
 #[test]
 fn cells_gpu_download_full_batch_into_zero_clears_all_scratches() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 8);
     let mut inputs_out = vec![[0.0_f32; BRAIN_INPUTS]; 4];
     let mut hidden_out = vec![[0.0_f32; BRAIN_HIDDEN]; 4];
@@ -264,7 +315,10 @@ fn cells_gpu_download_full_batch_into_zero_clears_all_scratches() {
 
 #[test]
 fn cells_gpu_upload_positions_roundtrip_via_full_batch() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 8;
     let cells = CellsGpu::with_context(&ctx, n);
     let positions: Vec<[f32; 3]> = (0..n)
@@ -285,7 +339,15 @@ fn cells_gpu_upload_positions_roundtrip_via_full_batch() {
     cells.upload_positions(&positions);
     cells.upload_velocities(&velocities);
     cells.upload_age_cooldown(&ages, &cooldowns);
-    cells.upload_metadata(&energies, &headings, &pitches, &damages, &max_speeds, &eff_radii, &eff_radii);
+    cells.upload_metadata(
+        &energies,
+        &headings,
+        &pitches,
+        &damages,
+        &max_speeds,
+        &eff_radii,
+        &eff_radii,
+    );
     cells.upload_angular_pitch(&angulars, &pitch_vels);
 
     let mut inputs_out = Vec::new();
@@ -328,7 +390,10 @@ fn cells_gpu_upload_positions_roundtrip_via_full_batch() {
 
 #[test]
 fn cells_gpu_upload_turn_rates_then_at_modifies_single_slot() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 6;
     let cells = CellsGpu::with_context(&ctx, n);
     let initial: Vec<f32> = (0..n).map(|i| 1.0 + i as f32).collect();
@@ -341,7 +406,10 @@ fn cells_gpu_upload_turn_rates_then_at_modifies_single_slot() {
 
 #[test]
 fn cells_gpu_upload_rewards_no_panic() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 12;
     let cells = CellsGpu::with_context(&ctx, n);
     let rewards: Vec<f32> = (0..n).map(|i| 0.1 * i as f32).collect();
@@ -350,7 +418,10 @@ fn cells_gpu_upload_rewards_no_panic() {
 
 #[test]
 fn cells_gpu_upload_inputs_no_panic() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 4;
     let cells = CellsGpu::with_context(&ctx, n);
     let inputs: Vec<[f32; BRAIN_INPUTS]> = (0..n)
@@ -367,29 +438,34 @@ fn cells_gpu_upload_inputs_no_panic() {
 
 #[test]
 fn cells_gpu_upload_body_dims_no_panic() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 5;
     let cells = CellsGpu::with_context(&ctx, n);
-    let dims: Vec<[f32; 3]> = (0..n)
-        .map(|i| [1.0 + i as f32, 1.0, 1.0])
-        .collect();
+    let dims: Vec<[f32; 3]> = (0..n).map(|i| [1.0 + i as f32, 1.0, 1.0]).collect();
     cells.upload_body_dims(&dims);
 }
 
 #[test]
 fn cells_gpu_upload_aux_no_panic() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 5;
     let cells = CellsGpu::with_context(&ctx, n);
-    let aux: Vec<[f32; 4]> = (0..n)
-        .map(|i| [i as f32, 0.5, 0.7, 0.0])
-        .collect();
+    let aux: Vec<[f32; 4]> = (0..n).map(|i| [i as f32, 0.5, 0.7, 0.0]).collect();
     cells.upload_aux(&aux);
 }
 
 #[test]
 fn cells_gpu_swap_to_self_is_noop() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 4;
     let cells = CellsGpu::with_context(&ctx, n);
     let mut rng = StdRng::seed_from_u64(211);
@@ -404,7 +480,10 @@ fn cells_gpu_swap_to_self_is_noop() {
 
 #[test]
 fn cells_gpu_swap_to_swaps_brain_weights_between_slots() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 4;
     let cells = CellsGpu::with_context(&ctx, n);
     let mut rng = StdRng::seed_from_u64(217);
@@ -417,7 +496,10 @@ fn cells_gpu_swap_to_swaps_brain_weights_between_slots() {
 
 #[test]
 fn cells_gpu_xoshiro_seeds_full_upload_no_panic() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 32;
     let cells = CellsGpu::with_context(&ctx, n);
     cells.upload_xoshiro_seeds((0..n as u64).map(|i| i + 1));
@@ -425,7 +507,10 @@ fn cells_gpu_xoshiro_seeds_full_upload_no_panic() {
 
 #[test]
 fn cells_gpu_xoshiro_seed_at_individual_slot_no_panic() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 16;
     let cells = CellsGpu::with_context(&ctx, n);
     cells.upload_xoshiro_seed_at(0, 0);
@@ -434,7 +519,10 @@ fn cells_gpu_xoshiro_seed_at_individual_slot_no_panic() {
 
 #[test]
 fn cells_gpu_upload_metadata_roundtrip_via_full_batch() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 6;
     let cells = CellsGpu::with_context(&ctx, n);
     let energies: Vec<f32> = (0..n).map(|i| 100.0 + i as f32).collect();
@@ -443,7 +531,15 @@ fn cells_gpu_upload_metadata_roundtrip_via_full_batch() {
     let damages: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
     let max_speeds = vec![60.0; n];
     let eff_radii = vec![5.0; n];
-    cells.upload_metadata(&energies, &headings, &pitches, &damages, &max_speeds, &eff_radii, &eff_radii);
+    cells.upload_metadata(
+        &energies,
+        &headings,
+        &pitches,
+        &damages,
+        &max_speeds,
+        &eff_radii,
+        &eff_radii,
+    );
     let positions = vec![[0.0_f32; 3]; n];
     let velocities = vec![[0.0_f32; 3]; n];
     let ages = vec![0u32; n];
@@ -484,7 +580,10 @@ fn cells_gpu_upload_metadata_roundtrip_via_full_batch() {
 
 #[test]
 fn cells_gpu_uploaded_partial_brains_zero_pads_remainder() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 8;
     let cells = CellsGpu::with_context(&ctx, n);
     let mut rng = StdRng::seed_from_u64(229);
@@ -499,7 +598,10 @@ fn cells_gpu_uploaded_partial_brains_zero_pads_remainder() {
 
 #[test]
 fn cells_gpu_motor_state_roundtrip_after_explicit_uploads() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 5;
     let cells = CellsGpu::with_context(&ctx, n);
     let velocities: Vec<[f32; 3]> = (0..n)
@@ -524,7 +626,10 @@ fn cells_gpu_motor_state_roundtrip_after_explicit_uploads() {
 
 #[test]
 fn cells_gpu_capacity_unchanged_across_uploads() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cap = 32;
     let cells = CellsGpu::with_context(&ctx, cap);
     let mut rng = StdRng::seed_from_u64(233);
@@ -538,7 +643,10 @@ fn cells_gpu_capacity_unchanged_across_uploads() {
 
 #[test]
 fn cells_gpu_shared_context_two_instances_independent() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let a = CellsGpu::with_context(&ctx, 4);
     let b = CellsGpu::with_context(&ctx, 8);
     assert_eq!(a.capacity(), 4);
@@ -550,7 +658,10 @@ fn cells_gpu_shared_context_two_instances_independent() {
 
 #[test]
 fn cells_gpu_age_cooldown_roundtrip_via_full_batch() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 10;
     let cells = CellsGpu::with_context(&ctx, n);
     let ages: Vec<u32> = (0..n as u32).map(|i| i * 7).collect();
@@ -598,7 +709,10 @@ fn cells_gpu_age_cooldown_roundtrip_via_full_batch() {
 
 #[test]
 fn cells_gpu_swap_does_not_touch_other_slots() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 5;
     let cells = CellsGpu::with_context(&ctx, n);
     let mut rng = StdRng::seed_from_u64(257);
@@ -615,7 +729,10 @@ fn cells_gpu_swap_does_not_touch_other_slots() {
 
 #[test]
 fn cells_gpu_epoch_initially_zero_and_unchanging_for_simple_uploads() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let cells = CellsGpu::with_context(&ctx, 4);
     assert_eq!(cells.epoch(), 0);
     let mut rng = StdRng::seed_from_u64(263);
@@ -627,7 +744,10 @@ fn cells_gpu_epoch_initially_zero_and_unchanging_for_simple_uploads() {
 
 #[test]
 fn cells_gpu_reset_persistent_brain_state_at_zeros_only_target_slot() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 4;
     let cells = CellsGpu::with_context(&ctx, n);
     // Seed last_hidden / last_outputs with non-zero data via upload_inputs
@@ -636,7 +756,9 @@ fn cells_gpu_reset_persistent_brain_state_at_zeros_only_target_slot() {
     // Easier path: write known patterns via the public buffer accessors +
     // wgpu queue write_buffer.
     let hidden_pattern: Vec<f32> = (0..n * BRAIN_HIDDEN).map(|i| (i + 1) as f32).collect();
-    let outputs_pattern: Vec<f32> = (0..n * BRAIN_OUTPUTS).map(|i| (i + 1) as f32 * 0.5).collect();
+    let outputs_pattern: Vec<f32> = (0..n * BRAIN_OUTPUTS)
+        .map(|i| (i + 1) as f32 * 0.5)
+        .collect();
     ctx.queue.write_buffer(
         cells.last_hidden_buffer(),
         0,
@@ -669,7 +791,10 @@ fn cells_gpu_reset_persistent_brain_state_at_zeros_only_target_slot() {
 
 #[test]
 fn cells_gpu_swap_to_resets_destination_persistent_state() {
-    let ctx = match try_ctx() { Some(c) => c, None => return };
+    let ctx = match try_ctx() {
+        Some(c) => c,
+        None => return,
+    };
     let n = 4;
     let cells = CellsGpu::with_context(&ctx, n);
     let mut rng = StdRng::seed_from_u64(271);
@@ -686,7 +811,10 @@ fn cells_gpu_swap_to_resets_destination_persistent_state() {
     // zeroed Hebbian-state (no leftover from the dead cell at slot 1).
     cells.swap_to(1, 3);
     let new_at_1 = cells.download_brain_at(1);
-    assert!(brain_eq(&new_at_1, &brains[3]), "brain at slot 1 should be slot 3's");
+    assert!(
+        brain_eq(&new_at_1, &brains[3]),
+        "brain at slot 1 should be slot 3's"
+    );
     let (hidden_after, _outputs_after) = cells.download_hidden_outputs(n);
     assert!(
         hidden_after[1].iter().all(|&v| v == 0.0),

@@ -47,13 +47,8 @@ struct Params {
 @group(0) @binding(12) var<storage, read> bonded_inbox: array<f32>;          // n × N_BOND_MSG_CHANNELS
 // Sprint 187: per-cell reproduce threshold (was a uniform Params field).
 @group(0) @binding(13) var<storage, read> reproduce_at_energies: array<f32>; // n
-// Sprint 198: per-cell symbiont state. `has` = 0 or 1, `deficit` = streak ticks.
-@group(0) @binding(14) var<storage, read> symbiont_has: array<u32>;          // n
-@group(0) @binding(15) var<storage, read> symbiont_deficit: array<u32>;      // n
-// Threshold below which a bearer hasn't been shed yet — must match
-// `bioscape::SYMBIONT_UPKEEP_DEFICIT_TICKS` (600 in S197/S198).
-const SYMBIONT_UPKEEP_DEFICIT_TICKS: f32 = 600.0;
-
+// S213+ social call-response: per-cell perceived unanswered-handshake signal.
+@group(0) @binding(14) var<storage, read> coop_call: array<f32>;             // n
 fn forward_vector(yaw: f32, pitch: f32) -> vec3<f32> {
     let cy = cos(yaw);
     let sy = sin(yaw);
@@ -211,14 +206,9 @@ fn populate_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
     last_inputs[inputs_off + 37u] = sensor_output[sensor_off + 23u] * 2.0 - 1.0;
     last_inputs[inputs_off + 38u] = sensor_output[sensor_off + 24u] * 2.0 - 1.0;
 
-    // S198: symbiont brain integration slots [39..41]. has = 0/1 binary;
-    // deficit normalised by SYMBIONT_UPKEEP_DEFICIT_TICKS so it stays in [0, 1].
-    last_inputs[inputs_off + 39u] = f32(symbiont_has[i]);
-    last_inputs[inputs_off + 40u] = clamp(
-        f32(symbiont_deficit[i]) / SYMBIONT_UPKEEP_DEFICIT_TICKS,
-        0.0,
-        1.0,
-    );
+    // S213+ social call-response slot 39: perceived unanswered-handshake signal,
+    // computed CPU-side from nearby coop nodes and uploaded per cell.
+    last_inputs[inputs_off + 39u] = coop_call[i];
 
     // Sprint 30: damage_accum reset after consume.
     damage_accums[i] = 0.0;

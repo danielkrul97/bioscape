@@ -300,7 +300,12 @@ fn sensor_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (z clamped). Replaces the per-iteration bucket_id_wrapped() chain.
     // Assumes r_cells < GRID_N/2 (vision radius < world half-extent).
     let center = bucket_coords_of(pos_i);
-    let r_cells = i32(ceil(vr / params.hash_cell_size));
+    // Cap the swept half-window at ⌊(GRID_NY-1)/2⌋ so the toroidal xy wrap below
+    // can never land on the same bucket twice (which would double-count
+    // neighbors and inflate `neighbors_count`). GRID_NY is the tighter wrapped
+    // axis. The world's reachable extent sits well inside this bound, so normal
+    // vision is unaffected — only a pathologically large vision_radius clamps.
+    let r_cells = min(i32(ceil(vr / params.hash_cell_size)), (GRID_NY - 1) / 2);
 
     // Cell scan accumulators.
     var best_cell_d2 = vr2 + 1.0;

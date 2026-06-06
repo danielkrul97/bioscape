@@ -30,8 +30,21 @@ pub const MAX_PREDATION_SIZE_RATIO: f32 = 2.5;
 /// Drain ×2 + gain ×1.5 oproti pre-Hunter baseline → defense matters → bonded
 /// clusters jsou viable strategy → arms race mezi predátorskými lineages a
 /// defenzivními clustery emerguje napříč seedy (siege sweep, 6/7 seedů).
-pub const PREDATION_DRAIN_PER_TICK: f32 = 6.0;
-pub const PREDATION_GAIN_PER_TICK: f32 = 2.25;
+///
+/// Complexity-ratchet rebalance: gain ×1.5 (2.25→3.375), drain ×0.7 (6.0→4.2).
+/// Raising gain makes predation profitable enough to sustain a predator-prey
+/// arms race (weapons/evasion/defense → behavioural complexity), while lowering
+/// drain keeps it non-lethal enough that victims live long enough to preserve
+/// the age-based MAP-Elites quality signal — so the CPPN structural ratchet is
+/// not starved by survival-only selection. Net efficiency gain/drain rises 0.375
+/// → 0.80 (less energy wasted per kill, more biologically realistic). Validated
+/// 5×60-gen cross-seed (0/5 extinction): faster CPPN ratchet (+slope), higher
+/// elite coverage / species / sustained spike arms race vs the prior values,
+/// Pareto-better with no downside. Decoupling drain from gain is the load-
+/// bearing change — raising gain alone (×2, full drain) collapsed the population
+/// on some seeds and froze the ratchet.
+pub const PREDATION_DRAIN_PER_TICK: f32 = 4.2;
+pub const PREDATION_GAIN_PER_TICK: f32 = 3.375;
 /// Sprint 27: attacker.last_outputs[6].max(0) musí být > THRESHOLD aby se
 /// predate-on-contact spustila. Bez aktivního brain signálu jsou `cell × cell`
 /// kolize jen kolize — energy se nepřevádí. Mirroruje semantiku

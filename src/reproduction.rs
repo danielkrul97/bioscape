@@ -29,11 +29,10 @@ pub fn pair_fertile<I>(
 where
     I: Copy + Eq + std::hash::Hash,
 {
-    let mut paired: rustc_hash::FxHashSet<I> =
-        rustc_hash::FxHashSet::with_capacity_and_hasher(
-            fertile.len(),
-            rustc_hash::FxBuildHasher::default(),
-        );
+    let mut paired: rustc_hash::FxHashSet<I> = rustc_hash::FxHashSet::with_capacity_and_hasher(
+        fertile.len(),
+        rustc_hash::FxBuildHasher::default(),
+    );
     let mut matings: Vec<(I, I)> = Vec::with_capacity(budget.min(fertile.len() / 2));
     for i in 0..fertile.len() {
         if matings.len() >= budget {
@@ -136,9 +135,7 @@ pub fn make_mating_child_no_brain(
     // bonded-parent větví. Z jitter je 0.3× kvůli užšímu z-rangi (±50 vs xy ±960).
     let jitter_x: f32 = rng.random_range(-CLUSTER_SPAWN_RADIUS..CLUSTER_SPAWN_RADIUS);
     let jitter_y: f32 = rng.random_range(-CLUSTER_SPAWN_RADIUS..CLUSTER_SPAWN_RADIUS);
-    let jitter_z: f32 = rng.random_range(
-        -CLUSTER_SPAWN_RADIUS * 0.3..CLUSTER_SPAWN_RADIUS * 0.3,
-    );
+    let jitter_z: f32 = rng.random_range(-CLUSTER_SPAWN_RADIUS * 0.3..CLUSTER_SPAWN_RADIUS * 0.3);
     let mid_pos = [
         (parent_a.position[0] + parent_b.position[0]) * 0.5,
         (parent_a.position[1] + parent_b.position[1]) * 0.5,
@@ -157,8 +154,7 @@ pub fn make_mating_child_no_brain(
     // vidět out-of-bounds pozici; for_each_in_radius_toroidal interně
     // používá min_image_delta, takže lookup je correct. No bug, just
     // race-tick edge case — accepted.
-    let cluster_parent =
-        pick_cluster_parent(parent_a, parent_b, child_genome.adhesion_type);
+    let cluster_parent = pick_cluster_parent(parent_a, parent_b, child_genome.adhesion_type);
     let pos = match cluster_parent {
         Some(p) => [
             p.position[0] + jitter_x,
@@ -168,40 +164,6 @@ pub fn make_mating_child_no_brain(
         None => mid_pos,
     };
     let child_phenotype = Phenotype::from_genome(&child_genome);
-    // Sprint 196: symbiont vertical inheritance. Passes from a bearer parent
-    // with probability SYMBIONT_INHERIT_P (~0.95) — the < 1.0 cap models
-    // imperfect maternal transmission, one of three Sprint 196 loss channels
-    // (alongside host death and attacker-already-bears predation skip). When
-    // both parents are bearers, pick uniformly (no maternal/paternal
-    // distinction in this sim). Symbiont genome mutates via MUTATION_CONFIG
-    // independently of host genome, opening a second evolutionary axis.
-    let child_symbiont: Option<Symbiont> = match (
-        parent_a.symbiont.as_ref(),
-        parent_b.symbiont.as_ref(),
-    ) {
-        (None, None) => None,
-        (Some(donor), None) | (None, Some(donor)) => {
-            if rng.random::<f32>() < SYMBIONT_INHERIT_P {
-                Some(Symbiont::new(
-                    donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
-                    donor.lineage_id,
-                ))
-            } else {
-                None
-            }
-        }
-        (Some(a_sym), Some(b_sym)) => {
-            if rng.random::<f32>() < SYMBIONT_INHERIT_P {
-                let donor = if rng.random::<bool>() { a_sym } else { b_sym };
-                Some(Symbiont::new(
-                    donor.genome.mutate_no_brain(rng, &MUTATION_CONFIG),
-                    donor.lineage_id,
-                ))
-            } else {
-                None
-            }
-        }
-    };
     Cell {
         position: pos,
         velocity: [
@@ -223,6 +185,7 @@ pub fn make_mating_child_no_brain(
         burst_accum: [0.0; N_PHEROMONE_CHANNELS],
         pooled_hidden: [0.0; BRAIN_HIDDEN],
         bonded_inbox: [0.0; N_BOND_MSG_CHANNELS],
+        coop_call_signal: 0.0,
         damage_accum: 0.0,
         age: 0,
         // Sprint 42: child startuje s plnou cooldown — rodičovská cooldown
@@ -241,7 +204,7 @@ pub fn make_mating_child_no_brain(
         // pre-Sprint-80 RNG draw order.
         cell_state: ((parent_a.cell_state + parent_b.cell_state) * 0.5
             + rng.random_range(-CELL_STATE_INHERIT_NOISE..CELL_STATE_INHERIT_NOISE))
-            .clamp(0.0, 1.0),
+        .clamp(0.0, 1.0),
         last_best_food_d2: f32::MAX,
         // Seed mirrors GPU `upload_xoshiro_seed_at(slot, cell.cell_id)` so
         // the child's CPU and GPU brownian streams agree from tick 0.
@@ -256,8 +219,22 @@ pub fn make_mating_child_no_brain(
         was_in_hazard_last_tick: false,
         phenotype: child_phenotype,
         genome: child_genome,
-        symbiont: child_symbiont,
+        // Sprint 204: inherit the parent's species so newborns don't read as a
+        // spurious species-0 between gen-boundary reclassifications.
+        species_id: parent_a.species_id,
     }
+}
+
+/// S213: asexual (clonal) division — one parent produces a mutated copy of
+/// itself. Reuses the full mating-child plumbing via self-crossover (a genome
+/// crossed with itself is clonal: every per-gene pick returns the same allele),
+/// then overrides energy to a single birth donation — self-cross would otherwise
+/// grant two parents' worth. Same RNG draw count as a real mating, so the
+/// stream stays well-defined; the child is clonal + mutated, lineage preserved.
+pub fn make_division_child_no_brain(parent: &Cell, rng: &mut impl Rng, cell_id: u64) -> Cell {
+    let mut child = make_mating_child_no_brain(parent, parent, rng, cell_id);
+    child.energy = parent.genome.birth_energy;
+    child
 }
 
 /// Sprint 66: differential-adhesion kernel pro jeden pár (i, j), aplikuje
@@ -339,9 +316,8 @@ pub fn bond_velocity_delta(
     // Damping: relativní velocity podél normálu. v_rel = v_i - v_j; closing
     // pair má v_rel·n < 0 (pos_i přibližuje k pos_j). Damping force opacuje
     // relative motion → -bond.damping × v_rel_n × n.
-    let v_rel_n = (vel_i[0] - vel_j[0]) * nx
-        + (vel_i[1] - vel_j[1]) * ny
-        + (vel_i[2] - vel_j[2]) * nz;
+    let v_rel_n =
+        (vel_i[0] - vel_j[0]) * nx + (vel_i[1] - vel_j[1]) * ny + (vel_i[2] - vel_j[2]) * nz;
     let damp = -bond.damping * v_rel_n;
     // Sprint 192: integrate Hookean force over the tick (`Δv = F · dt`).
     // Pre-S192 returned mag directly → 60× too strong impulses.

@@ -16,33 +16,47 @@ pub struct GpuContext {
 impl GpuContext {
     pub fn new() -> Result<Self, String> {
         let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .map_err(|e| format!("no suitable wgpu adapter: {e:?}"))?;
+        // Surface the selected adapter at init: a fallback to a software
+        // rasterizer (e.g. llvmpipe/lavapipe `Cpu` type) silently turns the
+        // whole sim CPU-bound and is the difference between µs and ms per
+        // dispatch — make it visible instead of guessing.
+        let info = adapter.get_info();
+        eprintln!(
+            "gpu: adapter={:?} type={:?} backend={:?} driver={} {}",
+            info.name, info.device_type, info.backend, info.driver, info.driver_info
+        );
+        if info.device_type == wgpu::DeviceType::Cpu {
+            eprintln!(
+                "gpu: WARNING software adapter selected — sim will be CPU-bound. \
+                 Install/repair a hardware Vulkan ICD (e.g. NVIDIA), or set WGPU_ADAPTER_NAME."
+            );
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("bioscape-shared"),
+            required_features: wgpu::Features::empty(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+            required_limits: wgpu::Limits {
+                // Wave 6 bumped 14 → 16: sensor_gather adds heading +
+                // pitch bindings for whisker raycast (bindings 14, 15)
+                // alongside the existing 12 + maze_mask binding 13.
+                // Wave L bumped 16 → 20: ch1/ch2 pheromone grids
+                // (bindings 16, 17) for multi-channel sensor gather.
+                // S213 bumped 20 → 22: predate binds bond_partner_idx
+                // (binding 21) + lineage_ids (binding 22) for tissue (kin /
+                // clonal) predation exclusion. Discrete GPUs expose far more
+                // (NVIDIA ≥ 1M); 22 is safe.
+                max_storage_buffers_per_shader_stage: 22,
+                ..wgpu::Limits::default()
             },
-        ))
-        .ok_or_else(|| "no suitable wgpu adapter".to_string())?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("bioscape-shared"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    // Wave 6 bumped 14 → 16: sensor_gather adds heading +
-                    // pitch bindings for whisker raycast (bindings 14, 15)
-                    // alongside the existing 12 + maze_mask binding 13.
-                    // Wave L bumped 16 → 20: ch1/ch2 pheromone grids
-                    // (bindings 16, 17) for multi-channel sensor gather.
-                    // 20 is the wgpu default for desktop adapters and
-                    // covers contemporary discrete GPUs comfortably.
-                    max_storage_buffers_per_shader_stage: 20,
-                    ..wgpu::Limits::default()
-                },
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+            memory_hints: wgpu::MemoryHints::Performance,
+        }))
         .map_err(|e| format!("device request failed: {e:?}"))?;
         Ok(Self {
             device: Arc::new(device),
@@ -68,12 +82,13 @@ pub const B2_OFFSET: usize = W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN;
 // `brain_forward.wgsl`, `hebbian.wgsl`, `populate_inputs.wgsl` are kept in
 // lock-step with these values.
 const _: () = assert!(W1_OFFSET == 0);
-// S198: BRAIN_INPUTS 84→86 (2 symbiont slots: has + deficit_norm). All
-// downstream offsets shift by BRAIN_HIDDEN × 2 = 90.
-const _: () = assert!(B1_OFFSET == 3870);
-const _: () = assert!(W2_OFFSET == 3915);
+// S203: removed the 2 symbiont brain slots → BRAIN_INPUTS 86→84. All
+// downstream offsets shift back by BRAIN_HIDDEN × 2 = 90.
+// S213+: added 1 coop-call sensory slot → BRAIN_INPUTS 84→85; offsets shift
+// forward by BRAIN_HIDDEN × 1 = 45.
+const _: () = assert!(B1_OFFSET == 3825);
+const _: () = assert!(W2_OFFSET == 3870);
 // Active vibration emit: BRAIN_OUTPUTS 14→15 adds one row to w2 (45 floats)
 // and one extra b2 entry. Downstream offsets shift accordingly.
-const _: () = assert!(B2_OFFSET == 4590);
-const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4605);
-
+const _: () = assert!(B2_OFFSET == 4545);
+const _: () = assert!(BRAIN_WEIGHTS_PER_CELL == 4560);

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::BRAIN_HIDDEN;
 use super::*;
+use crate::BRAIN_HIDDEN;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]

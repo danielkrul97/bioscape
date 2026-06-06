@@ -1,4 +1,5 @@
 mod brain;
+mod evolution;
 mod maze;
 mod morphology;
 mod pheromone;
@@ -9,6 +10,7 @@ mod vibration;
 mod world;
 
 pub use brain::*;
+pub use evolution::*;
 pub use maze::*;
 pub use morphology::*;
 pub use pheromone::*;

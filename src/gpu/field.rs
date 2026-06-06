@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -103,6 +104,18 @@ pub struct FieldGpu {
     flow_buf: wgpu::Buffer,
     flow_is_active: bool,
     grid_readback: wgpu::Buffer,
+    /// Async grid readback state. `download_kick` submits a copy + `map_async`
+    /// without blocking; the per-tick brain `poll(Wait)` drains it and fires
+    /// the callback, which flips `readback_done`. `try_take_grid` then reads
+    /// the mapped buffer with no stall of its own. Lets a 10 Hz debug HUD read
+    /// the field a frame late instead of forcing a full `poll(Wait)` barrier.
+    readback_inflight: bool,
+    readback_done: Arc<AtomicBool>,
+    /// Whether the completed map succeeded. The callback fires on both success
+    /// and failure (it always sets `readback_done`); on failure `try_take_grid`
+    /// clears `readback_inflight` without reading, so a failed map can't wedge
+    /// the channel permanently.
+    readback_ok: Arc<AtomicBool>,
     bg_round_a: wgpu::BindGroup,
     bg_round_b: wgpu::BindGroup,
     pending_sources: Vec<f32>, // [px, py, pz, amount] × N
@@ -121,7 +134,13 @@ impl FieldGpu {
     ) -> Result<Self, String> {
         assert!(resolution.iter().all(|&r| r >= 2) && sources_capacity > 0);
         let ctx = GpuContext::new()?;
-        Self::with_device_inner(ctx.device, ctx.queue, resolution, world_half, sources_capacity)
+        Self::with_device_inner(
+            ctx.device,
+            ctx.queue,
+            resolution,
+            world_half,
+            sources_capacity,
+        )
     }
 
     pub fn with_context(
@@ -160,82 +179,81 @@ impl FieldGpu {
             ),
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("field-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("field-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("field-pl"),
@@ -313,11 +331,8 @@ impl FieldGpu {
         // Sprint 202 — per-voxel flow vector field (binding 6). vec4 stride
         // = 16 bytes (3 floats + 1 pad to satisfy WGSL vec3 storage
         // alignment). Zero-init = no advection on the unconfigured path.
-        let flow_size_bytes = (resolution[0]
-            * resolution[1]
-            * resolution[2]
-            * 4
-            * std::mem::size_of::<f32>()) as u64;
+        let flow_size_bytes =
+            (resolution[0] * resolution[1] * resolution[2] * 4 * std::mem::size_of::<f32>()) as u64;
         let flow_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("field-flow"),
             size: flow_size_bytes,
@@ -388,6 +403,9 @@ impl FieldGpu {
             flow_buf,
             flow_is_active: false,
             grid_readback,
+            readback_inflight: false,
+            readback_done: Arc::new(AtomicBool::new(false)),
+            readback_ok: Arc::new(AtomicBool::new(false)),
             bg_round_a,
             bg_round_b,
             pending_sources: Vec::new(),
@@ -594,6 +612,68 @@ impl FieldGpu {
         }
     }
 
+    /// Non-blocking counterpart to `download`: encode the grid→readback copy,
+    /// submit, and register an async map. Returns immediately. A no-op while a
+    /// readback is already in flight (its buffer is mapped/pending). The copy
+    /// drains on the next sim-device poll, so pair with `try_take_grid` on a
+    /// later frame.
+    pub fn download_kick(&mut self) {
+        if self.readback_inflight {
+            return;
+        }
+        let n = self.resolution[0] * self.resolution[1] * self.resolution[2];
+        let bytes = (n * 4) as u64;
+        let src = if self.current_is_a {
+            &self.grid_a
+        } else {
+            &self.grid_b
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("field-readback-encoder"),
+            });
+        encoder.copy_buffer_to_buffer(src, 0, &self.grid_readback, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        self.readback_done.store(false, Ordering::Release);
+        let done = self.readback_done.clone();
+        let ok = self.readback_ok.clone();
+        self.grid_readback
+            .slice(0..bytes)
+            .map_async(wgpu::MapMode::Read, move |res| {
+                // Always signal completion — even on error — so a failed map
+                // releases `readback_inflight` instead of wedging the channel.
+                ok.store(res.is_ok(), Ordering::Release);
+                done.store(true, Ordering::Release);
+            });
+        self.readback_inflight = true;
+    }
+
+    /// If a kicked readback has completed its async map, drain it into a `Vec`,
+    /// unmap, and clear the in-flight flag so the next `download_kick` can run.
+    /// Returns `None` (never blocks) while the map is still pending or no
+    /// readback is in flight.
+    pub fn try_take_grid(&mut self) -> Option<Vec<f32>> {
+        if !self.readback_inflight || !self.readback_done.load(Ordering::Acquire) {
+            return None;
+        }
+        // Map failed: nothing to read (buffer isn't mapped). Clear the in-flight
+        // flag so the next `download_kick` can retry instead of stalling forever.
+        if !self.readback_ok.load(Ordering::Acquire) {
+            self.readback_inflight = false;
+            return None;
+        }
+        let n = self.resolution[0] * self.resolution[1] * self.resolution[2];
+        let bytes = (n * 4) as u64;
+        let slice = self.grid_readback.slice(0..bytes);
+        let data = slice.get_mapped_range();
+        let result: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+        drop(data);
+        self.grid_readback.unmap();
+        self.readback_inflight = false;
+        Some(result)
+    }
+
     /// Download the current grid (post-diffuse output) as a `Vec<f32>`.
     /// Slow — used by tests and visualization. The hot sensor path samples
     /// the buffer on the GPU instead and never reads it back.
@@ -616,7 +696,9 @@ impl FieldGpu {
         self.queue.submit(Some(encoder.finish()));
         let slice = self.grid_readback.slice(0..bytes);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let data = slice.get_mapped_range();
         let result: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
         drop(data);
@@ -624,4 +706,3 @@ impl FieldGpu {
         result
     }
 }
-

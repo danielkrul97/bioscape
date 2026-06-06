@@ -274,7 +274,11 @@ fn cppn_add_node_disables_split_link() {
     let enabled_pre = c.iter_links().filter(|l| l.enabled).count();
     c.mutate_add_node(&mut rng);
     let enabled_post = c.iter_links().filter(|l| l.enabled).count();
-    assert_eq!(enabled_post, enabled_pre + 1, "split link disabled, +2 enabled added");
+    assert_eq!(
+        enabled_post,
+        enabled_pre + 1,
+        "split link disabled, +2 enabled added"
+    );
 }
 
 #[test]
@@ -324,7 +328,12 @@ fn cppn_add_link_does_not_duplicate() {
     }
     let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
     for l in c.iter_links() {
-        assert!(seen.insert((l.from, l.to)), "duplicate link {} → {}", l.from, l.to);
+        assert!(
+            seen.insert((l.from, l.to)),
+            "duplicate link {} → {}",
+            l.from,
+            l.to
+        );
     }
 }
 
@@ -410,7 +419,10 @@ fn cppn_mutate_activation_only_hidden_changed() {
     for o in 0..CPPN_OUTPUTS {
         let nb = base.nodes[CPPN_INPUTS + o].unwrap();
         let nm = mutated.nodes[CPPN_INPUTS + o].unwrap();
-        assert_eq!(nb.activation, nm.activation, "output {o} activation changed");
+        assert_eq!(
+            nb.activation, nm.activation,
+            "output {o} activation changed"
+        );
     }
 }
 
@@ -442,7 +454,11 @@ fn cppn_crossover_links_subset_of_parent_union() {
         .map(|l| l.innovation)
         .collect();
     for l in c.iter_links() {
-        assert!(union.contains(&l.innovation), "child has innovation {} not in parents", l.innovation);
+        assert!(
+            union.contains(&l.innovation),
+            "child has innovation {} not in parents",
+            l.innovation
+        );
     }
 }
 
@@ -505,7 +521,10 @@ fn cppn_compatibility_distance_symmetric() {
     }
     let d_ab = Cppn::compatibility_distance(&a, &b);
     let d_ba = Cppn::compatibility_distance(&b, &a);
-    assert!((d_ab - d_ba).abs() < 1e-5, "distance not symmetric: {d_ab} vs {d_ba}");
+    assert!(
+        (d_ab - d_ba).abs() < 1e-5,
+        "distance not symmetric: {d_ab} vs {d_ba}"
+    );
 }
 
 #[test]
@@ -516,6 +535,274 @@ fn cppn_compatibility_distance_nonnegative() {
         let d = Cppn::compatibility_distance(&a, &b);
         assert!(d >= 0.0, "distance {d} negative");
     }
+}
+
+// ─── species classification (Sprint 204) ────────────────────────────────────
+
+#[test]
+fn classify_species_all_identical_is_one_species() {
+    let mut rng = StdRng::seed_from_u64(1);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        8,
+        10,
+        EventCalendar::default(),
+    );
+    let proto = world.cells[0].genome.cppn;
+    for c in world.cells.iter_mut() {
+        c.genome.cppn = proto;
+    }
+    world.classify_species();
+    assert!(world.cells.iter().all(|c| c.species_id == 0));
+    let n_species = world
+        .cells
+        .iter()
+        .map(|c| c.species_id)
+        .collect::<std::collections::HashSet<u32>>()
+        .len();
+    assert_eq!(n_species, 1);
+}
+
+#[test]
+fn classify_species_separates_distant_cppns() {
+    let mut rng = StdRng::seed_from_u64(2);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        8,
+        10,
+        EventCalendar::default(),
+    );
+    let proto = world.cells[0].genome.cppn;
+    let mut far = proto;
+    for _ in 0..120 {
+        far = far.mutate(&mut rng, &CPPN_MUTATION_CONFIG);
+    }
+    let d = Cppn::compatibility_distance(&proto, &far);
+    for (i, c) in world.cells.iter_mut().enumerate() {
+        c.genome.cppn = if i < 4 { proto } else { far };
+    }
+    world.classify_species();
+    let ids = world
+        .cells
+        .iter()
+        .map(|c| c.species_id)
+        .collect::<std::collections::HashSet<u32>>();
+    // Self-consistent against the tuned threshold: two clusters iff the far
+    // variant actually diverged past CPPN_SPECIATION_THRESHOLD.
+    if d > CPPN_SPECIATION_THRESHOLD {
+        assert_eq!(ids.len(), 2, "distance {d} should split into 2 species");
+    } else {
+        assert_eq!(ids.len(), 1, "distance {d} should stay 1 species");
+    }
+}
+
+#[test]
+fn classify_species_ids_are_dense() {
+    let mut rng = StdRng::seed_from_u64(3);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        16,
+        10,
+        EventCalendar::default(),
+    );
+    world.classify_species();
+    let max_id = world.cells.iter().map(|c| c.species_id).max().unwrap();
+    let ids = world
+        .cells
+        .iter()
+        .map(|c| c.species_id)
+        .collect::<std::collections::HashSet<u32>>();
+    assert_eq!(ids.len() as u32, max_id + 1);
+}
+
+// ─── MAP-Elites archive (Sprint 206) ────────────────────────────────────────
+
+#[test]
+fn elite_grid_key_in_range() {
+    let total = (crate::ELITE_BINS_Z
+        * crate::ELITE_BINS_CARN
+        * crate::ELITE_BINS_VOL
+        * crate::ELITE_BINS_HIDDEN) as u32;
+    let mut c = base_cell();
+    for carn in [0.0_f32, 0.5, 1.0] {
+        c.genome.carnivore_score = carn;
+        let k = crate::sim::elite_grid_key(&c, WORLD_HALF);
+        assert!(k < total, "key {k} out of range {total}");
+    }
+}
+
+#[test]
+fn elite_grid_key_deterministic() {
+    let c = base_cell();
+    assert_eq!(
+        crate::sim::elite_grid_key(&c, WORLD_HALF),
+        crate::sim::elite_grid_key(&c, WORLD_HALF)
+    );
+}
+
+#[test]
+fn elite_grid_key_carnivore_axis_separates() {
+    let mut herb = base_cell();
+    herb.genome.carnivore_score = 0.0;
+    let mut carn = base_cell();
+    carn.genome.carnivore_score = 1.0;
+    assert_ne!(
+        crate::sim::elite_grid_key(&herb, WORLD_HALF),
+        crate::sim::elite_grid_key(&carn, WORLD_HALF)
+    );
+}
+
+#[test]
+fn update_elite_archive_keeps_oldest() {
+    let mut rng = StdRng::seed_from_u64(4);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        4,
+        10,
+        EventCalendar::default(),
+    );
+    let proto = world.cells[0];
+    world.cells.clear();
+    for age in [10_u64, 50, 30] {
+        let mut c = proto;
+        c.age = age;
+        world.cells.push(c);
+    }
+    world.update_elite_archive();
+    let key = crate::sim::elite_grid_key(&world.cells[0], WORLD_HALF);
+    assert_eq!(world.elite_archive.len(), 1);
+    assert_eq!(world.elite_archive[&key].1, 50);
+}
+
+#[test]
+fn update_elite_archive_coverage_never_shrinks() {
+    let mut rng = StdRng::seed_from_u64(5);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        16,
+        10,
+        EventCalendar::default(),
+    );
+    world.update_elite_archive();
+    let after_first = world.elite_archive.len();
+    // Stepping stones persist: emptying the population must not shrink it.
+    world.cells.clear();
+    world.update_elite_archive();
+    assert_eq!(world.elite_archive.len(), after_first);
+}
+
+// ─── Red Queen pressure (Sprint 210) ────────────────────────────────────────
+
+#[test]
+fn redqueen_penalizes_common_defense_more_than_rare() {
+    let mut rng = StdRng::seed_from_u64(9);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        4,
+        10,
+        EventCalendar::default(),
+    );
+    // One rare defence (bin high) vs three common (bin low). carnivore_score
+    // zeroed so the diet bonus doesn't confound the defence comparison.
+    for (i, c) in world.cells.iter_mut().enumerate() {
+        c.genome.defense_contribution = if i == 0 { 0.9 } else { 0.1 };
+        c.genome.carnivore_score = 0.0;
+        c.energy = 100.0;
+    }
+    world.apply_redqueen_pressure(1.0);
+    let rare = world.cells[0].energy;
+    let common = world.cells[1].energy;
+    assert!(
+        common < rare,
+        "common defence {common} should pay more than rare {rare}"
+    );
+}
+
+#[test]
+fn redqueen_diet_bonus_favors_carnivore_when_prey_abundant() {
+    let mut rng = StdRng::seed_from_u64(10);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        4,
+        10,
+        EventCalendar::default(),
+    );
+    // Uniform defence (no penalty differential) + one carnivore among herbivores.
+    for (i, c) in world.cells.iter_mut().enumerate() {
+        c.genome.defense_contribution = 0.0;
+        c.genome.carnivore_score = if i == 0 { 0.8 } else { 0.0 };
+        c.energy = 100.0;
+    }
+    world.apply_redqueen_pressure(1.0);
+    let carnivore = world.cells[0].energy;
+    let herbivore = world.cells[1].energy;
+    assert!(
+        carnivore > herbivore,
+        "rare carnivore {carnivore} should out-gain herbivore {herbivore}"
+    );
+}
+
+// ─── ripening food (Sprint 209) ─────────────────────────────────────────────
+
+#[test]
+fn ripening_food_completes_with_sustained_processing() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        4,
+        10,
+        EventCalendar::default(),
+    );
+    let cpos = world.cells[0].position;
+    world.ripening_foods.push(RipeningFood {
+        position: cpos,
+        spawn_tick: 0,
+        progress: 0,
+    });
+    let e0 = world.cells[0].energy;
+    for _ in 0..RIPENING_STAGES {
+        world.update_ripening_food();
+    }
+    // Harvested after sustained processing: node gone, processor rewarded.
+    assert!(world.ripening_foods.is_empty());
+    assert!(world.cells[0].energy >= e0 + RIPENING_REWARD - 1.0);
+}
+
+#[test]
+fn ripening_food_decays_when_unattended() {
+    let mut rng = StdRng::seed_from_u64(8);
+    let mut world = crate::sim::World::new(
+        &mut rng,
+        WORLD_MAP_SEED,
+        MATING_RADIUS,
+        4,
+        10,
+        EventCalendar::default(),
+    );
+    world.cells.clear(); // nobody to process → always unattended
+    world.ripening_foods.push(RipeningFood {
+        position: [0.0, 0.0, 0.0],
+        spawn_tick: 0,
+        progress: 10,
+    });
+    world.update_ripening_food();
+    assert_eq!(world.ripening_foods[0].progress, 10 - RIPENING_DECAY);
 }
 
 // ─── substrate coords ──────────────────────────────────────────────────────
@@ -582,7 +869,10 @@ fn substrate_input_recurrent_maps_to_hidden() {
         let recurrent_slot = BRAIN_INPUTS_SENSORY + h;
         let from_input = substrate_input_coords(recurrent_slot);
         let from_hidden = substrate_hidden_coords(h);
-        assert_eq!(from_input, from_hidden, "recurrent slot {recurrent_slot} ≠ hidden {h}");
+        assert_eq!(
+            from_input, from_hidden,
+            "recurrent slot {recurrent_slot} ≠ hidden {h}"
+        );
     }
 }
 
@@ -682,7 +972,11 @@ fn brain_from_cppn_disabled_gate_zeros_weight() {
             ];
             let out = cppn.forward(inputs);
             if out[1] < CPPN_LINK_EXISTS_THRESHOLD {
-                assert_eq!(brain.w1[h][i], 0.0, "gate off but weight = {}", brain.w1[h][i]);
+                assert_eq!(
+                    brain.w1[h][i], 0.0,
+                    "gate off but weight = {}",
+                    brain.w1[h][i]
+                );
             }
         }
     }
@@ -756,7 +1050,9 @@ fn motor_gpu_zero_outputs_parity_with_cpu() {
     let pitches = vec![0.0_f32; n];
     let max_speeds = vec![60.0_f32; n];
     let turn_rates = vec![2.5_f32; n];
-    let masses = vec![1.0_f32; n];
+    // GPU mass must match the CPU cells' phenotype.mass() (S202 volume-based),
+    // else apply_brain_motor's thrust/mass differs and CPU/GPU parity fails.
+    let masses = vec![base_cell().phenotype.mass(); n];
     let velocities_in = vec![[1.0_f32, 0.0, 0.0]; n];
     let angular_in = vec![0.0_f32; n];
     let pitch_vel_in = vec![0.0_f32; n];
@@ -769,15 +1065,26 @@ fn motor_gpu_zero_outputs_parity_with_cpu() {
         }
     };
     let (gpu_v, _ga, _gp) = gpu.compute(
-        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &masses,
-        &velocities_in, &angular_in, &pitch_vel_in, dt, DRAG_COEFFICIENT,
+        &outputs,
+        &headings,
+        &pitches,
+        &max_speeds,
+        &turn_rates,
+        &masses,
+        &velocities_in,
+        &angular_in,
+        &pitch_vel_in,
+        dt,
+        DRAG_COEFFICIENT,
     );
 
-    let mut cpu_cells: Vec<Cell> = (0..n).map(|_| {
-        let mut c = base_cell();
-        c.velocity = velocities_in[0];
-        c
-    }).collect();
+    let mut cpu_cells: Vec<Cell> = (0..n)
+        .map(|_| {
+            let mut c = base_cell();
+            c.velocity = velocities_in[0];
+            c
+        })
+        .collect();
     for c in cpu_cells.iter_mut() {
         c.apply_brain_motor(&[0.0; BRAIN_OUTPUTS], dt);
     }
@@ -785,7 +1092,12 @@ fn motor_gpu_zero_outputs_parity_with_cpu() {
     for i in 0..n {
         for k in 0..3 {
             let d = (cpu_cells[i].velocity[k] - gpu_v[i][k]).abs();
-            assert!(d < 1e-4, "i={i} k={k} cpu={} gpu={}", cpu_cells[i].velocity[k], gpu_v[i][k]);
+            assert!(
+                d < 1e-4,
+                "i={i} k={k} cpu={} gpu={}",
+                cpu_cells[i].velocity[k],
+                gpu_v[i][k]
+            );
         }
     }
 }
@@ -800,11 +1112,15 @@ fn motor_gpu_small_batch_parity() {
     let mut cells: Vec<Cell> = (0..n)
         .map(|i| Cell::random(&mut rng, [960.0, 540.0, 2.0], 0, 0, i as u64))
         .collect();
-    let outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n).map(|_| {
-        let mut a = [0.0_f32; BRAIN_OUTPUTS];
-        for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
-        a
-    }).collect();
+    let outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
+        .map(|_| {
+            let mut a = [0.0_f32; BRAIN_OUTPUTS];
+            for v in a.iter_mut() {
+                *v = rng.random_range(-1.0_f32..1.0);
+            }
+            a
+        })
+        .collect();
     let headings: Vec<f32> = cells.iter().map(|c| c.heading).collect();
     let pitches: Vec<f32> = cells.iter().map(|c| c.pitch).collect();
     let max_speeds: Vec<f32> = cells.iter().map(|c| c.genome.max_speed).collect();
@@ -816,11 +1132,23 @@ fn motor_gpu_small_batch_parity() {
 
     let mut gpu = match MotorGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let (gpu_v, gpu_a, gpu_p) = gpu.compute(
-        &outputs, &headings, &pitches, &max_speeds, &turn_rates, &masses,
-        &velocities_in, &angular_in, &pitch_vel_in, dt, DRAG_COEFFICIENT,
+        &outputs,
+        &headings,
+        &pitches,
+        &max_speeds,
+        &turn_rates,
+        &masses,
+        &velocities_in,
+        &angular_in,
+        &pitch_vel_in,
+        dt,
+        DRAG_COEFFICIENT,
     );
     for (i, cell) in cells.iter_mut().enumerate() {
         cell.apply_brain_motor(&outputs[i], dt);
@@ -842,7 +1170,10 @@ fn field_gpu_zero_sources_decays_only() {
     let world_half = [320.0_f32, 320.0, 20.0];
     let mut gpu = match FieldGpu::new(resolution, world_half, 32) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let mut cpu = SmellField::new(resolution, world_half);
     cpu.add_source([0.0, 0.0, 0.0], 5.0);
@@ -865,7 +1196,10 @@ fn field_gpu_pure_decay_matches_analytic() {
     let world_half = [320.0_f32, 320.0, 20.0];
     let mut gpu = match FieldGpu::new(resolution, world_half, 32) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     gpu.add_source([0.0, 0.0, 0.0], 1.0);
     let decay = 0.5_f32;
@@ -886,28 +1220,50 @@ fn hebbian_gpu_zero_reward_noop() {
     let n = 8;
     let lr: f32 = 0.01;
     let brains: Vec<Brain> = (0..n).map(|_| Brain::random(&mut rng)).collect();
-    let last_inputs: Vec<[f32; BRAIN_INPUTS]> = (0..n).map(|_| {
-        let mut a = [0.0_f32; BRAIN_INPUTS];
-        for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
-        a
-    }).collect();
-    let last_hidden: Vec<[f32; BRAIN_HIDDEN]> = (0..n).map(|_| {
-        let mut a = [0.0_f32; BRAIN_HIDDEN];
-        for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
-        a
-    }).collect();
-    let last_outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n).map(|_| {
-        let mut a = [0.0_f32; BRAIN_OUTPUTS];
-        for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
-        a
-    }).collect();
+    let last_inputs: Vec<[f32; BRAIN_INPUTS]> = (0..n)
+        .map(|_| {
+            let mut a = [0.0_f32; BRAIN_INPUTS];
+            for v in a.iter_mut() {
+                *v = rng.random_range(-1.0_f32..1.0);
+            }
+            a
+        })
+        .collect();
+    let last_hidden: Vec<[f32; BRAIN_HIDDEN]> = (0..n)
+        .map(|_| {
+            let mut a = [0.0_f32; BRAIN_HIDDEN];
+            for v in a.iter_mut() {
+                *v = rng.random_range(-1.0_f32..1.0);
+            }
+            a
+        })
+        .collect();
+    let last_outputs: Vec<[f32; BRAIN_OUTPUTS]> = (0..n)
+        .map(|_| {
+            let mut a = [0.0_f32; BRAIN_OUTPUTS];
+            for v in a.iter_mut() {
+                *v = rng.random_range(-1.0_f32..1.0);
+            }
+            a
+        })
+        .collect();
     let rewards = vec![0.0_f32; n];
 
     let mut gpu = match HebbianGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
-    let after = gpu.compute(&last_inputs, &last_hidden, &last_outputs, &rewards, &brains, lr);
+    let after = gpu.compute(
+        &last_inputs,
+        &last_hidden,
+        &last_outputs,
+        &rewards,
+        &brains,
+        lr,
+    );
     for i in 0..n {
         for h in 0..BRAIN_HIDDEN {
             for in_i in 0..BRAIN_INPUTS {
@@ -924,7 +1280,10 @@ fn brownian_gpu_zero_noise_preserves_velocity() {
     let n = 32;
     let mut gpu = match BrownianGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let velocities = vec![[0.5_f32, 1.0, -0.3]; n];
     let state: Vec<[u32; 4]> = (0..n).map(|i| [i as u32 + 1, 7, 11, 13]).collect();
@@ -932,7 +1291,12 @@ fn brownian_gpu_zero_noise_preserves_velocity() {
     for i in 0..n {
         for k in 0..3 {
             let d = (velocities[i][k] - v_out[i][k]).abs();
-            assert!(d < 1e-6, "zero-noise drifted i={i} k={k} in={} out={}", velocities[i][k], v_out[i][k]);
+            assert!(
+                d < 1e-6,
+                "zero-noise drifted i={i} k={k} in={} out={}",
+                velocities[i][k],
+                v_out[i][k]
+            );
         }
     }
 }
@@ -942,7 +1306,10 @@ fn sensor_gather_gpu_no_neighbors_when_alone() {
     use crate::gpu::*;
     let ctx = match GpuContext::new() {
         Ok(c) => c,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let n = 1_usize;
     let nf = 1_usize;
@@ -987,12 +1354,26 @@ fn sensor_gather_gpu_no_neighbors_when_alone() {
     let test_pitches = vec![0.0_f32; positions.len()];
     let test_whisker_state = crate::test_helpers::whisker_state_buf(&ctx.device, n);
     let rows = sensor.compute(
-        &positions, &eff_radii, &vision_radii, &food_positions,
-        &test_headings, &test_pitches,
-        &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell,
-        &test_whisker_state, params,
+        &positions,
+        &eff_radii,
+        &vision_radii,
+        &food_positions,
+        &test_headings,
+        &test_pitches,
+        &cell_hash,
+        &food_hash,
+        &smell,
+        &phero,
+        &phero,
+        &phero,
+        &smell,
+        &test_whisker_state,
+        params,
     );
-    assert_eq!(rows[0].neighbors_in_vision, 0, "alone cell has no neighbors");
+    assert_eq!(
+        rows[0].neighbors_in_vision, 0,
+        "alone cell has no neighbors"
+    );
     assert!(rows[0].nearest_cell.is_none());
     assert!(rows[0].nearest_food.is_none(), "food too far for vision");
 }
@@ -1002,7 +1383,10 @@ fn sensor_gather_gpu_food_in_vision_detected() {
     use crate::gpu::*;
     let ctx = match GpuContext::new() {
         Ok(c) => c,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let n = 1_usize;
     let nf = 1_usize;
@@ -1047,12 +1431,26 @@ fn sensor_gather_gpu_food_in_vision_detected() {
     let test_pitches = vec![0.0_f32; positions.len()];
     let test_whisker_state = crate::test_helpers::whisker_state_buf(&ctx.device, n);
     let rows = sensor.compute(
-        &positions, &eff_radii, &vision_radii, &food_positions,
-        &test_headings, &test_pitches,
-        &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell,
-        &test_whisker_state, params,
+        &positions,
+        &eff_radii,
+        &vision_radii,
+        &food_positions,
+        &test_headings,
+        &test_pitches,
+        &cell_hash,
+        &food_hash,
+        &smell,
+        &phero,
+        &phero,
+        &phero,
+        &smell,
+        &test_whisker_state,
+        params,
     );
-    assert!(rows[0].nearest_food.is_some(), "food within vision radius missed");
+    assert!(
+        rows[0].nearest_food.is_some(),
+        "food within vision radius missed"
+    );
 }
 
 /// Sprint 195: the whisker spring-damper must produce bit-comparable results
@@ -1097,11 +1495,9 @@ fn whisker_spring_damper_gpu_matches_cpu() {
     let field_resolution = [8usize, 8, 4];
     let field_world_half = [WORLD_HALF[0], WORLD_HALF[1], 20.0];
 
-    let mut cell_hash =
-        SpatialHashGpu::with_context(&ctx, n, cell_size, world_half_xy).unwrap();
+    let mut cell_hash = SpatialHashGpu::with_context(&ctx, n, cell_size, world_half_xy).unwrap();
     cell_hash.rebuild(&positions);
-    let mut food_hash =
-        SpatialHashGpu::with_context(&ctx, nf, cell_size, world_half_xy).unwrap();
+    let mut food_hash = SpatialHashGpu::with_context(&ctx, nf, cell_size, world_half_xy).unwrap();
     food_hash.rebuild(&food_positions);
     let mut smell = FieldGpu::with_context(&ctx, field_resolution, field_world_half, 32).unwrap();
     let mut phero = FieldGpu::with_context(&ctx, field_resolution, field_world_half, 32).unwrap();
@@ -1126,7 +1522,8 @@ fn whisker_spring_damper_gpu_matches_cpu() {
         n * 12 * f,
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
     );
-    ctx.queue.write_buffer(&whisker_state, 0, &vec![0u8; n * 12 * f]);
+    ctx.queue
+        .write_buffer(&whisker_state, 0, &vec![0u8; n * 12 * f]);
     let stride = SENSOR_OUTPUT_STRIDE;
     let output_rb = mk_buf(
         "test-sensor-output-rb",
@@ -1167,10 +1564,21 @@ fn whisker_spring_damper_gpu_matches_cpu() {
         let mut params = base_params;
         params.tick = tick;
         sensor.dispatch_no_readback(
-            &positions, &eff_radii, &vision_radii, &food_positions,
-            &headings, &pitches,
-            &cell_hash, &food_hash, &smell, &phero, &phero, &phero, &smell,
-            &whisker_state, params,
+            &positions,
+            &eff_radii,
+            &vision_radii,
+            &food_positions,
+            &headings,
+            &pitches,
+            &cell_hash,
+            &food_hash,
+            &smell,
+            &phero,
+            &phero,
+            &phero,
+            &smell,
+            &whisker_state,
+            params,
         );
 
         let mut enc = ctx
@@ -1186,7 +1594,9 @@ fn whisker_spring_damper_gpu_matches_cpu() {
         ctx.queue.submit(Some(enc.finish()));
         let slice = output_rb.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let gpu_out: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
         output_rb.unmap();
 
@@ -1214,7 +1624,9 @@ fn whisker_spring_damper_gpu_matches_cpu() {
     ctx.queue.submit(Some(enc.finish()));
     let slice = whisker_state_rb.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
-    ctx.device.poll(wgpu::Maintain::Wait);
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
     let gpu_state: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
     whisker_state_rb.unmap();
 
@@ -1249,14 +1661,21 @@ fn brain_forward_gpu_matches_cpu_small_batch() {
     let mut rng = StdRng::seed_from_u64(401);
     let n = 4;
     let brains: Vec<Brain> = (0..n).map(|_| Brain::random(&mut rng)).collect();
-    let inputs: Vec<[f32; BRAIN_INPUTS]> = (0..n).map(|_| {
-        let mut a = [0.0_f32; BRAIN_INPUTS];
-        for v in a.iter_mut() { *v = rng.random_range(-1.0_f32..1.0); }
-        a
-    }).collect();
+    let inputs: Vec<[f32; BRAIN_INPUTS]> = (0..n)
+        .map(|_| {
+            let mut a = [0.0_f32; BRAIN_INPUTS];
+            for v in a.iter_mut() {
+                *v = rng.random_range(-1.0_f32..1.0);
+            }
+            a
+        })
+        .collect();
     let mut gpu = match BrainGpu::new(n) {
         Ok(g) => g,
-        Err(e) => { eprintln!("skip: no GPU adapter ({e})"); return; }
+        Err(e) => {
+            eprintln!("skip: no GPU adapter ({e})");
+            return;
+        }
     };
     let mut h_gpu = vec![[0.0_f32; BRAIN_HIDDEN]; n];
     let mut o_gpu = vec![[0.0_f32; BRAIN_OUTPUTS]; n];

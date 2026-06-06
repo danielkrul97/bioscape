@@ -55,6 +55,9 @@ pub fn dummy_genome() -> Genome {
         reproduce_at_energy: REPRODUCE_THRESHOLD,
         birth_energy: 50.0,
         altruism_share_frac: BOND_FOOD_SHARE_FRAC,
+        sexual_pref: 1.0,
+        bond_inherit_pref: 0.0,
+        division_angle: 0.0,
         cluster_share_bonus: BOND_FOOD_SHARE_CLUSTER_BONUS,
         attack_gate: ATTACK_THRESHOLD,
         predation_size_ratio: SIZE_RATIO_THRESHOLD,
@@ -95,6 +98,9 @@ pub fn zero_cfg() -> MutationConfig {
         sigma_reproduce_at_energy: 0.0,
         sigma_birth_energy: 0.0,
         sigma_altruism_share_frac: 0.0,
+        sigma_sexual_pref: 0.0,
+        sigma_bond_inherit_pref: 0.0,
+        sigma_division_angle: 0.0,
         sigma_cluster_share_bonus: 0.0,
         sigma_attack_gate: 0.0,
         sigma_predation_size_ratio: 0.0,
@@ -135,6 +141,7 @@ pub fn base_cell() -> Cell {
         burst_accum: [0.0; N_PHEROMONE_CHANNELS],
         pooled_hidden: [0.0; BRAIN_HIDDEN],
         bonded_inbox: [0.0; N_BOND_MSG_CHANNELS],
+        coop_call_signal: 0.0,
         damage_accum: 0.0,
         age: 0,
         reproduce_cooldown_ticks: 0,
@@ -154,7 +161,7 @@ pub fn base_cell() -> Cell {
         was_in_hazard_last_tick: false,
         phenotype,
         genome,
-        symbiont: None,
+        species_id: 0,
     }
 }
 

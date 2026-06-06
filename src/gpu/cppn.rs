@@ -3,8 +3,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::*;
 use super::*;
+use crate::*;
 
 /// Per-child substrate query count: 45×72 + 45 + 12×45 + 12 = 3837.
 pub const CPPN_QUERIES_PER_CHILD: u32 =
@@ -211,12 +211,8 @@ impl CppnGpu {
                     }
                 }
             }
-            self.meta_scratch.push([
-                cppn.num_nodes as u32,
-                cppn.num_links as u32,
-                max_layer,
-                0,
-            ]);
+            self.meta_scratch
+                .push([cppn.num_nodes as u32, cppn.num_links as u32, max_layer, 0]);
             // Pack nodes 0..CPPN_MAX_NODES; unused slots stay zero (caller
             // never reads past `num_nodes`, so zeros are harmless).
             let node_start = self.nodes_scratch.len();
@@ -280,11 +276,26 @@ impl CppnGpu {
             label: Some("cppn-from-cppn-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.meta_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.nodes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.links_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.slots_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.meta_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.nodes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.links_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.slots_buf.as_entire_binding(),
+                },
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: cells.brain_weights_buffer().as_entire_binding(),
@@ -321,17 +332,26 @@ impl CppnGpu {
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         self.queue
             .write_buffer(&self.meta_buf, 0, bytemuck::cast_slice(&self.meta_scratch));
-        self.queue
-            .write_buffer(&self.nodes_buf, 0, bytemuck::cast_slice(&self.nodes_scratch));
-        self.queue
-            .write_buffer(&self.links_buf, 0, bytemuck::cast_slice(&self.links_scratch));
+        self.queue.write_buffer(
+            &self.nodes_buf,
+            0,
+            bytemuck::cast_slice(&self.nodes_scratch),
+        );
+        self.queue.write_buffer(
+            &self.links_buf,
+            0,
+            bytemuck::cast_slice(&self.links_scratch),
+        );
         self.queue.write_buffer(
             &self.link_offsets_buf,
             0,
             bytemuck::cast_slice(&self.link_offsets_scratch),
         );
-        self.queue
-            .write_buffer(&self.slots_buf, 0, bytemuck::cast_slice(&self.slots_scratch));
+        self.queue.write_buffer(
+            &self.slots_buf,
+            0,
+            bytemuck::cast_slice(&self.slots_scratch),
+        );
 
         self.ensure_bind_group(cells);
         let bg = self.cached_bg.as_ref().unwrap();

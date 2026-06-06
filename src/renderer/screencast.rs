@@ -12,7 +12,9 @@ pub(super) fn screencast_capture(
     // Sprint 97 follow-up: `Time<Real>` (wall clock), ne `Time<Virtual>` —
     // virtual má 50ms max_delta cap, takže pod heavy sim load by virtual
     // čas běžel 20× pomaleji než wall a 5min screencast by trval >1h.
-    let Some(mut cfg) = cfg else { return; };
+    let Some(mut cfg) = cfg else {
+        return;
+    };
     let elapsed = time.elapsed_secs();
     if cfg.started_at.is_none() {
         cfg.started_at = Some(elapsed);

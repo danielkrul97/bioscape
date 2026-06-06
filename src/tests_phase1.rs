@@ -359,10 +359,7 @@ fn pair_fertile_single_cell_returns_empty() {
 
 #[test]
 fn pair_fertile_zero_budget_returns_empty() {
-    let fertile = vec![
-        (0usize, [0.0, 0.0, 0.0]),
-        (1usize, [10.0, 0.0, 0.0]),
-    ];
+    let fertile = vec![(0usize, [0.0, 0.0, 0.0]), (1usize, [10.0, 0.0, 0.0])];
     let pairs = pair_fertile(&fertile, 1000.0, 0, WORLD_HALF);
     assert!(pairs.is_empty());
 }
@@ -400,9 +397,8 @@ fn pair_fertile_picks_nearest_partner() {
 
 #[test]
 fn pair_fertile_respects_budget_cap() {
-    let fertile: Vec<(usize, [f32; 3])> = (0..20)
-        .map(|i| (i, [(i as f32) * 5.0, 0.0, 0.0]))
-        .collect();
+    let fertile: Vec<(usize, [f32; 3])> =
+        (0..20).map(|i| (i, [(i as f32) * 5.0, 0.0, 0.0])).collect();
     let pairs = pair_fertile(&fertile, 100.0 * 100.0, 3, WORLD_HALF);
     assert!(pairs.len() <= 3);
 }
@@ -561,8 +557,7 @@ fn bond_velocity_delta_breaks_at_zero_dist() {
         damping: BOND_DAMPING,
         age_ticks: 0,
     };
-    let (delta, broken) =
-        bond_velocity_delta(&bond, [0.0; 3], 0.0, [0.0; 3], [0.0; 3], 1.0 / 60.0);
+    let (delta, broken) = bond_velocity_delta(&bond, [0.0; 3], 0.0, [0.0; 3], [0.0; 3], 1.0 / 60.0);
     assert!(broken);
     assert_eq!(delta, [0.0; 3]);
 }
@@ -713,7 +708,7 @@ fn food_age_step_returns_false_when_value_zero() {
         age_ticks: 0,
         kind: FoodKind::Plant,
     };
-    let needed_secs = 1.0 / CARRION_DECAY_PER_SEC + 10.0;
+    let needed_secs = 1.0 / FOOD_DECAY_PER_SEC + 10.0;
     food.age_ticks = (needed_secs * FIXED_TIMESTEP_HZ) as u32;
     let alive = food.age_step();
     assert!(!alive);
@@ -799,14 +794,58 @@ fn coop_food_register_arrivals_for_all_picks_in_radius_only() {
     a.position = [0.0, 0.0, 0.0];
     a.cell_id = 1;
     let mut b = base_cell();
-    b.position = [
-        COOP_FOOD_ARRIVAL_RADIUS + 50.0,
-        0.0,
-        0.0,
-    ];
+    b.position = [COOP_FOOD_ARRIVAL_RADIUS + 50.0, 0.0, 0.0];
     b.cell_id = 2;
     register_coop_arrivals_for_all(&mut coops, &[a, b], WORLD_HALF);
     assert_eq!(coops[0].arrivals, vec![1]);
+}
+
+#[test]
+fn coop_handshake_complementary_pair_wins() {
+    // cell 0 plays A (a high, a>b), cell 1 plays B → handshake, both rewarded.
+    let present = [(0usize, 0.8, 0.1), (1usize, 0.1, 0.8)];
+    let winners = coop_handshake_winners(&present).expect("complementary pair unlocks");
+    assert_eq!(winners, vec![0, 1]);
+}
+
+#[test]
+fn coop_handshake_all_same_role_locks() {
+    // Two A-signallers, no B → no complementary pair → stays locked.
+    let present = [(0usize, 0.8, 0.1), (1usize, 0.7, 0.2)];
+    assert!(coop_handshake_winners(&present).is_none());
+}
+
+#[test]
+fn coop_handshake_excludes_non_signalling_bystander() {
+    // cell 2 is below threshold on both channels → present but not a winner.
+    let present = [(0usize, 0.8, 0.1), (1usize, 0.1, 0.8), (2usize, 0.05, 0.05)];
+    let winners = coop_handshake_winners(&present).expect("pair still unlocks");
+    assert_eq!(winners, vec![0, 1]);
+    assert!(!winners.contains(&2));
+}
+
+#[test]
+fn coop_handshake_below_threshold_locks() {
+    // Complementary directions but both under HANDSHAKE_SIGNAL_THRESHOLD.
+    let present = [(0usize, 0.2, 0.1), (1usize, 0.1, 0.2)];
+    assert!(HANDSHAKE_SIGNAL_THRESHOLD > 0.2);
+    assert!(coop_handshake_winners(&present).is_none());
+}
+
+#[test]
+fn coop_handshake_single_cell_emitting_both_locks() {
+    // One cell covering both roles can't handshake with itself (needs a
+    // distinct partner).
+    let present = [(0usize, 0.9, 0.9)];
+    assert!(coop_handshake_winners(&present).is_none());
+}
+
+#[test]
+fn coop_handshake_rectifies_negative_signals() {
+    // Negative raw emissions rectify to 0; cell 0 is pure B via its 0.8.
+    let present = [(0usize, -0.5, 0.8), (1usize, 0.9, -0.3)];
+    let winners = coop_handshake_winners(&present).expect("A=cell1, B=cell0");
+    assert_eq!(winners.len(), 2);
 }
 
 #[test]
@@ -1044,7 +1083,11 @@ fn pool_bonded_sensors_partner_with_smaller_signal_does_not_replace() {
     own[0] = 0.8;
     let mut partner = [0.0_f32; BRAIN_INPUTS];
     partner[0] = 0.3;
-    let pooled = pool_bonded_sensors(&cell, &own, |id| if id == 99 { Some(partner) } else { None });
+    let pooled = pool_bonded_sensors(
+        &cell,
+        &own,
+        |id| if id == 99 { Some(partner) } else { None },
+    );
     assert_eq!(pooled[0], 0.8);
 }
 
@@ -1061,7 +1104,13 @@ fn forward_vector_is_unit_length() {
     for (yaw, pitch) in cases {
         let v = forward_vector(yaw, pitch);
         let mag = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        assert!((mag - 1.0).abs() < 1e-5, "yaw={} pitch={} mag={}", yaw, pitch, mag);
+        assert!(
+            (mag - 1.0).abs() < 1e-5,
+            "yaw={} pitch={} mag={}",
+            yaw,
+            pitch,
+            mag
+        );
     }
 }
 

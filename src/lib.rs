@@ -106,8 +106,9 @@ pub const MATING_COOLDOWN_TICKS: u32 = 10;
 /// (extinkce gen 23 — food saturoval na low-pop, vzájemně decay) na 0.0005
 /// (gentle aging, food prakticky vždy fresh, decay viditelný jen u dlouho-
 /// nesnězeného carrion). Carrion-specific decay je cleaner ale Sprint 42
-/// scope-cut na universal gentle.
-pub const CARRION_DECAY_PER_SEC: f32 = 0.0005;
+/// scope-cut na universal gentle — odtud universal název (driver decaye pro
+/// VŠECHNY food kinds, ne jen carrion).
+pub const FOOD_DECAY_PER_SEC: f32 = 0.0005;
 
 // Sprint 66: differential adhesion (Steinberg) + persistent spring bonds.
 // Steinbergova differential-adhesion hypothesis: buňky stejného CAM/cadherin
@@ -139,8 +140,10 @@ pub const ADHESION_STRENGTH: f32 = 8.0;
 /// podobných k tissue-segregation. -0.3 = 1/4 of same-type magnitude.
 pub const ADHESION_CROSS_TYPE: f32 = -0.3;
 /// Maximum spring bondů per cell. Sphere packing kissing 12, ale soft cells
-/// se realisticky drží ≤ 6 sousedů. Fixní array → no heap alloc.
-pub const MAX_BONDS_PER_CELL: usize = 6;
+/// se realisticky drží ≤ 10 sousedů. Fixní array → no heap alloc.
+/// Coupled to `BOND_SLOTS` in shaders/collision.wgsl (local stack arrays) —
+/// keep that const ≥ this value.
+pub const MAX_BONDS_PER_CELL: usize = 10;
 /// Maximum per-cell in-contact partners the GPU collision shader records
 /// each tick. CPU side is unbounded (Vec<u64>) but the GPU buffer is fixed
 /// — overflow drops the extras (counter still tracks the true count). 32
@@ -200,13 +203,15 @@ pub const BOND_REST_LENGTH_SLACK: f32 = 1.05;
 /// Brain output[9] musí být ≥ tento threshold u OBOU buněk pro vznik bondu.
 /// Mirror MATING_PHEROMONE_THRESHOLD / ATTACK_THRESHOLD semantiku.
 pub const BOND_FORM_THRESHOLD: f32 = 0.0;
-/// Brain output[9] < tento threshold u některé z bonded cells → bond se
-/// explicit trhá tento tick. Negative = "pusť mě". Asymmetric: jeden silný
-/// negativní signál stačí (escape behavior). Sprint 132+ bump z -0.5 na -1.0
-/// — predchozí hodnota chytala náhodný brain noise (tanh distribuce přes 0
-/// dávala ~17 % per-tick šanci spadnout pod -0.5), takže clustery se rozpadaly
-/// dřív, než selekce stihla "naučit" bonding-positive brainy. -1.0 vyžaduje
-/// silnější negative drive — break je vědomé, ne stochastické.
+/// Brain output[9] < tento threshold → endpoint signalizuje "pusť mě".
+/// Mutual consent: bond se brainem trhá jen když jsou OBA endpointy pod
+/// thresholdem ve stejném ticku — jedna buňka se sama neodpojí. Jediný solo
+/// únik je fyzický overstretch (dist > rest × BOND_BREAK_FACTOR). Sprint 132+
+/// bump z -0.5 na -1.0 — predchozí hodnota chytala náhodný brain noise (tanh
+/// distribuce přes 0 dávala ~17 % per-tick šanci spadnout pod -0.5), takže
+/// clustery se rozpadaly dřív, než selekce stihla "naučit" bonding-positive
+/// brainy. -1.0 vyžaduje silnější negative drive — break je vědomé, ne
+/// stochastické.
 pub const BOND_BREAK_THRESHOLD: f32 = -1.0;
 /// Energy cost při formaci bondu (one-shot, paid by initiator). Ne-trivial,
 /// aby selekce váhala bonding vs free-roaming.
@@ -215,6 +220,13 @@ pub const BOND_FORMATION_COST: f32 = 0.05;
 /// je výhoda (tissue stability), ale ne free. Tuned tak, aby cluster benefit
 /// rostl relativně k maintenance cost při low food periods.
 pub const BOND_MAINTENANCE_PER_SEC: f32 = 0.015;
+/// Heritable multicelularita: asexuální dělení vyrobí dceru už spojenou
+/// bondem s rodičem (mitóza → spojené buňky), bez contact/brain-signal
+/// handshake a bez one-shot formation cost (birth už zaplatil). Maintenance
+/// + break pravidla platí normálně, takže selekce může spojení udržet i
+/// rozpustit. Per-child gated genem `Genome::bond_inherit_pref` (selekce ladí
+/// míru); tahle konstanta je master switch. False = nikdy nedědit.
+pub const DIVISION_INHERITS_BOND: bool = true;
 /// Sprint 78: gen-0 default for the per-genome `altruism_share_frac` trait.
 /// When a bonded cell eats food, it distributes a pool `value × altruism ×
 /// state` split evenly across its bonded partners (see `bonded_food_share`).
@@ -323,14 +335,10 @@ pub const REWARD_WEIGHT_DEFAULTS: [f32; N_REWARD_KINDS] = [
     BOND_FORMED_REWARD_MAGNITUDE, // 0.6
     MATING_REWARD_MAGNITUDE,      // 0.5
     0.3,                          // HazardAvoided (similar to EscapedAttack — "escaped a threat")
-    0.1,                          // ThreatEscaped (brief-encounter escape; halved vs initial to reduce reproductive disruption observed in HA+TE smoke)
+    0.1, // ThreatEscaped (brief-encounter escape; halved vs initial to reduce reproductive disruption observed in HA+TE smoke)
 ];
-pub const REWARD_WEIGHT_MAX: [f32; N_REWARD_KINDS] = [
-    2.0, 0.1, 0.8, 0.6, 0.2, 1.2, 1.0, 0.6, 0.2,
-];
-pub const REWARD_WEIGHT_MIN: [f32; N_REWARD_KINDS] = [
-    0.0; N_REWARD_KINDS
-];
+pub const REWARD_WEIGHT_MAX: [f32; N_REWARD_KINDS] = [2.0, 0.1, 0.8, 0.6, 0.2, 1.2, 1.0, 0.6, 0.2];
+pub const REWARD_WEIGHT_MIN: [f32; N_REWARD_KINDS] = [0.0; N_REWARD_KINDS];
 /// Maximum bondů, které se počítají do defense multiplikátoru. Cap brání
 /// stacking abuse (cell s 6 bondy = 100% immune). 4 = sweet spot, kde
 /// střední cluster (3-4 bondy) má smysluplnou ochranu, ale solo cell jasně
@@ -347,106 +355,6 @@ pub const BOND_DEFENSE_CAP: u32 = 4;
 pub fn bond_defense_factor(defense_pool: f32) -> f32 {
     (1.0 - defense_pool).max(0.4)
 }
-
-
-// ─── Sprint 196: endosymbiosis plumbing ─────────────────────────────────────
-// First slice of the endosymbiosis arc — data + inheritance + visualization
-// only. No energy mechanic yet (Sprint 197 will add z-band photosynthesis +
-// conditional upkeep). Three loss channels apply from day one: host death,
-// transmission failure at reproduction (P_inherit < 1), and predation event
-// where the attacker already has a symbiont.
-
-/// Fraction of the gen-0 population that spawns with a random `Symbiont`.
-/// Seed pool — without it the predation-derived origin pathway has nothing
-/// to copy from. 10 % is high enough to make bearer dynamics visible in the
-/// first generations and low enough that drift / loss can drive it down.
-pub const SYMBIONT_INIT_FRACTION: f32 = 0.50;
-// S199 tune: 0.10 → 0.50. Cross-seed 3×80-gen smoke at INIT=0.10 showed
-// bearer extinction gen 5-6 in all 3 seeds — kohort too small (26/200) for
-// brain-integration selection to amplify `has_symbiont → swim_up` correlation
-// before population vymře. 5× larger starting cohort (100/200) gives selection
-// dozens more bearer-bearing reproductions per gen.
-
-/// Per-offspring probability that a bearer parent passes its symbiont to the
-/// child. Models maternal-transmission imperfection: ~5 % of offspring lose
-/// the symbiont at birth even when the parent had one. Combined with host
-/// mortality and predation-event loss, this gives Sprint 196 three loss
-/// channels — Sprint 197 will add the conditional-upkeep deficit channel.
-pub const SYMBIONT_INHERIT_P: f32 = 0.95;
-
-/// Probability that an attacker without a symbiont acquires the victim's
-/// symbiont during a successful predation event ("failed digestion" →
-/// fagocytóza→endosymbióza, the canonical evolutionary pathway). Low rate
-/// keeps origin events rare enough that selection has time to fixate or
-/// purge a symbiont lineage between events.
-pub const SYMBIONT_CAPTURE_P: f32 = 0.0;
-// S203: 0.005 → 0. S202 smoke showed bearer fraction stuck at 0.94-0.96
-// regardless of `SYMBIONT_DAMAGE_RESIST_FRAC` magnitude — predation transfer
-// was the dominant force, "infecting" non-bearers with bearer status faster
-// than transmission failure could erode the fraction. Disabling transfer
-// isolates the surviving channels: vertical inheritance (P_inherit=0.95
-// drift down) vs damage-resist survival edge (selection up). The
-// equilibrium between these two should produce real polymorphism.
-
-pub const SYMBIONT_PHOTO_RATE: f32 = 0.6;
-// S198 tuning history: PHOTO_RATE 0.6 unchanged (initial smoke already gave
-// good gain at high z). The losing knob was the niche width — most bearers
-// spawned outside the original threshold and shed before they could find
-// the light.
-
-/// Sprint 200 mitochondrial baseline: per-second gain that bearers receive
-/// at *any* z, independent of light. Like cellular respiration alongside
-/// photosynthesis — provides a survival floor so bearers don't shed instantly
-/// in dark zones, but the light component still drives upper-z selection.
-/// Tuned so bearer at z=0 + metab=1.0 breaks even with `UPKEEP_PER_SEC`,
-/// leaving the entire gain budget to the light bonus (= selection signal).
-pub const SYMBIONT_PHOTO_BASE: f32 = 0.04;
-/// 2D worlds (`WORLD_HALF[2] == 0`) skip the mechanic; this threshold is
-/// only meaningful in 3D where z maps to [0, 1].
-pub const SYMBIONT_PHOTO_Z_THRESHOLD: f32 = 0.3;
-// S198 tune: 0.5 → 0.3. Original smoke at 0.5 left bearers in the middle
-// band (0 < z < 50, light=0) on a net-negative budget — 26 init bearers
-// dropped to 0 within 4 gens because most spawned at z below threshold.
-// Widening the lit band to z_norm > 0.3 (= z > -40) gives ~70 % of init
-// positions some photo gain.
-pub const SYMBIONT_UPKEEP_PER_SEC: f32 = 0.04;
-// S198 tune: 0.15 → 0.08. Halving upkeep widens the niche margin so a bearer
-// at z_norm = 0.5 (mid-light) is net-positive (~0.10/sec) instead of near
-// zero. Combined with the 0.3 threshold drop, bearers should now persist
-// through the early generations and let selection feedback take over.
-// S199 tune: 0.08 → 0.04. S198 smoke still showed gen 5-6 extinction — even
-// gentler drain so bearers survive long enough for brain to learn the
-// `has_symbiont` correlation. Mid-light cells (z_norm 0.5) now net +0.13/sec
-// (vs +0.09 at 0.08); dark-zone bearers shed in ~25 s (vs ~12.5 s).
-/// ~10 s at FIXED_TIMESTEP_HZ=60 — rides out a transient dive but a
-/// permanent deep-diver loses the symbiont.
-pub const SYMBIONT_UPKEEP_DEFICIT_TICKS: u32 = 600;
-
-/// Sprint 201 — biological-shield pivot: bearer cells absorb only
-/// `(1 - DAMAGE_RESIST_FRAC)` of incoming damage (hazards, predation, maze
-/// wall bumps). Replaces S197-S200's energy-budget mechanic, which produced
-/// bearer fitness signals too weak (≤2 % lifetime energy) to stabilize
-/// bearer fraction across 4 sprints of tuning. Damage reduction is
-/// dimensionally significant — 50 % less drain in a hazard zone or
-/// predation hit doubles bearer survival in dangerous niches. Selection
-/// signal: bearers preferentially persist where damage is frequent;
-/// transmission failure (`P_inherit < 1`) plus host mortality remain the
-/// loss channels (no more deficit_streak shed).
-pub const SYMBIONT_DAMAGE_RESIST_FRAC: f32 = 0.10;
-
-/// Sprint 204: bearer cells pay an extra per-second energy drain — the
-/// metabolic cost of maintaining the symbiont passenger. Counter-balances
-/// the damage-resist benefit (asymmetric advantage led to fixation in S201-
-/// S203). Trade-off: bearer thrives in danger-frequent niches (resist > cost),
-/// non-bearer thrives in safe niches (no cost > no benefit). Polymorphism
-/// emerges when both niches exist in the same world. Tuned at 0.5/sec ≈
-/// 5-15 % of typical baseline body cost.
-pub const SYMBIONT_BODY_COST_PER_SEC: f32 = 0.5;
-// S202 tune: 0.5 → 0.10. S201 smoke at 0.5 stabilized bearers but bearer
-// fraction climbed to 0.95-1.0 (near fixation) — selection advantage too
-// strong vs P_inherit=0.95 transmission failure. Polymorphism collapsed.
-// 5× weaker resist (10 % vs 50 %) aims for equilibrium ~50-70 %, preserving
-// bearer / non-bearer coexistence as a real evolutionary tension.
 
 // Sdílené testovací fixtures. Není gated #[cfg(test)] aby je mohly importovat
 // i binární testy (bin/headless/*_tests.rs) — bin se kompiluje proti lib bez

@@ -71,13 +71,15 @@ pub struct ThermalCtx {
 impl ThermalCtx {
     #[inline]
     pub fn for_tick(tick: u64, generation: u64) -> Self {
-        let seasonal_phase =
-            (generation % CYCLE_GEN_PERIOD) as f32 / CYCLE_GEN_PERIOD as f32;
+        let seasonal_phase = (generation % CYCLE_GEN_PERIOD) as f32 / CYCLE_GEN_PERIOD as f32;
         let seasonal_offset = THERMAL_SEASONAL_AMP * (TAU * seasonal_phase).sin();
         let diurnal_phase =
             (tick % THERMAL_DIURNAL_PERIOD_TICKS) as f32 / THERMAL_DIURNAL_PERIOD_TICKS as f32;
         let diurnal_phase_sin = (TAU * diurnal_phase).sin();
-        Self { seasonal_offset, diurnal_phase_sin }
+        Self {
+            seasonal_offset,
+            diurnal_phase_sin,
+        }
     }
 }
 

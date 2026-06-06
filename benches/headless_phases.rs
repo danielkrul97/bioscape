@@ -4,9 +4,9 @@
 // pro paralelizaci a SIMD úvahy bez reaktor-level setup.
 use bioscape::{
     populate_brain_inputs, Brain, BrainSensors, Cell, Genome, PhysicsConfig, SmellField, WorldMap,
-    BRAIN_INPUTS, PHEROMONE_DECAY, PHEROMONE_DIFFUSION, PHYSICS_CONFIG, SMELL_DECAY, SMELL_DIFFUSION,
-    SMELL_GRID_RES, SMELL_GRID_RES_Z, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES,
-    WORLD_MAP_RES_Z,
+    BRAIN_INPUTS, PHEROMONE_DECAY, PHEROMONE_DIFFUSION, PHYSICS_CONFIG, SMELL_DECAY,
+    SMELL_DIFFUSION, SMELL_GRID_RES, SMELL_GRID_RES_Z, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z,
+    WORLD_MAP_RES, WORLD_MAP_RES_Z,
 };
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;

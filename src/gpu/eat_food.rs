@@ -33,7 +33,7 @@ pub struct EatFoodParamsGpu {
     pub fixed_timestep_hz: f32,
     pub plant_food_value: f32,
     pub carrion_food_value: f32,
-    pub carrion_decay_per_sec: f32,
+    pub food_decay_per_sec: f32,
     pub world_map_food_floor: f32,
     pub world_map_food_amp: f32,
 }
@@ -159,8 +159,9 @@ impl EatFoodGpu {
             })
         };
         let stor_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let stor_dst_src =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let stor_dst_src = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let n = cell_capacity as u64;
         let m = food_capacity as u64;
@@ -260,18 +261,36 @@ impl EatFoodGpu {
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Per-tick uploads.
-        self.queue
-            .write_buffer(&self.cell_positions_buf, 0, bytemuck::cast_slice(cell_positions));
-        self.queue
-            .write_buffer(&self.cell_headings_buf, 0, bytemuck::cast_slice(cell_headings));
-        self.queue
-            .write_buffer(&self.cell_pitches_buf, 0, bytemuck::cast_slice(cell_pitches));
-        self.queue
-            .write_buffer(&self.cell_body_dims_buf, 0, bytemuck::cast_slice(cell_body_dims));
-        self.queue
-            .write_buffer(&self.cell_carnivore_buf, 0, bytemuck::cast_slice(cell_carnivore));
-        self.queue
-            .write_buffer(&self.cell_max_axes_buf, 0, bytemuck::cast_slice(cell_max_axes));
+        self.queue.write_buffer(
+            &self.cell_positions_buf,
+            0,
+            bytemuck::cast_slice(cell_positions),
+        );
+        self.queue.write_buffer(
+            &self.cell_headings_buf,
+            0,
+            bytemuck::cast_slice(cell_headings),
+        );
+        self.queue.write_buffer(
+            &self.cell_pitches_buf,
+            0,
+            bytemuck::cast_slice(cell_pitches),
+        );
+        self.queue.write_buffer(
+            &self.cell_body_dims_buf,
+            0,
+            bytemuck::cast_slice(cell_body_dims),
+        );
+        self.queue.write_buffer(
+            &self.cell_carnivore_buf,
+            0,
+            bytemuck::cast_slice(cell_carnivore),
+        );
+        self.queue.write_buffer(
+            &self.cell_max_axes_buf,
+            0,
+            bytemuck::cast_slice(cell_max_axes),
+        );
         if n_foods > 0 {
             self.queue.write_buffer(
                 &self.food_positions_buf,
@@ -291,27 +310,74 @@ impl EatFoodGpu {
             label: Some("eat-food-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.cell_positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.cell_headings_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.cell_pitches_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.cell_body_dims_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.cell_carnivore_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: self.cell_max_axes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: self.food_positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.food_kinds_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.food_age_ticks_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: food_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: food_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: self.world_map_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.out_food_idx_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.out_value_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.cell_positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.cell_headings_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.cell_pitches_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.cell_body_dims_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.cell_carnivore_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.cell_max_axes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.food_positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.food_kinds_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.food_age_ticks_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: food_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: food_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: self.world_map_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: self.out_food_idx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: self.out_value_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("eat-food-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("eat-food-encoder"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("eat-food-pass"),
@@ -338,7 +404,9 @@ impl EatFoodGpu {
         let val_slice = self.out_value_rb.slice(0..val_bytes);
         idx_slice.map_async(wgpu::MapMode::Read, |_| {});
         val_slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let idx_data = idx_slice.get_mapped_range();
         let val_data = val_slice.get_mapped_range();
         let food_idx: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&idx_data).to_vec();

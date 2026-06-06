@@ -1,6 +1,6 @@
 //! CSV per-generation logging and analytics for headless harness.
 
-use bioscape::sim::{World, EDGE_FRAC_THRESHOLD};
+use bioscape::sim::{bin_unit, vertical_niche_z, World, EDGE_FRAC_THRESHOLD};
 
 use bioscape::{
     Cell, EventCalendar, SpatialGrid, BRAIN_INPUTS_SENSORY, BRAIN_RECURRENT, GRID_CELL_SIZE,
@@ -18,6 +18,17 @@ use std::path::Path;
 /// arrays resize → V3 savefiles incompatible.
 /// Sprint 126 bump: multi-channel pheromones (3 fields), BRAIN_INPUTS_SENSORY
 /// 21→27, BRAIN_INPUTS 71→77, BRAIN_OUTPUTS 10→12. V4 savefiles incompatible.
+///
+/// `gen` column convention (load-bearing for cross-seed analysis): each row is
+/// labelled with `world.clock.generation`, i.e. the snapshot taken *at the
+/// start* of generation N (the pre-loop baseline row is N=0, the initial state).
+/// `clock.advance()` increments the generation before this write runs, so the
+/// per-generation *flow* counters in the same row — `births`, `deaths`,
+/// `fertile_ticks`, `predation_events`, `bonds_formed`/`bonds_broken`,
+/// `coop_food_*` — describe the generation that just ENDED (N−1), since they are
+/// reset only after this write (headless `main.rs`). When joining flows to a
+/// generation, subtract one from `gen`. This off-by-one is intentional and
+/// pinned by `csv_tests.rs`; do not silently relabel.
 pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::io::Result<()> {
     let n = world.cells.len();
     if n == 0 {
@@ -35,7 +46,8 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         let maze_active: u8 = if world.obstacles.is_some() { 1 } else { 0 };
         return writeln!(
             w,
-            // 86 columns total (82 base + 4 maze). Layout:
+            // Column count MUST match the populated row written below (regression
+            // test `empty_and_populated_rows_have_same_column_count`). Layout (approx):
             //   gen, cells, 11×0(cell metrics), food, density,
             //   17×0(lineages..mean_y), 0(energy_avg), births, deaths, fertile_ticks,
             //   0(atk_emit), predation, 6×0(recurrent..noise),
@@ -45,7 +57,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
             //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
             //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000,0,0.00,0,0.000,0.000,0,0.0000,0,0.0000,0.00,0,0.0000",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000,0,0.00,0,0.000,0.000,0.0000,0,0.000,0.000,0.000,0,0,0.0000,0.0000,0,0.0000",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -101,12 +113,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let mut corner_count = 0_u64;
     let mut lineages: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut oldest_age: u64 = 0;
-    // Sprint 196: symbiont diagnostics — bearer count, distinct symbiont
-    // lineage richness, and (computed after the loop) bearer fraction.
-    let mut sym_count: u64 = 0;
-    let mut sym_lineages: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut sym_z_sum = 0.0_f64;
-    let mut sym_deficit_sum = 0.0_f64;
     // Sprint 67 bond/adhesion diagnostics: per-cell aggregates pro CSV.
     let mut bond_signal_sum = 0.0_f64;
     let mut total_bonds = 0_u64;
@@ -156,9 +162,15 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         }
     }
     let cell_count = world.cells.len();
-    let carnivore_m = if cell_count > 0 { carnivore_sum / cell_count as f64 } else { 0.0 };
+    let carnivore_m = if cell_count > 0 {
+        carnivore_sum / cell_count as f64
+    } else {
+        0.0
+    };
     let gain_mean_dev = |k: usize| -> (f64, f64) {
-        if cell_count == 0 { return (0.0, 0.0); }
+        if cell_count == 0 {
+            return (0.0, 0.0);
+        }
         let n = cell_count as f64;
         let m = gain_sum[k] / n;
         let var = (gain_sumsq[k] / n - m * m).max(0.0);
@@ -185,10 +197,26 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             .gradient_at(pos, bioscape::VIBRATION_SAMPLE_EPSILON);
         vib_grad_mag_sum += ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) as f64).sqrt();
     }
-    let vib_emit_m = if cell_count > 0 { vib_emit_sum / cell_count as f64 } else { 0.0 };
-    let vib_emit_active_m = if cell_count > 0 { vib_emit_active_sum / cell_count as f64 } else { 0.0 };
-    let vib_amp_m = if cell_count > 0 { vib_amp_sum / cell_count as f64 } else { 0.0 };
-    let vib_grad_mag_m = if cell_count > 0 { vib_grad_mag_sum / cell_count as f64 } else { 0.0 };
+    let vib_emit_m = if cell_count > 0 {
+        vib_emit_sum / cell_count as f64
+    } else {
+        0.0
+    };
+    let vib_emit_active_m = if cell_count > 0 {
+        vib_emit_active_sum / cell_count as f64
+    } else {
+        0.0
+    };
+    let vib_amp_m = if cell_count > 0 {
+        vib_amp_sum / cell_count as f64
+    } else {
+        0.0
+    };
+    let vib_grad_mag_m = if cell_count > 0 {
+        vib_grad_mag_sum / cell_count as f64
+    } else {
+        0.0
+    };
     // Sprint 107: speciation distance diagnostic. Sample N pairs random,
     // průměr compatibility_distance na CPPN. Indicator of population-wide
     // genetic divergence (vyšší = víc speciation).
@@ -293,7 +321,9 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         // napříč generacemi, populace je pod selekčním tlakem (predace/hazard),
         // pokud zůstává ~0, žádná nedobrovolná energy loss neprobíhá.
         dmg_sum += c.last_inputs[14] as f64;
-        noise_sum += world.map.sample([c.position[0], c.position[1], c.position[2]]) as f64;
+        noise_sum += world
+            .map
+            .sample([c.position[0], c.position[1], c.position[2]]) as f64;
         energy_sum += c.energy as f64;
         let nx = (c.position[0] / WORLD_HALF[0]).clamp(-1.0, 1.0);
         let ny = (c.position[1] / WORLD_HALF[1]).clamp(-1.0, 1.0);
@@ -335,16 +365,6 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         if cs > 0.6 {
             altruist_count += 1;
         }
-        if let Some(sym) = c.symbiont.as_ref() {
-            sym_count += 1;
-            sym_lineages.insert(sym.lineage_id);
-            if WORLD_HALF[2] > 0.0 {
-                let half_z = WORLD_HALF[2] as f64;
-                sym_z_sum += ((c.position[2] as f64 + half_z) / (2.0 * half_z))
-                    .clamp(0.0, 1.0);
-            }
-            sym_deficit_sum += sym.deficit_streak as f64;
-        }
     }
     let nf = n as f64;
     let spd_m = spd_sum / nf;
@@ -379,7 +399,9 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let edge_f = edge_count as f64 / nf;
     let corner_f = corner_count as f64 / nf;
     let density_m = density_sum / nf;
-    let density_d = ((density_sumsq / nf) - density_m * density_m).max(0.0).sqrt();
+    let density_d = ((density_sumsq / nf) - density_m * density_m)
+        .max(0.0)
+        .sqrt();
     let dmg_m = dmg_sum / nf;
     let noise_m = noise_sum / nf;
     // Sprint 67 bond/adhesion diagnostics.
@@ -388,22 +410,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let bond_active_frac = bonded_cells as f64 / nf;
     // Shannon entropy of adhesion_type distribution, normalized by log2(K)
     // (K = ADHESION_TYPE_COUNT) — uniformní distribuce → 1.0, monokultura → 0.0.
-    let adhesion_entropy = {
-        let k = adhesion_hist.len() as f64;
-        if k <= 1.0 {
-            0.0
-        } else {
-            let mut h = 0.0_f64;
-            for &count in adhesion_hist.iter() {
-                if count == 0 {
-                    continue;
-                }
-                let p = count as f64 / nf;
-                h -= p * p.log2();
-            }
-            h / k.log2()
-        }
-    };
+    let adhesion_entropy = normalized_shannon(&adhesion_hist);
     // Sprint 68 gene means.
     let bond_stiff_m = bond_stiff_sum / nf;
     let bond_damp_m = bond_damp_sum / nf;
@@ -432,8 +439,8 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
                 .enumerate()
                 .map(|(i, c)| (i, c.position, ())),
         );
-        let world_diag = (4.0 * (WORLD_HALF[0] * WORLD_HALF[0] + WORLD_HALF[1] * WORLD_HALF[1]))
-            .sqrt();
+        let world_diag =
+            (4.0 * (WORLD_HALF[0] * WORLD_HALF[0] + WORLD_HALF[1] * WORLD_HALF[1])).sqrt();
         let mut sum = 0.0_f64;
         for i in 0..n {
             let pi = world.cells[i].position;
@@ -482,9 +489,21 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     // aktivním FoodCrash). Single per-gen scalar — žádný spatial average.
     let shock_food_factor =
         bioscape::food_density_shock_multiplier(&world.events.events, world.clock.generation);
-    let spike_count_avg = if n > 0 { spike_count_sum as f64 / nf } else { 0.0 };
-    let spike_complexity_avg = if n > 0 { spike_complexity_sum / nf } else { 0.0 };
-    let spike_total_length_avg = if n > 0 { spike_total_length_sum / nf } else { 0.0 };
+    let spike_count_avg = if n > 0 {
+        spike_count_sum as f64 / nf
+    } else {
+        0.0
+    };
+    let spike_complexity_avg = if n > 0 {
+        spike_complexity_sum / nf
+    } else {
+        0.0
+    };
+    let spike_total_length_avg = if n > 0 {
+        spike_total_length_sum / nf
+    } else {
+        0.0
+    };
     // Sprint 128: coop food per-gen events (solved/failed) + mean arrivals per
     // event (přes všechny zaniklé v gen, vč. expired-without-trigger).
     let coop_arrivals_avg = if world.coop_food_events_gen > 0 {
@@ -495,7 +514,11 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let bonded_attack_eff = if world.bonded_attacks_gen > 0 && world.solo_attacks_gen > 0 {
         let b_avg = world.bonded_attack_gain_sum_gen / world.bonded_attacks_gen as f64;
         let s_avg = world.solo_attack_gain_sum_gen / world.solo_attacks_gen as f64;
-        if s_avg > 0.0 { b_avg / s_avg } else { 0.0 }
+        if s_avg > 0.0 {
+            b_avg / s_avg
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -529,30 +552,53 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let maze_first_reach_total = world.goal_first_reach_tick.len() as u64;
     // Sprint 140: per-cell rate stats from Sprint 136/137 genome fields.
     let (lr_avg, lr_std) = mean_std(world.cells.iter().map(|c| c.genome.learning_rate as f64));
-    let (decay_avg, decay_std) =
-        mean_std(world.cells.iter().map(|c| c.genome.trace_decay_per_sec as f64));
+    let (decay_avg, decay_std) = mean_std(
+        world
+            .cells
+            .iter()
+            .map(|c| c.genome.trace_decay_per_sec as f64),
+    );
     // Sprint 187: per-cell reproduction threshold + birth donation (r/K
     // niche tracking — two axes that should correlate negatively if pure
     // r and K strategies emerge as distinct attractors).
-    let (repro_avg, repro_std) =
-        mean_std(world.cells.iter().map(|c| c.genome.reproduce_at_energy as f64));
-    let (birth_avg, birth_std) =
-        mean_std(world.cells.iter().map(|c| c.genome.birth_energy as f64));
+    let (repro_avg, repro_std) = mean_std(
+        world
+            .cells
+            .iter()
+            .map(|c| c.genome.reproduce_at_energy as f64),
+    );
+    let (birth_avg, birth_std) = mean_std(world.cells.iter().map(|c| c.genome.birth_energy as f64));
     // Sprint 187: per-cell altruism + cluster bonus. Polymorphism vs
     // convergence in long runs answers the kin-selection question.
-    let (altruism_avg, altruism_std) =
-        mean_std(world.cells.iter().map(|c| c.genome.altruism_share_frac as f64));
-    let (cluster_bonus_avg, cluster_bonus_std) =
-        mean_std(world.cells.iter().map(|c| c.genome.cluster_share_bonus as f64));
+    let (altruism_avg, altruism_std) = mean_std(
+        world
+            .cells
+            .iter()
+            .map(|c| c.genome.altruism_share_frac as f64),
+    );
+    let (cluster_bonus_avg, cluster_bonus_std) = mean_std(
+        world
+            .cells
+            .iter()
+            .map(|c| c.genome.cluster_share_bonus as f64),
+    );
     // Sprint 187: per-cell aggression traits. attack_gate drift down = hawk
     // pressure, drift up = dove. defense_contribution drift up = altruistic
     // defense emerging (parallel to altruism_share_frac).
     let (attack_gate_avg, attack_gate_std) =
         mean_std(world.cells.iter().map(|c| c.genome.attack_gate as f64));
-    let (size_ratio_avg, size_ratio_std) =
-        mean_std(world.cells.iter().map(|c| c.genome.predation_size_ratio as f64));
-    let (defense_avg, defense_std) =
-        mean_std(world.cells.iter().map(|c| c.genome.defense_contribution as f64));
+    let (size_ratio_avg, size_ratio_std) = mean_std(
+        world
+            .cells
+            .iter()
+            .map(|c| c.genome.predation_size_ratio as f64),
+    );
+    let (defense_avg, defense_std) = mean_std(
+        world
+            .cells
+            .iter()
+            .map(|c| c.genome.defense_contribution as f64),
+    );
     // Sprint 187: per-cell reward weights (7 kinds). Means only — stds skipped
     // for CSV compactness (variance can be inferred from per-tick events).
     let mut rw_means = [0.0_f64; bioscape::N_REWARD_KINDS];
@@ -612,13 +658,78 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         .map(|c| c.genome.brain.hidden_n)
         .max()
         .unwrap_or(0);
-    let sym_fraction = if n > 0 { sym_count as f64 / nf } else { 0.0 };
-    let sym_lineage_count = sym_lineages.len() as u64;
-    let sym_z_avg = if sym_count > 0 { sym_z_sum / sym_count as f64 } else { 0.0 };
-    let sym_deficit_avg = if sym_count > 0 { sym_deficit_sum / sym_count as f64 } else { 0.0 };
+    // Sprint 203: complexity & open-endedness metrics. `complexity_floor` is
+    // the simplest surviving brain (min active hidden count) — the ratchet
+    // target, expected to rise once selection rewards computation. `cppn_*`
+    // track structural genome size; `behavioral_entropy` is strategy-space
+    // diversity. `species_count` is a placeholder (0) here — Sprint 204 fills
+    // it from the CPPN speciation gate.
+    let complexity_floor = world
+        .cells
+        .iter()
+        .map(|c| c.genome.brain.hidden_n)
+        .min()
+        .unwrap_or(0);
+    let cppn_nodes_avg = world
+        .cells
+        .iter()
+        .map(|c| c.genome.cppn.num_nodes as f64)
+        .sum::<f64>()
+        / nf;
+    let cppn_links_avg = world
+        .cells
+        .iter()
+        .map(|c| c.genome.cppn.num_links as f64)
+        .sum::<f64>()
+        / nf;
+    let behavioral_entropy_strategy = behavioral_entropy(&world.cells);
+    // Sprint 204: distinct CPPN-compatibility species assigned at the last
+    // generation boundary by `World::classify_species`.
+    let species_count = world
+        .cells
+        .iter()
+        .map(|c| c.species_id)
+        .collect::<std::collections::HashSet<u32>>()
+        .len() as u64;
+    // Sprint 206: occupied cells of the MAP-Elites archive — open-endedness
+    // proxy (how much of strategy space the population has ever covered).
+    let elite_coverage = world.elite_archive.len() as u64;
+    // S213: mean sexual-vs-asexual preference gene — reveals which reproduction
+    // strategy evolution favours (1.0 = all sexual, 0.0 = all asexual division).
+    let sexual_pref_avg = if n > 0 {
+        world
+            .cells
+            .iter()
+            .map(|c| c.genome.sexual_pref as f64)
+            .sum::<f64>()
+            / nf
+    } else {
+        0.0
+    };
+    // S213: mean division bond-inheritance gene — tracks whether selection
+    // favours heritable multicellularity (1.0 = always inherit, 0.0 = never).
+    let bond_inherit_pref_avg = if n > 0 {
+        world
+            .cells
+            .iter()
+            .map(|c| c.genome.bond_inherit_pref as f64)
+            .sum::<f64>()
+            / nf
+    } else {
+        0.0
+    };
+    // Axis C morphogenesis diagnostics. `cluster_size_max` = largest bonded
+    // connected component (organism size). `morphogen_max` = deepest interiority
+    // reached (cluster compactness proxy).
+    let morphogen_max = world
+        .morphogen
+        .values()
+        .copied()
+        .fold(0.0_f32, f32::max) as f64;
+    let cluster_size_max = largest_bond_cluster(&world.cells) as f64;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{:.3},{:.3},{},{:.4},{},{:.4},{:.2},{},{:.4}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{:.3},{:.3},{:.4},{},{:.3},{:.3},{:.3},{},{},{:.4},{:.4},{:.0},{:.4}",
         world.clock.generation,
         n,
         spd_m,
@@ -770,18 +881,63 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         hidden_n_max,
         rw_means[7], // HazardAvoided
         rw_means[8], // ThreatEscaped
-        // Sprint 196: endosymbiosis diagnostics.
-        sym_count,
-        sym_fraction,
-        sym_lineage_count,
-        sym_z_avg,
-        sym_deficit_avg,
-        world.sym_sheds_gen,
         // Brain-controlled vibration emit (rectified last_outputs[14] ×
         // MAX_ACTIVE_EMIT, averaged over the population). Compare with
         // `vib_emit_m` (total) — passive component = total − active.
         vib_emit_active_m,
+        // Sprint 203: complexity & open-endedness metrics.
+        complexity_floor,
+        cppn_nodes_avg,
+        cppn_links_avg,
+        behavioral_entropy_strategy,
+        species_count,
+        // Sprint 206: MAP-Elites archive coverage (occupied behavioural cells).
+        elite_coverage,
+        // S213: mean sexual_pref gene.
+        sexual_pref_avg,
+        // S213: mean bond_inherit_pref gene.
+        bond_inherit_pref_avg,
+        // Axis C: morphogenesis diagnostics.
+        cluster_size_max,
+        morphogen_max,
     )
+}
+
+/// Largest connected component over the bond graph (= biggest multicellular
+/// organism). Union-find with path compression; O(N·MAX_BONDS·α).
+fn largest_bond_cluster(cells: &[bioscape::Cell]) -> u32 {
+    let n = cells.len();
+    if n == 0 {
+        return 0;
+    }
+    let idx: std::collections::HashMap<u64, usize> =
+        cells.iter().enumerate().map(|(i, c)| (c.cell_id, i)).collect();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for (i, c) in cells.iter().enumerate() {
+        for bond in c.bonds.iter().flatten() {
+            if let Some(&j) = idx.get(&bond.other_cell_id) {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut sizes = vec![0u32; n];
+    let mut best = 1u32;
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        sizes[r] += 1;
+        best = best.max(sizes[r]);
+    }
+    best
 }
 
 /// Sprint 140: shared mean/stddev reducer for the new per-cell genome
@@ -893,9 +1049,7 @@ fn w1_effective_rank_avg(cells: &[Cell]) -> f64 {
             // Off-diagonal pairs counted twice (G symmetric).
             for j in (i + 1)..h_n {
                 let row_j = &w1[j];
-                let g_ij: f64 = (0..active)
-                    .map(|k| row_i[k] as f64 * row_j[k] as f64)
-                    .sum();
+                let g_ij: f64 = (0..active).map(|k| row_i[k] as f64 * row_j[k] as f64).sum();
                 frob_sq += 2.0 * g_ij * g_ij;
             }
         }
@@ -955,6 +1109,46 @@ pub fn attack_entropy(cells: &[Cell]) -> f64 {
     h
 }
 
+/// Sprint 203: normalized base-2 Shannon entropy of a histogram. Divided by
+/// `log2(bins)` so a uniform spread returns 1.0 and a single occupied bin 0.0.
+fn normalized_shannon(hist: &[u64]) -> f64 {
+    let total: u64 = hist.iter().sum();
+    let bins = hist.len();
+    if total == 0 || bins <= 1 {
+        return 0.0;
+    }
+    let t = total as f64;
+    let mut h = 0.0_f64;
+    for &count in hist {
+        if count == 0 {
+            continue;
+        }
+        let p = count as f64 / t;
+        h -= p * p.log2();
+    }
+    h / (bins as f64).log2()
+}
+
+/// Sprint 203: strategy-space diversity — normalized Shannon entropy over a
+/// 4×4×4 grid of (carnivore_score, vertical niche z_norm, vision_fov). 1.0 =
+/// strategies spread across the whole space, 0.0 = monoculture. Complements
+/// the behaviour-signal `attack_entropy` with a genotype-strategy view of how
+/// the population is partitioned across ecological niches.
+fn behavioral_entropy(cells: &[Cell]) -> f64 {
+    if cells.is_empty() {
+        return 0.0;
+    }
+    const B: usize = 4;
+    let mut hist = [0_u64; B * B * B];
+    for c in cells {
+        let carn = bin_unit(c.genome.carnivore_score, B);
+        let zb = bin_unit(vertical_niche_z(c.position, WORLD_HALF), B);
+        let fb = bin_unit(c.genome.vision_fov / std::f32::consts::PI, B);
+        hist[carn * B * B + zb * B + fb] += 1;
+    }
+    normalized_shannon(&hist)
+}
+
 /// Sprint 111: zapíše scheduled shock events do sidecar CSV vedle hlavního
 /// out_path (`events_seed{seed}.csv`). Caller už ověřil, že `events` není prázdný.
 pub fn write_events_sidecar(
@@ -966,7 +1160,10 @@ pub fn write_events_sidecar(
     let sidecar = dir.join(format!("events_seed{}.csv", seed));
     let file = std::fs::File::create(&sidecar)?;
     let mut w = BufWriter::new(file);
-    writeln!(w, "start_gen,duration_gen,kind,intensity,center_x,center_y,radius")?;
+    writeln!(
+        w,
+        "start_gen,duration_gen,kind,intensity,center_x,center_y,radius"
+    )?;
     for e in &events.events {
         let kind = match e.kind {
             bioscape::ShockKind::HazardPulse => "hazard_pulse",
@@ -981,10 +1178,7 @@ pub fn write_events_sidecar(
             .center_xy
             .map(|c| format!("{:.2}", c[1]))
             .unwrap_or_default();
-        let r = e
-            .radius
-            .map(|r| format!("{:.2}", r))
-            .unwrap_or_default();
+        let r = e.radius.map(|r| format!("{:.2}", r)).unwrap_or_default();
         writeln!(
             w,
             "{},{},{},{:.3},{},{},{}",

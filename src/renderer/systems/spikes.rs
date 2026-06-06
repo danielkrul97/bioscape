@@ -50,11 +50,8 @@ pub(crate) fn sync_spikes(
         // expensive and unnecessary for visual feedback.
         let surface = CELL_RADIUS * cell.phenotype.effective_radius();
         let half_len = s.length * 0.5 * CELL_RADIUS;
-        let center = Vec3::new(
-            cell.position[0],
-            cell.position[1],
-            cell.position[2],
-        ) + dir * (surface + half_len);
+        let center = Vec3::new(cell.position[0], cell.position[1], cell.position[2])
+            + dir * (surface + half_len);
         let thickness = SPIKE_THICKNESS_FRAC * CELL_RADIUS;
         let length = s.length * CELL_RADIUS;
         transform.translation = center;

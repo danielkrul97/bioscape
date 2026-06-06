@@ -20,7 +20,7 @@
 
 use bevy::log;
 use bevy::prelude::Resource;
-use bioscape::{INITIAL_CELLS, MATING_RADIUS, MAX_POPULATION, MazeDifficulty, WORLD_MAP_SEED};
+use bioscape::{MazeDifficulty, INITIAL_CELLS, MATING_RADIUS, MAX_POPULATION, WORLD_MAP_SEED};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

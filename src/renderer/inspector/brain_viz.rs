@@ -17,7 +17,13 @@ const BAR_GAP: f32 = 2.0;
 
 pub(super) fn brain_panel(ui: &mut Ui, cell: &Cell) {
     ui.horizontal(|ui| {
-        column(ui, "Inputs", &cell.last_inputs[..], BRAIN_INPUTS, input_label);
+        column(
+            ui,
+            "Inputs",
+            &cell.last_inputs[..],
+            BRAIN_INPUTS,
+            input_label,
+        );
         ui.separator();
         column(
             ui,
@@ -68,11 +74,7 @@ fn activation_row(ui: &mut Ui, idx: usize, value: f32, label: &str) {
                 .weak(),
         );
         draw_bar(ui, value);
-        ui.label(
-            RichText::new(format!("{:+.2}", value))
-                .monospace()
-                .small(),
-        );
+        ui.label(RichText::new(format!("{:+.2}", value)).monospace().small());
         ui.label(RichText::new(label).small().weak());
     });
 }
@@ -401,11 +403,9 @@ pub(super) fn history_panel(ui: &mut Ui, history: &ActivationHistory) {
     let len = history.hidden.len();
     if len < 2 {
         ui.label(
-            RichText::new(
-                "Recording… (history fills as the cell ticks; freezes on death)",
-            )
-            .small()
-            .weak(),
+            RichText::new("Recording… (history fills as the cell ticks; freezes on death)")
+                .small()
+                .weak(),
         );
         return;
     }
@@ -529,7 +529,11 @@ fn top_active_neurons<const N: usize>(
         }
     }
     let mut idx: Vec<usize> = (0..count).collect();
-    idx.sort_by(|a, b| energy[*b].partial_cmp(&energy[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|a, b| {
+        energy[*b]
+            .partial_cmp(&energy[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     idx.truncate(k.min(count));
     idx.sort();
     idx

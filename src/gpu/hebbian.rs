@@ -3,8 +3,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::*;
 use super::*;
+use crate::*;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -98,7 +98,11 @@ impl HebbianGpu {
                 wgpu::BindGroupLayoutEntry {
                     binding: i,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer {
+                        ty,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 }
             })
@@ -137,15 +141,20 @@ impl HebbianGpu {
                 wgpu::BindGroupLayoutEntry {
                     binding: i,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer {
+                        ty,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 }
             })
             .collect();
-        let bind_group_layout_step = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("hebbian-step-bgl"),
-            entries: &step_entries,
-        });
+        let bind_group_layout_step =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("hebbian-step-bgl"),
+                entries: &step_entries,
+            });
         let pipeline_layout_step = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("hebbian-step-pl"),
             bind_group_layouts: &[&bind_group_layout_step],
@@ -176,20 +185,26 @@ impl HebbianGpu {
                 wgpu::BindGroupLayoutEntry {
                     binding: i,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer {
+                        ty,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 }
             })
             .collect();
-        let bind_group_layout_apply = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("hebbian-apply-bgl"),
-            entries: &apply_entries,
-        });
-        let pipeline_layout_apply = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("hebbian-apply-pl"),
-            bind_group_layouts: &[&bind_group_layout_apply],
-            push_constant_ranges: &[],
-        });
+        let bind_group_layout_apply =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("hebbian-apply-bgl"),
+                entries: &apply_entries,
+            });
+        let pipeline_layout_apply =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("hebbian-apply-pl"),
+                bind_group_layouts: &[&bind_group_layout_apply],
+                push_constant_ranges: &[],
+            });
         let pipeline_apply = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("hebbian-apply-pipeline"),
             layout: Some(&pipeline_layout_apply),
@@ -219,24 +234,52 @@ impl HebbianGpu {
             })
         };
         let stor_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let stor_dst_src = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let stor_dst_src = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let inputs_buf = mk("hebbian-inputs", n * (BRAIN_INPUTS as u64) * f, stor_dst);
         let hidden_buf = mk("hebbian-hidden", n * (BRAIN_HIDDEN as u64) * f, stor_dst);
         let outputs_buf = mk("hebbian-outputs", n * (BRAIN_OUTPUTS as u64) * f, stor_dst);
         let rewards_buf = mk("hebbian-rewards", n * f, stor_dst);
-        let weights_buf = mk("hebbian-weights", n * (BRAIN_WEIGHTS_PER_CELL as u64) * f, stor_dst_src);
-        let weights_rb = mk("hebbian-weights-rb", n * (BRAIN_WEIGHTS_PER_CELL as u64) * f, read);
+        let weights_buf = mk(
+            "hebbian-weights",
+            n * (BRAIN_WEIGHTS_PER_CELL as u64) * f,
+            stor_dst_src,
+        );
+        let weights_rb = mk(
+            "hebbian-weights-rb",
+            n * (BRAIN_WEIGHTS_PER_CELL as u64) * f,
+            read,
+        );
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hebbian-bg"),
             layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: inputs_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: hidden_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: outputs_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: rewards_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: weights_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: inputs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: hidden_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: outputs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: rewards_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: weights_buf.as_entire_binding(),
+                },
             ],
         });
         Ok(Self {
@@ -288,17 +331,37 @@ impl HebbianGpu {
             label: Some("hebbian-step-bg-persistent"),
             layout: &self.bind_group_layout_step,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.step_params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.last_inputs_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.brain_traces_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cells_gpu.trace_decays_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.step_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cells_gpu.last_inputs_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cells_gpu.last_hidden_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: cells_gpu.last_outputs_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cells_gpu.brain_traces_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cells_gpu.trace_decays_buffer().as_entire_binding(),
+                },
             ],
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("hebbian-step-encoder-persistent"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hebbian-step-encoder-persistent"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("hebbian-step-pass-persistent"),
@@ -339,18 +402,41 @@ impl HebbianGpu {
             label: Some("hebbian-apply-bg-persistent"),
             layout: &self.bind_group_layout_apply,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.rewards_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cells_gpu.brain_traces_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: cells_gpu.learning_rates_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cells_gpu.last_hidden_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cells_gpu.last_outputs_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: cells_gpu.rewards_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cells_gpu.brain_weights_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cells_gpu.brain_traces_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: cells_gpu.learning_rates_buffer().as_entire_binding(),
+                },
             ],
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("hebbian-apply-encoder-persistent"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hebbian-apply-encoder-persistent"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("hebbian-apply-pass-persistent"),
@@ -390,9 +476,13 @@ impl HebbianGpu {
         let mut weights_flat: Vec<f32> = Vec::with_capacity(n * BRAIN_WEIGHTS_PER_CELL);
         let mut count = 0;
         for brain in brains.into_iter().take(n) {
-            for row in brain.w1.iter() { weights_flat.extend_from_slice(row); }
+            for row in brain.w1.iter() {
+                weights_flat.extend_from_slice(row);
+            }
             weights_flat.extend_from_slice(&brain.b1);
-            for row in brain.w2.iter() { weights_flat.extend_from_slice(row); }
+            for row in brain.w2.iter() {
+                weights_flat.extend_from_slice(row);
+            }
             weights_flat.extend_from_slice(&brain.b2);
             count += 1;
         }
@@ -403,16 +493,24 @@ impl HebbianGpu {
             learning_rate,
             ..HebbianParams::default()
         };
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue.write_buffer(&self.inputs_buf, 0, bytemuck::cast_slice(&inputs_flat));
-        self.queue.write_buffer(&self.hidden_buf, 0, bytemuck::cast_slice(&hidden_flat));
-        self.queue.write_buffer(&self.outputs_buf, 0, bytemuck::cast_slice(&outputs_flat));
-        self.queue.write_buffer(&self.rewards_buf, 0, bytemuck::cast_slice(rewards));
-        self.queue.write_buffer(&self.weights_buf, 0, bytemuck::cast_slice(&weights_flat));
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.inputs_buf, 0, bytemuck::cast_slice(&inputs_flat));
+        self.queue
+            .write_buffer(&self.hidden_buf, 0, bytemuck::cast_slice(&hidden_flat));
+        self.queue
+            .write_buffer(&self.outputs_buf, 0, bytemuck::cast_slice(&outputs_flat));
+        self.queue
+            .write_buffer(&self.rewards_buf, 0, bytemuck::cast_slice(rewards));
+        self.queue
+            .write_buffer(&self.weights_buf, 0, bytemuck::cast_slice(&weights_flat));
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("hebbian-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hebbian-encoder"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("hebbian-pass"),
@@ -427,7 +525,9 @@ impl HebbianGpu {
         self.queue.submit(Some(encoder.finish()));
         let s = self.weights_rb.slice(0..bytes);
         s.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let data = s.get_mapped_range();
         let f: &[f32] = bytemuck::cast_slice(&data);
         let mut out: Vec<Brain> = Vec::with_capacity(n);
@@ -479,12 +579,7 @@ impl HebbianGpu {
     /// (`last_inputs`, `last_hidden`, `last_outputs`, `rewards`,
     /// `brain_weights`). Brain weights stay resident on the GPU across
     /// ticks; this call mutates them in place. Run after `upload_rewards()`.
-    pub fn compute_persistent(
-        &self,
-        cells_gpu: &CellsGpu,
-        n: usize,
-        learning_rate: f32,
-    ) {
+    pub fn compute_persistent(&self, cells_gpu: &CellsGpu, n: usize, learning_rate: f32) {
         if n == 0 {
             return;
         }
@@ -493,22 +588,43 @@ impl HebbianGpu {
             learning_rate,
             ..HebbianParams::default()
         };
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hebbian-bg-persistent"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.last_inputs_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.rewards_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cells_gpu.last_inputs_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cells_gpu.last_hidden_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: cells_gpu.last_outputs_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cells_gpu.rewards_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cells_gpu.brain_weights_buffer().as_entire_binding(),
+                },
             ],
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("hebbian-encoder-persistent"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hebbian-encoder-persistent"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("hebbian-pass-persistent"),
@@ -521,4 +637,3 @@ impl HebbianGpu {
         self.queue.submit(Some(encoder.finish()));
     }
 }
-

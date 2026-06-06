@@ -17,14 +17,14 @@
 //   3. hidden = 2 × spike_count / IZH_SUBSTEPS − 1 (maps to [-1, +1]).
 //   4. L2 matvec + tanh → outputs.
 
-const BRAIN_INPUTS: u32 = 86u;
+const BRAIN_INPUTS: u32 = 85u;
 const BRAIN_HIDDEN: u32 = 45u;
 const BRAIN_OUTPUTS: u32 = 15u;
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3870u;
-const W2_OFFSET: u32 = 3915u;
-const B2_OFFSET: u32 = 4590u;
-const WEIGHTS_PER_CELL: u32 = 4605u;
+const B1_OFFSET: u32 = 3825u;
+const W2_OFFSET: u32 = 3870u;
+const B2_OFFSET: u32 = 4545u;
+const WEIGHTS_PER_CELL: u32 = 4560u;
 
 const IZH_A: f32 = 0.02;
 const IZH_B: f32 = 0.2;

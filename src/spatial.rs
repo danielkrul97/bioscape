@@ -180,4 +180,3 @@ impl<Id: Copy, P: Copy> SpatialGrid<Id, P> {
 /// (50). Větší = méně buckets, víc kandidátů per query; menší = víc buckets,
 /// méně kandidátů. Renderer v `main.rs` má svůj vlastní knob.
 pub const GRID_CELL_SIZE: f32 = 64.0;
-

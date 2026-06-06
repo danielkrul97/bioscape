@@ -3,8 +3,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::*;
 use super::*;
+use crate::*;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
@@ -440,7 +440,9 @@ impl BrainGpu {
         let outputs_slice = self.outputs_readback.slice(0..outputs_bytes);
         hidden_slice.map_async(wgpu::MapMode::Read, |_| {});
         outputs_slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
 
         {
             let h_data = hidden_slice.get_mapped_range();
@@ -477,9 +479,11 @@ impl BrainGpu {
         if n == 0 {
             return;
         }
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("brain-encoder-persistent"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("brain-encoder-persistent"),
+            });
         self.forward_persistent_into(&mut encoder, cells_gpu, n, hidden_n, lateral_alpha);
         self.queue.submit(Some(encoder.finish()));
     }
@@ -501,22 +505,43 @@ impl BrainGpu {
             lateral_inhibition_alpha: lateral_alpha,
             ..Params::default()
         };
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue.write_buffer(&self.hidden_n_buf, 0, bytemuck::cast_slice(hidden_n));
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.hidden_n_buf, 0, bytemuck::cast_slice(hidden_n));
         let cells_epoch = cells_gpu.epoch();
         if self.cached_persistent_bg.is_none() || self.cached_persistent_epoch != cells_epoch {
-            self.cached_persistent_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("brain-bg-persistent"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.last_inputs_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.last_hidden_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.last_outputs_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: self.hidden_n_buf.as_entire_binding() },
-                ],
-            }));
+            self.cached_persistent_bg =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("brain-bg-persistent"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: cells_gpu.last_inputs_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: cells_gpu.brain_weights_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: cells_gpu.last_hidden_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: cells_gpu.last_outputs_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: self.hidden_n_buf.as_entire_binding(),
+                        },
+                    ],
+                }));
             self.cached_persistent_epoch = cells_epoch;
         }
         let bind_group = self.cached_persistent_bg.as_ref().unwrap();

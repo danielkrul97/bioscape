@@ -55,18 +55,18 @@ pub const N_BOND_MSG_CHANNELS: usize = 2;
 // and BRAIN_INPUTS 78→84. CHECKPOINT_VERSION bumped — pre-V9 brain weights
 // don't match the new w1 matrix shape and re-init from CPPN at next reproduce.
 //
-// Sprint 198 endosymbiosis brain integration (slots [39..41]): 2 symbiont
-// passenger inputs — has_symbiont (0 or 1) and deficit_norm (deficit_streak
-// / SYMBIONT_UPKEEP_DEFICIT_TICKS, clamped to [0, 1]). Lets the brain
-// correlate motor outputs with bearer status — without these, the host
-// can't evolve to swim toward upper z to keep its symbiont alive.
-// Shifts BRAIN_INPUTS_SENSORY 39→41, BRAIN_INPUTS 84→86. CHECKPOINT_VERSION
-// bumped to V9 — pre-V8 brain weight matrices don't match the new w1 shape.
-/// Per-host symbiont brain inputs: `has_symbiont` + `deficit_norm`.
-pub const N_SYMBIONT_INPUTS: usize = 2;
-pub const BRAIN_INPUTS_SENSORY: usize =
-    27 + N_BOND_MSG_CHANNELS + crate::params::vibration::N_VIBRATION_INPUTS
-        + crate::params::maze::WHISKER_COUNT + N_SYMBIONT_INPUTS;
+/// S213+ social call-response: one sensory slot carrying the net *unanswered
+/// handshake call* a cell perceives from nearby coop nodes (signed: it tells the
+/// cell which complementary role is missing and how close, so it can navigate to
+/// the node and emit the answering signal). Closes the perceive→respond loop the
+/// blind handshake lacked. Written into the slot just past the whiskers; see
+/// `sensors.rs` / `populate_inputs.wgsl`.
+pub const N_COOP_CALL_INPUTS: usize = 1;
+pub const BRAIN_INPUTS_SENSORY: usize = 27
+    + N_BOND_MSG_CHANNELS
+    + crate::params::vibration::N_VIBRATION_INPUTS
+    + crate::params::maze::WHISKER_COUNT
+    + N_COOP_CALL_INPUTS;
 // Sprint 39: 8 → 16 — větší hidden kapacita pro 3D + gravity. 28 inputs → 8
 // hidden bylo příliš stěsnaný "kompresní bottleneck" pro 3D navigaci.
 // w1 z 28×8=224 na 36×16=576 weights (2.6×).
@@ -166,3 +166,17 @@ pub const INNATE_BOND_BIAS: f32 = 2.5;
 /// the bias positive (or build positive weight pathways from hidden units)
 /// before active emission turns on. tanh(-2.0) ≈ -0.96, rectified to 0.
 pub const INNATE_VIBRATION_EMIT_BIAS: f32 = -2.0;
+/// Handshake-signal biases on the two bond-message outputs (b2[12]=A, b2[13]=B).
+/// Those channels were fully plumbed but fitness-neutral (dormant) until the
+/// coop-food handshake attached a payoff to them. Deliberately ASYMMETRIC: A is
+/// biased on (fresh brains are A-callers, tanh(1.0)≈0.76 > threshold), B is
+/// biased off (tanh(-1.0)≈−0.76, rectified to 0). A symmetric bias made both
+/// channels sit at ≈0.46 so no cell was a clear role-player and handshakes never
+/// bootstrapped. With the asymmetry the gen-0 world is full of callers waiting
+/// for a responder, so the first cell that evolves B (a single upward push on
+/// b2[13]) is immediately rewarded by every nearby caller — the responder role
+/// evolves *to meet the abundant call*, the way real signalling systems
+/// bootstrap. Negative-frequency dependence (rare role pays most) plus the
+/// novelty bonus then balance the two roles.
+pub const INNATE_HANDSHAKE_A_BIAS: f32 = 1.0;
+pub const INNATE_HANDSHAKE_B_BIAS: f32 = -1.0;

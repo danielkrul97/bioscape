@@ -1,5 +1,5 @@
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use wide::f32x8;
 
@@ -190,12 +190,9 @@ impl Brain {
     pub fn from_cppn(cppn: &Cppn, hidden_n: u32) -> Brain {
         // Pre-compute substrate coordinates — otherwise input coords are
         // recomputed BRAIN_HIDDEN times, hidden coords BRAIN_OUTPUTS times.
-        let input_coords: [_; BRAIN_INPUTS] =
-            std::array::from_fn(substrate_input_coords);
-        let hidden_coords: [_; BRAIN_HIDDEN] =
-            std::array::from_fn(substrate_hidden_coords);
-        let output_coords: [_; BRAIN_OUTPUTS] =
-            std::array::from_fn(substrate_output_coords);
+        let input_coords: [_; BRAIN_INPUTS] = std::array::from_fn(substrate_input_coords);
+        let hidden_coords: [_; BRAIN_HIDDEN] = std::array::from_fn(substrate_hidden_coords);
+        let output_coords: [_; BRAIN_OUTPUTS] = std::array::from_fn(substrate_output_coords);
 
         let mut w1 = [[0.0_f32; BRAIN_INPUTS]; BRAIN_HIDDEN];
         let mut b1 = [0.0_f32; BRAIN_HIDDEN];
@@ -215,9 +212,7 @@ impl Brain {
                 for k in 0..count {
                     let from_c = input_coords[i + k];
                     inputs_buf[k] = [
-                        from_c[0], from_c[1], from_c[2],
-                        to_c[0], to_c[1], to_c[2],
-                        1.0,
+                        from_c[0], from_c[1], from_c[2], to_c[0], to_c[1], to_c[2], 1.0,
                     ];
                 }
                 let pad = inputs_buf[count - 1];
@@ -240,9 +235,7 @@ impl Brain {
             let count = (BRAIN_HIDDEN - h).min(8);
             for k in 0..count {
                 let to_c = hidden_coords[h + k];
-                inputs_buf[k] = [
-                    to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0,
-                ];
+                inputs_buf[k] = [to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0];
             }
             let pad = inputs_buf[count - 1];
             for k in count..8 {
@@ -264,9 +257,7 @@ impl Brain {
                 for k in 0..count {
                     let from_c = hidden_coords[h + k];
                     inputs_buf[k] = [
-                        from_c[0], from_c[1], from_c[2],
-                        to_c[0], to_c[1], to_c[2],
-                        1.0,
+                        from_c[0], from_c[1], from_c[2], to_c[0], to_c[1], to_c[2], 1.0,
                     ];
                 }
                 let pad = inputs_buf[count - 1];
@@ -289,9 +280,7 @@ impl Brain {
             let count = (BRAIN_OUTPUTS - o).min(8);
             for k in 0..count {
                 let to_c = output_coords[o + k];
-                inputs_buf[k] = [
-                    to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0,
-                ];
+                inputs_buf[k] = [to_c[0], to_c[1], to_c[2], to_c[0], to_c[1], to_c[2], 0.0];
             }
             let pad = inputs_buf[count - 1];
             for k in count..8 {
@@ -538,9 +527,7 @@ pub mod serde_arr_inputs {
     pub fn serialize<S: Serializer>(a: &[f32; BRAIN_INPUTS], s: S) -> Result<S::Ok, S::Error> {
         a.as_slice().serialize(s)
     }
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<[f32; BRAIN_INPUTS], D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; BRAIN_INPUTS], D::Error> {
         let v: Vec<f32> = Vec::deserialize(d)?;
         if v.len() != BRAIN_INPUTS {
             return Err(serde::de::Error::custom("inputs length mismatch"));
@@ -557,9 +544,7 @@ pub mod serde_arr_hidden {
     pub fn serialize<S: Serializer>(a: &[f32; BRAIN_HIDDEN], s: S) -> Result<S::Ok, S::Error> {
         a.as_slice().serialize(s)
     }
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<[f32; BRAIN_HIDDEN], D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; BRAIN_HIDDEN], D::Error> {
         let v: Vec<f32> = Vec::deserialize(d)?;
         if v.len() != BRAIN_HIDDEN {
             return Err(serde::de::Error::custom("hidden length mismatch"));
@@ -582,8 +567,7 @@ impl Brain {
     /// sequence byte-identical.
     pub fn random_with_hidden(rng: &mut impl Rng, hidden_n: u32) -> Self {
         debug_assert!(
-            (hidden_n as usize) >= BRAIN_HIDDEN_MIN
-                && (hidden_n as usize) <= BRAIN_HIDDEN,
+            (hidden_n as usize) >= BRAIN_HIDDEN_MIN && (hidden_n as usize) <= BRAIN_HIDDEN,
             "hidden_n {} out of [{}, {}]",
             hidden_n,
             BRAIN_HIDDEN_MIN,
@@ -626,6 +610,10 @@ impl Brain {
         // wants a high baseline). Just enough to avoid a cold start near 0.
         b2[10] += INNATE_PHEROMONE_AUX_BIAS;
         b2[11] += INNATE_PHEROMONE_AUX_BIAS;
+        // Handshake signals (bond-message channels): A (12) on by default, B (13)
+        // off — fresh brains are callers, the responder role evolves to meet them.
+        b2[12] += INNATE_HANDSHAKE_A_BIAS;
+        b2[13] += INNATE_HANDSHAKE_B_BIAS;
         // Vibration emit: silent default. See INNATE_VIBRATION_EMIT_BIAS docs.
         b2[VIBRATION_EMIT_OUTPUT] += INNATE_VIBRATION_EMIT_BIAS;
         Self {
@@ -811,11 +799,7 @@ impl Brain {
             if L1_TAIL > 0 {
                 let mut tail = [0.0_f32; 8];
                 tail[..L1_TAIL].copy_from_slice(&row[L1_FULL * 8..]);
-                kahan_step_simd(
-                    f32x8::new(tail) * input_lanes[L1_FULL],
-                    &mut acc,
-                    &mut comp,
-                );
+                kahan_step_simd(f32x8::new(tail) * input_lanes[L1_FULL], &mut acc, &mut comp);
             }
             pre_hidden[i] = self.b1[i] + kahan_reduce_lanes(acc);
         }
@@ -1072,13 +1056,7 @@ impl Brain {
     /// S133 reward funnel). Reward 0 → no weight change; reward > 0
     /// boosts the LTP/LTD magnitudes uniformly. Three-factor learning
     /// in the simplest form (timing × pair × reward).
-    pub fn stdp_apply_rewarded(
-        &mut self,
-        tick: u32,
-        a_plus: f32,
-        a_minus: f32,
-        reward: f32,
-    ) {
+    pub fn stdp_apply_rewarded(&mut self, tick: u32, a_plus: f32, a_minus: f32, reward: f32) {
         if reward == 0.0 {
             return;
         }

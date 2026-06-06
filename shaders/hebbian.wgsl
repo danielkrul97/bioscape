@@ -16,14 +16,14 @@
 // dead-zone neurons have `last_hidden = 0`, so their updates resolve to
 // `lr · 0 · x = 0` and leave weights untouched.
 
-const BRAIN_INPUTS: u32 = 86u;       // Wave 2: 27 + 2 bond inbox + 4 vibration + 6 whisker + 45 recurrent
+const BRAIN_INPUTS: u32 = 85u;       // Wave 2: 27 + 2 bond inbox + 4 vibration + 6 whisker + 45 recurrent
 const BRAIN_HIDDEN: u32 = 45u;
 const BRAIN_OUTPUTS: u32 = 15u;      // 12 motor/morph + 2 bond message + 1 vibration emit
 const W1_OFFSET: u32 = 0u;
-const B1_OFFSET: u32 = 3870u;        // BRAIN_HIDDEN * BRAIN_INPUTS
-const W2_OFFSET: u32 = 3915u;        // B1_OFFSET + BRAIN_HIDDEN
-const B2_OFFSET: u32 = 4590u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
-const WEIGHTS_PER_CELL: u32 = 4605u; // B2_OFFSET + BRAIN_OUTPUTS
+const B1_OFFSET: u32 = 3825u;        // BRAIN_HIDDEN * BRAIN_INPUTS
+const W2_OFFSET: u32 = 3870u;        // B1_OFFSET + BRAIN_HIDDEN
+const B2_OFFSET: u32 = 4545u;        // W2_OFFSET + BRAIN_OUTPUTS * BRAIN_HIDDEN
+const WEIGHTS_PER_CELL: u32 = 4560u; // B2_OFFSET + BRAIN_OUTPUTS
 
 struct HebbianParams {
     num_cells: u32,

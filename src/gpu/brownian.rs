@@ -68,7 +68,11 @@ impl BrownianGpu {
                 wgpu::BindGroupLayoutEntry {
                     binding: i,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer {
+                        ty,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 }
             })
@@ -105,29 +109,61 @@ impl BrownianGpu {
                 mapped_at_creation: false,
             })
         };
-        let stor_dst_src = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let stor_dst_src = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let velocities_buf = mk("brownian-vel", n * 3 * f, stor_dst_src);
         let state_buf = mk("brownian-state", n * 4 * 4, stor_dst_src);
-        let masses_buf = mk("brownian-masses", n * f, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let masses_buf = mk(
+            "brownian-masses",
+            n * f,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         // Default = 1.0 so legacy `compute()` callers without a mass upload
         // behave like the pre-S202 (no-mass) shader.
-        queue.write_buffer(&masses_buf, 0, bytemuck::cast_slice(&vec![1.0_f32; capacity]));
+        queue.write_buffer(
+            &masses_buf,
+            0,
+            bytemuck::cast_slice(&vec![1.0_f32; capacity]),
+        );
         let velocities_rb = mk("brownian-vel-rb", n * 3 * f, read);
         let state_rb = mk("brownian-state-rb", n * 4 * 4, read);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("brownian-bg"),
             layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: velocities_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: state_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: masses_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: velocities_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: masses_buf.as_entire_binding(),
+                },
             ],
         });
         Ok(Self {
-            device, queue, pipeline, bind_group_layout, capacity,
-            params_buf, velocities_buf, state_buf, masses_buf, velocities_rb, state_rb, bind_group,
+            device,
+            queue,
+            pipeline,
+            bind_group_layout,
+            capacity,
+            params_buf,
+            velocities_buf,
+            state_buf,
+            masses_buf,
+            velocities_rb,
+            state_rb,
+            bind_group,
             cached_persistent_bg: None,
             cached_persistent_epoch: 0,
         })
@@ -155,12 +191,17 @@ impl BrownianGpu {
             thermal_noise,
             sqrt_dt: dt.sqrt(),
         };
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue.write_buffer(&self.velocities_buf, 0, bytemuck::cast_slice(&vel_flat));
-        self.queue.write_buffer(&self.state_buf, 0, bytemuck::cast_slice(&state_flat));
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("brownian-encoder"),
-        });
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.velocities_buf, 0, bytemuck::cast_slice(&vel_flat));
+        self.queue
+            .write_buffer(&self.state_buf, 0, bytemuck::cast_slice(&state_flat));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("brownian-encoder"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("brownian-pass"),
@@ -179,13 +220,19 @@ impl BrownianGpu {
         let s_s = self.state_rb.slice(0..s_bytes);
         v_s.map_async(wgpu::MapMode::Read, |_| {});
         s_s.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let v_data = v_s.get_mapped_range();
         let s_data = s_s.get_mapped_range();
         let v_f: &[f32] = bytemuck::cast_slice(&v_data);
         let s_u: &[u32] = bytemuck::cast_slice(&s_data);
-        let velocities: Vec<[f32; 3]> = (0..n).map(|i| [v_f[i*3], v_f[i*3+1], v_f[i*3+2]]).collect();
-        let state: Vec<[u32; 4]> = (0..n).map(|i| [s_u[i*4], s_u[i*4+1], s_u[i*4+2], s_u[i*4+3]]).collect();
+        let velocities: Vec<[f32; 3]> = (0..n)
+            .map(|i| [v_f[i * 3], v_f[i * 3 + 1], v_f[i * 3 + 2]])
+            .collect();
+        let state: Vec<[u32; 4]> = (0..n)
+            .map(|i| [s_u[i * 4], s_u[i * 4 + 1], s_u[i * 4 + 2], s_u[i * 4 + 3]])
+            .collect();
         drop(v_data);
         drop(s_data);
         self.velocities_rb.unmap();
@@ -214,9 +261,11 @@ impl BrownianGpu {
         if n == 0 {
             return;
         }
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("brownian-encoder-persistent"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("brownian-encoder-persistent"),
+            });
         self.compute_persistent_into(&mut encoder, cells_gpu, n, thermal_noise, dt, has_z);
         self.queue.submit(Some(encoder.finish()));
     }
@@ -239,19 +288,33 @@ impl BrownianGpu {
             thermal_noise,
             sqrt_dt: dt.sqrt(),
         };
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         let cells_epoch = cells_gpu.epoch();
         if self.cached_persistent_bg.is_none() || self.cached_persistent_epoch != cells_epoch {
-            self.cached_persistent_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("brownian-bg-persistent"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.velocities_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.xoshiro_state_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.mass_buffer().as_entire_binding() },
-                ],
-            }));
+            self.cached_persistent_bg =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("brownian-bg-persistent"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: cells_gpu.velocities_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: cells_gpu.xoshiro_state_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: cells_gpu.mass_buffer().as_entire_binding(),
+                        },
+                    ],
+                }));
             self.cached_persistent_epoch = cells_epoch;
         }
         let bind_group = self.cached_persistent_bg.as_ref().unwrap();
@@ -264,4 +327,3 @@ impl BrownianGpu {
         pass.dispatch_workgroups(((n as u32) + 63) / 64, 1, 1);
     }
 }
-

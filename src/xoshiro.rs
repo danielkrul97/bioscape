@@ -146,7 +146,10 @@ mod tests {
                 same_count += 1;
             }
         }
-        assert!(same_count < 4, "neighbouring seeds produced identical stream");
+        assert!(
+            same_count < 4,
+            "neighbouring seeds produced identical stream"
+        );
     }
 
     #[test]

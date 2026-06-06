@@ -3,7 +3,7 @@ use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bioscape::{
-    CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, WorldMap,
+    WorldMap, CYCLE_AMPLITUDE, CYCLE_GEN_PERIOD, HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR,
     WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR, WORLD_UNITS_PER_FOOD,
 };
 

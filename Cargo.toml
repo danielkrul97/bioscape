@@ -71,8 +71,9 @@ rustc-hash = "2"
 # BRAIN_INPUTS=80 a padded BRAIN_HIDDEN=56.
 wide = "1"
 # Wave N: GPU compute is mandatory — wgpu / bytemuck / pollster no longer
-# gated by the `gpu` feature flag (removed).
-wgpu = "23"
+# gated by the `gpu` feature flag (removed). Pinned to 27 to share a single
+# wgpu copy with bevy_render 0.18 (which depends on wgpu 27).
+wgpu = "27"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 clap = { version = "4", features = ["derive"] }
@@ -86,10 +87,10 @@ cpal = { version = "0.17", optional = true }
 fundsp = { version = "0.23", optional = true, default-features = false, features = ["std"] }
 
 [features]
-default = ["audio"]
-# Renderer audio sonification of the vibration field. Requires libasound2-dev
-# at link time on Linux. Disable with `--no-default-features` for CI / headless
-# boxes that don't have ALSA.
+default = []
+# Renderer audio sonification of the vibration field (off by default). Requires
+# libasound2-dev at link time on Linux. Enable with `--features audio`; F8
+# toggles it on/off at runtime once built.
 audio = ["dep:cpal", "dep:fundsp"]
 # Speeds up incremental rebuilds during development.
 # Run with: cargo run --features dev

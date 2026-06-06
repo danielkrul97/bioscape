@@ -279,9 +279,11 @@ impl SensorGatherGpu {
         if positions.is_empty() {
             return;
         }
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("sensor-dispatch-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sensor-dispatch-encoder"),
+            });
         self.dispatch_no_readback_into(
             &mut encoder,
             positions,
@@ -348,37 +350,110 @@ impl SensorGatherGpu {
             self.food_packed.extend_from_slice(&[0.0, 0.0, 0.0]);
         }
 
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue.write_buffer(&self.positions_buf, 0, bytemuck::cast_slice(&self.pos_packed));
-        self.queue.write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
-        self.queue.write_buffer(&self.vision_radii_buf, 0, bytemuck::cast_slice(vision_radii));
-        self.queue.write_buffer(&self.food_positions_buf, 0, bytemuck::cast_slice(&self.food_packed));
-        self.queue.write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
-        self.queue.write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(
+            &self.positions_buf,
+            0,
+            bytemuck::cast_slice(&self.pos_packed),
+        );
+        self.queue
+            .write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
+        self.queue.write_buffer(
+            &self.vision_radii_buf,
+            0,
+            bytemuck::cast_slice(vision_radii),
+        );
+        self.queue.write_buffer(
+            &self.food_positions_buf,
+            0,
+            bytemuck::cast_slice(&self.food_packed),
+        );
+        self.queue
+            .write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
+        self.queue
+            .write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sensor-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.eff_radii_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.vision_radii_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.food_positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cell_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: cell_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: food_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: food_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: smell.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.headings_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: pheromone_ch1.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 17, resource: pheromone_ch2.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 18, resource: whisker_state.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.eff_radii_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.vision_radii_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.food_positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cell_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: cell_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: food_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: food_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: smell.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: pheromone.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: vibration.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: self.maze_mask_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: self.headings_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: self.pitches_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: pheromone_ch1.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: pheromone_ch2.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: whisker_state.as_entire_binding(),
+                },
             ],
         });
 
@@ -439,44 +514,119 @@ impl SensorGatherGpu {
             self.food_packed.extend_from_slice(&[0.0, 0.0, 0.0]);
         }
 
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue.write_buffer(&self.positions_buf, 0, bytemuck::cast_slice(&self.pos_packed));
-        self.queue.write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
-        self.queue.write_buffer(&self.vision_radii_buf, 0, bytemuck::cast_slice(vision_radii));
-        self.queue.write_buffer(&self.food_positions_buf, 0, bytemuck::cast_slice(&self.food_packed));
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(
+            &self.positions_buf,
+            0,
+            bytemuck::cast_slice(&self.pos_packed),
+        );
+        self.queue
+            .write_buffer(&self.eff_radii_buf, 0, bytemuck::cast_slice(eff_radii));
+        self.queue.write_buffer(
+            &self.vision_radii_buf,
+            0,
+            bytemuck::cast_slice(vision_radii),
+        );
+        self.queue.write_buffer(
+            &self.food_positions_buf,
+            0,
+            bytemuck::cast_slice(&self.food_packed),
+        );
         // Wave 6: per-cell heading + pitch for in-shader whisker raycast.
-        self.queue.write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
-        self.queue.write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
+        self.queue
+            .write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
+        self.queue
+            .write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sensor-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.eff_radii_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.vision_radii_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.food_positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cell_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: cell_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: food_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: food_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: smell.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: pheromone.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.output_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: vibration.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.maze_mask_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.headings_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: self.pitches_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: pheromone_ch1.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 17, resource: pheromone_ch2.current_grid_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 18, resource: whisker_state.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.eff_radii_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.vision_radii_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.food_positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cell_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: cell_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: food_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: food_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: smell.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: pheromone.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: vibration.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: self.maze_mask_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: self.headings_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: self.pitches_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: pheromone_ch1.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: pheromone_ch2.current_grid_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: whisker_state.as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("sensor-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sensor-encoder"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("sensor-pass"),
@@ -492,7 +642,9 @@ impl SensorGatherGpu {
 
         let s = self.output_rb.slice(0..bytes);
         s.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let data = s.get_mapped_range();
         let f: &[f32] = bytemuck::cast_slice(&data);
         let mut out = Vec::with_capacity(n);
@@ -534,4 +686,3 @@ impl SensorGatherGpu {
         out
     }
 }
-

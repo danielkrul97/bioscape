@@ -226,12 +226,30 @@ impl StdpStepGpu {
             label: Some("stdp-step-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.pre_spike_times_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.post_spike_times_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.pre_trace_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.post_trace_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cells_gpu.neuron_models_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cells_gpu.pre_spike_times_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cells_gpu.post_spike_times_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: cells_gpu.pre_trace_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cells_gpu.post_trace_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cells_gpu.neuron_models_buffer().as_entire_binding(),
+                },
             ],
         });
         let mut encoder = self
@@ -304,14 +322,7 @@ impl StdpApplyGpu {
         })
     }
 
-    pub fn dispatch(
-        &self,
-        cells_gpu: &CellsGpu,
-        n: usize,
-        tick: u32,
-        a_plus: f32,
-        a_minus: f32,
-    ) {
+    pub fn dispatch(&self, cells_gpu: &CellsGpu, n: usize, tick: u32, a_plus: f32, a_minus: f32) {
         if n == 0 {
             return;
         }
@@ -327,14 +338,38 @@ impl StdpApplyGpu {
             label: Some("stdp-apply-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.brain_weights_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: cells_gpu.pre_trace_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: cells_gpu.post_trace_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cells_gpu.pre_spike_times_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cells_gpu.post_spike_times_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: cells_gpu.rewards_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: cells_gpu.neuron_models_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cells_gpu.brain_weights_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cells_gpu.pre_trace_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: cells_gpu.post_trace_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cells_gpu.pre_spike_times_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cells_gpu.post_spike_times_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: cells_gpu.rewards_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: cells_gpu.neuron_models_buffer().as_entire_binding(),
+                },
             ],
         });
         let mut encoder = self

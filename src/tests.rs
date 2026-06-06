@@ -83,6 +83,9 @@ fn dummy_genome() -> Genome {
         attack_gate: ATTACK_THRESHOLD,
         predation_size_ratio: SIZE_RATIO_THRESHOLD,
         defense_contribution: BOND_DEFENSE_FRAC,
+        sexual_pref: 1.0,
+        bond_inherit_pref: 0.0,
+        division_angle: 0.0,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
     }
 }
@@ -119,6 +122,9 @@ fn zero_cfg() -> MutationConfig {
         sigma_reproduce_at_energy: 0.0,
         sigma_birth_energy: 0.0,
         sigma_altruism_share_frac: 0.0,
+        sigma_sexual_pref: 0.0,
+        sigma_bond_inherit_pref: 0.0,
+        sigma_division_angle: 0.0,
         sigma_cluster_share_bonus: 0.0,
         sigma_attack_gate: 0.0,
         sigma_predation_size_ratio: 0.0,
@@ -181,6 +187,9 @@ fn mutation_with_zero_sigma_is_identity() {
         attack_gate: ATTACK_THRESHOLD,
         predation_size_ratio: SIZE_RATIO_THRESHOLD,
         defense_contribution: BOND_DEFENSE_FRAC,
+        sexual_pref: 1.0,
+        bond_inherit_pref: 0.0,
+        division_angle: 0.0,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
     };
     let m = g.mutate(&mut rng, &zero_cfg());
@@ -235,6 +244,9 @@ fn mutation_keeps_genes_in_valid_ranges() {
         sigma_reproduce_at_energy: 100.0,
         sigma_birth_energy: 100.0,
         sigma_altruism_share_frac: 10.0,
+        sigma_sexual_pref: 10.0,
+        sigma_bond_inherit_pref: 0.0,
+        sigma_division_angle: 0.0,
         sigma_cluster_share_bonus: 10.0,
         sigma_attack_gate: 10.0,
         sigma_predation_size_ratio: 10.0,
@@ -245,9 +257,7 @@ fn mutation_keeps_genes_in_valid_ranges() {
         let m = g.mutate(&mut rng, &cfg);
         for spike in m.spikes.iter() {
             assert!((MIN_SPIKE_AZIMUTH..=MAX_SPIKE_AZIMUTH).contains(&spike.azimuth_offset));
-            assert!(
-                (MIN_SPIKE_ELEVATION..=MAX_SPIKE_ELEVATION).contains(&spike.elevation_offset)
-            );
+            assert!((MIN_SPIKE_ELEVATION..=MAX_SPIKE_ELEVATION).contains(&spike.elevation_offset));
             assert!((MIN_SPIKE_COMPLEXITY..=MAX_SPIKE_COMPLEXITY).contains(&spike.complexity));
         }
         assert!(m.spike_count <= SPIKE_SLOTS as u8);
@@ -421,7 +431,11 @@ fn climate_offset_default_zero() {
         radius: None,
     };
     let off = climate_shock_offset(&[event], 5, pos_xy, WORLD_HALF);
-    assert!(off.abs() < 1e-6, "HazardPulse must not affect climate, got {}", off);
+    assert!(
+        off.abs() < 1e-6,
+        "HazardPulse must not affect climate, got {}",
+        off
+    );
 }
 
 #[test]
@@ -463,7 +477,11 @@ fn temperature_with_shocks_matches_baseline_when_no_events() {
         (50.0, 100, 5),
         (-50.0, 1000, 25),
         (25.0, THERMAL_DIURNAL_PERIOD_TICKS / 4, CYCLE_GEN_PERIOD / 4),
-        (-25.0, 3 * THERMAL_DIURNAL_PERIOD_TICKS / 4, CYCLE_GEN_PERIOD / 2),
+        (
+            -25.0,
+            3 * THERMAL_DIURNAL_PERIOD_TICKS / 4,
+            CYCLE_GEN_PERIOD / 2,
+        ),
     ] {
         let base = temperature_at_z(z, half, tick, gen);
         let with_shocks = temperature_at_z_with_shocks(z, half, tick, gen, &[], pos_xy);
@@ -560,11 +578,22 @@ fn pool_bonded_hidden_pair_averages() {
     for k in 0..BRAIN_HIDDEN {
         partner_hidden[k] = 3.0;
     }
-    let pooled = pool_bonded_hidden(&cell, |id| {
-        if id == 2 { Some(partner_hidden) } else { None }
-    });
+    let pooled = pool_bonded_hidden(
+        &cell,
+        |id| {
+            if id == 2 {
+                Some(partner_hidden)
+            } else {
+                None
+            }
+        },
+    );
     for k in 0..BRAIN_HIDDEN {
-        assert!((pooled[k] - 2.0).abs() < 1e-6, "expected 2.0, got {}", pooled[k]);
+        assert!(
+            (pooled[k] - 2.0).abs() < 1e-6,
+            "expected 2.0, got {}",
+            pooled[k]
+        );
     }
 }
 
@@ -656,9 +685,7 @@ fn pool_bonded_sensors_takes_max_magnitude_from_partner() {
     let mut partner = [0.0; BRAIN_INPUTS];
     partner[0] = -0.9;
     partner[7] = 0.1;
-    let pooled = pool_bonded_sensors(&cell, &own, |id| {
-        if id == 2 { Some(partner) } else { None }
-    });
+    let pooled = pool_bonded_sensors(&cell, &own, |id| if id == 2 { Some(partner) } else { None });
     // Vision slot: |-0.9| > |0.2| → partner wins
     assert!((pooled[0] - (-0.9)).abs() < 1e-6);
     // Chemistry slot: |0.5| > |0.1| → own wins
@@ -681,9 +708,7 @@ fn pool_bonded_sensors_ignores_proprio_slots() {
     own[4] = 0.1; // proprio
     let mut partner = [0.0; BRAIN_INPUTS];
     partner[4] = 0.99; // partner higher proprio
-    let pooled = pool_bonded_sensors(&cell, &own, |id| {
-        if id == 7 { Some(partner) } else { None }
-    });
+    let pooled = pool_bonded_sensors(&cell, &own, |id| if id == 7 { Some(partner) } else { None });
     // Proprio slot 4 zůstává own — nebyl poolen.
     assert!((pooled[4] - 0.1).abs() < 1e-6);
 }
@@ -814,53 +839,6 @@ fn thermal_optimum_random_in_range() {
 }
 
 #[test]
-fn apply_energy_costs_thermal_stress_quadratic() {
-    // Sprint 87: penalty kvadratický v |temp - optimum|. Cell s optimum
-    // matching local temp platí 0 penalty; cell s extreme deviation platí
-    // PENALTY × (dev/13)². Compare 3 cells: matched, half-deviation,
-    // extreme.
-    let half = [1000.0, 1000.0, 50.0];
-    let physics = PhysicsConfig {
-        drag: 0.0,
-        angular_drag: 0.0,
-        energy_cost_per_v_sq: 0.0,
-        angular_energy_cost: 0.0,
-        vision_cost_per_radius: 0.0,
-        body_cost_factor: 0.0,
-        thermal_optimum_penalty: 1.0,
-    };
-    // Cell at z=0 → temp = REF = 17. Optimum = 17 → no penalty.
-    let mut matched = base_cell();
-    matched.position = [0.0, 0.0, 0.0];
-    matched.genome.thermal_optimum = THERMAL_REF_TEMP;
-    matched.step(1.0, half, 0, 0, &physics);
-    let matched_drain = 100.0 - matched.energy;
-    assert!(matched_drain.abs() < 0.01, "matched drain {matched_drain}");
-    // Cell at z=0 (temp=17), optimum=4 (= BOTTOM, dev=13). penalty/sec =
-    // (13/13)² × 1.0 = 1.0.
-    let mut extreme = base_cell();
-    extreme.position = [0.0, 0.0, 0.0];
-    extreme.genome.thermal_optimum = MIN_THERMAL_OPTIMUM;
-    extreme.step(1.0, half, 0, 0, &physics);
-    let extreme_drain = 100.0 - extreme.energy;
-    assert!(
-        (extreme_drain - 1.0).abs() < 0.01,
-        "extreme drain {extreme_drain}"
-    );
-    // Cell at z=0, optimum = 17 + 6.5 = 23.5 (= half-deviation). penalty/sec
-    // = (6.5/13)² × 1.0 = 0.25.
-    let mut half_dev = base_cell();
-    half_dev.position = [0.0, 0.0, 0.0];
-    half_dev.genome.thermal_optimum = THERMAL_REF_TEMP + 6.5;
-    half_dev.step(1.0, half, 0, 0, &physics);
-    let half_dev_drain = 100.0 - half_dev.energy;
-    assert!(
-        (half_dev_drain - 0.25).abs() < 0.01,
-        "half-dev drain {half_dev_drain}"
-    );
-}
-
-#[test]
 fn populate_brain_inputs_writes_temperature_slot() {
     // Sprint 87: slot 20 = tanh_fast_scalar((temp - REF) / 10). Expected
     // values derive from the same fast-tanh approximation the implementation
@@ -879,7 +857,11 @@ fn populate_brain_inputs_writes_temperature_slot() {
         whisker_distances: [1.0; WHISKER_COUNT],
     };
     let inputs = populate_brain_inputs(&mut cell, &sensors, 50.0);
-    assert!((inputs[20] - 0.0).abs() < 1e-4, "REF should be 0, got {}", inputs[20]);
+    assert!(
+        (inputs[20] - 0.0).abs() < 1e-4,
+        "REF should be 0, got {}",
+        inputs[20]
+    );
     // Test top temp.
     let sensors_top = BrainSensors {
         temperature_local: THERMAL_TOP,
@@ -962,26 +944,6 @@ fn fov_cone_works_in_3d() {
     assert!(!fov_cone_accept(down_front, d2, fwd, cos_q));
 }
 
-#[test]
-fn vision_fov_narrows_energy_cost() {
-    // Sprint 82: užší FOV → menší cost. Hemisphere (factor 0.5) drained
-    // přesně poloviční energy než full sphere (factor 1.0) při stejném
-    // vision_radius a stejném dt.
-    let mut wide = base_cell();
-    wide.genome.vision_fov = MAX_VISION_FOV;
-    let mut narrow = base_cell();
-    narrow.genome.vision_fov = core::f32::consts::PI * 0.5;
-    let physics = no_drag_physics(0.0, 0.05);
-    wide.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
-    narrow.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
-    let wide_drain = 100.0 - wide.energy;
-    let narrow_drain = 100.0 - narrow.energy;
-    // Vision part: wide = 40 × 0.05 × 1.0 = 2.0, narrow = 40 × 0.05 × 0.5 = 1.0.
-    // Ostatní drain (body, motion, …) je 0 v no_drag_physics.
-    assert!((wide_drain - 2.0).abs() < 1e-4, "wide drain {wide_drain}");
-    assert!((narrow_drain - 1.0).abs() < 1e-4, "narrow drain {narrow_drain}");
-}
-
 fn no_drag_physics(cost_per_v_sq: f32, vision_cost: f32) -> PhysicsConfig {
     PhysicsConfig {
         drag: 0.0,
@@ -1014,6 +976,7 @@ fn base_cell() -> Cell {
         burst_accum: [0.0; N_PHEROMONE_CHANNELS],
         pooled_hidden: [0.0; BRAIN_HIDDEN],
         bonded_inbox: [0.0; N_BOND_MSG_CHANNELS],
+        coop_call_signal: 0.0,
         damage_accum: 0.0,
         age: 0,
         reproduce_cooldown_ticks: 0,
@@ -1033,8 +996,21 @@ fn base_cell() -> Cell {
         was_in_hazard_last_tick: false,
         phenotype,
         genome,
-        symbiont: None,
+        species_id: 0,
     }
+}
+
+#[test]
+fn division_child_is_clonal_with_single_birth_energy() {
+    let mut rng = StdRng::seed_from_u64(4113);
+    let parent = base_cell();
+    let child = crate::make_division_child_no_brain(&parent, &mut rng, 777);
+    // Single-parent birth: one birth_energy donation (not two), clone inherits
+    // the parent's lineage + species.
+    assert_eq!(child.energy, parent.genome.birth_energy);
+    assert_eq!(child.lineage_id, parent.lineage_id);
+    assert_eq!(child.species_id, parent.species_id);
+    assert_eq!(child.cell_id, 777);
 }
 
 #[test]
@@ -1043,12 +1019,22 @@ fn step_drains_energy_from_motion_and_vision() {
         velocity: [60.0, 0.0, 0.0],
         ..base_cell()
     };
-    cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &no_drag_physics(0.001, 0.05));
+    cell.step(
+        1.0,
+        [1000.0, 1000.0, 0.0],
+        0,
+        0,
+        &no_drag_physics(0.001, 0.05),
+    );
     // motion (v² model): 60² × 0.001 × 1.0 = 3.6 energy
     // vision: 40 × 0.05 × 1.0 = 2.0 energy
     // body: 0 (factor = 0)
     // total drained: 5.6 → energy 100 − 5.6 = 94.4
-    assert!((cell.energy - 94.4).abs() < 1e-4, "expected ~94.4, got {}", cell.energy);
+    assert!(
+        (cell.energy - 94.4).abs() < 1e-4,
+        "expected ~94.4, got {}",
+        cell.energy
+    );
     assert!((cell.position[0] - 60.0).abs() < 1e-4);
 }
 
@@ -1104,7 +1090,11 @@ fn step_applies_quadratic_drag() {
     cell.step(1.0, [1000.0, 1000.0, 0.0], 0, 0, &physics);
     // |v| = 10, drag_dt = 0.01 × 10 × 1 = 0.1
     // velocity[0] -= 0.1 × 10 = 1.0 → final velocity[0] = 9.0
-    assert!((cell.velocity[0] - 9.0).abs() < 1e-4, "got {}", cell.velocity[0]);
+    assert!(
+        (cell.velocity[0] - 9.0).abs() < 1e-4,
+        "got {}",
+        cell.velocity[0]
+    );
 }
 
 #[test]
@@ -1174,7 +1164,11 @@ fn try_eat_within_radius_returns_true_and_adds_energy() {
         energy: 50.0,
         ..base_cell()
     };
-    let food = Food { position: [5.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+    let food = Food {
+        position: [5.0, 0.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     assert!(cell.try_eat(&food, 8.0, 20.0));
     assert_eq!(cell.energy, 70.0);
 }
@@ -1185,7 +1179,11 @@ fn try_eat_outside_radius_returns_false_and_keeps_energy() {
         energy: 50.0,
         ..base_cell()
     };
-    let food = Food { position: [20.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+    let food = Food {
+        position: [20.0, 0.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     assert!(!cell.try_eat(&food, 8.0, 20.0));
     assert_eq!(cell.energy, 50.0);
 }
@@ -1226,6 +1224,9 @@ fn crossover_picks_genes_from_either_parent() {
         attack_gate: ATTACK_THRESHOLD,
         predation_size_ratio: SIZE_RATIO_THRESHOLD,
         defense_contribution: BOND_DEFENSE_FRAC,
+        sexual_pref: 1.0,
+        bond_inherit_pref: 0.0,
+        division_angle: 0.0,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
     };
     let b = Genome {
@@ -1265,6 +1266,9 @@ fn crossover_picks_genes_from_either_parent() {
         attack_gate: ATTACK_THRESHOLD,
         predation_size_ratio: SIZE_RATIO_THRESHOLD,
         defense_contribution: BOND_DEFENSE_FRAC,
+        sexual_pref: 1.0,
+        bond_inherit_pref: 0.0,
+        division_angle: 0.0,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
     };
     for _ in 0..100 {
@@ -1278,8 +1282,7 @@ fn crossover_picks_genes_from_either_parent() {
         assert!(c.spikes[0].length == 0.0 || c.spikes[0].length == 0.8);
         assert!(c.vision_fov == MIN_VISION_FOV || c.vision_fov == MAX_VISION_FOV);
         assert!(
-            c.thermal_optimum == MIN_THERMAL_OPTIMUM
-                || c.thermal_optimum == MAX_THERMAL_OPTIMUM
+            c.thermal_optimum == MIN_THERMAL_OPTIMUM || c.thermal_optimum == MAX_THERMAL_OPTIMUM
         );
     }
 }
@@ -1471,7 +1474,11 @@ fn pheromone_field_array_independent_decay() {
     let dt = 1.0 / FIXED_TIMESTEP_HZ;
     for ch in 0..N_PHEROMONE_CHANNELS {
         for _ in 0..30 {
-            fields[ch].step(PHEROMONE_DIFFUSION_PER_CH[ch], PHEROMONE_DECAY_PER_CH[ch], dt);
+            fields[ch].step(
+                PHEROMONE_DIFFUSION_PER_CH[ch],
+                PHEROMONE_DECAY_PER_CH[ch],
+                dt,
+            );
         }
     }
     let signal_ch0 = fields[0].sample([0.0, 0.0, 0.0]);
@@ -1592,9 +1599,7 @@ fn add_neuron_initializes_active_region_only() {
     // New neuron's row [new_idx] active part [0..active_inputs] should be
     // gaussian-initialized (some non-zero values expected). Dead-zone of
     // that same row [active_inputs..BRAIN_INPUTS] should remain 0.
-    let any_active_nonzero = b.w1[new_idx][..active_inputs]
-        .iter()
-        .any(|&w| w != 0.0);
+    let any_active_nonzero = b.w1[new_idx][..active_inputs].iter().any(|&w| w != 0.0);
     assert!(any_active_nonzero, "new neuron active w1 row all-zero");
     for &w in &b.w1[new_idx][active_inputs..] {
         assert_eq!(w, 0.0, "new neuron dead-cols must stay 0");
@@ -1609,11 +1614,10 @@ fn add_neuron_preserves_existing_neurons() {
     let snapshot_b1 = b.b1;
     let snapshot_b2 = b.b2;
     // Snapshot w2 active cols only — dead col at new_idx will get populated.
-    let snapshot_w2_active: Vec<Vec<f32>> = b
-        .w2
-        .iter()
-        .map(|row| row[..BRAIN_HIDDEN_DEFAULT].to_vec())
-        .collect();
+    let snapshot_w2_active: Vec<Vec<f32>> =
+        b.w2.iter()
+            .map(|row| row[..BRAIN_HIDDEN_DEFAULT].to_vec())
+            .collect();
     let _ = b.add_neuron(&mut rng, ADD_NEURON_SIGMA);
     // Existing neurons (rows 0..BRAIN_HIDDEN_DEFAULT) untouched.
     for (i, expected) in snapshot_w1.iter().enumerate() {
@@ -1809,9 +1813,18 @@ fn anisotropic_drag_slower_along_width_when_elongated() {
     // |v| sideways after step: 10 - 0.01·10·2·10 = 8.0
     let v_forward = forward.velocity[0].hypot(forward.velocity[1]);
     let v_sideways = sideways.velocity[0].hypot(sideways.velocity[1]);
-    assert!(v_forward > v_sideways, "forward {} should be > sideways {}", v_forward, v_sideways);
+    assert!(
+        v_forward > v_sideways,
+        "forward {} should be > sideways {}",
+        v_forward,
+        v_sideways
+    );
     assert!((v_forward - 9.0).abs() < 1e-3, "forward got {}", v_forward);
-    assert!((v_sideways - 8.0).abs() < 1e-3, "sideways got {}", v_sideways);
+    assert!(
+        (v_sideways - 8.0).abs() < 1e-3,
+        "sideways got {}",
+        v_sideways
+    );
 }
 
 #[test]
@@ -1895,7 +1908,13 @@ fn step_3d_position_advances_with_z_velocity() {
     // jako x/y, takže Sprint 33+ má pevnou základnu.
     let mut cell = base_cell();
     cell.velocity = [0.0, 0.0, 5.0];
-    cell.step(1.0, [1000.0, 1000.0, 1000.0], 0, 0, &no_drag_physics(0.0, 0.0));
+    cell.step(
+        1.0,
+        [1000.0, 1000.0, 1000.0],
+        0,
+        0,
+        &no_drag_physics(0.0, 0.0),
+    );
     assert!(
         (cell.position[2] - 5.0).abs() < 1e-4,
         "expected z=5.0, got {}",
@@ -1954,7 +1973,10 @@ fn body_basis_orthonormal() {
         let (fwd, right, up) = body_basis(yaw, pitch);
         let mag = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-        assert!((mag(fwd) - 1.0).abs() < 1e-5, "fwd not unit at yaw={yaw} pitch={pitch}");
+        assert!(
+            (mag(fwd) - 1.0).abs() < 1e-5,
+            "fwd not unit at yaw={yaw} pitch={pitch}"
+        );
         assert!((mag(right) - 1.0).abs() < 1e-5, "right not unit");
         assert!((mag(up) - 1.0).abs() < 1e-5, "up not unit");
         assert!(dot(fwd, right).abs() < 1e-5, "fwd·right != 0");
@@ -1967,11 +1989,30 @@ fn body_basis_orthonormal() {
 fn try_eat_isotropic_unchanged_for_unit_sphere() {
     // L=W=H=1, eat_factor=8 → ellipsoid degeneruje na sféru radius 8.
     // Backward-kompat se Sprint 40 sférickou eat-zónou.
-    let cell = Cell { energy: 50.0, ..base_cell() };
-    let inside = Food { position: [5.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
-    let outside = Food { position: [10.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
-    let lateral_inside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
-    let vertical_inside = Food { position: [0.0, 0.0, 5.0], age_ticks: 0, kind: FoodKind::Plant };
+    let cell = Cell {
+        energy: 50.0,
+        ..base_cell()
+    };
+    let inside = Food {
+        position: [5.0, 0.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
+    let outside = Food {
+        position: [10.0, 0.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
+    let lateral_inside = Food {
+        position: [0.0, 5.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
+    let vertical_inside = Food {
+        position: [0.0, 0.0, 5.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     assert!(cell.eat_test(&inside, 8.0));
     assert!(!cell.eat_test(&outside, 8.0));
     assert!(cell.eat_test(&lateral_inside, 8.0));
@@ -1981,7 +2022,10 @@ fn try_eat_isotropic_unchanged_for_unit_sphere() {
 #[test]
 fn try_eat_forward_chip_reaches_further_than_lateral() {
     // Chip: L=2, W=0.5, H=0.5, heading=0 → forward semi-osa = 16, lateral = 4.
-    let mut cell = Cell { energy: 50.0, ..base_cell() };
+    let mut cell = Cell {
+        energy: 50.0,
+        ..base_cell()
+    };
     cell.phenotype = Phenotype {
         body_length: 2.0,
         body_width: 0.5,
@@ -1991,13 +2035,29 @@ fn try_eat_forward_chip_reaches_further_than_lateral() {
         shell_thickness: 0.0,
     };
     // Forward at +14: inside ellipsoid (14/16 = 0.875).
-    let forward_inside = Food { position: [14.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+    let forward_inside = Food {
+        position: [14.0, 0.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     // Lateral at +3.5: inside (3.5/4 = 0.875).
-    let lateral_inside = Food { position: [0.0, 3.5, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+    let lateral_inside = Food {
+        position: [0.0, 3.5, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     // Forward at +17: outside (17/16 > 1).
-    let forward_outside = Food { position: [17.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+    let forward_outside = Food {
+        position: [17.0, 0.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     // Lateral at +5: outside (5/4 > 1).
-    let lateral_outside = Food { position: [0.0, 5.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+    let lateral_outside = Food {
+        position: [0.0, 5.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     assert!(cell.eat_test(&forward_inside, 8.0));
     assert!(cell.eat_test(&lateral_inside, 8.0));
     assert!(!cell.eat_test(&forward_outside, 8.0));
@@ -2111,6 +2171,9 @@ fn shell_mutation_clamps_to_range() {
         sigma_reproduce_at_energy: 0.0,
         sigma_birth_energy: 0.0,
         sigma_altruism_share_frac: 0.0,
+        sigma_sexual_pref: 0.0,
+        sigma_bond_inherit_pref: 0.0,
+        sigma_division_angle: 0.0,
         sigma_cluster_share_bonus: 0.0,
         sigma_attack_gate: 0.0,
         sigma_predation_size_ratio: 0.0,
@@ -2188,8 +2251,8 @@ fn cooldown_does_not_underflow() {
 
 #[test]
 fn motor_scales_inversely_with_mass() {
-    // Unit cell eff_r=1 vs tubby cell eff_r=2 (L=W=H=2): tubby pomalejší 2×.
-    // Mass scaling používá effective_radius (smoke-tuned fallback z volume).
+    // Unit vol=1 vs tubby vol=8 (L=W=H=2): tubby 8× pomalejší. S202 mass =
+    // volume × MASS_DENSITY (cubic), takže accel ∝ 1/volume.
     let mut unit = base_cell();
     let mut tubby = base_cell();
     tubby.phenotype.body_length = 2.0;
@@ -2210,8 +2273,8 @@ fn motor_scales_inversely_with_mass() {
     );
     let ratio = unit_v / tubby_v.max(1e-6);
     assert!(
-        (ratio - 2.0).abs() < 0.2,
-        "expected ratio ~2 (eff_r), got {}",
+        (ratio - 8.0).abs() < 0.2,
+        "expected ratio ~8 (volume), got {}",
         ratio
     );
 }
@@ -2226,8 +2289,7 @@ fn brownian_perturbs_zero_velocity() {
     }
     // 2D případ (world_half_z = 0) — z se nesmí měnit.
     assert_eq!(cell.velocity[2], 0.0);
-    let v_xy_sq =
-        cell.velocity[0] * cell.velocity[0] + cell.velocity[1] * cell.velocity[1];
+    let v_xy_sq = cell.velocity[0] * cell.velocity[0] + cell.velocity[1] * cell.velocity[1];
     assert!(v_xy_sq > 0.0, "expected nonzero velocity from brownian");
 }
 
@@ -2263,11 +2325,15 @@ fn brownian_deterministic_across_paths_for_same_cell_id() {
 
 #[test]
 fn food_value_decays_with_age() {
-    let mut food = Food { position: [0.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+    let mut food = Food {
+        position: [0.0, 0.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     assert!((food.value_factor() - 1.0).abs() < 1e-6);
-    // 1 sec = 60 ticks → factor = 1 - CARRION_DECAY_PER_SEC.
+    // 1 sec = 60 ticks → factor = 1 - FOOD_DECAY_PER_SEC.
     food.age_ticks = 60;
-    let expected = 1.0 - CARRION_DECAY_PER_SEC;
+    let expected = 1.0 - FOOD_DECAY_PER_SEC;
     assert!(
         (food.value_factor() - expected).abs() < 1e-4,
         "got {}, expected {}",
@@ -2278,14 +2344,18 @@ fn food_value_decays_with_age() {
 
 #[test]
 fn food_expires_when_zero_value() {
-    let mut fresh = Food { position: [0.0, 0.0, 0.0], age_ticks: 0, kind: FoodKind::Plant };
+    let mut fresh = Food {
+        position: [0.0, 0.0, 0.0],
+        age_ticks: 0,
+        kind: FoodKind::Plant,
+    };
     assert!(fresh.age_step());
     // Past lifetime: age_step bump → value_factor = 0 → returns false.
     // F32 precision: použijeme age daleko za bod expirace, abychom se vyhli
     // ULP edge case (60.0/0.0005 jako u32 rounds k 119999, ne 120000).
     let mut expired = Food {
         position: [0.0, 0.0, 0.0],
-        age_ticks: ((FIXED_TIMESTEP_HZ / CARRION_DECAY_PER_SEC) as u32) + 100,
+        age_ticks: ((FIXED_TIMESTEP_HZ / FOOD_DECAY_PER_SEC) as u32) + 100,
         kind: FoodKind::Plant,
     };
     assert!(!expired.age_step());
@@ -2363,7 +2433,10 @@ fn spatial_grid_finds_all_neighbors_in_radius() {
 #[test]
 fn spatial_grid_rebuild_clears_old_buckets() {
     let mut grid: SpatialGrid<usize, ()> = SpatialGrid::new(50.0, WORLD_HALF);
-    grid.rebuild(vec![(0_usize, [0.0, 0.0, 0.0], ()), (1, [10.0, 10.0, 0.0], ())]);
+    grid.rebuild(vec![
+        (0_usize, [0.0, 0.0, 0.0], ()),
+        (1, [10.0, 10.0, 0.0], ()),
+    ]);
 
     let mut first: Vec<usize> = Vec::new();
     grid.for_each_in_radius([0.0, 0.0, 0.0], 100.0, |id, _, _| first.push(id));
@@ -2446,29 +2519,55 @@ fn adhesion_repels_cross_type_outward() {
 #[test]
 fn bond_spring_pulls_when_stretched() {
     // Bond rest 5, current 10 (stretched) → cell i taženo k j.
-    let bond = Bond { other_cell_id: 1, rest_length: 5.0, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
+    let bond = Bond {
+        other_cell_id: 1,
+        rest_length: 5.0,
+        stiffness: BOND_STIFFNESS,
+        damping: BOND_DAMPING,
+        age_ticks: 0,
+    };
     let delta = [10.0, 0.0, 0.0];
     let dt = 1.0 / 60.0;
     let (v, broken) = bond_velocity_delta(&bond, delta, 10.0, [0.0; 3], [0.0; 3], dt);
     assert!(!broken);
-    assert!(v[0] < 0.0, "stretched bond should pull i toward j, got {:?}", v);
+    assert!(
+        v[0] < 0.0,
+        "stretched bond should pull i toward j, got {:?}",
+        v
+    );
 }
 
 #[test]
 fn bond_spring_pushes_when_compressed() {
     // Bond rest 10, current 5 (compressed) → cell i tlačeno od j.
-    let bond = Bond { other_cell_id: 1, rest_length: 10.0, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
+    let bond = Bond {
+        other_cell_id: 1,
+        rest_length: 10.0,
+        stiffness: BOND_STIFFNESS,
+        damping: BOND_DAMPING,
+        age_ticks: 0,
+    };
     let delta = [5.0, 0.0, 0.0];
     let dt = 1.0 / 60.0;
     let (v, broken) = bond_velocity_delta(&bond, delta, 5.0, [0.0; 3], [0.0; 3], dt);
     assert!(!broken);
-    assert!(v[0] > 0.0, "compressed bond should push i away, got {:?}", v);
+    assert!(
+        v[0] > 0.0,
+        "compressed bond should push i away, got {:?}",
+        v
+    );
 }
 
 #[test]
 fn bond_breaks_past_break_factor() {
     let rest = 5.0;
-    let bond = Bond { other_cell_id: 1, rest_length: rest, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
+    let bond = Bond {
+        other_cell_id: 1,
+        rest_length: rest,
+        stiffness: BOND_STIFFNESS,
+        damping: BOND_DAMPING,
+        age_ticks: 0,
+    };
     let stretched = rest * BOND_BREAK_FACTOR + 0.1;
     let (v, broken) = bond_velocity_delta(
         &bond,
@@ -2486,13 +2585,23 @@ fn bond_breaks_past_break_factor() {
 fn bond_damping_opposes_closing_velocity() {
     // Cell i at +x, j at origin, bond at rest. v_i moves toward j (−x).
     // Damping should *resist* closing → push i back (+x).
-    let bond = Bond { other_cell_id: 1, rest_length: 5.0, stiffness: BOND_STIFFNESS, damping: BOND_DAMPING, age_ticks: 0 };
+    let bond = Bond {
+        other_cell_id: 1,
+        rest_length: 5.0,
+        stiffness: BOND_STIFFNESS,
+        damping: BOND_DAMPING,
+        age_ticks: 0,
+    };
     let delta = [5.0, 0.0, 0.0];
     let v_i = [-1.0, 0.0, 0.0];
     let v_j = [0.0, 0.0, 0.0];
     let dt = 1.0 / 60.0;
     let (dv, _) = bond_velocity_delta(&bond, delta, 5.0, v_i, v_j, dt);
-    assert!(dv[0] > 0.0, "damping should oppose closing motion, got {:?}", dv);
+    assert!(
+        dv[0] > 0.0,
+        "damping should oppose closing motion, got {:?}",
+        dv
+    );
 }
 
 #[test]
@@ -2614,7 +2723,8 @@ fn mating_child_spawns_near_bonded_parent() {
     let dy = (child.position[1] - a.position[1]).abs();
     let dz = (child.position[2] - a.position[2]).abs();
     assert!(
-        dx <= CLUSTER_SPAWN_RADIUS && dy <= CLUSTER_SPAWN_RADIUS
+        dx <= CLUSTER_SPAWN_RADIUS
+            && dy <= CLUSTER_SPAWN_RADIUS
             && dz <= CLUSTER_SPAWN_RADIUS * 0.3 + 1e-3,
         "child spawn pozice mimo cluster jitter range — dx={} dy={} dz={}",
         dx,
@@ -2660,8 +2770,7 @@ fn cppn_random_has_correct_topology() {
         CPPN_INITIAL_HIDDEN,
         "CPPN_INITIAL_HIDDEN hidden nodes at layer 1"
     );
-    let expected_links = CPPN_INPUTS * CPPN_INITIAL_HIDDEN
-        + CPPN_INITIAL_HIDDEN * CPPN_OUTPUTS;
+    let expected_links = CPPN_INPUTS * CPPN_INITIAL_HIDDEN + CPPN_INITIAL_HIDDEN * CPPN_OUTPUTS;
     assert_eq!(c.iter_links().count(), expected_links);
 }
 
@@ -2845,7 +2954,10 @@ fn event_calendar_different_seeds_differ() {
             .iter()
             .zip(b.events.iter())
             .all(|(x, y)| x.start_gen == y.start_gen && x.kind == y.kind);
-    assert!(!identical, "different seeds should produce different schedules");
+    assert!(
+        !identical,
+        "different seeds should produce different schedules"
+    );
 }
 
 #[test]
@@ -2854,7 +2966,12 @@ fn event_calendar_respects_max_gens() {
     let max_gens = 500;
     let cal = EventCalendar::generate(7, &cfg, max_gens);
     for e in &cal.events {
-        assert!(e.start_gen < max_gens, "start_gen {} >= max {}", e.start_gen, max_gens);
+        assert!(
+            e.start_gen < max_gens,
+            "start_gen {} >= max {}",
+            e.start_gen,
+            max_gens
+        );
     }
 }
 
@@ -2917,8 +3034,7 @@ fn event_calendar_intensity_in_range() {
     assert!(!cal.events.is_empty());
     for e in &cal.events {
         assert!(
-            e.intensity >= cfg.intensity_min - 1e-6
-                && e.intensity <= cfg.intensity_max + 1e-6,
+            e.intensity >= cfg.intensity_min - 1e-6 && e.intensity <= cfg.intensity_max + 1e-6,
             "intensity {} out of range",
             e.intensity
         );
@@ -2944,7 +3060,11 @@ fn event_calendar_global_vs_spatial_split() {
         let r = e.radius.unwrap();
         let lo = cfg.spatial_radius_min_frac * WORLD_HALF[0];
         let hi = cfg.spatial_radius_max_frac * WORLD_HALF[0];
-        assert!(r >= lo - 1e-3 && r <= hi + 1e-3, "radius {} out of range", r);
+        assert!(
+            r >= lo - 1e-3 && r <= hi + 1e-3,
+            "radius {} out of range",
+            r
+        );
     }
 }
 
@@ -2952,7 +3072,11 @@ fn event_calendar_global_vs_spatial_split() {
 fn hazard_multiplier_default_one() {
     let pos = [0.0, 0.0, 0.0];
     let m = hazard_shock_multiplier(pos, &[], 50, 0, WORLD_HALF);
-    assert!((m - 1.0).abs() < 1e-6, "empty events must give 1.0, got {}", m);
+    assert!(
+        (m - 1.0).abs() < 1e-6,
+        "empty events must give 1.0, got {}",
+        m
+    );
 }
 
 #[test]
@@ -2969,7 +3093,11 @@ fn hazard_multiplier_global_pulse_doubles_at_peak() {
     let pos = [123.0, -45.0, 7.0];
     // Plateau (gen 102..=107) → ramp = 1.0, mask = 1.0 → 1 + 1 * 1 * 1 * 1 = 2.0.
     let m = hazard_shock_multiplier(pos, &[event], 105, 0, WORLD_HALF);
-    assert!((m - 2.0).abs() < 1e-5, "global peak must give 2.0, got {}", m);
+    assert!(
+        (m - 2.0).abs() < 1e-5,
+        "global peak must give 2.0, got {}",
+        m
+    );
     // Pre-start: no contribution.
     let m_before = hazard_shock_multiplier(pos, &[event], 99, 0, WORLD_HALF);
     assert!((m_before - 1.0).abs() < 1e-6);
@@ -2995,48 +3123,51 @@ fn hazard_multiplier_spatial_mask_falls_off() {
     // Plateau, ramp = 1.0.
     // Center → mask = 1.0 → multiplier = 2.0.
     let m_center = hazard_shock_multiplier([0.0, 0.0, 0.0], &[event], gen, 0, WORLD_HALF);
-    assert!((m_center - 2.0).abs() < 1e-5, "center must be 2.0, got {}", m_center);
+    assert!(
+        (m_center - 2.0).abs() < 1e-5,
+        "center must be 2.0, got {}",
+        m_center
+    );
     // At edge (dist = radius) → mask = 0 → multiplier = 1.0.
     let m_edge = hazard_shock_multiplier([radius, 0.0, 0.0], &[event], gen, 0, WORLD_HALF);
-    assert!((m_edge - 1.0).abs() < 1e-5, "edge must be 1.0, got {}", m_edge);
+    assert!(
+        (m_edge - 1.0).abs() < 1e-5,
+        "edge must be 1.0, got {}",
+        m_edge
+    );
     // Beyond radius → mask = 0.
-    let m_outside = hazard_shock_multiplier(
-        [radius * 1.5, 0.0, 0.0],
-        &[event],
-        gen,
-        0,
-        WORLD_HALF,
+    let m_outside = hazard_shock_multiplier([radius * 1.5, 0.0, 0.0], &[event], gen, 0, WORLD_HALF);
+    assert!(
+        (m_outside - 1.0).abs() < 1e-5,
+        "outside must be 1.0, got {}",
+        m_outside
     );
-    assert!((m_outside - 1.0).abs() < 1e-5, "outside must be 1.0, got {}", m_outside);
     // Mid-radius → strictly between 1.0 and 2.0 (smoothstep monotone).
-    let m_mid = hazard_shock_multiplier(
-        [radius * 0.5, 0.0, 0.0],
-        &[event],
-        gen,
-        0,
-        WORLD_HALF,
-    );
+    let m_mid = hazard_shock_multiplier([radius * 0.5, 0.0, 0.0], &[event], gen, 0, WORLD_HALF);
     assert!(
         m_mid > 1.0 && m_mid < 2.0,
         "mid must be in (1, 2), got {}",
         m_mid
     );
     // Smoothstep monotone: closer point → higher multiplier.
-    let m_near = hazard_shock_multiplier(
-        [radius * 0.25, 0.0, 0.0],
-        &[event],
-        gen,
-        0,
-        WORLD_HALF,
+    let m_near = hazard_shock_multiplier([radius * 0.25, 0.0, 0.0], &[event], gen, 0, WORLD_HALF);
+    assert!(
+        m_near > m_mid,
+        "near {} should exceed mid {}",
+        m_near,
+        m_mid
     );
-    assert!(m_near > m_mid, "near {} should exceed mid {}", m_near, m_mid);
 }
 
 #[test]
 fn food_multiplier_default_one() {
     // Empty events → 1.0.
     let m = food_density_shock_multiplier(&[], 50);
-    assert!((m - 1.0).abs() < 1e-6, "empty events must give 1.0, got {}", m);
+    assert!(
+        (m - 1.0).abs() < 1e-6,
+        "empty events must give 1.0, got {}",
+        m
+    );
     // Non-FoodCrash event (HazardPulse) → 1.0.
     let event = ShockEvent {
         kind: ShockKind::HazardPulse,
@@ -3048,7 +3179,11 @@ fn food_multiplier_default_one() {
         radius: None,
     };
     let m = food_density_shock_multiplier(&[event], 5);
-    assert!((m - 1.0).abs() < 1e-6, "HazardPulse must not affect food, got {}", m);
+    assert!(
+        (m - 1.0).abs() < 1e-6,
+        "HazardPulse must not affect food, got {}",
+        m
+    );
 }
 
 #[test]
@@ -3075,10 +3210,18 @@ fn food_multiplier_global_crash_drops() {
     );
     // Pre-start: 1.0.
     let m_before = food_density_shock_multiplier(&[event], 99);
-    assert!((m_before - 1.0).abs() < 1e-6, "pre-start must be 1.0, got {}", m_before);
+    assert!(
+        (m_before - 1.0).abs() < 1e-6,
+        "pre-start must be 1.0, got {}",
+        m_before
+    );
     // Post-end: 1.0.
     let m_after = food_density_shock_multiplier(&[event], 110);
-    assert!((m_after - 1.0).abs() < 1e-6, "post-end must be 1.0, got {}", m_after);
+    assert!(
+        (m_after - 1.0).abs() < 1e-6,
+        "post-end must be 1.0, got {}",
+        m_after
+    );
 }
 
 #[test]
@@ -3342,10 +3485,8 @@ fn izhikevich_dead_zone_weights_do_not_affect_output() {
     // Lateral inhibition on, so a regression that pulled dead-zone preacts
     // into the softplus pool would also visibly change `hidden` here.
     let lateral = 0.3_f32;
-    let (h_baseline, o_baseline) =
-        baseline.forward_izhikevich_with_state(&inputs, 0, lateral);
-    let (h_polluted, o_polluted) =
-        polluted.forward_izhikevich_with_state(&inputs, 0, lateral);
+    let (h_baseline, o_baseline) = baseline.forward_izhikevich_with_state(&inputs, 0, lateral);
+    let (h_polluted, o_polluted) = polluted.forward_izhikevich_with_state(&inputs, 0, lateral);
 
     for i in 0..h_n {
         let d = (h_baseline[i] - h_polluted[i]).abs();
@@ -3369,243 +3510,4 @@ fn izhikevich_dead_zone_weights_do_not_affect_output() {
             d
         );
     }
-}
-
-// ─── Sprint 196: endosymbiosis ──────────────────────────────────────────────
-
-fn bearer_cell(cell_id: u64, sym_lineage: u64) -> Cell {
-    let mut c = base_cell();
-    c.cell_id = cell_id;
-    c.symbiont = Some(Symbiont::new(dummy_genome(), sym_lineage));
-    c
-}
-
-#[test]
-fn symbiont_inherits_with_p_inherit_single_bearer_parent() {
-    let mut rng = StdRng::seed_from_u64(42);
-    let parent_a = bearer_cell(1, 100);
-    let parent_b = base_cell();
-    const TRIALS: usize = 4000;
-    let mut bearer_count = 0;
-    for i in 0..TRIALS {
-        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 1000 + i as u64);
-        if child.symbiont.is_some() {
-            bearer_count += 1;
-        }
-    }
-    let observed = bearer_count as f64 / TRIALS as f64;
-    let expected = SYMBIONT_INHERIT_P as f64;
-    // 4σ binomial proportion tolerance: σ = √(p(1-p)/n).
-    let sigma = (expected * (1.0 - expected) / TRIALS as f64).sqrt();
-    let tolerance = 4.0 * sigma;
-    assert!(
-        (observed - expected).abs() < tolerance,
-        "observed {:.4} expected {:.4} ± {:.4} (4σ, n={})",
-        observed, expected, tolerance, TRIALS
-    );
-}
-
-#[test]
-fn symbiont_lineage_preserved_through_inheritance() {
-    let mut rng = StdRng::seed_from_u64(7);
-    let parent_a = bearer_cell(1, 42);
-    let parent_b = base_cell();
-    for i in 0..200 {
-        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 5000 + i as u64);
-        if let Some(sym) = child.symbiont.as_ref() {
-            assert_eq!(sym.lineage_id, 42, "lineage_id must propagate verbatim");
-            assert_eq!(sym.age, 0, "child symbiont age must reset to 0");
-        }
-    }
-}
-
-#[test]
-fn symbiont_no_inherit_when_neither_parent_bears() {
-    let mut rng = StdRng::seed_from_u64(9);
-    let parent_a = base_cell();
-    let parent_b = base_cell();
-    for i in 0..200 {
-        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 6000 + i as u64);
-        assert!(child.symbiont.is_none());
-    }
-}
-
-#[test]
-fn symbiont_both_parents_offspring_picks_one_lineage() {
-    let mut rng = StdRng::seed_from_u64(13);
-    let parent_a = bearer_cell(1, 111);
-    let parent_b = bearer_cell(2, 222);
-    let mut from_a = 0u32;
-    let mut from_b = 0u32;
-    let mut none_count = 0u32;
-    const TRIALS: usize = 4000;
-    for i in 0..TRIALS {
-        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 7000 + i as u64);
-        match child.symbiont.as_ref().map(|s| s.lineage_id) {
-            Some(111) => from_a += 1,
-            Some(222) => from_b += 1,
-            Some(other) => panic!("unexpected lineage_id {}", other),
-            None => none_count += 1,
-        }
-    }
-    // Both parents bear → at most one P_inherit roll → bearer fraction
-    // matches P_inherit (single-parent path is statistically equivalent).
-    let bearer_frac = (from_a + from_b) as f64 / TRIALS as f64;
-    let expected = SYMBIONT_INHERIT_P as f64;
-    let sigma = (expected * (1.0 - expected) / TRIALS as f64).sqrt();
-    assert!(
-        (bearer_frac - expected).abs() < 4.0 * sigma,
-        "bearer_frac {:.4} vs expected {:.4} (4σ tolerance)",
-        bearer_frac, expected
-    );
-    // Within the bearers, both lineages must show up — picker is uniform.
-    let total_bearers = from_a + from_b;
-    assert!(from_a > 0 && from_b > 0,
-        "both parent lineages must contribute: from_a={} from_b={}", from_a, from_b);
-    let a_frac = from_a as f64 / total_bearers as f64;
-    let sigma_pick = (0.5 * 0.5 / total_bearers as f64).sqrt();
-    assert!(
-        (a_frac - 0.5).abs() < 4.0 * sigma_pick,
-        "donor pick must be ~50/50: from_a={} from_b={} a_frac={:.4}",
-        from_a, from_b, a_frac
-    );
-    let _ = none_count;
-}
-
-#[test]
-fn symbiont_age_persists_in_parent_resets_in_child() {
-    let mut rng = StdRng::seed_from_u64(101);
-    let mut parent_a = bearer_cell(1, 50);
-    parent_a.symbiont.as_mut().unwrap().age = 999;
-    let parent_b = base_cell();
-    // Force inheritance by retrying until a bearer child appears; with
-    // P_inherit ~ 0.95 this terminates fast.
-    for i in 0..40 {
-        let child = make_mating_child_no_brain(&parent_a, &parent_b, &mut rng, 8000 + i as u64);
-        if let Some(sym) = child.symbiont.as_ref() {
-            assert_eq!(sym.age, 0, "child symbiont must start with age 0");
-            return;
-        }
-    }
-    panic!("no bearer child in 40 trials — P_inherit far too low");
-}
-
-fn world_with_n_cells(n: usize) -> crate::sim::world::World {
-    let mut rng = StdRng::seed_from_u64(7);
-    let mut world = crate::sim::world::World::new(
-        &mut rng,
-        1,
-        100.0,
-        n,
-        1000,
-        crate::EventCalendar::default(),
-    );
-    for c in world.cells.iter_mut() {
-        c.symbiont = None;
-    }
-    world
-}
-
-fn attach_symbiont(cell: &mut Cell, lineage_id: u64) {
-    cell.symbiont = Some(Symbiont::new(cell.genome, lineage_id));
-}
-
-// S204 pivot: photosynthesis + shed tests removed. apply_symbiont_energy is
-// now a pure bearer-energy drain (counterbalance to damage_resist). The
-// remaining tests cover the new semantics + the damage_resist mechanic.
-
-#[test]
-fn symbiont_skips_non_bearers() {
-    if WORLD_HALF[2] <= 0.0 {
-        return;
-    }
-    let mut world = world_with_n_cells(2);
-    world.cells[1].position = [0.0, 0.0, -WORLD_HALF[2] * 0.95];
-    world.cells[1].energy = 50.0;
-    assert!(world.cells[1].symbiont.is_none());
-    let dt = 1.0 / FIXED_TIMESTEP_HZ;
-    let before = world.cells[1].energy;
-    world.apply_symbiont_energy(dt);
-    assert_eq!(world.cells[1].energy, before,
-        "non-bearer cell must not be touched by apply_symbiont_energy");
-    assert_eq!(world.sym_sheds_gen, 0);
-}
-
-// ─── Sprint 201: damage resistance ──────────────────────────────────────────
-
-#[test]
-fn damage_resist_factor_unity_without_symbiont() {
-    let cell = base_cell();
-    assert!((cell.damage_resist_factor() - 1.0).abs() < 1e-6);
-}
-
-#[test]
-fn damage_resist_factor_halves_with_bearer() {
-    let mut cell = base_cell();
-    cell.symbiont = Some(Symbiont {
-        genome: dummy_genome(),
-        lineage_id: 42,
-        age: 0,
-        deficit_streak: 0,
-    });
-    let expected = 1.0 - SYMBIONT_DAMAGE_RESIST_FRAC;
-    assert!(
-        (cell.damage_resist_factor() - expected).abs() < 1e-6,
-        "expected {} got {}",
-        expected,
-        cell.damage_resist_factor()
-    );
-}
-
-#[test]
-fn maze_wall_bump_scales_with_resist_factor() {
-    let field = crate::ObstacleField::new_maze([1000.0, 1000.0, 100.0], 42,
-        crate::MazeDifficulty::Medium);
-    // Find a position inside a wall to trigger collision.
-    let mut bearer = base_cell();
-    let mut non_bearer = base_cell();
-    bearer.symbiont = Some(Symbiont {
-        genome: dummy_genome(),
-        lineage_id: 1,
-        age: 0,
-        deficit_streak: 0,
-    });
-    // Same starting position; the helper bump fires when push exceeds 1e-4.
-    let pos = [0.0, 0.0, 0.0];
-    bearer.position = pos;
-    non_bearer.position = pos;
-    let bumped_b = bearer.apply_obstacle_collision(&field);
-    let bumped_n = non_bearer.apply_obstacle_collision(&field);
-    if !(bumped_b && bumped_n) {
-        // Origin happened to be in open space — test inconclusive but not a
-        // regression. Skip rather than scan for a wall; the unit test for the
-        // factor itself plus the smoke covers the path.
-        return;
-    }
-    assert!(
-        bearer.damage_accum < non_bearer.damage_accum - 1e-6,
-        "bearer wall bump damage_accum {} should be < non-bearer {}",
-        bearer.damage_accum,
-        non_bearer.damage_accum
-    );
-}
-
-#[test]
-fn symbiont_bearer_body_cost_drains_energy() {
-    let mut world = world_with_n_cells(2);
-    attach_symbiont(&mut world.cells[0], 1);
-    world.cells[0].energy = 100.0;
-    let dt = 1.0 / FIXED_TIMESTEP_HZ;
-    let before = world.cells[0].energy;
-    world.apply_symbiont_energy(dt);
-    let delta = world.cells[0].energy - before;
-    let expected = -SYMBIONT_BODY_COST_PER_SEC * dt;
-    // 1e-4 tolerance — `100.0 - 0.0083` loses ~1.5e-5 absolute precision in
-    // f32 round-trip; testing intent is "bearer paid the cost", not bit-exact.
-    assert!(
-        (delta - expected).abs() < 1e-4,
-        "bearer energy delta {} expected {}",
-        delta,
-        expected
-    );
 }

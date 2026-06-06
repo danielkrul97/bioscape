@@ -33,7 +33,9 @@ struct CollisionParams {
     /// at pair formation in `bond_rest_cos`.
     bond_bend_stiffness: f32,
     bond_bend_damping: f32,
-    _pad1: u32,
+    /// Sprint 202 hotfix — stability ceiling on `dt/mass` for the bond spring +
+    /// damper + bending impulse. See `crate::DT_OVER_M_BOND_MAX`.
+    dt_over_m_bond_max: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +82,10 @@ pub struct CollisionGpu {
     velocities_buf: wgpu::Buffer,
     eff_radii_buf: wgpu::Buffer,
     max_axes_buf: wgpu::Buffer,
+    /// Sprint 203: per-cell heading + body dims for the oriented-ellipsoid
+    /// contact radius (`ellipsoid_support` in collision.wgsl).
+    headings_buf: wgpu::Buffer,
+    body_dims_buf: wgpu::Buffer,
     adhesion_types_buf: wgpu::Buffer,
     bond_partner_idx_buf: wgpu::Buffer,
     bond_rest_buf: wgpu::Buffer,
@@ -109,10 +115,18 @@ pub struct CollisionGpu {
     /// upload, with the comparison itself well under 1 µs at 1.5k cells.
     cached_eff_radii: Vec<f32>,
     cached_max_axes: Vec<f32>,
+    cached_body_dims: Vec<f32>,
     cached_adhesion_types: Vec<u32>,
 }
 
 impl CollisionGpu {
+    /// Bond partner-index buffer (`i * bonds_per_cell + slot`, -1 = empty),
+    /// uploaded each tick. Shared read-only with the predation shader so an
+    /// attacker can exclude its own bonded partners.
+    pub fn bond_partner_idx_buffer(&self) -> &wgpu::Buffer {
+        &self.bond_partner_idx_buf
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_context(
         ctx: &GpuContext,
@@ -183,7 +197,7 @@ impl CollisionGpu {
             label: Some("collision"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/collision.wgsl").into()),
         });
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..18)
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..20)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -243,6 +257,8 @@ impl CollisionGpu {
         let velocities_buf = mk("collision-velocities", n * 3 * f, stor_dst);
         let eff_radii_buf = mk("collision-eff-radii", n * f, stor_dst);
         let max_axes_buf = mk("collision-max-axes", n * f, stor_dst);
+        let headings_buf = mk("collision-headings", n * f, stor_dst);
+        let body_dims_buf = mk("collision-body-dims", n * 3 * f, stor_dst);
         let adhesion_types_buf = mk("collision-adhesion-types", n * f, stor_dst);
         let bonds_total = n * (bonds.bonds_per_cell.max(1) as u64);
         let bond_partner_idx_buf = mk("collision-bond-partner-idx", bonds_total * f, stor_dst);
@@ -252,14 +268,21 @@ impl CollisionGpu {
         let masses_buf = mk("collision-masses", n * f, stor_dst);
         // Default mass = 1.0 so a never-uploaded buffer still divides
         // by a finite scalar instead of zeroing impulses.
-        queue.write_buffer(&masses_buf, 0, bytemuck::cast_slice(&vec![1.0_f32; capacity]));
+        queue.write_buffer(
+            &masses_buf,
+            0,
+            bytemuck::cast_slice(&vec![1.0_f32; capacity]),
+        );
         let bond_pairs_total = n * (bonds.bonds_per_cell.max(1) as u64).pow(2);
         let bond_rest_cos_buf = mk("collision-bond-rest-cos", bond_pairs_total * f, stor_dst);
         let stor_dst_src = stor_dst | wgpu::BufferUsages::COPY_SRC;
         let contacts_total = n * (max_contacts_per_cell.max(1) as u64);
         let contact_count_buf = mk("collision-contact-count", n * f, stor_dst_src);
-        let contact_partners_buf =
-            mk("collision-contact-partners", contacts_total * f, stor_dst_src);
+        let contact_partners_buf = mk(
+            "collision-contact-partners",
+            contacts_total * f,
+            stor_dst_src,
+        );
         let deltas_buf = mk("collision-deltas", n * 3 * f, stor_src);
         let vel_deltas_buf = mk("collision-vel-deltas", n * 3 * f, stor_src);
         let deltas_rb = mk("collision-deltas-rb", n * 3 * f, read);
@@ -285,6 +308,8 @@ impl CollisionGpu {
             velocities_buf,
             eff_radii_buf,
             max_axes_buf,
+            headings_buf,
+            body_dims_buf,
             adhesion_types_buf,
             bond_partner_idx_buf,
             bond_rest_buf,
@@ -304,6 +329,7 @@ impl CollisionGpu {
             vel_packed: Vec::new(),
             cached_eff_radii: Vec::new(),
             cached_max_axes: Vec::new(),
+            cached_body_dims: Vec::new(),
             cached_adhesion_types: Vec::new(),
         })
     }
@@ -321,6 +347,8 @@ impl CollisionGpu {
         velocities: &[[f32; 3]],
         eff_radii: &[f32],
         max_axes: &[f32],
+        headings: &[f32],
+        body_dims: &[f32],
         adhesion_types: &[u32],
         bond_partner_idx: &[i32],
         bond_rest: &[f32],
@@ -350,6 +378,8 @@ impl CollisionGpu {
             velocities,
             eff_radii,
             max_axes,
+            headings,
+            body_dims,
             adhesion_types,
             bond_partner_idx,
             bond_rest,
@@ -377,6 +407,8 @@ impl CollisionGpu {
         velocities: &[[f32; 3]],
         eff_radii: &[f32],
         max_axes: &[f32],
+        headings: &[f32],
+        body_dims: &[f32],
         adhesion_types: &[u32],
         bond_partner_idx: &[i32],
         bond_rest: &[f32],
@@ -393,11 +425,27 @@ impl CollisionGpu {
         assert_eq!(masses.len(), n, "masses length mismatch");
         let bonds_total = n * self.bonds.bonds_per_cell as usize;
         let bond_pairs_total = bonds_total * self.bonds.bonds_per_cell as usize;
-        assert_eq!(bond_rest_cos.len(), bond_pairs_total, "bond_rest_cos length mismatch");
-        assert_eq!(bond_partner_idx.len(), bonds_total, "bond_partner_idx length mismatch");
+        assert_eq!(
+            bond_rest_cos.len(),
+            bond_pairs_total,
+            "bond_rest_cos length mismatch"
+        );
+        assert_eq!(
+            bond_partner_idx.len(),
+            bonds_total,
+            "bond_partner_idx length mismatch"
+        );
         assert_eq!(bond_rest.len(), bonds_total, "bond_rest length mismatch");
-        assert_eq!(bond_stiffness.len(), bonds_total, "bond_stiffness length mismatch");
-        assert_eq!(bond_damping.len(), bonds_total, "bond_damping length mismatch");
+        assert_eq!(
+            bond_stiffness.len(),
+            bonds_total,
+            "bond_stiffness length mismatch"
+        );
+        assert_eq!(
+            bond_damping.len(),
+            bonds_total,
+            "bond_damping length mismatch"
+        );
         if n == 0 {
             return;
         }
@@ -427,7 +475,7 @@ impl CollisionGpu {
             dt: 1.0 / crate::FIXED_TIMESTEP_HZ,
             bond_bend_stiffness: crate::BOND_BENDING_STIFFNESS,
             bond_bend_damping: crate::BOND_BENDING_DAMPING,
-            _pad1: 0,
+            dt_over_m_bond_max: crate::DT_OVER_M_BOND_MAX,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -443,6 +491,16 @@ impl CollisionGpu {
         );
         self.queue
             .write_buffer(&self.masses_buf, 0, bytemuck::cast_slice(masses));
+        // Sprint 203: heading changes every tick (always upload); body_dims
+        // only on morph (content-cached like eff_radii / max_axes).
+        self.queue
+            .write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
+        if self.cached_body_dims != body_dims {
+            self.queue
+                .write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(body_dims));
+            self.cached_body_dims.clear();
+            self.cached_body_dims.extend_from_slice(body_dims);
+        }
         self.queue.write_buffer(
             &self.bond_rest_cos_buf,
             0,
@@ -502,24 +560,86 @@ impl CollisionGpu {
             label: Some("collision-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.eff_radii_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.max_axes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cell_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cell_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: self.deltas_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: self.velocities_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.vel_deltas_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.adhesion_types_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: self.bond_partner_idx_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.bond_rest_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: self.bond_stiffness_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.bond_damping_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.contact_count_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: self.contact_partners_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: self.masses_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 17, resource: self.bond_rest_cos_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.eff_radii_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.max_axes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cell_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cell_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.deltas_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.velocities_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.vel_deltas_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.adhesion_types_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: self.bond_partner_idx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.bond_rest_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: self.bond_stiffness_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: self.bond_damping_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: self.contact_count_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: self.contact_partners_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: self.masses_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: self.bond_rest_cos_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: self.headings_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: self.body_dims_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -577,6 +697,7 @@ impl CollisionGpu {
         n: usize,
         eff_radii: &[f32],
         max_axes: &[f32],
+        body_dims: &[f32],
         adhesion_types: &[u32],
         bond_partner_idx: &[i32],
         bond_rest: &[f32],
@@ -590,11 +711,27 @@ impl CollisionGpu {
         assert_eq!(adhesion_types.len(), n, "adhesion_types length mismatch");
         let bonds_total = n * self.bonds.bonds_per_cell as usize;
         let bond_pairs_total = bonds_total * self.bonds.bonds_per_cell as usize;
-        assert_eq!(bond_rest_cos.len(), bond_pairs_total, "bond_rest_cos length mismatch");
-        assert_eq!(bond_partner_idx.len(), bonds_total, "bond_partner_idx length mismatch");
+        assert_eq!(
+            bond_rest_cos.len(),
+            bond_pairs_total,
+            "bond_rest_cos length mismatch"
+        );
+        assert_eq!(
+            bond_partner_idx.len(),
+            bonds_total,
+            "bond_partner_idx length mismatch"
+        );
         assert_eq!(bond_rest.len(), bonds_total, "bond_rest length mismatch");
-        assert_eq!(bond_stiffness.len(), bonds_total, "bond_stiffness length mismatch");
-        assert_eq!(bond_damping.len(), bonds_total, "bond_damping length mismatch");
+        assert_eq!(
+            bond_stiffness.len(),
+            bonds_total,
+            "bond_stiffness length mismatch"
+        );
+        assert_eq!(
+            bond_damping.len(),
+            bonds_total,
+            "bond_damping length mismatch"
+        );
         if n == 0 {
             return;
         }
@@ -614,7 +751,7 @@ impl CollisionGpu {
             dt: 1.0 / crate::FIXED_TIMESTEP_HZ,
             bond_bend_stiffness: crate::BOND_BENDING_STIFFNESS,
             bond_bend_damping: crate::BOND_BENDING_DAMPING,
-            _pad1: 0,
+            dt_over_m_bond_max: crate::DT_OVER_M_BOND_MAX,
         };
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
@@ -669,38 +806,108 @@ impl CollisionGpu {
         let zero_partners = vec![0u8; contacts_total * 4];
         self.queue
             .write_buffer(&self.contact_partners_buf, 0, &zero_partners);
+        // Sprint 203: body_dims content-cached (changes on morph only). Heading
+        // is bound from the persistent cells buffer (holds the post-step value).
+        if self.cached_body_dims != body_dims {
+            self.queue
+                .write_buffer(&self.body_dims_buf, 0, bytemuck::cast_slice(body_dims));
+            self.cached_body_dims.clear();
+            self.cached_body_dims.extend_from_slice(body_dims);
+        }
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("collision-bg-cells"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
                 // Positions / velocities come from persistent `CellsGpu`
                 // buffers — no per-tick upload. `eff_radii` stays on the
                 // internal cached buffer because `apply_morph` runs between
                 // `brain_act` (which last uploaded `cells.eff_radius_buf`)
                 // and this dispatch and may mutate a cell's effective
                 // radius — binding the cells buffer would feed stale values.
-                wgpu::BindGroupEntry { binding: 1, resource: cells_gpu.position_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.eff_radii_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.max_axes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cell_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cell_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: self.deltas_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: cells_gpu.velocities_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.vel_deltas_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.adhesion_types_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: self.bond_partner_idx_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.bond_rest_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: self.bond_stiffness_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: self.bond_damping_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: self.contact_count_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: self.contact_partners_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cells_gpu.position_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.eff_radii_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.max_axes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cell_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cell_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.deltas_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: cells_gpu.velocities_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.vel_deltas_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.adhesion_types_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: self.bond_partner_idx_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.bond_rest_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: self.bond_stiffness_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: self.bond_damping_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: self.contact_count_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: self.contact_partners_buf.as_entire_binding(),
+                },
                 // S202: mass + bend-rest-cos bound from the persistent cells +
                 // internal buffers respectively. The cells buffer was already
                 // uploaded in `brain_act_gpu_full` Phase 2.
-                wgpu::BindGroupEntry { binding: 16, resource: cells_gpu.mass_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 17, resource: self.bond_rest_cos_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: cells_gpu.mass_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: self.bond_rest_cos_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: cells_gpu.heading_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: self.body_dims_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -756,7 +963,9 @@ impl CollisionGpu {
         vel_slice.map_async(wgpu::MapMode::Read, |_| {});
         count_slice.map_async(wgpu::MapMode::Read, |_| {});
         partners_slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let pos_data = pos_slice.get_mapped_range();
         let vel_data = vel_slice.get_mapped_range();
         let count_data = count_slice.get_mapped_range();
@@ -770,8 +979,7 @@ impl CollisionGpu {
             .map(|i| [vf[i * 3], vf[i * 3 + 1], vf[i * 3 + 2]])
             .collect();
         let contact_count: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&count_data).to_vec();
-        let contact_partners: Vec<u32> =
-            bytemuck::cast_slice::<u8, u32>(&partners_data).to_vec();
+        let contact_partners: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&partners_data).to_vec();
         drop(pos_data);
         drop(vel_data);
         drop(count_data);
@@ -788,4 +996,3 @@ impl CollisionGpu {
         }
     }
 }
-

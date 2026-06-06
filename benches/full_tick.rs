@@ -52,8 +52,10 @@ impl BenchWorld {
         let foods: Vec<Food> = (0..n_food)
             .map(|_| Food::random(&mut rng, WORLD_HALF))
             .collect();
-        let smell =
-            SmellField::new([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z], WORLD_HALF);
+        let smell = SmellField::new(
+            [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
+            WORLD_HALF,
+        );
         let pheromone = SmellField::new(
             [PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z],
             WORLD_HALF,

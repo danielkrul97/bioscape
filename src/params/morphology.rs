@@ -97,3 +97,31 @@ pub const COMPLEXITY_GRAB_GAIN: f32 = 1.0;
 /// grab cone od cell centra: `tip_distance = effective_radius + spike.length`.
 /// Šířka cone u tipu = `tip_distance × tan(half_angle)`.
 pub const SPIKE_GRAB_REACH_BONUS: f32 = 1.0;
+
+// ─── Axis C: morphogenesis (S213) ────────────────────────────────────────────
+// Positional information for emergent multicellular body-plans. A per-cell
+// scalar "morphogen" diffuses over the bond graph (one Jacobi step per tick),
+// each cell sourcing in proportion to its bond degree. Steady state grades from
+// high (deeply interior cells, surrounded by bonded neighbours) to ~0
+// (surface/tip/solo cells) — giving cells a sense of *where* they sit in the
+// cluster, the precondition for spatially-organised differentiation.
+//
+// Stability needs `MORPHOGEN_DECAY > MORPHOGEN_DIFFUSION`; the uniform fixed
+// point is `SOURCE·deg / (DECAY − DIFFUSION)`.
+pub const MORPHOGEN_DECAY: f32 = 0.3;
+pub const MORPHOGEN_DIFFUSION: f32 = 0.2;
+pub const MORPHOGEN_SOURCE: f32 = 0.1;
+pub const MORPHOGEN_MAX: f32 = 1.5;
+/// Differentiation coupling: per-second rate at which a cluster cell's
+/// `cell_state` is pulled toward its positional role. SURFACE foragers (low
+/// morphogen) become altruists — they can reach food and share it inward to
+/// feed the blocked interior; DEEP interior cells (high morphogen) stay
+/// self-focused (they are fed). Without this division of labour the interior
+/// of a dense organism starves. Gentle so the bistable feedback in
+/// `update_cell_state` still amplifies. Only applied to bonded cells.
+pub const MORPHOGEN_DIFFERENTIATION_K: f32 = 0.3;
+
+/// Mutation sigma for the heritable `division_angle` gene (oriented division).
+/// ~2 % of the 2π range per generation — slow drift so a lineage's body-build
+/// rule is strategically stable.
+pub const SIGMA_DIVISION_ANGLE: f32 = 0.13;

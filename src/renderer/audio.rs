@@ -211,8 +211,7 @@ fn sample_vibration_at_camera(
     audio.smoothed_pan += alpha * (pan_axis - audio.smoothed_pan);
 
     let amp_norm = (audio.smoothed_amp * AMP_GAIN).tanh();
-    let cutoff_hz =
-        CUTOFF_BASE_HZ + CUTOFF_RANGE_HZ * (audio.smoothed_grad_mag * GRAD_GAIN).tanh();
+    let cutoff_hz = CUTOFF_BASE_HZ + CUTOFF_RANGE_HZ * (audio.smoothed_grad_mag * GRAD_GAIN).tanh();
     let pan_val = (audio.smoothed_pan * GRAD_GAIN).clamp(-1.0, 1.0);
 
     audio.master_amp.set(amp_norm);

@@ -118,10 +118,7 @@ fn disable_egui_auto_context(mut settings: ResMut<EguiGlobalSettings>) {
 /// Runs in `PostStartup` so the renderer's `setup` chain has already
 /// spawned the camera. `Camera3d` filter excludes the mystery
 /// `Camera`-only entity from any plugin we don't control.
-fn attach_primary_egui_context(
-    mut commands: Commands,
-    cameras: Query<Entity, With<Camera3d>>,
-) {
+fn attach_primary_egui_context(mut commands: Commands, cameras: Query<Entity, With<Camera3d>>) {
     for entity in &cameras {
         commands.entity(entity).insert(PrimaryEguiContext);
         info!("inspector: attached PrimaryEguiContext to {:?}", entity);
@@ -141,34 +138,34 @@ impl Plugin for InspectorPlugin {
             enable_multipass_for_primary_context: false,
             ..Default::default()
         })
-            .init_resource::<SelectedCell>()
-            .init_resource::<HoverCell>()
-            .init_resource::<PendingSave>()
-            .init_resource::<ActivationHistory>()
-            // PreStartup: disable auto-attach BEFORE any camera spawns
-            // so bevy_egui doesn't latch onto the wrong Camera entity.
-            // PostStartup: explicit attach after the renderer's `setup`
-            // has run.
-            .add_systems(PreStartup, disable_egui_auto_context)
-            .add_systems(PostStartup, attach_primary_egui_context)
-            // Picking & hover read mouse state; gate them off when egui owns
-            // the cursor so the dialog itself is clickable. Picking runs
-            // before camera orbit input so a click never starts an orbit
-            // and a selection at the same time.
-            .add_systems(
-                Update,
-                (
-                    picking::hover_cell.run_if(not(egui_wants_any_pointer_input)),
-                    picking::pick_cell.run_if(not(egui_wants_any_pointer_input)),
-                    picking::clear_on_escape.run_if(not(egui_wants_any_keyboard_input)),
-                    picking::sync_selection_snapshot,
-                    history::record_history,
-                    outline::draw_outline,
-                    outline::draw_hover_outline,
-                    export::poll_pending_save,
-                )
-                    .chain(),
+        .init_resource::<SelectedCell>()
+        .init_resource::<HoverCell>()
+        .init_resource::<PendingSave>()
+        .init_resource::<ActivationHistory>()
+        // PreStartup: disable auto-attach BEFORE any camera spawns
+        // so bevy_egui doesn't latch onto the wrong Camera entity.
+        // PostStartup: explicit attach after the renderer's `setup`
+        // has run.
+        .add_systems(PreStartup, disable_egui_auto_context)
+        .add_systems(PostStartup, attach_primary_egui_context)
+        // Picking & hover read mouse state; gate them off when egui owns
+        // the cursor so the dialog itself is clickable. Picking runs
+        // before camera orbit input so a click never starts an orbit
+        // and a selection at the same time.
+        .add_systems(
+            Update,
+            (
+                picking::hover_cell.run_if(not(egui_wants_any_pointer_input)),
+                picking::pick_cell.run_if(not(egui_wants_any_pointer_input)),
+                picking::clear_on_escape.run_if(not(egui_wants_any_keyboard_input)),
+                picking::sync_selection_snapshot,
+                history::record_history,
+                outline::draw_outline,
+                outline::draw_hover_outline,
+                export::poll_pending_save,
             )
-            .add_systems(EguiPrimaryContextPass, dialog::draw_inspector_window);
+                .chain(),
+        )
+        .add_systems(EguiPrimaryContextPass, dialog::draw_inspector_window);
     }
 }

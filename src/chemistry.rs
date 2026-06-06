@@ -125,8 +125,7 @@ impl SmellField {
                         let back = grid[back_row + i];
                         let front = grid[front_row + i];
                         let new = center
-                            + diffusion
-                                * (left + right + up + down + back + front - 6.0 * center);
+                            + diffusion * (left + right + up + down + back + front - 6.0 * center);
                         new * decay
                     };
                     scratch_plane[j * nx] = scalar_cell(0);
@@ -145,18 +144,13 @@ impl SmellField {
                                 .try_into()
                                 .unwrap(),
                         );
-                        let up = f32x8::new(
-                            grid[up_row + i..up_row + i + 8].try_into().unwrap(),
-                        );
-                        let down = f32x8::new(
-                            grid[down_row + i..down_row + i + 8].try_into().unwrap(),
-                        );
-                        let back = f32x8::new(
-                            grid[back_row + i..back_row + i + 8].try_into().unwrap(),
-                        );
-                        let front = f32x8::new(
-                            grid[front_row + i..front_row + i + 8].try_into().unwrap(),
-                        );
+                        let up = f32x8::new(grid[up_row + i..up_row + i + 8].try_into().unwrap());
+                        let down =
+                            f32x8::new(grid[down_row + i..down_row + i + 8].try_into().unwrap());
+                        let back =
+                            f32x8::new(grid[back_row + i..back_row + i + 8].try_into().unwrap());
+                        let front =
+                            f32x8::new(grid[front_row + i..front_row + i + 8].try_into().unwrap());
                         let mut acc = left + right;
                         acc += up;
                         acc += down;
@@ -183,13 +177,7 @@ impl SmellField {
     /// flux through walls). Scalar-only path; the SIMD fast path in `step`
     /// is bypassed because mask checks vary per-voxel. Caller pays one
     /// branch per voxel — acceptable since this only runs in maze mode.
-    pub fn step_masked(
-        &mut self,
-        diffusion: f32,
-        decay_per_sec: f32,
-        dt: f32,
-        mask: &[bool],
-    ) {
+    pub fn step_masked(&mut self, diffusion: f32, decay_per_sec: f32, dt: f32, mask: &[bool]) {
         debug_assert_eq!(mask.len(), self.grid.len());
         let nx = self.resolution[0];
         let ny = self.resolution[1];
@@ -221,7 +209,11 @@ impl SmellField {
                         let i_right = if i + 1 == nx { 0 } else { i + 1 };
                         let center = grid[idx];
                         let read = |neighbor_idx: usize| -> f32 {
-                            if mask[neighbor_idx] { center } else { grid[neighbor_idx] }
+                            if mask[neighbor_idx] {
+                                center
+                            } else {
+                                grid[neighbor_idx]
+                            }
                         };
                         let left = read(center_plane + j * nx + i_left);
                         let right = read(center_plane + j * nx + i_right);
@@ -230,8 +222,7 @@ impl SmellField {
                         let back = read(back_plane + j * nx + i);
                         let front = read(front_plane + j * nx + i);
                         let new = center
-                            + diffusion
-                                * (left + right + up + down + back + front - 6.0 * center);
+                            + diffusion * (left + right + up + down + back + front - 6.0 * center);
                         scratch_plane[j * nx + i] = new * decay;
                     }
                 }

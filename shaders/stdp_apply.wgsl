@@ -9,10 +9,10 @@
 // Workgroup_size 64 = one thread per cell; no inter-cell weight sharing
 // → no atomics needed (weights are per-cell).
 
-const BRAIN_INPUTS: u32 = 86u;
+const BRAIN_INPUTS: u32 = 85u;
 const BRAIN_HIDDEN: u32 = 45u;
 const W1_OFFSET: u32 = 0u;
-const WEIGHTS_PER_CELL: u32 = 4605u;
+const WEIGHTS_PER_CELL: u32 = 4560u;
 const NEURON_MODEL_IZHIKEVICH: u32 = 1u;
 
 struct Params {

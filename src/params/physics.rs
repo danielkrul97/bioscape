@@ -36,7 +36,18 @@ pub const ANGULAR_DRAG: f32 = 1.0;
 pub const ENERGY_COST_PER_V_SQ: f32 = 0.0008;
 pub const ANGULAR_ENERGY_COST: f32 = 0.05;
 pub const VISION_COST_PER_RADIUS: f32 = 0.02;
-pub const BODY_COST_FACTOR: f32 = 0.8;
+/// Sprint 203 — body maintenance recalibrated for allometric (Kleiber)
+/// scaling. Pre-S203: cost = volume × 0.8 (isometric ∝ M). Now cost =
+/// volume^BODY_COST_EXPONENT × BODY_COST_FACTOR, so upkeep grows sub-linearly
+/// with mass — large bodies get an economy-of-scale instead of a cubic
+/// penalty. Factor bumped 0.8 → 1.2 so a mid-size body (volume ≈ 8) keeps
+/// roughly its old per-tick cost; the exponent is the biological change, the
+/// factor is the recalibration knob (tune via the 5×100-gen cross-seed sweep).
+pub const BODY_COST_FACTOR: f32 = 1.2;
+/// Kleiber's-law exponent (metabolic rate ∝ mass^0.75). Mirrored verbatim in
+/// `shaders/step.wgsl` (`const BODY_COST_EXPONENT`) — keep in sync for CPU/GPU
+/// parity (`step_gpu_matches_cpu`).
+pub const BODY_COST_EXPONENT: f32 = 0.75;
 
 pub const FOOD_VALUE: f32 = 20.0;
 pub const FOOD_SPAWN_RATE: usize = 5;
@@ -88,13 +99,61 @@ pub const FOOD_SINK_RATE: f32 = 8.0;
 
 /// Sprint 202 — inertial mass. `mass = body_l × body_w × body_h × DENSITY`.
 /// Replaces the pre-S202 mass proxy `effective_radius = (l+w+h)/3` used by
-/// `motor.wgsl` and treated as 1.0 elsewhere. DENSITY = 0.1 keeps the typical
-/// cell mass (body ≈ 3³ = 27 → mass ≈ 2.7) within an order of magnitude of
-/// the pre-S202 motor inertia coefficient so brain outputs that worked at the
-/// old scale still produce comparable accelerations. Selection now sees a
-/// cubic size penalty on responsiveness rather than linear, which is the
-/// real-physics behavior the pre-S202 linear scaling was an approximation of.
-pub const MASS_DENSITY: f32 = 0.1;
+/// `motor.wgsl` and treated as 1.0 elsewhere.
+///
+/// Motor thrust ∝ 1/mass, drag (`step.wgsl`) ∝ geometric `body_w`, so terminal
+/// speed is `max_speed / √(mass · body_w)`. The original 0.1 left mass ~10× too
+/// small for the real spawn body (~1.0): terminal speed ~3.2× `max_speed`, so
+/// every cell saturated the `VELOCITY_CAP_FACTOR` cap (1.5×) and turning was
+/// ~10× too twitchy. A sweep (seed 1, 18 gen) showed the full physical value
+/// 1.0 (terminal ≈ max_speed, off the cap) starves the population: fast movement
+/// is load-bearing for foraging at the current food density, so slow cells can't
+/// reach enough food (pop collapsed 200→14, bodies bloating as S203 size-rewards
+/// won the now-uncontested race). 0.5 is the chosen compromise — terminal ≈ 1.4×
+/// max_speed (just under the cap, no longer hard-saturated, turning ~5× calmer
+/// than at 0.1) while the population stays viable. Genuinely slower cells would
+/// require also loosening the food economy (↑ density / vision / eat radius).
+/// Keep the quadratic-drag regime: linear Stokes drag → v_term ∝ 1/b⁴, crushing
+/// large bodies (see `project_drag_regime`).
+pub const MASS_DENSITY: f32 = 0.5;
+
+/// Sprint 203 — surface-area-to-volume uptake limit. Food intake is scaled by
+/// a sphericity-like factor: a cell absorbs nutrients across its membrane, so a
+/// big compact (low surface-per-volume) body is uptake-limited relative to its
+/// volume-driven maintenance, while flat/elongated (high SA:V) bodies forage
+/// efficiently. factor = clamp(sqrt(sa_v / SA_V_UPTAKE_REF), MIN, MAX), where
+/// sa_v = surface/volume (box proxies, see `Phenotype::surface_area`).
+/// SA_V_UPTAKE_REF = 6.0 is the SA:V of the unit isotropic body (gen-0 spawn
+/// size), so a reference cell is neutral. MAX = 1.0 caps the factor so it never
+/// injects free energy — it only penalizes sub-reference compact bodies. Tune
+/// via the 5×100-gen cross-seed sweep.
+pub const SA_V_UPTAKE_REF: f32 = 6.0;
+pub const SA_V_UPTAKE_MIN: f32 = 0.5;
+pub const SA_V_UPTAKE_MAX: f32 = 1.0;
+
+/// Sprint 203 — volume-scaled energy storage ceiling. Pre-S203 `energy` was an
+/// unbounded scalar; real cells hold a finite reserve that scales with volume.
+/// max_energy = max(volume × ENERGY_STORAGE_DENSITY, ENERGY_STORAGE_FLOOR). The
+/// density term gives large bodies a genuinely larger famine reserve — the
+/// missing upside of being big; the floor keeps the smallest bodies viable. The
+/// frequency-scaled reproduction threshold is clamped to this capacity in
+/// `collect_fertile` (`reproduce_threshold`), so the cap throttles a dominant
+/// lineage (it must fill nearer its ceiling) without ever making it unable to
+/// reproduce. Applied as a CPU clamp at end-of-tick.
+pub const ENERGY_STORAGE_DENSITY: f32 = 30.0;
+pub const ENERGY_STORAGE_FLOOR: f32 = 600.0;
+
+/// Stability ceiling on `dt / mass` for the Hookean bond spring + damper in
+/// `collision.wgsl`. Semi-implicit Euler stays stable only while
+/// `k·dt·(dt/m)` and `c·(dt/m)` stay bounded; with `k_max = MAX_BOND_STIFFNESS`
+/// (960), `c_max = MAX_BOND_DAMPING` (120) and `dt = 1/60` the damping term is
+/// the binding constraint at `dt/m < 0.0125`. 0.008 keeps it non-oscillatory
+/// (damping factor 0.96, spring factor 0.13). Clamping the ratio caps the bond
+/// impulse only — `Phenotype::mass()` for motor/brownian keeps its full range.
+/// Without it S202's division by the 0.01 mass floor let small/stiff cells blow
+/// past the integrator stability limit: springs exploded, cells crossed
+/// `rest × BOND_BREAK_FACTOR`, and the bonds were pruned.
+pub const DT_OVER_M_BOND_MAX: f32 = 0.008;
 
 /// Sprint 202 — bulk-flow advection of diffusion fields (smell, pheromone,
 /// vibration, thermal perturbation). Curl-noise vector field generated at

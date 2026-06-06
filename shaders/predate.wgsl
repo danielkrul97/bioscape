@@ -50,7 +50,7 @@ struct PredateParams {
     spike_dot_threshold: f32,
     spike_bonus: f32,
     dilution_k: f32,
-    _pad0: u32,
+    bonds_per_cell: u32,
     world_half_x: f32,
     world_half_y: f32,
     _pad1: u32,
@@ -120,6 +120,16 @@ fn bucket_coords_of(pos: vec3<f32>) -> vec3<i32> {
 // Per-victim summed defense from bonded partners' `defense_contribution`,
 // CPU-aggregated each tick (similar pattern to bonded_inbox).
 @group(0) @binding(20) var<storage, read> defense_pool: array<f32>;
+// Sprint S213: per-cell bond partner indices (`bond_base = i * bonds_per_cell`,
+// -1 = empty slot), shared with the collision shader. Lets an attacker skip
+// its own bonded partners — tissue cells don't cannibalise each other, the
+// precondition for heritable multicellularity to be a net positive.
+@group(0) @binding(21) var<storage, read> bond_partner_idx: array<i32>;
+// Axis C: per-cell lineage id (low 32 bits). Same-lineage cells in contact are
+// one clonal organism — they don't predate each other. Predation only fires in
+// contact, so this protects co-located clusters without over-protecting a
+// lineage that has spread across the world.
+@group(0) @binding(22) var<storage, read> lineage_ids: array<u32>;
 
 // Per-bucket min(eff_radii) reduction. One thread per bucket walks
 // `hash_sorted[hash_offsets[b]..hash_offsets[b+1]]` and writes the smallest
@@ -165,9 +175,12 @@ fn herd_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     var count: u32 = 0u;
     // Resolve the center bucket once and walk neighbors via integer ±wrap on
     // xy (z clamped) — replaces the per-iteration `bucket_id_wrapped` chain.
+    // Iterate distinct bz planes (GRID_NZ is tiny): the `dz..=r_cells` + `clamp`
+    // pattern rescans z-edge planes, inflating `count` for boundary cells.
     let center = bucket_coords_of(pos_i);
-    for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-        let bz = clamp(center.z + dz, 0, GRID_NZ - 1);
+    let bz_lo = max(center.z - r_cells, 0);
+    let bz_hi = min(center.z + r_cells, GRID_NZ - 1);
+    for (var bz = bz_lo; bz <= bz_hi; bz = bz + 1) {
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
             var by = center.y + dy;
             if (by < 0) { by = by + GRID_NY; }
@@ -261,9 +274,13 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Resolve the center bucket once, walk neighbors via integer ±wrap on xy
     // (z clamped). Halves bucket-coord overhead vs the ghost-position pattern.
+    // Iterate distinct bz planes (GRID_NZ is tiny): the `dz..=r_cells` + `clamp`
+    // pattern rescans z-edge planes, applying attack damage to the same victim
+    // multiple times via the per-visit atomicAdd below.
     let center = bucket_coords_of(pos_i);
-    for (var dz = -r_cells; dz <= r_cells; dz = dz + 1) {
-        let bz = clamp(center.z + dz, 0, GRID_NZ - 1);
+    let bz_lo = max(center.z - r_cells, 0);
+    let bz_hi = min(center.z + r_cells, GRID_NZ - 1);
+    for (var bz = bz_lo; bz <= bz_hi; bz = bz + 1) {
         for (var dy = -r_cells; dy <= r_cells; dy = dy + 1) {
             var by = center.y + dy;
             if (by < 0) { by = by + GRID_NY; }
@@ -305,6 +322,22 @@ fn attack(@builtin(global_invocation_id) gid: vec3<u32>) {
                     );
                     let d2 = dot(d, d);
                     if (d2 < pair_r2) {
+                        // Tissue exclusion (no event, no drain): same clonal
+                        // organism (lineage) or directly bonded → don't predate.
+                        if (lineage_ids[i] == lineage_ids[j]) {
+                            continue;
+                        }
+                        var is_bonded = false;
+                        let bp_base = i * params.bonds_per_cell;
+                        for (var s = 0u; s < params.bonds_per_cell; s = s + 1u) {
+                            if (bond_partner_idx[bp_base + s] == i32(j)) {
+                                is_bonded = true;
+                                break;
+                            }
+                        }
+                        if (is_bonded) {
+                            continue;
+                        }
                         atomicAdd(&attacker_event_count[i], 1u);
                         let slot = atomicAdd(&victim_attacker_count[j], 1u);
                         if (slot < MAX_ATTACKERS_PER_VICTIM) {

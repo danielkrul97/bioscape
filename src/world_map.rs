@@ -24,9 +24,7 @@ impl WorldMap {
         world_half: [f32; 3],
         seed: u64,
     ) -> Self {
-        assert!(
-            resolution.iter().all(|&r| r >= 2) && base_resolution.iter().all(|&r| r >= 2)
-        );
+        assert!(resolution.iter().all(|&r| r >= 2) && base_resolution.iter().all(|&r| r >= 2));
         let mut rng = StdRng::seed_from_u64(seed);
         let base_n = base_resolution[0] * base_resolution[1] * base_resolution[2];
         let base: Vec<f32> = (0..base_n).map(|_| rng.random()).collect();

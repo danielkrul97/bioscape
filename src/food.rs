@@ -34,28 +34,70 @@ pub struct Food {
 pub const PLANT_FOOD_VALUE: f32 = 20.0;
 pub const CARRION_FOOD_VALUE: f32 = 30.0;
 
-// Cooperative food node — a high-value spawn that yields nothing until N
-// cells arrive within a time window. Creates fitness coupling for
-// recruitment signaling: solo cells get nothing, a coordinated trio gets
-// the full reward, so selection rewards "I see food, signal peers."
+// Cooperative food node — a high-value spawn that yields nothing until a
+// complementary-signal *handshake* happens between co-present cells. The node
+// reads each present cell's two bond-message emissions (out[12] = signal A,
+// out[13] = signal B); it unlocks only when at least one cell signals role A and
+// a *distinct* cell signals role B at the same time, and rewards only the
+// role-players (co-present non-signalers — free-riders — get nothing). This is
+// the social-coevolution loop: a cell's payoff is contingent on another cell
+// perceiving the situation and emitting the complementary signal, so the
+// otherwise-dormant communication channels finally come under selection and a
+// division-of-signalling-labour protocol can evolve.
 
+/// Legacy anonymous-arrival threshold. Retained for the `arrivals_avg` metric
+/// and old tests; the live trigger is the signal handshake, not this count.
 pub const COOP_FOOD_REQUIRED_ARRIVALS: usize = 3;
+/// Minimum rectified emission (`max(0, out[12 or 13])`) for a present cell to
+/// count as a handshake role-player (provider) on that channel.
+pub const HANDSHAKE_SIGNAL_THRESHOLD: f32 = 0.3;
+/// Energy/sec a cell pays per unit of handshake signal it emits (A + B summed,
+/// rectified), charged every tick regardless of location. This is what turns
+/// signalling from constitutive into *conditional*: emitting both channels
+/// everywhere is a standing tax, so selection favours cells that signal only
+/// when it pays — i.e. when they perceive a coop node and a prospective partner.
+/// That perceive-then-signal contingency is the social-intelligence hook (it
+/// makes the recurrent brain earn its keep), and the cost also keeps signalling
+/// honest so the handshake can't collapse into everyone-emits-everything. Small
+/// vs the `COOP_FOOD_REWARD_PER_CELL` payoff so a real handshake stays worth it.
+pub const HANDSHAKE_SIGNAL_COST: f32 = 0.25;
+/// Range over which a cell perceives an unanswered handshake call at a coop node
+/// (brain input slot 39). Several × `COOP_FOOD_ARRIVAL_RADIUS` so a cell can sense
+/// the opportunity from a distance, navigate in (via the node's nearest-food
+/// direction slot) and emit the missing complementary role — the call→response
+/// loop the blind handshake lacked.
+pub const COOP_CALL_PERCEPTION_RADIUS: f32 = 150.0;
 /// Time window (ticks) since spawn. After expiry, the node despawns with
 /// no reward distributed.
 pub const COOP_FOOD_TIME_WINDOW_TICKS: u32 = 120;
 /// Per-participant reward on a successful trigger. 4× the plant baseline —
 /// large enough to justify the loitering cost of waiting for peers.
-pub const COOP_FOOD_REWARD_PER_CELL: f32 = 80.0;
+pub const COOP_FOOD_REWARD_PER_CELL: f32 = 160.0;
 /// Acceptance radius for "arrived". Larger than the regular eat radius
 /// because the coop node represents a gathering point, not a literal
 /// food pickup — cells signal nearby, they don't need to overlap.
 pub const COOP_FOOD_ARRIVAL_RADIUS: f32 = 30.0;
 /// Per-tick Poisson-like spawn rate, calibrated for ~10–15 coop nodes per
 /// 600-tick generation.
-pub const COOP_FOOD_SPAWN_RATE_PER_TICK: f32 = 0.02;
+pub const COOP_FOOD_SPAWN_RATE_PER_TICK: f32 = 0.05;
 /// Cap on simultaneously live coop nodes. Bounds memory and per-tick
 /// arrival-scan cost.
 pub const COOP_FOOD_MAX_CONCURRENT: usize = 8;
+
+/// Sprint 209: single-cell multi-step "ripening" food. Unlike the grab-and-go
+/// plant food, it yields nothing until one cell *processes* it for several
+/// consecutive ticks (progress builds while a cell stays in range, decays
+/// otherwise). Rewards a persistent "commit and stay" policy that has to hold a
+/// goal in recurrent memory — the single-cell counterpart to `CoopFood`'s
+/// multi-cell coordination. A separate world list (like `CoopFood`), so the
+/// GPU eat-food path and the `Food` struct are untouched.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RipeningFood {
+    pub position: [f32; 3],
+    pub spawn_tick: u64,
+    /// Ticks of sustained processing accumulated so far.
+    pub progress: u32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoopFood {
@@ -126,6 +168,40 @@ pub fn try_trigger_coop(coop: &mut CoopFood, cells: &mut [Cell]) -> bool {
     true
 }
 
+/// Evaluate the complementary-signal handshake among the cells currently present
+/// at a coop node. `present` is `(idx, a, b)` per cell, where `a`/`b` are the raw
+/// signal-A (`out[12]`) and signal-B (`out[13]`) emissions (rectified here). A
+/// cell *provides* role A when `a ≥ T` and role B when `b ≥ T` (non-exclusive —
+/// a cell may provide both). The handshake unlocks only when both roles are
+/// covered by at least two *distinct* present cells; it then returns every
+/// provider's index (the reward set). A node where everyone calls (A) but nobody
+/// responds (B) stays locked — that asymmetry is the pressure that pulls the
+/// responder role into existence. Non-signalling bystanders are never rewarded
+/// (no free-riding), and the per-tick `HANDSHAKE_SIGNAL_COST` keeps providers
+/// from emitting both channels for free.
+pub fn coop_handshake_winners(present: &[(usize, f32, f32)]) -> Option<Vec<usize>> {
+    let t = HANDSHAKE_SIGNAL_THRESHOLD;
+    let mut winners: Vec<usize> = Vec::new();
+    let mut has_a = false;
+    let mut has_b = false;
+    for &(idx, a, b) in present {
+        let a = a.max(0.0);
+        let b = b.max(0.0);
+        if a >= t || b >= t {
+            winners.push(idx);
+        }
+        has_a |= a >= t;
+        has_b |= b >= t;
+    }
+    // Both roles present AND carried by ≥2 distinct cells (a lone cell emitting
+    // both can't handshake with itself).
+    if has_a && has_b && winners.len() >= 2 {
+        Some(winners)
+    } else {
+        None
+    }
+}
+
 /// Random position inside the world bounds (toroidal XY, optionally
 /// non-zero Z). Mirrors `Food::random`.
 pub fn random_coop_position(rng: &mut impl Rng, world_half: [f32; 3]) -> [f32; 3] {
@@ -143,7 +219,11 @@ pub fn random_coop_position(rng: &mut impl Rng, world_half: [f32; 3]) -> [f32; 3
 
 /// Per-tick arrival scan: every cell within `ARRIVAL_RADIUS` (toroidal-aware)
 /// of each non-triggered coop node is registered as an arrival.
-pub fn register_coop_arrivals_for_all(coops: &mut [CoopFood], cells: &[Cell], world_half: [f32; 3]) {
+pub fn register_coop_arrivals_for_all(
+    coops: &mut [CoopFood],
+    cells: &[Cell],
+    world_half: [f32; 3],
+) {
     let r2 = COOP_FOOD_ARRIVAL_RADIUS * COOP_FOOD_ARRIVAL_RADIUS;
     for coop in coops.iter_mut() {
         if coop.triggered {
@@ -212,7 +292,7 @@ impl Food {
     /// Linear value decay by age, clamped at 0.
     pub fn value_factor(&self) -> f32 {
         let age_sec = self.age_ticks as f32 / FIXED_TIMESTEP_HZ;
-        (1.0 - CARRION_DECAY_PER_SEC * age_sec).max(0.0)
+        (1.0 - FOOD_DECAY_PER_SEC * age_sec).max(0.0)
     }
 
     /// Increment age by one tick. Returns `false` once the food has

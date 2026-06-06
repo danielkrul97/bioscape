@@ -3,8 +3,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::*;
 use super::*;
+use crate::*;
 
 // GPU motor — applies brain outputs to velocity / angular_velocity /
 // pitch_velocity. Mirror of `Cell::apply_brain_motor`.
@@ -129,16 +129,46 @@ impl MotorGpu {
             label: Some("motor-bg"),
             layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: outputs_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: headings_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: pitches_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: max_speeds_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: turn_rates_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: masses_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: velocities_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: angular_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: pitch_vel_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: outputs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: headings_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pitches_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: max_speeds_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: turn_rates_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: masses_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: velocities_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: angular_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: pitch_vel_buf.as_entire_binding(),
+                },
             ],
         });
         Ok(Self {
@@ -171,9 +201,18 @@ impl MotorGpu {
         device: &wgpu::Device,
         capacity: usize,
     ) -> (
-        wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer,
-        wgpu::Buffer, wgpu::Buffer, wgpu::Buffer,
-        wgpu::Buffer, wgpu::Buffer, wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
     ) {
         let f = std::mem::size_of::<f32>();
         let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| {
@@ -185,12 +224,17 @@ impl MotorGpu {
             })
         };
         let stor_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let stor_dst_src =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let stor_dst_src = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let n = capacity as u64;
         (
-            mk("motor-outputs", n * BRAIN_OUTPUTS as u64 * f as u64, stor_dst),
+            mk(
+                "motor-outputs",
+                n * BRAIN_OUTPUTS as u64 * f as u64,
+                stor_dst,
+            ),
             mk("motor-headings", n * f as u64, stor_dst),
             mk("motor-pitches", n * f as u64, stor_dst),
             mk("motor-max-speeds", n * f as u64, stor_dst),
@@ -229,10 +273,14 @@ impl MotorGpu {
         }
 
         let mut outputs_flat: Vec<f32> = Vec::with_capacity(n * BRAIN_OUTPUTS);
-        for o in outputs { outputs_flat.extend_from_slice(o); }
+        for o in outputs {
+            outputs_flat.extend_from_slice(o);
+        }
         self.pos_packed.clear();
         self.pos_packed.reserve(n * 3);
-        for v in velocities_in { self.pos_packed.extend_from_slice(v); }
+        for v in velocities_in {
+            self.pos_packed.extend_from_slice(v);
+        }
 
         let params = MotorParams {
             num_cells: n as u32,
@@ -240,20 +288,35 @@ impl MotorGpu {
             drag_coefficient,
             ..MotorParams::default()
         };
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue.write_buffer(&self.outputs_buf, 0, bytemuck::cast_slice(&outputs_flat));
-        self.queue.write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
-        self.queue.write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
-        self.queue.write_buffer(&self.max_speeds_buf, 0, bytemuck::cast_slice(max_speeds));
-        self.queue.write_buffer(&self.turn_rates_buf, 0, bytemuck::cast_slice(turn_rates));
-        self.queue.write_buffer(&self.masses_buf, 0, bytemuck::cast_slice(masses));
-        self.queue.write_buffer(&self.velocities_buf, 0, bytemuck::cast_slice(&self.pos_packed));
-        self.queue.write_buffer(&self.angular_buf, 0, bytemuck::cast_slice(angular_in));
-        self.queue.write_buffer(&self.pitch_vel_buf, 0, bytemuck::cast_slice(pitch_vel_in));
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.outputs_buf, 0, bytemuck::cast_slice(&outputs_flat));
+        self.queue
+            .write_buffer(&self.headings_buf, 0, bytemuck::cast_slice(headings));
+        self.queue
+            .write_buffer(&self.pitches_buf, 0, bytemuck::cast_slice(pitches));
+        self.queue
+            .write_buffer(&self.max_speeds_buf, 0, bytemuck::cast_slice(max_speeds));
+        self.queue
+            .write_buffer(&self.turn_rates_buf, 0, bytemuck::cast_slice(turn_rates));
+        self.queue
+            .write_buffer(&self.masses_buf, 0, bytemuck::cast_slice(masses));
+        self.queue.write_buffer(
+            &self.velocities_buf,
+            0,
+            bytemuck::cast_slice(&self.pos_packed),
+        );
+        self.queue
+            .write_buffer(&self.angular_buf, 0, bytemuck::cast_slice(angular_in));
+        self.queue
+            .write_buffer(&self.pitch_vel_buf, 0, bytemuck::cast_slice(pitch_vel_in));
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("motor-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("motor-encoder"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("motor-pass"),
@@ -266,7 +329,13 @@ impl MotorGpu {
         let f = std::mem::size_of::<f32>() as u64;
         let v_bytes = (n as u64) * 3 * f;
         let s_bytes = (n as u64) * f;
-        encoder.copy_buffer_to_buffer(&self.velocities_buf, 0, &self.velocities_readback, 0, v_bytes);
+        encoder.copy_buffer_to_buffer(
+            &self.velocities_buf,
+            0,
+            &self.velocities_readback,
+            0,
+            v_bytes,
+        );
         encoder.copy_buffer_to_buffer(&self.angular_buf, 0, &self.angular_readback, 0, s_bytes);
         encoder.copy_buffer_to_buffer(&self.pitch_vel_buf, 0, &self.pitch_vel_readback, 0, s_bytes);
         self.queue.submit(Some(encoder.finish()));
@@ -277,12 +346,16 @@ impl MotorGpu {
         v_slice.map_async(wgpu::MapMode::Read, |_| {});
         a_slice.map_async(wgpu::MapMode::Read, |_| {});
         p_slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
 
         let velocities: Vec<[f32; 3]> = {
             let data = v_slice.get_mapped_range();
             let f: &[f32] = bytemuck::cast_slice(&data);
-            (0..n).map(|i| [f[i * 3], f[i * 3 + 1], f[i * 3 + 2]]).collect()
+            (0..n)
+                .map(|i| [f[i * 3], f[i * 3 + 1], f[i * 3 + 2]])
+                .collect()
         };
         let angular: Vec<f32> = {
             let data = a_slice.get_mapped_range();
@@ -314,9 +387,11 @@ impl MotorGpu {
         if num_cells == 0 {
             return;
         }
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("motor-dispatch-cells-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("motor-dispatch-cells-encoder"),
+            });
         self.dispatch_with_cells_into(&mut encoder, cells, num_cells, dt, drag_coefficient);
         self.queue.submit(Some(encoder.finish()));
     }
@@ -342,22 +417,53 @@ impl MotorGpu {
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         let cells_epoch = cells.epoch();
         if self.cached_cells_bg.is_none() || self.cached_cells_epoch != cells_epoch {
-            self.cached_cells_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("motor-bg-cells"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: cells.last_outputs_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: cells.heading_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: cells.pitch_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: cells.max_speed_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: cells.turn_rate_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: cells.mass_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: cells.velocities_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: cells.angular_velocity_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 9, resource: cells.pitch_velocity_buffer().as_entire_binding() },
-                ],
-            }));
+            self.cached_cells_bg =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("motor-bg-cells"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: cells.last_outputs_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: cells.heading_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: cells.pitch_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: cells.max_speed_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: cells.turn_rate_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: cells.mass_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: cells.velocities_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: cells.angular_velocity_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: cells.pitch_velocity_buffer().as_entire_binding(),
+                        },
+                    ],
+                }));
             self.cached_cells_epoch = cells_epoch;
         }
         let bind_group = self.cached_cells_bg.as_ref().unwrap();
@@ -371,4 +477,3 @@ impl MotorGpu {
         pass.dispatch_workgroups(workgroups, 1, 1);
     }
 }
-

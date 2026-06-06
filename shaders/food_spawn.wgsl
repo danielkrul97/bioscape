@@ -29,6 +29,10 @@ struct FoodSpawnParams {
     obstacle_ny: u32,
     obstacle_nz: u32,
     _pad0: u32,
+    generation: u32,
+    food_patch_contrast: f32,
+    food_patch_scale: f32,
+    food_patch_drift: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: FoodSpawnParams;
@@ -149,6 +153,19 @@ fn food_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rej_threshold = params.rejection_strength * (1.0 - richness);
     let rej_draw = uniform01(&s);
     if (rej_draw < rej_threshold) {
+        xoshiro_state[i] = s;
+        return;
+    }
+
+    // Sprint 207: patchy resource field. A slowly drifting analytic pattern
+    // makes some regions fertile and others barren so recurrent brains gain a
+    // reason to remember resource locations. patch in [0,1]; reject in deserts.
+    let drift = params.food_patch_drift * f32(params.generation);
+    let pw = sin(params.food_patch_scale * pos.x + drift)
+           * sin(params.food_patch_scale * pos.y - drift * 0.7);
+    let patch_val = 0.5 + 0.5 * pw;
+    let patch_rej = params.food_patch_contrast * (1.0 - patch_val);
+    if (uniform01(&s) < patch_rej) {
         xoshiro_state[i] = s;
         return;
     }

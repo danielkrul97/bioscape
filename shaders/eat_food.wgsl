@@ -40,7 +40,7 @@ struct EatFoodParams {
     fixed_timestep_hz: f32,
     plant_food_value: f32,
     carrion_food_value: f32,
-    carrion_decay_per_sec: f32,
+    food_decay_per_sec: f32,
     world_map_food_floor: f32,
     world_map_food_amp: f32,
 }
@@ -222,7 +222,7 @@ fn eat_food(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let kind = food_kinds[f];
                     let age_sec = f32(food_age_ticks[f]) / params.fixed_timestep_hz;
                     let value_factor = max(
-                        1.0 - params.carrion_decay_per_sec * age_sec,
+                        1.0 - params.food_decay_per_sec * age_sec,
                         0.0,
                     );
                     let richness = sample_world_map(

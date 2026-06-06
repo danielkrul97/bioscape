@@ -59,10 +59,10 @@ impl PopulateInputsGpu {
                 include_str!("../../shaders/populate_inputs.wgsl").into(),
             ),
         });
-        // 16 bindings: 0 uniform, 6 + 11 storage read_write, rest read-only.
+        // 15 bindings: 0 uniform, 6 + 11 storage read_write, rest read-only.
         // S187: binding 13 = per-cell reproduce_at_energies.
-        // S198: bindings 14 = symbiont_has, 15 = symbiont_deficit.
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..16u32)
+        // S213+: binding 14 = per-cell coop_call_signal.
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = (0..15u32)
             .map(|i| {
                 let ty = if i == 0 {
                     wgpu::BufferBindingType::Uniform
@@ -132,9 +132,11 @@ impl PopulateInputsGpu {
         if params.num_cells == 0 {
             return;
         }
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("populate-inputs-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("populate-inputs-encoder"),
+            });
         self.dispatch_into(&mut encoder, cells, sensor, params);
         self.queue.submit(Some(encoder.finish()));
     }
@@ -161,22 +163,66 @@ impl PopulateInputsGpu {
                 label: Some("populate-inputs-bg"),
                 layout: &self.bind_group_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: sensor.output_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: cells.velocities_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: cells.energy_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: cells.heading_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: cells.pitch_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: cells.damage_accum_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: cells.max_speed_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: cells.eff_radius_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 9, resource: sensor.vision_radii_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 10, resource: cells.last_hidden_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 11, resource: cells.last_inputs_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 12, resource: cells.bonded_inbox_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 13, resource: cells.reproduce_at_energies_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 14, resource: cells.symbiont_has_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 15, resource: cells.symbiont_deficit_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: sensor.output_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: cells.velocities_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: cells.energy_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: cells.heading_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: cells.pitch_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: cells.damage_accum_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: cells.max_speed_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: cells.eff_radius_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: sensor.vision_radii_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: cells.last_hidden_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: cells.last_inputs_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 12,
+                        resource: cells.bonded_inbox_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: cells.reproduce_at_energies_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 14,
+                        resource: cells.coop_call_buffer().as_entire_binding(),
+                    },
                 ],
             }));
             self.cached_cells_epoch = cells_epoch;
@@ -193,4 +239,3 @@ impl PopulateInputsGpu {
         pass.dispatch_workgroups(workgroups, 1, 1);
     }
 }
-

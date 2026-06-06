@@ -1,8 +1,8 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bioscape::{
-    EventCalendar, ObstacleField, SimClock, SmellField, WorldMap,
-    INITIAL_CELLS, N_PHEROMONE_CHANNELS,
+    EventCalendar, ObstacleField, SimClock, SmellField, WorldMap, INITIAL_CELLS,
+    N_PHEROMONE_CHANNELS,
 };
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
@@ -74,10 +74,7 @@ pub(super) struct CellEntityLookups {
 
 impl CellEntityLookups {
     #[allow(dead_code)]
-    pub(super) fn rebuild<'a>(
-        &mut self,
-        iter: impl Iterator<Item = (Entity, u64, [f32; 3])>,
-    ) {
+    pub(super) fn rebuild<'a>(&mut self, iter: impl Iterator<Item = (Entity, u64, [f32; 3])>) {
         self.id_to_entity.clear();
         self.id_to_position.clear();
         self.entity_to_idx.clear();
@@ -197,12 +194,6 @@ pub(super) struct SpikeMesh(pub(super) Handle<Mesh>);
 
 #[derive(Resource)]
 pub(super) struct SpikeMaterial(pub(super) Handle<StandardMaterial>);
-
-#[derive(Resource)]
-pub(super) struct SymbiontMesh(pub(super) Handle<Mesh>);
-
-#[derive(Resource)]
-pub(super) struct SymbiontMaterial(pub(super) Handle<StandardMaterial>);
 
 /// Sprint 36: per-lineage material cache. Lineage hue → handle do
 /// `Assets<StandardMaterial>`. Bevy automaticky deduplikuje stejné materialy

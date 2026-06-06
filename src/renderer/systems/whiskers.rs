@@ -9,10 +9,7 @@ use super::super::components::{CellEntity, Dying, Pooled};
 #[derive(Resource, Debug, Clone, Copy, Default)]
 pub(crate) struct ShowWhiskers(pub(crate) bool);
 
-pub(crate) fn toggle_whiskers(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut show: ResMut<ShowWhiskers>,
-) {
+pub(crate) fn toggle_whiskers(keys: Res<ButtonInput<KeyCode>>, mut show: ResMut<ShowWhiskers>) {
     if !keys.just_pressed(KeyCode::KeyK) {
         return;
     }
@@ -37,7 +34,10 @@ pub(crate) fn draw_whiskers(
         let cell = &cell.0;
         let pos = Vec3::new(cell.position[0], cell.position[1], cell.position[2]);
         let surface = CELL_RADIUS * cell.phenotype.effective_radius();
-        for (k, dir) in whisker_directions(cell.heading, cell.pitch).iter().enumerate() {
+        for (k, dir) in whisker_directions(cell.heading, cell.pitch)
+            .iter()
+            .enumerate()
+        {
             let dir = Vec3::new(dir[0], dir[1], dir[2]);
             let d = cell.last_whisker_distances[k].clamp(0.0, 1.0);
             let start = pos + dir * surface;

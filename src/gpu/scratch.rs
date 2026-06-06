@@ -31,12 +31,8 @@ pub struct GpuFullScratch {
     pub aux: Vec<[f32; 4]>,
     pub hidden_ns: Vec<u32>,
     pub bonded_inboxes: Vec<[f32; N_BOND_MSG_CHANNELS]>,
-    /// Sprint 198: per-cell symbiont presence (0/1) — read by populate_inputs
-    /// to drive brain input slot 39 (has_symbiont).
-    pub sym_has: Vec<u32>,
-    /// Sprint 198: per-cell symbiont `deficit_streak` (u32 ticks). Shader
-    /// normalises by SYMBIONT_UPKEEP_DEFICIT_TICKS for input slot 40.
-    pub sym_deficit: Vec<u32>,
+    /// S213+ per-cell coop-call perception signal, uploaded to the brain pass.
+    pub coop_call_signals: Vec<f32>,
     // Readback scratch — `CellsGpu::download_full_batch_into` zapisuje do těchto.
     /// Sprint 188: GPU now mirrors `last_inputs_buf` back to the CPU so
     /// `Cell.last_inputs` reflects what the brain actually saw this tick
@@ -75,6 +71,9 @@ pub struct GpuFullScratch {
     pub lt_attack_gates: Vec<f32>,
     pub lt_predation_size_ratios: Vec<f32>,
     pub lt_defense_pool: Vec<f32>,
+    /// Axis C: per-cell lineage id (low 32 bits) for predate same-lineage
+    /// (clonal organism) exclusion.
+    pub lt_lineage_ids: Vec<u32>,
     pub lt_adhesion_types: Vec<u32>,
     pub lt_spike_counts: Vec<u32>,
     pub lt_spikes_packed: Vec<[f32; 4]>,
@@ -104,6 +103,7 @@ impl GpuFullScratch {
         cr!(self.positions, n);
         cr!(self.eff_radii, n);
         cr!(self.masses, n);
+        cr!(self.coop_call_signals, n);
         cr!(self.vision_radii, n);
         cr!(self.food_positions, food_n);
         cr!(self.energies, n);
@@ -120,8 +120,6 @@ impl GpuFullScratch {
         cr!(self.aux, n);
         cr!(self.hidden_ns, n);
         cr!(self.bonded_inboxes, n);
-        cr!(self.sym_has, n);
-        cr!(self.sym_deficit, n);
     }
 
     /// Resize all per-cell snapshot fields to exactly `n` elements (filling

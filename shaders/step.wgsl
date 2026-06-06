@@ -1,5 +1,8 @@
-// Per-cell `Cell::step` mirror: integrate kinematics, anisotropic + angular
+// Authoritative per-cell step: integrate kinematics, anisotropic + angular
 // drag, thermal-modulated energy costs, world bounce. No neighbor lookup.
+// The CPU `Cell::step` mirrors this exact cost set; thermal-optimum / sensor-
+// gain / vibration-emit costs and FOV cost weighting are deliberately absent
+// here, so those genome traits exert no selection in the live sim.
 //
 // Pipeline order on the host: apply_brain_motor (motor.wgsl) → apply_morph
 // (CPU) → apply_brownian (CPU, RNG-bound) → this shader.
@@ -79,6 +82,10 @@ struct StepParams {
 // Sprint 202: thermal perturbation grid. Each voxel = f32 (bitcast<u32> on
 // upload by FieldGpu). Optional: skipped when `thermal_pert_active = 0`.
 @group(0) @binding(13) var<storage, read> thermal_pert_grid: array<u32>;
+
+// Sprint 203 — Kleiber's-law exponent for body maintenance. Mirror of
+// `params::physics::BODY_COST_EXPONENT`; keep in sync for CPU/GPU parity.
+const BODY_COST_EXPONENT: f32 = 0.75;
 
 @compute @workgroup_size(64)
 fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -183,7 +190,10 @@ fn step(@builtin(global_invocation_id) gid: vec3<u32>) {
     let age_sec = f32(new_age) / params.fixed_timestep_hz;
     let aging_factor = 1.0 + params.age_decay_per_sec * age_sec;
     let volume = body_l * body_w * body_h;
-    energy = energy - volume * params.body_cost_factor * aging_factor * dt_eff;
+    // Sprint 203 — Kleiber sub-linear body maintenance (mirror of CPU
+    // Cell::apply_energy_costs): cost ∝ volume^0.75.
+    let body_maint = pow(volume, BODY_COST_EXPONENT);
+    energy = energy - body_maint * params.body_cost_factor * aging_factor * dt_eff;
     energy = energy - spike * params.spike_cost_per_sec * dt_eff;
     energy = energy - shell * params.shell_cost_per_sec * dt_eff;
     let attack_strength = max(attack, 0.0);

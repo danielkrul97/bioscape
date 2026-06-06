@@ -301,7 +301,10 @@ impl ObstacleField {
     /// avoids bit-twiddling on the shader side; storage cost is small (a
     /// Hard-mode 65×37 maze packs to ~2.4 KB).
     pub fn packed_for_gpu(&self) -> Vec<u32> {
-        self.occupied.iter().map(|&b| if b { 1 } else { 0 }).collect()
+        self.occupied
+            .iter()
+            .map(|&b| if b { 1 } else { 0 })
+            .collect()
     }
 
     /// Whisker raycast: shoots `WHISKER_COUNT` short rays from `pos` in the
@@ -516,17 +519,20 @@ mod tests {
                 }
             }
         }
-        assert!(found_repel, "expected at least one wall to push back a nearby sphere");
+        assert!(
+            found_repel,
+            "expected at least one wall to push back a nearby sphere"
+        );
     }
 
     #[test]
     fn easy_more_open_than_hard() {
         let easy = ObstacleField::new_maze(HALF, 7, MazeDifficulty::Easy);
         let hard = ObstacleField::new_maze(HALF, 7, MazeDifficulty::Hard);
-        let easy_open = easy.occupied.iter().filter(|&&o| !o).count() as f32
-            / easy.occupied.len() as f32;
-        let hard_open = hard.occupied.iter().filter(|&&o| !o).count() as f32
-            / hard.occupied.len() as f32;
+        let easy_open =
+            easy.occupied.iter().filter(|&&o| !o).count() as f32 / easy.occupied.len() as f32;
+        let hard_open =
+            hard.occupied.iter().filter(|&&o| !o).count() as f32 / hard.occupied.len() as f32;
         assert!(
             easy_open > hard_open,
             "easy={easy_open:.3} should be more open than hard={hard_open:.3}"
@@ -543,7 +549,10 @@ mod tests {
     #[test]
     fn parse_difficulty_strings() {
         assert_eq!(MazeDifficulty::parse("easy"), Some(MazeDifficulty::Easy));
-        assert_eq!(MazeDifficulty::parse("MEDIUM"), Some(MazeDifficulty::Medium));
+        assert_eq!(
+            MazeDifficulty::parse("MEDIUM"),
+            Some(MazeDifficulty::Medium)
+        );
         assert_eq!(MazeDifficulty::parse("hard"), Some(MazeDifficulty::Hard));
         assert_eq!(MazeDifficulty::parse("nope"), None);
     }

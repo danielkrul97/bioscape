@@ -29,6 +29,13 @@ pub struct FoodSpawnParamsGpu {
     pub obstacle_ny: u32,
     pub obstacle_nz: u32,
     pub _pad0: u32,
+    /// Sprint 207: current generation — drives the drifting patch pattern in
+    /// `food_spawn.wgsl`. The remaining three mirror the `FOOD_PATCH_*`
+    /// constants. Four added fields keep the struct 16-byte aligned (80 B).
+    pub generation: u32,
+    pub food_patch_contrast: f32,
+    pub food_patch_scale: f32,
+    pub food_patch_drift: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -160,8 +167,9 @@ impl FoodSpawnGpu {
             })
         };
         let stor_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let stor_dst_src =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let stor_dst_src = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let k = capacity as u64;
         let xoshiro_buf = mk("food-spawn-xoshiro", k * u4, stor_dst);
@@ -232,7 +240,10 @@ impl FoodSpawnGpu {
         cell_hash: &SpatialHashGpu,
         params: FoodSpawnParamsGpu,
     ) -> FoodSpawnResult {
-        assert!(num_attempts <= self.capacity, "food-spawn dispatch overflow");
+        assert!(
+            num_attempts <= self.capacity,
+            "food-spawn dispatch overflow"
+        );
         let n_cells = cell_positions.len();
         assert_eq!(cell_max_axes.len(), n_cells, "max_axes length mismatch");
         if num_attempts == 0 {
@@ -260,13 +271,15 @@ impl FoodSpawnGpu {
         // outputs, so they don't need clearing — every thread unconditionally
         // writes to its slot.
         let cell_positions_buf =
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("food-spawn-cell-positions-tick"),
-                contents: bytemuck::cast_slice(&pos_packed),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let cell_max_axes_buf =
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("food-spawn-cell-positions-tick"),
+                    contents: bytemuck::cast_slice(&pos_packed),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+        let cell_max_axes_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("food-spawn-cell-max-axes-tick"),
                 contents: bytemuck::cast_slice(cell_max_axes),
                 usage: wgpu::BufferUsages::STORAGE,
@@ -276,22 +289,54 @@ impl FoodSpawnGpu {
             label: Some("food-spawn-bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.xoshiro_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.world_map_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.obstacle_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: cell_positions_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: cell_max_axes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: cell_hash.offsets_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: cell_hash.sorted_buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.candidates_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.valid_mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.xoshiro_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.world_map_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.obstacle_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cell_positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cell_max_axes_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: cell_hash.offsets_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: cell_hash.sorted_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.candidates_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.valid_mask_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("food-spawn-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("food-spawn-encoder"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("food-spawn-pass"),
@@ -312,7 +357,9 @@ impl FoodSpawnGpu {
         let mask_slice = self.valid_mask_rb.slice(0..mask_bytes);
         pos_slice.map_async(wgpu::MapMode::Read, |_| {});
         mask_slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let pos_data = pos_slice.get_mapped_range();
         let mask_data = mask_slice.get_mapped_range();
         let pf: &[f32] = bytemuck::cast_slice(&pos_data);

@@ -60,16 +60,13 @@ mod gpu_bench {
                 [
                     rng.random_range(0.0_f32..1.0),
                     rng.random_range(-core::f32::consts::PI..core::f32::consts::PI),
-                    rng.random_range(
-                        -core::f32::consts::FRAC_PI_2..core::f32::consts::FRAC_PI_2,
-                    ),
+                    rng.random_range(-core::f32::consts::FRAC_PI_2..core::f32::consts::FRAC_PI_2),
                     rng.random_range(0.0_f32..1.0),
                 ]
             })
             .collect();
         // Aby se attack pass spustil pro většinu cells.
-        let attack_signals: Vec<f32> =
-            (0..n).map(|_| rng.random_range(0.3_f32..1.5)).collect();
+        let attack_signals: Vec<f32> = (0..n).map(|_| rng.random_range(0.3_f32..1.5)).collect();
         Fixture {
             positions,
             eff_radii,
@@ -96,8 +93,8 @@ mod gpu_bench {
         for &n in &[1000_usize, 10000] {
             let fixture_full = make_fixture(n, 0xBEEF, false);
             let fixture_zero = make_fixture(n, 0xBEEF, true);
-            let mut hash = SpatialHashGpu::with_context(&ctx, n, cell_size, world_half)
-                .expect("hash init");
+            let mut hash =
+                SpatialHashGpu::with_context(&ctx, n, cell_size, world_half).expect("hash init");
             let _ = hash.rebuild(&fixture_full.positions);
             let mut pred = PredateGpu::with_context(&ctx, n).expect("predate init");
             let params = PredateParamsGpu {
@@ -116,47 +113,39 @@ mod gpu_bench {
                 ..PredateParamsGpu::default()
             };
 
-            group.bench_with_input(
-                BenchmarkId::new("full_multispike", n),
-                &n,
-                |b, &_n| {
-                    b.iter(|| {
-                        let res = pred.compute(
-                            black_box(&fixture_full.positions),
-                            black_box(&fixture_full.eff_radii),
-                            black_box(&fixture_full.headings),
-                            black_box(&fixture_full.pitches),
-                            black_box(&fixture_full.spikes_packed),
-                            black_box(&fixture_full.spike_counts),
-                            black_box(&fixture_full.attack_signals),
-                            &hash,
-                            params,
-                        );
-                        black_box(res);
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("full_multispike", n), &n, |b, &_n| {
+                b.iter(|| {
+                    let res = pred.compute(
+                        black_box(&fixture_full.positions),
+                        black_box(&fixture_full.eff_radii),
+                        black_box(&fixture_full.headings),
+                        black_box(&fixture_full.pitches),
+                        black_box(&fixture_full.spikes_packed),
+                        black_box(&fixture_full.spike_counts),
+                        black_box(&fixture_full.attack_signals),
+                        &hash,
+                        params,
+                    );
+                    black_box(res);
+                });
+            });
 
-            group.bench_with_input(
-                BenchmarkId::new("zero_spike_baseline", n),
-                &n,
-                |b, &_n| {
-                    b.iter(|| {
-                        let res = pred.compute(
-                            black_box(&fixture_zero.positions),
-                            black_box(&fixture_zero.eff_radii),
-                            black_box(&fixture_zero.headings),
-                            black_box(&fixture_zero.pitches),
-                            black_box(&fixture_zero.spikes_packed),
-                            black_box(&fixture_zero.spike_counts),
-                            black_box(&fixture_zero.attack_signals),
-                            &hash,
-                            params,
-                        );
-                        black_box(res);
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("zero_spike_baseline", n), &n, |b, &_n| {
+                b.iter(|| {
+                    let res = pred.compute(
+                        black_box(&fixture_zero.positions),
+                        black_box(&fixture_zero.eff_radii),
+                        black_box(&fixture_zero.headings),
+                        black_box(&fixture_zero.pitches),
+                        black_box(&fixture_zero.spikes_packed),
+                        black_box(&fixture_zero.spike_counts),
+                        black_box(&fixture_zero.attack_signals),
+                        &hash,
+                        params,
+                    );
+                    black_box(res);
+                });
+            });
         }
         group.finish();
     }

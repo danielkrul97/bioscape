@@ -124,22 +124,8 @@ pub fn populate_brain_inputs(
     for k in 0..WHISKER_COUNT {
         inputs[wh_base + k] = sensors.whisker_distances[k] * 2.0 - 1.0;
     }
-    // Sprint 198: endosymbiosis brain integration. Two slots right after
-    // whiskers: has_symbiont (0/1 binary) and deficit_norm (current
-    // deficit_streak normalized to [0, 1]). Both stay at 0 for non-bearers,
-    // so a pre-S198 brain (everyone non-bearer) reads byte-identical zeros
-    // here — once the population evolves bearers, the brain has signals to
-    // correlate motor outputs with bearer status.
-    let sym_base = wh_base + WHISKER_COUNT;
-    let (sym_has, sym_def_norm) = match cell.symbiont.as_ref() {
-        Some(s) => (
-            1.0_f32,
-            (s.deficit_streak as f32 / SYMBIONT_UPKEEP_DEFICIT_TICKS as f32).clamp(0.0, 1.0),
-        ),
-        None => (0.0_f32, 0.0_f32),
-    };
-    inputs[sym_base] = sym_has;
-    inputs[sym_base + 1] = sym_def_norm;
+    // S213+ social call-response: perceived unanswered-handshake signal (slot 39).
+    inputs[wh_base + WHISKER_COUNT] = cell.coop_call_signal;
     // Sprint 94: cluster-shared brain. Recurrent slots (21..52) čtou
     // `pooled_hidden` (mean self + bonded neighbors z předchozího ticku)
     // místo `last_hidden`. Solo cells: pool == self → behavior identical
@@ -275,10 +261,7 @@ where
 /// Pair (1 bond): output = (self + partner) / 2.
 /// Triad / cluster: arithmetic mean over alive bonded subgraph (1-hop only,
 /// no transitive — keeps O(n_bonds) per cell, no graph traversal cost).
-pub fn pool_bonded_hidden<F>(
-    cell: &Cell,
-    lookup_partner_hidden: F,
-) -> [f32; BRAIN_HIDDEN]
+pub fn pool_bonded_hidden<F>(cell: &Cell, lookup_partner_hidden: F) -> [f32; BRAIN_HIDDEN]
 where
     F: Fn(u64) -> Option<[f32; BRAIN_HIDDEN]>,
 {
@@ -305,10 +288,7 @@ where
 /// (= partner brain message channels). Solo cell vrátí [0; N]. Used jako
 /// pre-brain_act pass: caller assigns výsledek do `cell.bonded_inbox`,
 /// `populate_brain_inputs` ho čte do slots [27..29].
-pub fn pool_bond_messages<F>(
-    cell: &Cell,
-    lookup_partner_outputs: F,
-) -> [f32; N_BOND_MSG_CHANNELS]
+pub fn pool_bond_messages<F>(cell: &Cell, lookup_partner_outputs: F) -> [f32; N_BOND_MSG_CHANNELS]
 where
     F: Fn(u64) -> Option<[f32; BRAIN_OUTPUTS]>,
 {
@@ -343,8 +323,8 @@ pub fn vibration_passive_emit_for_cell(cell: &Cell) -> f32 {
     let vz = cell.velocity[2];
     let speed = (vx * vx + vy * vy + vz * vz).sqrt();
     let speed_norm = (speed / max_speed).clamp(0.0, 1.0);
-    let rot_norm = ((cell.angular_velocity.abs() + cell.pitch_velocity.abs()) / turn_rate)
-        .clamp(0.0, 2.0);
+    let rot_norm =
+        ((cell.angular_velocity.abs() + cell.pitch_velocity.abs()) / turn_rate).clamp(0.0, 2.0);
     VIBRATION_K_LINEAR * speed_norm + VIBRATION_K_ANGULAR * rot_norm
 }
 

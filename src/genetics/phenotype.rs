@@ -131,6 +131,32 @@ impl Phenotype {
         (self.volume() * MASS_DENSITY).max(0.01)
     }
 
+    /// Box-proxy surface area `2(lw + lh + wh)` — consistent with `volume()`'s
+    /// box proxy `lwh`. Drives the surface-area-to-volume uptake limit.
+    pub fn surface_area(&self) -> f32 {
+        let l = self.body_length;
+        let w = self.body_width;
+        let h = self.body_height;
+        2.0 * (l * w + l * h + w * h)
+    }
+
+    /// Sprint 203 — surface-area-to-volume uptake multiplier on ingested food.
+    /// `clamp(sqrt((surface/volume) / SA_V_UPTAKE_REF), MIN, MAX)`. A compact
+    /// (low SA:V) body absorbs less per bite; capped at 1.0 so high-SA:V shapes
+    /// reach neutral without an energy bonus. See `params::physics` for the
+    /// rationale and tuning notes.
+    pub fn sa_v_uptake_factor(&self) -> f32 {
+        let sa_v = self.surface_area() / self.volume().max(1e-6);
+        (sa_v / SA_V_UPTAKE_REF)
+            .sqrt()
+            .clamp(SA_V_UPTAKE_MIN, SA_V_UPTAKE_MAX)
+    }
+
+    /// Sprint 203 — volume-scaled energy storage ceiling. See `ENERGY_STORAGE_*`.
+    pub fn max_energy_capacity(&self) -> f32 {
+        (self.volume() * ENERGY_STORAGE_DENSITY).max(ENERGY_STORAGE_FLOOR)
+    }
+
     /// Applies the four morph signals from the brain to body dimensions.
     /// Signals below `MORPH_ACTIVATION_THRESHOLD` in absolute value are
     /// dead-zoned to zero so untrained random-brain noise doesn't drift the
@@ -186,8 +212,7 @@ impl Phenotype {
             // complexity=0 → 100 %.
             let rate_factor = 1.0 - 0.5 * self.spikes[i].complexity.clamp(0.0, 1.0);
             let delta = raw_ds * weight * rate_factor;
-            let new_len = (self.spikes[i].length + delta)
-                .clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
+            let new_len = (self.spikes[i].length + delta).clamp(MIN_SPIKE_LENGTH, MAX_SPIKE_LENGTH);
             total_delta += (new_len - self.spikes[i].length).abs();
             self.spikes[i].length = new_len;
         }

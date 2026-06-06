@@ -49,7 +49,9 @@ impl GpuProfiler {
         if !self.enabled {
             return;
         }
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         self.frames += 1;
         self.last = Instant::now();
     }
@@ -61,7 +63,9 @@ impl GpuProfiler {
         if !self.enabled {
             return;
         }
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         self.last = Instant::now();
     }
 
@@ -70,7 +74,9 @@ impl GpuProfiler {
         if !self.enabled {
             return;
         }
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f64() * 1e6;
         self.last = now;

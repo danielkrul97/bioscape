@@ -1,11 +1,11 @@
-use super::*;
 use super::config::{
     CAMERA_OFFSET_DISTANCE, CAMERA_PITCH_INITIAL, CAMERA_PITCH_MAX, CAMERA_PITCH_MIN,
     CAMERA_SCALE_INITIAL,
 };
-use super::world_map::{food_multiplier, hazard_drain};
 use super::resources::WorldExtent;
 use super::world_map::food_target;
+use super::world_map::{food_multiplier, hazard_drain};
+use super::*;
 use bioscape::{
     HAZARD_AMP, HAZARD_DRAIN_PER_SEC, HAZARD_FLOOR, WORLD_MAP_FOOD_AMP, WORLD_MAP_FOOD_FLOOR,
 };
@@ -73,12 +73,7 @@ fn cell_rotation_pitch_lifts_z() {
 
 #[test]
 fn cell_rotation_matches_forward_vector() {
-    let cases = [
-        (0.0_f32, 0.0_f32),
-        (0.5, 0.3),
-        (-1.2, 0.8),
-        (3.1, -0.4),
-    ];
+    let cases = [(0.0_f32, 0.0_f32), (0.5, 0.3), (-1.2, 0.8), (3.1, -0.4)];
     for (yaw, pitch) in cases {
         let q = cell_rotation(yaw, pitch);
         let v = q * Vec3::X;
@@ -91,7 +86,11 @@ fn cell_rotation_matches_forward_vector() {
 
 #[test]
 fn food_multiplier_at_noise_zero_is_floor() {
-    assert!(approx_eq(food_multiplier(0.0), WORLD_MAP_FOOD_FLOOR, FLT_EPS));
+    assert!(approx_eq(
+        food_multiplier(0.0),
+        WORLD_MAP_FOOD_FLOOR,
+        FLT_EPS
+    ));
 }
 
 #[test]
@@ -113,7 +112,11 @@ fn food_multiplier_is_linear() {
 
 #[test]
 fn hazard_drain_zero_at_floor_zero_noise() {
-    assert!(approx_eq(hazard_drain(0.0), HAZARD_DRAIN_PER_SEC * HAZARD_FLOOR, FLT_EPS));
+    assert!(approx_eq(
+        hazard_drain(0.0),
+        HAZARD_DRAIN_PER_SEC * HAZARD_FLOOR,
+        FLT_EPS
+    ));
 }
 
 #[test]
@@ -188,7 +191,11 @@ fn food_target_scales_with_area() {
     let n_small = food_target(&small, 1.0);
     let n_big = food_target(&big, 1.0);
     let diff = (n_big as i64 - (n_small as i64) * 4).abs();
-    assert!(diff <= 5, "n_big={n_big} ≠ 4×n_small={} (±5 tolerance kvůli `as usize` truncation)", n_small * 4);
+    assert!(
+        diff <= 5,
+        "n_big={n_big} ≠ 4×n_small={} (±5 tolerance kvůli `as usize` truncation)",
+        n_small * 4
+    );
 }
 
 #[test]

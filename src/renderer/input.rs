@@ -1,16 +1,18 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bioscape::{
-    reject_food_for_richness, EventCalendar, Food, GENERATIONS_PER_EPOCH,
-    MAX_SPAWN_ATTEMPTS, MazeDifficulty, N_PHEROMONE_CHANNELS, ObstacleField, PHEROMONE_GRID_RES,
-    PHEROMONE_GRID_RES_Z, ShockScheduleConfig, SimClock, SmellField, SMELL_GRID_RES,
-    SMELL_GRID_RES_Z, SPIKE_SLOTS, TICKS_PER_GENERATION, VIBRATION_GRID_RES,
-    VIBRATION_GRID_RES_Z, WORLD_HALF, WORLD_MAP_SEED,
+    reject_food_for_richness, EventCalendar, Food, MazeDifficulty, ObstacleField,
+    ShockScheduleConfig, SimClock, SmellField, GENERATIONS_PER_EPOCH, MAX_SPAWN_ATTEMPTS,
+    N_PHEROMONE_CHANNELS, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES,
+    SMELL_GRID_RES_Z, SPIKE_SLOTS, TICKS_PER_GENERATION, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z,
+    WORLD_HALF, WORLD_MAP_SEED,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use super::components::{CellEntity, FoodEntity, MazeWallEntity, SpikeEntity, StatsRoot, WorldMapOverlay};
+use super::components::{
+    CellEntity, FoodEntity, MazeWallEntity, SpikeEntity, StatsRoot, WorldMapOverlay,
+};
 use super::gizmos::ShowVibration;
 use super::godmode::{GodMenuRoot, GodMode, GodModeState};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
@@ -24,10 +26,7 @@ use super::resources_gpu::GpuFullPipeline;
 use super::sim_config::SimConfig;
 use super::world_map::food_target;
 
-pub(super) fn speed_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut time: ResMut<Time<Virtual>>,
-) {
+pub(super) fn speed_input(keys: Res<ButtonInput<KeyCode>>, mut time: ResMut<Time<Virtual>>) {
     if keys.just_pressed(KeyCode::Space) {
         if time.is_paused() {
             time.unpause();
@@ -67,7 +66,11 @@ pub(super) fn speed_input(
         (None, d) if d != 0.0 => {
             let s = time.relative_speed();
             let next = if d > 0.0 {
-                if s >= 1.0 { s + 1.0 } else { s * 2.0 }
+                if s >= 1.0 {
+                    s + 1.0
+                } else {
+                    s * 2.0
+                }
             } else if s > 1.0 {
                 s - 1.0
             } else {
@@ -179,20 +182,12 @@ pub(super) fn toggle_maze_world(
         "maze: on (medium, {}×{} voxels, goal at [{:.0}, {:.0}])",
         field.resolution[0], field.resolution[1], field.goal_position[0], field.goal_position[1]
     );
-    let smell_mask =
-        Some(field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]));
+    let smell_mask = Some(field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]));
     let pheromone_masks: [Option<Vec<bool>>; N_PHEROMONE_CHANNELS] = std::array::from_fn(|_| {
-        Some(field.mask_for_grid([
-            PHEROMONE_GRID_RES,
-            PHEROMONE_GRID_RES,
-            PHEROMONE_GRID_RES_Z,
-        ]))
+        Some(field.mask_for_grid([PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z]))
     });
-    let vibration_mask = Some(field.mask_for_grid([
-        VIBRATION_GRID_RES,
-        VIBRATION_GRID_RES,
-        VIBRATION_GRID_RES_Z,
-    ]));
+    let vibration_mask =
+        Some(field.mask_for_grid([VIBRATION_GRID_RES, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z]));
     let cs = field.voxel_size();
     let half_z = WORLD_HALF[2];
     let wall_mesh = meshes.add(Cuboid::new(cs[0], cs[1], 2.0 * half_z).mesh());
@@ -225,16 +220,10 @@ pub(super) fn toggle_maze_world(
         let packed = field.packed_for_gpu();
         let smell_mask_for_gpu =
             field.mask_for_grid([SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z]);
-        let phero_mask_for_gpu = field.mask_for_grid([
-            PHEROMONE_GRID_RES,
-            PHEROMONE_GRID_RES,
-            PHEROMONE_GRID_RES_Z,
-        ]);
-        let vib_mask_for_gpu = field.mask_for_grid([
-            VIBRATION_GRID_RES,
-            VIBRATION_GRID_RES,
-            VIBRATION_GRID_RES_Z,
-        ]);
+        let phero_mask_for_gpu =
+            field.mask_for_grid([PHEROMONE_GRID_RES, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z]);
+        let vib_mask_for_gpu =
+            field.mask_for_grid([VIBRATION_GRID_RES, VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z]);
         gpu.step.upload_maze(&packed);
         gpu.sensor.upload_maze(&packed);
         gpu.smell.upload_obstacle_mask(&smell_mask_for_gpu);
@@ -423,7 +412,10 @@ pub(super) fn restart_simulation(
             .id();
         for slot in 0..SPIKE_SLOTS as u8 {
             commands.spawn((
-                SpikeEntity { owner: entity, slot },
+                SpikeEntity {
+                    owner: entity,
+                    slot,
+                },
                 Mesh3d(assets.spike_mesh.0.clone()),
                 MeshMaterial3d(assets.spike_material.0.clone()),
                 Transform::default(),
@@ -439,11 +431,7 @@ pub(super) fn restart_simulation(
     gpu_full
         .cells
         .upload_xoshiro_seeds(new_world.cells.iter().map(|c| c.cell_id));
-    let turn_rates: Vec<f32> = new_world
-        .cells
-        .iter()
-        .map(|c| c.genome.turn_rate)
-        .collect();
+    let turn_rates: Vec<f32> = new_world.cells.iter().map(|c| c.genome.turn_rate).collect();
     gpu_full.cells.upload_turn_rates(&turn_rates);
     gpu_full.cells.zero_persistent_state();
 
@@ -458,7 +446,9 @@ pub(super) fn restart_simulation(
     for _ in 0..initial_food {
         let mut food = Food::random(&mut food_rng, half);
         for _ in 0..MAX_SPAWN_ATTEMPTS {
-            let richness = world_map_res.0.sample([food.position[0], food.position[1], 0.0]);
+            let richness = world_map_res
+                .0
+                .sample([food.position[0], food.position[1], 0.0]);
             if !reject_food_for_richness(&mut food_rng, richness) {
                 break;
             }

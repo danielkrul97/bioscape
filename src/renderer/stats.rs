@@ -128,28 +128,39 @@ pub(super) fn update_stats_overlay(
     let food_count = world.foods.len();
     let lineage_count = lineages.len();
 
-    let (spd_avg, spd_dev, vis_avg, vis_dev, trn_avg, len_avg, wid_avg, asp_avg, asp_dev, spk_avg, e_avg) =
-        if count == 0 {
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        } else {
-            let n = count as f64;
-            let spd_m = spd_sum / n;
-            let vis_m = vis_sum / n;
-            let asp_m = asp_sum / n;
-            (
-                spd_m,
-                ((spd_sumsq / n) - spd_m * spd_m).max(0.0).sqrt(),
-                vis_m,
-                ((vis_sumsq / n) - vis_m * vis_m).max(0.0).sqrt(),
-                trn_sum / n,
-                len_sum / n,
-                wid_sum / n,
-                asp_m,
-                ((asp_sumsq / n) - asp_m * asp_m).max(0.0).sqrt(),
-                spk_sum / n,
-                e_sum / n,
-            )
-        };
+    let (
+        spd_avg,
+        spd_dev,
+        vis_avg,
+        vis_dev,
+        trn_avg,
+        len_avg,
+        wid_avg,
+        asp_avg,
+        asp_dev,
+        spk_avg,
+        e_avg,
+    ) = if count == 0 {
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    } else {
+        let n = count as f64;
+        let spd_m = spd_sum / n;
+        let vis_m = vis_sum / n;
+        let asp_m = asp_sum / n;
+        (
+            spd_m,
+            ((spd_sumsq / n) - spd_m * spd_m).max(0.0).sqrt(),
+            vis_m,
+            ((vis_sumsq / n) - vis_m * vis_m).max(0.0).sqrt(),
+            trn_sum / n,
+            len_sum / n,
+            wid_sum / n,
+            asp_m,
+            ((asp_sumsq / n) - asp_m * asp_m).max(0.0).sqrt(),
+            spk_sum / n,
+            e_sum / n,
+        )
+    };
     let (vib_emit_avg, vib_amp_avg, vib_grad_avg) = if count == 0 {
         (0.0, 0.0, 0.0)
     } else {

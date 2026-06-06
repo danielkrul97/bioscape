@@ -6,7 +6,7 @@
 // Pre-S153 STDP design assumed pre-spikes; this shader is the GPU
 // realisation of `Brain::forward_izhikevich_with_state`'s CPU encoder.
 
-const BRAIN_INPUTS: u32 = 86u;
+const BRAIN_INPUTS: u32 = 85u;
 const SPIKE_ENCODE_THRESHOLD: f32 = 0.5;
 const NEURON_MODEL_IZHIKEVICH: u32 = 1u;
 

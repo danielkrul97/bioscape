@@ -25,28 +25,6 @@ pub struct Bond {
     pub age_ticks: u32,
 }
 
-/// Sprint 196: per-host endosymbiont passenger. Carries its own full `Genome`
-/// so it can co-evolve independently of the host (mitochondria-style: separate
-/// genetic lineage living inside the host). `lineage_id` uses a counter
-/// independent from host lineages and stays stable across predation transfer;
-/// `age` is reset at reproduction (offspring symbiont = fresh copy) and
-/// persists across transfer events. Sprint 196 only plumbs data and
-/// inheritance — no shader reads the symbiont yet.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct Symbiont {
-    pub genome: Genome,
-    pub lineage_id: u64,
-    pub age: u64,
-    #[serde(default)]
-    pub deficit_streak: u32,
-}
-
-impl Symbiont {
-    pub fn new(genome: Genome, lineage_id: u64) -> Self {
-        Self { genome, lineage_id, age: 0, deficit_streak: 0 }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Cell {
     pub position: [f32; 3],
@@ -100,6 +78,11 @@ pub struct Cell {
     /// Solo cells: zero (no bonds → no inbox).
     #[serde(default = "default_bonded_inbox")]
     pub bonded_inbox: [f32; N_BOND_MSG_CHANNELS],
+    /// S213+ social call-response: perceived unanswered-handshake signal from
+    /// nearby coop nodes (signed role-need × proximity), recomputed each tick
+    /// before the brain pass; fed to brain input slot 39.
+    #[serde(default)]
+    pub coop_call_signal: f32,
     /// Involuntary energy drain accumulated this tick (predation + hazard).
     /// The brain reads it next tick as a damage input, then it resets to 0.
     /// Voluntary costs (driven by the cell's own outputs) are NOT written
@@ -198,11 +181,13 @@ pub struct Cell {
     pub was_in_hazard_last_tick: bool,
     pub phenotype: Phenotype,
     pub genome: Genome,
-    /// Sprint 196: endosymbiont passenger. `None` for the bulk of cells; the
-    /// bearer fraction at init is `SYMBIONT_INIT_FRACTION` and changes only
-    /// at reproduction (P_inherit) and predation transfer (P_capture).
+    /// Sprint 204: CPPN-compatibility species assigned at each generation
+    /// boundary by `World::classify_species`. Diagnostic only in S204
+    /// (feeds the `species_count` CSV column); Sprint 205 reads it to scale
+    /// reproduction by species size (fitness sharing). Recomputed fresh each
+    /// generation, so ids are dense `0..k` but not stable across generations.
     #[serde(default)]
-    pub symbiont: Option<Symbiont>,
+    pub species_id: u32,
 }
 
 fn default_whiskers() -> [f32; WHISKER_COUNT] {
@@ -258,26 +243,20 @@ impl Cell {
         cell_id: u64,
     ) -> Self {
         let genome = Genome::random(rng);
-        Self::from_genome(rng, genome, world_half, lineage_id, lineage_birth_gen, cell_id)
+        Self::from_genome(
+            rng,
+            genome,
+            world_half,
+            lineage_id,
+            lineage_birth_gen,
+            cell_id,
+        )
     }
 
     /// Number of populated bond slots. Predation defense scales with this.
     #[inline]
     pub fn n_bonds(&self) -> u32 {
         self.bonds.iter().filter(|b| b.is_some()).count() as u32
-    }
-
-    /// Sprint 201: incoming-damage multiplier. Bearer cells take only
-    /// `(1 - SYMBIONT_DAMAGE_RESIST_FRAC)` of each damage event — applied at
-    /// hazards, predation hits, and maze wall bumps. Non-bearers see no
-    /// reduction (multiplier = 1.0).
-    #[inline]
-    pub fn damage_resist_factor(&self) -> f32 {
-        if self.symbiont.is_some() {
-            1.0 - SYMBIONT_DAMAGE_RESIST_FRAC
-        } else {
-            1.0
-        }
     }
 
     pub fn from_genome(
@@ -325,6 +304,7 @@ impl Cell {
             burst_accum: [0.0; N_PHEROMONE_CHANNELS],
             pooled_hidden: [0.0; BRAIN_HIDDEN],
             bonded_inbox: [0.0; N_BOND_MSG_CHANNELS],
+            coop_call_signal: 0.0,
             damage_accum: 0.0,
             age: 0,
             reproduce_cooldown_ticks: 0,
@@ -351,7 +331,7 @@ impl Cell {
             was_in_hazard_last_tick: false,
             phenotype,
             genome,
-            symbiont: None,
+            species_id: 0,
         }
     }
 
@@ -407,9 +387,6 @@ impl Cell {
         // Aging + cooldown decrement run before energy costs so the age ramp
         // sees the post-increment age.
         self.age = self.age.saturating_add(1);
-        if let Some(s) = self.symbiont.as_mut() {
-            s.age = s.age.saturating_add(1);
-        }
         if self.reproduce_cooldown_ticks > 0 {
             self.reproduce_cooldown_ticks -= 1;
         }
@@ -435,9 +412,6 @@ impl Cell {
         obstacles: Option<&ObstacleField>,
     ) {
         self.age = self.age.saturating_add(1);
-        if let Some(s) = self.symbiont.as_mut() {
-            s.age = s.age.saturating_add(1);
-        }
         if self.reproduce_cooldown_ticks > 0 {
             self.reproduce_cooldown_ticks -= 1;
         }
@@ -495,8 +469,7 @@ impl Cell {
         let v_perp_x = self.velocity[0] - v_par * fx;
         let v_perp_y = self.velocity[1] - v_par * fy;
         let v_perp_z = self.velocity[2] - v_par * fz;
-        let v_perp_mag =
-            (v_perp_x * v_perp_x + v_perp_y * v_perp_y + v_perp_z * v_perp_z).sqrt();
+        let v_perp_mag = (v_perp_x * v_perp_x + v_perp_y * v_perp_y + v_perp_z * v_perp_z).sqrt();
         let length = self.phenotype.body_length;
         let width = self.phenotype.body_width;
         let drag_par_factor = physics.drag * v_par.abs() * width * dt;
@@ -517,12 +490,15 @@ impl Cell {
         self.pitch_velocity *= drag_factor;
     }
 
-    /// Per-tick energy drains: v², rotational (yaw only — pitch is free,
-    /// otherwise random brains would lose 2× to rotation), vision, body
-    /// volume maintenance, spike, attack upkeep, plus a thermal-stress
-    /// penalty. Most drains are `metabolism_factor(T)`-scaled so warm cells
-    /// burn ~2.46× faster than the cold floor (~0.41×) — niche separation
-    /// by depth.
+    /// Per-tick energy drains, kept a faithful mirror of the authoritative GPU
+    /// `shaders/step.wgsl` cost set (this CPU path is a no-op in `--gpu-full`):
+    /// v², rotational (yaw only — pitch is free, otherwise random brains would
+    /// lose 2× to rotation), vision, body volume maintenance (Kleiber), spike,
+    /// shell, attack upkeep. Most drains are `metabolism_factor(T)`-scaled so
+    /// warm cells burn ~2.46× faster than the cold floor (~0.41×) — niche
+    /// separation by depth. Thermal-optimum, sensor-gain and vibration-emit
+    /// costs (and FOV cost weighting) live only in this genome model, not on the
+    /// GPU, so those traits are sensing-only / neutral in the live sim.
     fn apply_energy_costs(
         &mut self,
         dt: f32,
@@ -531,8 +507,7 @@ impl Cell {
         physics: &PhysicsConfig,
         climate_offset: f32,
     ) {
-        let temp =
-            temperature_at_z_with_ctx(self.position[2], world_half, ctx) + climate_offset;
+        let temp = temperature_at_z_with_ctx(self.position[2], world_half, ctx) + climate_offset;
         let metabolism = metabolism_factor(temp);
         let dt_eff = dt * metabolism;
         let v = self.velocity;
@@ -541,16 +516,16 @@ impl Cell {
         let av = self.angular_velocity;
         let eff_r = self.phenotype.effective_radius();
         self.energy -= eff_r * eff_r * av * av * physics.angular_energy_cost * dt_eff;
-        // Vision cost scales with fov_factor — narrower cones pay less but
-        // lose information once the cone filter activates in sensor gather.
-        let fov_factor = vision_fov_factor(self.genome.vision_fov);
-        self.energy -=
-            self.genome.vision_radius * physics.vision_cost_per_radius * fov_factor * dt_eff;
+        self.energy -= self.genome.vision_radius * physics.vision_cost_per_radius * dt_eff;
         // Body maintenance: per-volume, with an aging ramp.
         let age_sec = self.age as f32 / FIXED_TIMESTEP_HZ;
         let aging_factor = 1.0 + AGE_DECAY_PER_SEC * age_sec;
-        self.energy -=
-            self.phenotype.volume() * physics.body_cost_factor * aging_factor * dt_eff;
+        // Sprint 203 — allometric (Kleiber) body maintenance: cost ∝
+        // volume^0.75, sub-linear in mass. Mirror of `shaders/step.wgsl`.
+        self.energy -= self.phenotype.volume().powf(BODY_COST_EXPONENT)
+            * physics.body_cost_factor
+            * aging_factor
+            * dt_eff;
         let mut spike_cost = 0.0;
         for spike in self.phenotype.active_spikes() {
             spike_cost += spike.length * spike_complexity_cost_factor(spike.complexity);
@@ -559,15 +534,6 @@ impl Cell {
         self.energy -= self.phenotype.shell_thickness * SHELL_COST_PER_SEC * dt_eff;
         let attack_strength = self.last_outputs[6].max(0.0);
         self.energy -= attack_strength * ATTACK_COST_PER_SEC * dt_eff;
-        // Thermal-stress penalty: quadratic in deviation from the per-cell
-        // optimum, intentionally NOT Q10-modulated (uses `dt`, not `dt_eff`)
-        // — this models extra stress damage, not a metabolic rate change.
-        let dev = (temp - self.genome.thermal_optimum) / 13.0;
-        self.energy -= dev * dev * physics.thermal_optimum_penalty * dt;
-        let total_sensor_gain: f32 = self.genome.sensor_gains.iter().sum();
-        self.energy -= total_sensor_gain * SENSOR_GAIN_COST * dt_eff;
-        let active_vib_emit = self.last_outputs[VIBRATION_EMIT_OUTPUT].max(0.0) * MAX_ACTIVE_EMIT;
-        self.energy -= active_vib_emit * VIBRATION_EMIT_COST * dt_eff;
     }
 
     /// XY uses toroidal wrap (cylinder topology), Z reflects. Reflective XY
@@ -632,7 +598,10 @@ impl Cell {
     /// and accrues a small `damage_accum` so the brain perceives the bump
     /// next tick (slot 14). Returns true if a collision was resolved.
     pub fn apply_obstacle_collision(&mut self, field: &ObstacleField) -> bool {
-        let radius = self.phenotype.effective_radius().max(crate::CELL_RADIUS * 0.5);
+        let radius = self
+            .phenotype
+            .effective_radius()
+            .max(crate::CELL_RADIUS * 0.5);
         let push = field.collision_push(self.position, radius);
         if push[0].abs() < 1e-4 && push[1].abs() < 1e-4 {
             return false;
@@ -650,7 +619,7 @@ impl Cell {
                 self.velocity[1] -= v_dot_n * ny;
             }
         }
-        self.damage_accum += MAZE_WALL_BUMP_DAMAGE * self.damage_resist_factor();
+        self.damage_accum += MAZE_WALL_BUMP_DAMAGE;
         true
     }
 
@@ -675,11 +644,9 @@ impl Cell {
     /// `[7] = pitch`.
     pub fn apply_brain_motor(&mut self, outputs: &[f32; BRAIN_OUTPUTS], dt: f32) {
         // Sprint 202: F=ma with `mass = volume × MASS_DENSITY`. Pre-S202 used
-        // `effective_radius` (linear scaling with size) as a mass proxy after
-        // a full-volume attempt killed untrained populations; the new
-        // `MASS_DENSITY = 0.1` keeps a typical 3³ cell at mass ≈ 2.7,
-        // matching the pre-S202 motor scale at typical size while restoring
-        // proper cubic dependence at the extremes.
+        // `effective_radius` (linear scaling with size) as a mass proxy.
+        // `MASS_DENSITY` trades velocity-cap saturation against foraging
+        // viability; see `params::physics::MASS_DENSITY`.
         let mass = self.phenotype.mass();
         let turn_rate = self.genome.turn_rate;
         let max_speed = self.genome.max_speed;
@@ -813,8 +780,7 @@ impl Cell {
             }
             let dist = dist_sq.sqrt();
             let cos_food = (dx * dir[0] + dy * dir[1] + dz * dir[2]) / dist;
-            let half_angle =
-                SPIKE_GRAB_HALF_ANGLE * spike_complexity_grab_factor(spike.complexity);
+            let half_angle = SPIKE_GRAB_HALF_ANGLE * spike_complexity_grab_factor(spike.complexity);
             if cos_food >= half_angle.cos() {
                 return true;
             }
@@ -848,10 +814,10 @@ impl Cell {
     pub fn novelty_voxel_index(pos: [f32; 3], world_half: [f32; 3]) -> u32 {
         let nx = ((2.0 * world_half[0]) / NOVELTY_GRID_CELL_SIZE).ceil() as i32;
         let ny = ((2.0 * world_half[1]) / NOVELTY_GRID_CELL_SIZE).ceil() as i32;
-        let xi = (((pos[0] + world_half[0]) / NOVELTY_GRID_CELL_SIZE).floor() as i32)
-            .clamp(0, nx - 1);
-        let yi = (((pos[1] + world_half[1]) / NOVELTY_GRID_CELL_SIZE).floor() as i32)
-            .clamp(0, ny - 1);
+        let xi =
+            (((pos[0] + world_half[0]) / NOVELTY_GRID_CELL_SIZE).floor() as i32).clamp(0, nx - 1);
+        let yi =
+            (((pos[1] + world_half[1]) / NOVELTY_GRID_CELL_SIZE).floor() as i32).clamp(0, ny - 1);
         (yi as u32) * (nx as u32) + (xi as u32)
     }
 

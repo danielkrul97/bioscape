@@ -4,33 +4,33 @@ use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
+use bioscape::gpu::{
+    BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu, PopulateInputsGpu,
+    SensorGatherGpu, SpatialHashGpu, StepGpu,
+};
 use bioscape::{
-    Cell, EventCalendar, Food, INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
-    ShockScheduleConfig, SmellField, SPIKE_SLOTS, WorldMap, WORLD_MAP_SEED, CELL_RADIUS,
-    CYCLE_AMPLITUDE, PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z,
-    VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, WORLD_HALF, WORLD_MAP_BASE_RES,
-    WORLD_MAP_BASE_RES_Z, WORLD_MAP_RES, WORLD_MAP_RES_Z, reject_food_for_richness,
+    reject_food_for_richness, Cell, EventCalendar, Food, ShockScheduleConfig, SmellField, WorldMap,
+    CELL_RADIUS, CYCLE_AMPLITUDE, INITIAL_CELLS, MAX_POPULATION, MAX_SPAWN_ATTEMPTS,
+    PHEROMONE_GRID_RES, PHEROMONE_GRID_RES_Z, SMELL_GRID_RES, SMELL_GRID_RES_Z, SPIKE_SLOTS,
+    VIBRATION_GRID_RES, VIBRATION_GRID_RES_Z, WORLD_HALF, WORLD_MAP_BASE_RES, WORLD_MAP_BASE_RES_Z,
+    WORLD_MAP_RES, WORLD_MAP_RES_Z, WORLD_MAP_SEED,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use bioscape::gpu::{
-    BrainGpu, BrownianGpu, CellsGpu, FieldGpu, GpuContext, HebbianGpu, MotorGpu,
-    PopulateInputsGpu, SensorGatherGpu, SpatialHashGpu, StepGpu,
-};
 use std::time::Duration;
 
 use super::components::{
-    CellEntity, FoodEntity, SpikeEntity, StatsRoot, StatsText, SymbiontMarker, WorldMapOverlay,
+    CellEntity, FoodEntity, SpikeEntity, StatsRoot, StatsText, WorldMapOverlay,
 };
 use super::config::{CAMERA_OFFSET_DISTANCE, FOOD_RADIUS};
 use super::material::{adhesion_material, cell_rotation, cell_scale, BioMaterial};
 use super::resources::{
     AdhesionMaterials, CellMesh, CellSlotMap, EventCalendarResource, FoodMaterial, FoodMesh,
     OrbitCamera, PheromoneResource, SimRng, SimWorld, SmellResource, SpikeMaterial, SpikeMesh,
-    SymbiontMaterial, SymbiontMesh, VibrationResource, WorldExtent, WorldMapResource,
+    VibrationResource, WorldExtent, WorldMapResource,
 };
-use super::sim_config::{SimConfig, CONFIG_FILENAME};
 use super::resources_gpu::GpuFullPipeline;
+use super::sim_config::{SimConfig, CONFIG_FILENAME};
 use super::world_map::{food_target, world_map_image};
 
 pub(super) fn setup(
@@ -211,8 +211,7 @@ pub(super) fn setup(
         unlit: true,
         ..default()
     });
-    let overlay_mesh =
-        meshes.add(Plane3d::default().mesh().size(2.0 * half[0], 2.0 * half[1]));
+    let overlay_mesh = meshes.add(Plane3d::default().mesh().size(2.0 * half[0], 2.0 * half[1]));
     commands.spawn((
         Mesh3d(overlay_mesh),
         MeshMaterial3d(overlay_material),
@@ -228,22 +227,17 @@ pub(super) fn setup(
     // Spike mesh: unit cone (radius=1, height=1) v Bevy default orientation —
     // apex +Y, base v origin. Sync system škáluje na (thickness, length, thickness)
     // a rotuje tak, aby Y axis aligned se spike_direction.
-    let spike_mesh_handle = meshes.add(Cone {
-        radius: 1.0,
-        height: 1.0,
-    }.mesh());
+    let spike_mesh_handle = meshes.add(
+        Cone {
+            radius: 1.0,
+            height: 1.0,
+        }
+        .mesh(),
+    );
     let spike_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.85, 0.10, 0.10),
         perceptual_roughness: 0.4,
         metallic: 0.6,
-        ..default()
-    });
-    let symbiont_mesh_handle = meshes.add(Sphere::new(CELL_RADIUS).mesh().ico(1).unwrap());
-    let symbiont_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.85, 0.30),
-        emissive: LinearRgba::new(1.6, 1.1, 0.30, 1.0),
-        perceptual_roughness: 0.3,
-        metallic: 0.4,
         ..default()
     });
     // Sprint 53: jídlo decentnější — menší radius (10× větší food count po
@@ -279,20 +273,16 @@ pub(super) fn setup(
             .id();
         for slot in 0..SPIKE_SLOTS as u8 {
             commands.spawn((
-                SpikeEntity { owner: entity, slot },
+                SpikeEntity {
+                    owner: entity,
+                    slot,
+                },
                 Mesh3d(spike_mesh_handle.clone()),
                 MeshMaterial3d(spike_material.clone()),
                 Transform::default(),
                 Visibility::Hidden,
             ));
         }
-        commands.spawn((
-            SymbiontMarker { owner: entity },
-            Mesh3d(symbiont_mesh_handle.clone()),
-            MeshMaterial3d(symbiont_material.clone()),
-            Transform::default(),
-            Visibility::Hidden,
-        ));
         slot_map.allocate(entity);
         initial_cells.push(cell);
     }
@@ -377,8 +367,7 @@ pub(super) fn setup(
             // for the worst-case dispatch (FOOD_SPAWN_RATE × MAX_SPAWN_ATTEMPTS).
             // World map uploaded once at init; obstacle mask gets refreshed on
             // each maze toggle in `input::toggle_maze_world`.
-            let food_spawn_cap =
-                bioscape::FOOD_SPAWN_RATE * bioscape::MAX_SPAWN_ATTEMPTS;
+            let food_spawn_cap = bioscape::FOOD_SPAWN_RATE * bioscape::MAX_SPAWN_ATTEMPTS;
             let world_map_size = (bioscape::WORLD_MAP_RES
                 * bioscape::WORLD_MAP_RES
                 * bioscape::WORLD_MAP_RES_Z) as u64;
@@ -482,8 +471,6 @@ pub(super) fn setup(
     commands.insert_resource(FoodMaterial(food_material));
     commands.insert_resource(SpikeMesh(spike_mesh_handle));
     commands.insert_resource(SpikeMaterial(spike_material));
-    commands.insert_resource(SymbiontMesh(symbiont_mesh_handle));
-    commands.insert_resource(SymbiontMaterial(symbiont_material));
 
     commands.insert_resource(SmellResource(SmellField::new(
         [SMELL_GRID_RES, SMELL_GRID_RES, SMELL_GRID_RES_Z],
