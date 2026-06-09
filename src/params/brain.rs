@@ -180,3 +180,61 @@ pub const INNATE_VIBRATION_EMIT_BIAS: f32 = -2.0;
 /// novelty bonus then balance the two roles.
 pub const INNATE_HANDSHAKE_A_BIAS: f32 = 1.0;
 pub const INNATE_HANDSHAKE_B_BIAS: f32 = -1.0;
+
+/// S223 active inference: the curated sensory slots the prediction head (S224+)
+/// will forecast and against which surprise is scored. Deliberately *exogenous*
+/// channels — ones whose next-tick value needs a model of the world, not
+/// self-determined state (energy/speed/heading). `cell_*` are the seed of social
+/// prediction (forecasting another agent's relative motion). All entries index
+/// the sensory block `[0..BRAIN_INPUTS_SENSORY)`; the final set is pruned by
+/// variance in S223 (zero-variance slots are useless predictors).
+pub const PREDICTED_SENSORY_SLOTS: [usize; 12] = [
+    0, 1, 15, // food gradient dx, dy, dz
+    2, 3, 16, // nearest cell dx, dy, dz
+    7, 8, 17, // smell gradient x, y, z
+    29, 30, 31, // vibration gradient x, y, z
+];
+/// S224 active inference: width of the prediction readout = number of predicted
+/// sensory channels. A direct-weight CPU layer maps `last_hidden` → predicted
+/// next-tick values for `PREDICTED_SENSORY_SLOTS` (output k ↔ slot k).
+pub const BRAIN_PREDICT: usize = PREDICTED_SENSORY_SLOTS.len();
+/// S225 active inference: learning rate for the within-life prediction
+/// delta-rule on `Cell.predict_w_live`. Online linear regression of
+/// `hidden(t) → sensory(t+1)`; small enough to stay stable across the 45 hidden
+/// inputs, large enough to converge within a cell's lifetime.
+pub const PREDICT_LEARNING_RATE: f32 = 0.05;
+/// S227 active inference (keystone): reproduction-threshold discount for good
+/// predictors. A cell's prediction advantage (skill above the warmed-cohort mean,
+/// clamped to [0,1]) lowers its reproduce threshold by up to this fraction, so it
+/// reproduces sooner — the novelty-bonus pattern (one-sided: a fertility bonus,
+/// never a penalty, so it can't starve cells or collapse the population). Early on
+/// skill variation is ~0 → no discount → the population bloom is undisturbed;
+/// selection ramps up only as readouts train and brains differentiate.
+pub const PREDICT_REPRO_BONUS: f32 = 0.3;
+/// S228 active inference (Baldwin bridge): fraction of the parents' within-life
+/// learned prediction readout (`predict_w_live`) a child inherits as its readout
+/// seed. **Tested and rejected — kept at 0.** At 1.0 the population stays healthy
+/// but `pred_skill` DROPS (~−0.45 vs S227's ~−0.28): the learned readout maps the
+/// hidden state of a SPECIFIC brain to the sensory future, and a sexual child's
+/// brain is a crossover of both parents' — so the inherited readout is mistuned
+/// and predicts worse than re-learning from zero would. The lesson: S227 already
+/// embodies the Baldwin EFFECT (within-life learning adapts the readout to the
+/// cell's own brain, and selection acts on the resulting brain-predictability);
+/// the plateau is the slow CPPN ratchet on predictive brains, not a missing
+/// inheritance channel. A Lamarckian weight leak transfers the non-transferable.
+pub const BALDWIN_LEAK: f32 = 0.0;
+/// S226 active inference (brain-directed): neuromodulator strength for the
+/// prediction reward that shapes the BRAIN's plasticity. Each tick a cell whose
+/// model beat persistence (`pred_skill > 0`) emits `COEFF · max(0, pred_skill)`
+/// as a reward into the reward-modulated Hebbian dispatch — reinforcing the
+/// input→hidden→output pathways that produced a *predictable* hidden state. This
+/// shapes hidden states toward predictability (raising the ceiling S227's
+/// selection plateaus against), not just selecting among fixed brains.
+/// `max(0, ·)` so it only reinforces, never anti-Hebbians (no brain collapse);
+/// the prediction target is non-constant, so a degenerate constant hidden state
+/// predicts badly → earns nothing → isn't a fixed point.
+pub const PREDICT_HEBB_COEFF: f32 = 1.0;
+/// S227: a cell's readout must warm up (learn) for this many ticks before its
+/// skill counts toward the energy advantage — a good brain with a still-untrained
+/// readout shouldn't be penalised for being young.
+pub const PREDICT_WARMUP_TICKS: u64 = 60;

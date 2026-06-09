@@ -78,7 +78,9 @@ const CHECKPOINT_MAGIC: &[u8; 8] = b"BIOSCP01";
 /// truncate / pad.
 // S203: removed 2 symbiont brain-input slots → BRAIN_INPUTS 86→84, w1 reshaped.
 // S213+: added 1 coop-call sensory slot → BRAIN_INPUTS 84→85, w1 reshaped again.
-const CHECKPOINT_VERSION: u32 = 12;
+// S224: Genome gained the `predict_w`/`predict_b` readout → V12 savefiles
+// incompatible.
+const CHECKPOINT_VERSION: u32 = 13;
 
 /// Sprint 48: serializovatelný snapshot sim state. Skip fields:
 /// - SpatialGrid (rebuild from cells/foods on load)
@@ -218,6 +220,17 @@ pub struct World {
     pub deaths_gen: u64,
     pub fertile_ticks_gen: u64,
     pub predation_events_gen: u64,
+    /// S223 active inference: per-generation accumulator of the per-tick
+    /// population-mean persistence-baseline surprise (MSE between consecutive
+    /// sensory vectors over `PREDICTED_SENSORY_SLOTS`). Reset each generation by
+    /// the tick driver, mirroring the other `*_gen` flow counters. Logged as
+    /// `surprise_persist_avg = accum / ticks` — the denominator the model's
+    /// prediction skill (S224+) is scored against.
+    pub surprise_persist_accum: f64,
+    pub surprise_persist_ticks: u64,
+    /// S224: companion accumulator for the model (readout) surprise; shares the
+    /// `surprise_persist_ticks` denominator. `pred_skill = 1 − model/persist`.
+    pub surprise_model_accum: f64,
     /// Sprint 66: monotonic counter pro stable Cell.cell_id přidělování.
     /// Initial population uses 0..INITIAL_CELLS, takže start = INITIAL_CELLS.
     pub next_cell_id: u64,
@@ -569,6 +582,9 @@ impl World {
             deaths_gen: 0,
             fertile_ticks_gen: 0,
             predation_events_gen: 0,
+            surprise_persist_accum: 0.0,
+            surprise_persist_ticks: 0,
+            surprise_model_accum: 0.0,
             next_cell_id: initial_cells as u64,
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
@@ -961,6 +977,9 @@ impl World {
             deaths_gen: chk.deaths_gen,
             fertile_ticks_gen: chk.fertile_ticks_gen,
             predation_events_gen: chk.predation_events_gen,
+            surprise_persist_accum: 0.0,
+            surprise_persist_ticks: 0,
+            surprise_model_accum: 0.0,
             next_cell_id,
             contact_progress: rustc_hash::FxHashMap::default(),
             bonds_formed_gen: 0,
@@ -1135,6 +1154,41 @@ impl World {
         }
     }
 
+    /// S226 active inference (brain-directed): a reward-modulated Hebbian pulse
+    /// proportional to each cell's prediction skill, shaping the brain's w1/w2
+    /// toward predictable hidden states. Only cells whose model beat persistence
+    /// last tick (`pred_skill > 0`) emit (`max(0, ·)`) → the pulse only
+    /// reinforces, never anti-Hebbians. Reuses the GPU reward apply the
+    /// ecological rewards use; this tick's eligibility trace (from brain_act)
+    /// credits the pathways that produced the predictable state.
+    fn apply_prediction_reward(&self) {
+        let coeff = crate::PREDICT_HEBB_COEFF;
+        if coeff <= 0.0 {
+            return;
+        }
+        let Some(gpu) = self.gpu_full.as_ref() else {
+            return;
+        };
+        let n = self.cells.len();
+        if n == 0 {
+            return;
+        }
+        let mut rewards = vec![0.0_f32; n];
+        let mut any = false;
+        for (i, cell) in self.cells.iter().enumerate() {
+            let r = coeff * cell.pred_skill.max(0.0);
+            if r > 0.0 {
+                rewards[i] = r.min(2.0);
+                any = true;
+            }
+        }
+        if any {
+            gpu.cells.upload_rewards(&rewards);
+            gpu.hebbian
+                .dispatch_apply_reward_persistent(&gpu.cells, n, LEARNING_RATE);
+        }
+    }
+
     /// Sprint 203 — clamp each cell's energy to its volume-scaled storage
     /// ceiling (`Phenotype::max_energy_capacity`). Single end-of-tick
     /// chokepoint that catches every gain (eat, predation, coop, ripening,
@@ -1286,6 +1340,9 @@ impl World {
         // signal (brain input slot 39) before the brain reads it.
         self.compute_coop_call_signals();
         timed!(brain_act, self.run_brain_act(dt));
+        // S226: shape the brain toward predictable hidden states via a
+        // prediction-skill Hebbian pulse, while this tick's trace is fresh.
+        self.apply_prediction_reward();
         // Wave 3: per-tick eligibility-trace decay+accumulate — runs once
         // brain_act has populated this tick's last_inputs/last_hidden/last_outputs.
         // Wave 7: GPU full pipeline runs the equivalent on-device, mutating
@@ -2069,19 +2126,104 @@ impl World {
         let new_ages = &dl.dl_ages;
         let new_cooldowns = &dl.dl_cooldowns;
         let new_energies = &dl.dl_energies;
-        self.cells.par_iter_mut().enumerate().for_each(|(i, cell)| {
-            cell.last_inputs = inputs[i];
-            cell.last_hidden = hiddens[i];
-            cell.last_outputs = outputs[i];
-            cell.velocity = new_vels[i];
-            cell.angular_velocity = new_ang[i];
-            cell.pitch_velocity = new_pitch[i];
-            cell.position = new_pos[i];
-            cell.age = new_ages[i] as u64;
-            cell.reproduce_cooldown_ticks = new_cooldowns[i];
-            cell.energy = new_energies[i];
-            cell.damage_accum = 0.0;
-        });
+        // S223: persistence-baseline surprise — compare this tick's sensory
+        // (inputs[i]) against last tick's (still in cell.last_inputs) over the
+        // predicted slots, BEFORE the overwrite, and accumulate the per-tick
+        // population mean. Newborns carry a zeroed last_inputs → a one-tick
+        // transient, negligible across a generation.
+        let per_cell = self
+            .cells
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i, cell)| {
+                // Both surprises use the PRE-overwrite state: persistence vs
+                // last tick's sensory (cell.last_inputs), model vs last tick's
+                // readout prediction (cell.predicted_sensory).
+                let mut persist_se = 0.0_f32;
+                let mut model_se = 0.0_f32;
+                for (k, &s) in crate::PREDICTED_SENSORY_SLOTS.iter().enumerate() {
+                    let actual = inputs[i][s];
+                    let dp = actual - cell.last_inputs[s];
+                    persist_se += dp * dp;
+                    let pred_k = cell.predicted_sensory[k];
+                    let dm = actual - pred_k;
+                    model_se += dm * dm;
+                    // S225: delta-rule — train the live readout toward this
+                    // tick's actual using hidden(t) (cell.last_hidden still holds
+                    // the value that produced pred_k). Measurement-only → the sim
+                    // dynamics stay byte-identical.
+                    let g = crate::PREDICT_LEARNING_RATE * dm * (1.0 - pred_k * pred_k);
+                    let row = &mut cell.predict_w_live[k];
+                    for h in 0..BRAIN_HIDDEN {
+                        row[h] += g * cell.last_hidden[h];
+                    }
+                    cell.predict_b_live[k] += g;
+                }
+                cell.last_inputs = inputs[i];
+                cell.last_hidden = hiddens[i];
+                cell.last_outputs = outputs[i];
+                cell.velocity = new_vels[i];
+                cell.angular_velocity = new_ang[i];
+                cell.pitch_velocity = new_pitch[i];
+                cell.position = new_pos[i];
+                cell.age = new_ages[i] as u64;
+                cell.reproduce_cooldown_ticks = new_cooldowns[i];
+                cell.energy = new_energies[i];
+                cell.damage_accum = 0.0;
+                // Regenerate next tick's prediction from the freshly-updated
+                // live readout and hidden(t+1).
+                let mut pred = [0.0_f32; crate::BRAIN_PREDICT];
+                for (k, p) in pred.iter_mut().enumerate() {
+                    let mut acc = cell.predict_b_live[k];
+                    let row = &cell.predict_w_live[k];
+                    for h in 0..BRAIN_HIDDEN {
+                        acc += row[h] * cell.last_hidden[h];
+                    }
+                    *p = acc.tanh();
+                }
+                cell.predicted_sensory = pred;
+                let inv = 1.0 / crate::PREDICTED_SENSORY_SLOTS.len() as f32;
+                let pm = (persist_se * inv) as f64;
+                let mm = (model_se * inv) as f64;
+                // Per-cell skill vs the cell's own persistence baseline, clamped
+                // so an unlucky tick can't dominate selection.
+                let skill = if pm > 1e-9 { (1.0 - mm / pm) as f32 } else { 0.0 };
+                let warmed = cell.age >= crate::PREDICT_WARMUP_TICKS;
+                (pm, mm, skill.clamp(-2.0, 1.0), warmed)
+            })
+            .collect::<Vec<(f64, f64, f32, bool)>>();
+        let persist_sum: f64 = per_cell.iter().map(|x| x.0).sum();
+        let model_sum: f64 = per_cell.iter().map(|x| x.1).sum();
+        self.surprise_persist_accum += persist_sum / n as f64;
+        self.surprise_model_accum += model_sum / n as f64;
+        self.surprise_persist_ticks += 1;
+        // S227 keystone: store each cell's prediction advantage = skill above
+        // the warmed-cohort mean, clamped to [0,1]. `collect_fertile` reads it to
+        // discount the reproduce threshold (a one-sided fertility bonus — never a
+        // penalty, so it can't starve cells). The mean is taken over warmed cells
+        // (readout trained) so an untrained newborn doesn't inflate the baseline;
+        // newborns sit far below it → advantage 0 → undisturbed. FEP coupling:
+        // predictive efficiency → fitness, with no explicit "be smart" objective.
+        let mut warm_sum = 0.0_f64;
+        let mut warm_n = 0usize;
+        for x in &per_cell {
+            if x.3 {
+                warm_sum += x.2 as f64;
+                warm_n += 1;
+            }
+        }
+        let warm_mean = if warm_n > 0 {
+            (warm_sum / warm_n as f64) as f32
+        } else {
+            0.0
+        };
+        self.cells
+            .par_iter_mut()
+            .zip(per_cell.par_iter())
+            .for_each(|(cell, x)| {
+                cell.pred_advantage = (x.2 - warm_mean).clamp(0.0, 1.0);
+                cell.pred_skill = x.2;
+            });
     }
 
     fn brain_act_gpu(&mut self, dt: f32) {
@@ -4269,6 +4411,8 @@ impl World {
                 let f = freq.get(&c.lineage_id).copied().unwrap_or(0.0);
                 let sf = sfreq.get(&c.species_id).copied().unwrap_or(0.0);
                 let bf = bfreq.get(&bkeys[*i]).copied().unwrap_or(1.0);
+                // S227: better-than-cohort predictors reproduce at a lower
+                // energy threshold (up to PREDICT_REPRO_BONUS cheaper).
                 let scaled = reproduce_threshold(
                     c.genome.reproduce_at_energy,
                     f,
@@ -4276,7 +4420,7 @@ impl World {
                     bf,
                     c.genome.birth_energy,
                     c.phenotype.max_energy_capacity(),
-                );
+                ) * (1.0 - crate::PREDICT_REPRO_BONUS * c.pred_advantage);
                 c.energy >= scaled
                     && c.last_outputs[2] > MATING_PHEROMONE_THRESHOLD
                     && c.reproduce_cooldown_ticks == 0

@@ -113,6 +113,9 @@ pub const MUTATION_CONFIG: MutationConfig = MutationConfig {
         0.012, // HazardAvoided (MAX 0.6) — same magnitude as EscapedAttack
         0.004, // ThreatEscaped (MAX 0.2) — ~2% of range, scaled with halved default
     ],
+    // S224: 0 = prediction readout frozen (byte-identical). S226 raises it to
+    // put the readout under selection.
+    sigma_predict: 0.0,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -210,6 +213,9 @@ pub struct MutationConfig {
     /// slot = no drift on that kind (RNG draw skipped, byte-identical with
     /// pre-S187 baseline for that index).
     pub sigma_reward_weights: [f32; N_REWARD_KINDS],
+    /// S224: gaussian sigma for the direct-weight prediction readout. Zero =
+    /// frozen readout (RNG draw skipped). S226 raises it to evolve the readout.
+    pub sigma_predict: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -376,6 +382,15 @@ pub struct Genome {
     /// MateSignalAccepted]`).
     #[serde(default = "default_reward_weights")]
     pub reward_weights: [f32; N_REWARD_KINDS],
+    /// S224 active inference: direct-weight prediction readout `last_hidden →
+    /// predicted next-tick value` for each `PREDICTED_SENSORY_SLOTS` channel.
+    /// Heritable + evolvable, but a sibling of the CPPN brain, not part of it —
+    /// `Brain` is fully regenerated from the CPPN each birth, so a direct-weight
+    /// readout cannot survive inside it. Within-life learned by S225's delta rule.
+    #[serde(default = "default_predict_w", with = "serde_arrays_predict")]
+    pub predict_w: [[f32; BRAIN_HIDDEN]; BRAIN_PREDICT],
+    #[serde(default = "default_predict_b")]
+    pub predict_b: [f32; BRAIN_PREDICT],
 }
 
 pub fn default_cppn() -> Cppn {
@@ -479,6 +494,41 @@ pub fn default_defense_contribution() -> f32 {
 
 pub fn default_reward_weights() -> [f32; N_REWARD_KINDS] {
     REWARD_WEIGHT_DEFAULTS
+}
+
+pub fn default_predict_w() -> [[f32; BRAIN_HIDDEN]; BRAIN_PREDICT] {
+    [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT]
+}
+
+pub fn default_predict_b() -> [f32; BRAIN_PREDICT] {
+    [0.0; BRAIN_PREDICT]
+}
+
+/// Serde flatten/unflatten for the prediction readout matrix (serde's native
+/// `[T; N]` impl only covers N ≤ 32; `BRAIN_HIDDEN` exceeds that).
+mod serde_arrays_predict {
+    use crate::{BRAIN_HIDDEN, BRAIN_PREDICT};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(
+        w: &[[f32; BRAIN_HIDDEN]; BRAIN_PREDICT],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let flat: Vec<f32> = w.iter().flat_map(|row| row.iter().copied()).collect();
+        flat.serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[[f32; BRAIN_HIDDEN]; BRAIN_PREDICT], D::Error> {
+        let flat: Vec<f32> = Vec::deserialize(d)?;
+        if flat.len() != BRAIN_PREDICT * BRAIN_HIDDEN {
+            return Err(serde::de::Error::custom("predict_w length mismatch"));
+        }
+        let mut out = [[0.0_f32; BRAIN_HIDDEN]; BRAIN_PREDICT];
+        for (i, row) in out.iter_mut().enumerate() {
+            row.copy_from_slice(&flat[i * BRAIN_HIDDEN..(i + 1) * BRAIN_HIDDEN]);
+        }
+        Ok(out)
+    }
 }
 
 impl Genome {
@@ -600,6 +650,11 @@ impl Genome {
                 }
                 w
             },
+            // S224: dormant zero readout at birth (no RNG draw → gen-0
+            // byte-identical with the S223 baseline). S225 learns it within
+            // life; S226 raises `sigma_predict` to put it under selection.
+            predict_w: default_predict_w(),
+            predict_b: default_predict_b(),
         }
         .clamp_birth_energy()
     }
@@ -861,6 +916,26 @@ impl Genome {
                     }
                 }
                 w
+            },
+            predict_w: {
+                let mut w = self.predict_w;
+                if cfg.sigma_predict > 0.0 {
+                    for row in w.iter_mut() {
+                        for x in row.iter_mut() {
+                            *x += gaussian(rng) * cfg.sigma_predict;
+                        }
+                    }
+                }
+                w
+            },
+            predict_b: {
+                let mut b = self.predict_b;
+                if cfg.sigma_predict > 0.0 {
+                    for x in b.iter_mut() {
+                        *x += gaussian(rng) * cfg.sigma_predict;
+                    }
+                }
+                b
             },
         }
         .clamp_birth_energy()
@@ -1160,6 +1235,22 @@ impl Genome {
                     };
                 }
                 w
+            },
+            // Whole-unit inheritance; skip the RNG draw when equal — keeps the
+            // S224 zero readout byte-identical until S226 makes parents diverge.
+            predict_w: if a.predict_w == b.predict_w {
+                a.predict_w
+            } else if rng.random::<bool>() {
+                a.predict_w
+            } else {
+                b.predict_w
+            },
+            predict_b: if a.predict_b == b.predict_b {
+                a.predict_b
+            } else if rng.random::<bool>() {
+                a.predict_b
+            } else {
+                b.predict_b
             },
         }
         .clamp_birth_energy()

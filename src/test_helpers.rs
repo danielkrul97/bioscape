@@ -63,6 +63,8 @@ pub fn dummy_genome() -> Genome {
         predation_size_ratio: SIZE_RATIO_THRESHOLD,
         defense_contribution: BOND_DEFENSE_FRAC,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
+        predict_w: [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT],
+        predict_b: [0.0; BRAIN_PREDICT],
     }
 }
 
@@ -106,6 +108,7 @@ pub fn zero_cfg() -> MutationConfig {
         sigma_predation_size_ratio: 0.0,
         sigma_defense_contribution: 0.0,
         sigma_reward_weights: [0.0; N_REWARD_KINDS],
+        sigma_predict: 0.0,
     }
 }
 
@@ -137,6 +140,11 @@ pub fn base_cell() -> Cell {
         last_inputs: [0.0; BRAIN_INPUTS],
         last_hidden: [0.0; BRAIN_HIDDEN],
         last_outputs: [0.0; BRAIN_OUTPUTS],
+        predicted_sensory: [0.0; BRAIN_PREDICT],
+        predict_w_live: [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT],
+        predict_b_live: [0.0; BRAIN_PREDICT],
+        pred_advantage: 0.0,
+        pred_skill: 0.0,
         last_emit: [0.0; N_PHEROMONE_CHANNELS],
         burst_accum: [0.0; N_PHEROMONE_CHANNELS],
         pooled_hidden: [0.0; BRAIN_HIDDEN],

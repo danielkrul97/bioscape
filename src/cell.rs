@@ -55,6 +55,39 @@ pub struct Cell {
     #[serde(with = "serde_arr_hidden")]
     pub last_hidden: [f32; BRAIN_HIDDEN],
     pub last_outputs: [f32; BRAIN_OUTPUTS],
+    /// S224 active inference: the genome readout's prediction of next tick's
+    /// sensory values (one per `PREDICTED_SENSORY_SLOTS`), produced from
+    /// `last_hidden`. Transient (recomputed every tick) → not persisted.
+    #[serde(skip)]
+    pub predicted_sensory: [f32; BRAIN_PREDICT],
+    /// S225 active inference: the within-life-learned prediction readout
+    /// (`hidden(t) → predicted_sensory`). A working copy, NOT inherited — each
+    /// cell relearns from its birth prior (`genome.predict_w`, zero until S226).
+    /// Trained by the delta-rule in the tick writeback. Transient → not
+    /// persisted (re-learned on restore).
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "crate::default_predict_w"
+    )]
+    pub predict_w_live: [[f32; BRAIN_HIDDEN]; BRAIN_PREDICT],
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "crate::default_predict_b"
+    )]
+    pub predict_b_live: [f32; BRAIN_PREDICT],
+    /// S227 active inference: prediction advantage = this cell's skill above the
+    /// warmed-cohort mean, clamped to [0,1]. Set in the tick writeback, read by
+    /// `collect_fertile` to discount the reproduce threshold. Transient.
+    #[serde(skip)]
+    pub pred_advantage: f32,
+    /// S226 active inference: raw per-cell prediction skill (`1 − model/persist`)
+    /// from the last tick, clamped to [-2,1]. Set in the writeback, read by
+    /// `apply_prediction_reward` to drive the brain-shaping Hebbian reward.
+    /// Transient.
+    #[serde(skip)]
+    pub pred_skill: f32,
     /// Per-channel emission from the previous tick. `emit_pheromones`
     /// updates this after computing the new emit value.
     #[serde(default)]
@@ -300,6 +333,11 @@ impl Cell {
             last_inputs: [0.0; BRAIN_INPUTS],
             last_hidden: [0.0; BRAIN_HIDDEN],
             last_outputs: [0.0; BRAIN_OUTPUTS],
+            predicted_sensory: [0.0; BRAIN_PREDICT],
+            predict_w_live: [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT],
+            predict_b_live: [0.0; BRAIN_PREDICT],
+            pred_advantage: 0.0,
+            pred_skill: 0.0,
             last_emit: [0.0; N_PHEROMONE_CHANNELS],
             burst_accum: [0.0; N_PHEROMONE_CHANNELS],
             pooled_hidden: [0.0; BRAIN_HIDDEN],

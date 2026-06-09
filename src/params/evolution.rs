@@ -12,7 +12,13 @@
 // Sprint 212 tuning: 1.0 → 0.6. The 100-gen validation held at only 2 species
 // (genealogical collapse to ~4 lineages); a finer threshold splits species
 // earlier so the fitness-sharing gate protects more nascent niches.
-pub const CPPN_SPECIATION_THRESHOLD: f32 = 0.6;
+// Metric-fix recalibration: 0.6 → 0.8. compatibility_distance now speciates on
+// the FUNCTIONAL gene set (smaller N → larger distances), so the old scale broke:
+// 0.6 over-split to ~90 species (fitness-sharing neutralised), while ≥1.0 merged
+// to 1 species and the 2.5× share penalty crashed the population. 0.8 holds ~5–7
+// species at a healthy population on a seed-1 smoke — provisional, lock with the
+// 5×100 sweep (may need joint retune with FITNESS_SHARE_PRESSURE).
+pub const CPPN_SPECIATION_THRESHOLD: f32 = 0.8;
 
 /// Sprint 205: fitness-sharing pressure on the reproduction energy threshold.
 /// A cell in a species holding fraction `sf` of the population reproduces only

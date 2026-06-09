@@ -31,6 +31,60 @@ use std::path::Path;
 /// pinned by `csv_tests.rs`; do not silently relabel.
 pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> std::io::Result<()> {
     let n = world.cells.len();
+    // S223 active inference baseline: per-gen mean persistence surprise.
+    let surprise_persist_avg = if world.surprise_persist_ticks > 0 {
+        world.surprise_persist_accum / world.surprise_persist_ticks as f64
+    } else {
+        0.0
+    };
+    // S224: model (readout) surprise + skill vs the persistence baseline.
+    let surprise_model_avg = if world.surprise_persist_ticks > 0 {
+        world.surprise_model_accum / world.surprise_persist_ticks as f64
+    } else {
+        0.0
+    };
+    let pred_skill = if surprise_persist_avg > 0.0 {
+        1.0 - surprise_model_avg / surprise_persist_avg
+    } else {
+        0.0
+    };
+    // S229 recurrence-ablation probe: re-run the (parity-matched, gen-synced) CPU
+    // forward with the recurrent input slots zeroed, and measure how much the
+    // readout's prediction changes vs the normal forward. High divergence = the
+    // prediction leans on memory (temporal integration); ~0 = feedforward-only.
+    let pred_ablation_div = if n > 0 {
+        let alpha = bioscape::LATERAL_INHIBITION_ALPHA;
+        let inv_k = 1.0_f32 / bioscape::PREDICTED_SENSORY_SLOTS.len() as f32;
+        let readout = |w: &[f32; bioscape::BRAIN_HIDDEN], b: f32, h: &[f32; bioscape::BRAIN_HIDDEN]| {
+            let mut acc = b;
+            for j in 0..bioscape::BRAIN_HIDDEN {
+                acc += w[j] * h[j];
+            }
+            acc.tanh()
+        };
+        let sum: f64 = world
+            .cells
+            .iter()
+            .map(|c| {
+                let (h_norm, _) = c.genome.brain.forward_with_state(&c.last_inputs, alpha);
+                let mut abl = c.last_inputs;
+                for s in &mut abl[BRAIN_INPUTS_SENSORY..] {
+                    *s = 0.0;
+                }
+                let (h_abl, _) = c.genome.brain.forward_with_state(&abl, alpha);
+                let mut div = 0.0_f32;
+                for k in 0..bioscape::PREDICTED_SENSORY_SLOTS.len() {
+                    let pn = readout(&c.predict_w_live[k], c.predict_b_live[k], &h_norm);
+                    let pa = readout(&c.predict_w_live[k], c.predict_b_live[k], &h_abl);
+                    div += (pn - pa).abs();
+                }
+                (div * inv_k) as f64
+            })
+            .sum();
+        sum / n as f64
+    } else {
+        0.0
+    };
     if n == 0 {
         // Empty-pop row: zero-padded cell metrics + actual world counters.
         // Sprint 111: shocks exist nezávisle na cell pop, takže reportujeme.
@@ -57,7 +111,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             //   ticks_per_sec, coop_solved, coop_failed, coop_arrivals_avg,
             //   bonded_attack_eff, swarm_attack_frac, pack_attack_frac,
             //   maze_active, maze_in_goal_frac, maze_unique_reach_frac, maze_first_reach_total
-            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000,0,0.00,0,0.000,0.000,0.0000,0,0.000,0.000,0.000,0,0,0.0000,0.0000,0,0.0000",
+            "{},0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{},{},0,{},0,0,0,0,0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,{},{:.3},0.000,{:.3},0,0.000,0.000,0,0,0,{:.1},{},{},{:.3},0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,{},0.000,0.000,{},0.000000,0.000000,0.0000,0.0000,0.000,0.0000,0.0000,0.00,0.00,0.00,0.00,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0.0000,0.0000,0.000,0.0000,0.000,0.000,0.000,0.000,0.000,0,0.00,0,0.000,0.000,0.0000,0,0.000,0.000,0.000,0,0,0.0000,0.0000,0,0.0000,0.000,0.000,0.000,{:.4},{:.4},{:.4},{:.4}",
             world.clock.generation,
             world.foods.len(),
             world.density_factor,
@@ -76,6 +130,10 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
             coop_arrivals_avg,
             maze_active,
             world.goal_first_reach_tick.len() as u64,
+            surprise_persist_avg,
+            surprise_model_avg,
+            pred_skill,
+            pred_ablation_div,
         );
     }
     let mut spd_sum = 0.0_f64;
@@ -682,6 +740,19 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         .map(|c| c.genome.cppn.num_links as f64)
         .sum::<f64>()
         / nf;
+    // Metric-fix pre-sprint: functional (input→output reachable) CPPN structure.
+    // num_nodes/num_links count inert bloat too; these track the real, working
+    // genome size. dead_nodes = num_nodes − functional is the bloat itself.
+    let (mut fn_sum, mut fl_sum, mut dead_sum) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for c in &world.cells {
+        let fnodes = c.genome.cppn.functional_node_count();
+        fn_sum += fnodes as f64;
+        fl_sum += c.genome.cppn.functional_link_count() as f64;
+        dead_sum += c.genome.cppn.num_nodes as f64 - fnodes as f64;
+    }
+    let functional_nodes_avg = fn_sum / nf;
+    let functional_links_avg = fl_sum / nf;
+    let dead_nodes_avg = dead_sum / nf;
     let behavioral_entropy_strategy = behavioral_entropy(&world.cells);
     // Sprint 204: distinct CPPN-compatibility species assigned at the last
     // generation boundary by `World::classify_species`.
@@ -729,7 +800,7 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
     let cluster_size_max = largest_bond_cluster(&world.cells) as f64;
     writeln!(
         w,
-        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{:.3},{:.3},{:.4},{},{:.3},{:.3},{:.3},{},{},{:.4},{:.4},{:.0},{:.4}",
+        "{},{},{:.2},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{},{},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{},{},{:.3},{},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{},{},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.3},{:.3},{},{:.4},{:.4},{},{:.6},{:.6},{:.4},{:.4},{:.3},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{},{:.3},{:.3},{:.4},{},{:.3},{:.3},{:.3},{},{},{:.4},{:.4},{:.0},{:.4},{:.3},{:.3},{:.3},{:.4},{:.4},{:.4},{:.4}",
         world.clock.generation,
         n,
         spd_m,
@@ -900,6 +971,13 @@ pub fn write_stats<W: Write>(w: &mut W, world: &World, ticks_per_sec: f64) -> st
         // Axis C: morphogenesis diagnostics.
         cluster_size_max,
         morphogen_max,
+        functional_nodes_avg,
+        functional_links_avg,
+        dead_nodes_avg,
+        surprise_persist_avg,
+        surprise_model_avg,
+        pred_skill,
+        pred_ablation_div,
     )
 }
 

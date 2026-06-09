@@ -308,6 +308,7 @@ fn aggressive_cfg() -> MutationConfig {
         sigma_predation_size_ratio: 100.0,
         sigma_defense_contribution: 100.0,
         sigma_reward_weights: [100.0; N_REWARD_KINDS],
+        sigma_predict: 0.0,
     }
 }
 

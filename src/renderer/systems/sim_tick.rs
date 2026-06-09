@@ -33,6 +33,9 @@ pub(crate) fn sim_tick(mut sim_world: ResMut<SimWorld>, mut sim_rng: ResMut<SimR
         world.deaths_gen = 0;
         world.fertile_ticks_gen = 0;
         world.predation_events_gen = 0;
+        world.surprise_persist_accum = 0.0;
+        world.surprise_model_accum = 0.0;
+        world.surprise_persist_ticks = 0;
         world.bonds_formed_gen = 0;
         world.bonds_broken_gen = 0;
         world.bonded_attacks_gen = 0;

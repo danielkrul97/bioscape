@@ -201,6 +201,92 @@ impl Cppn {
             .filter_map(|l| l.as_ref())
     }
 
+    /// Forward (reachable from an input) + backward (can reach an output)
+    /// masks over ENABLED links, indexed by node id. A node on a real
+    /// input→output path has both bits set. Separates functional structure
+    /// from inert bloat (disabled splits, dead-end add_links) that still
+    /// inflates `num_nodes`/`num_links`. Node ids are < CPPN_MAX_NODES (same
+    /// invariant `forward` relies on); out-of-range ids are skipped defensively.
+    fn path_masks(&self) -> ([bool; CPPN_MAX_NODES], [bool; CPPN_MAX_NODES]) {
+        let mut from_in = [false; CPPN_MAX_NODES];
+        let mut to_out = [false; CPPN_MAX_NODES];
+        for i in 0..CPPN_INPUTS {
+            if let Some(n) = self.nodes[i] {
+                if (n.id as usize) < CPPN_MAX_NODES {
+                    from_in[n.id as usize] = true;
+                }
+            }
+        }
+        for o in 0..CPPN_OUTPUTS {
+            if let Some(n) = self.nodes[CPPN_INPUTS + o] {
+                if (n.id as usize) < CPPN_MAX_NODES {
+                    to_out[n.id as usize] = true;
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for l in self.iter_links() {
+                if !l.enabled {
+                    continue;
+                }
+                let (f, t) = (l.from as usize, l.to as usize);
+                if f >= CPPN_MAX_NODES || t >= CPPN_MAX_NODES {
+                    continue;
+                }
+                if from_in[f] && !from_in[t] {
+                    from_in[t] = true;
+                    changed = true;
+                }
+                if to_out[t] && !to_out[f] {
+                    to_out[f] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        (from_in, to_out)
+    }
+
+    /// CPPN nodes on an enabled input→output path — the de-bloated counterpart
+    /// to `num_nodes`, which only ever increments (no remove mutation).
+    pub fn functional_node_count(&self) -> u32 {
+        let (fi, to) = self.path_masks();
+        self.iter_nodes()
+            .filter(|n| {
+                let id = n.id as usize;
+                id < CPPN_MAX_NODES && fi[id] && to[id]
+            })
+            .count() as u32
+    }
+
+    /// Enabled CPPN links keyed by innovation whose both endpoints lie on an
+    /// input→output path — the functional gene set `compatibility_distance`
+    /// speciates over, so inert bloat can't found a protected species.
+    fn functional_links(&self) -> rustc_hash::FxHashMap<u32, &CppnLink> {
+        let (fi, to) = self.path_masks();
+        self.iter_links()
+            .filter(|l| {
+                let (f, t) = (l.from as usize, l.to as usize);
+                l.enabled
+                    && f < CPPN_MAX_NODES
+                    && t < CPPN_MAX_NODES
+                    && fi[f]
+                    && to[f]
+                    && fi[t]
+                    && to[t]
+            })
+            .map(|l| (l.innovation, l))
+            .collect()
+    }
+
+    /// Enabled CPPN links whose both endpoints lie on an input→output path.
+    pub fn functional_link_count(&self) -> u32 {
+        self.functional_links().len() as u32
+    }
+
     fn push_node(&mut self, n: CppnNode) -> bool {
         if (self.num_nodes as usize) >= CPPN_MAX_NODES {
             return false;
@@ -576,21 +662,25 @@ impl Cppn {
     ///   N = max(genome size) — normalizace
     ///   W̄ = average |weight diff| pro matching genes
     /// Constants follow classical NEAT defaults.
+    ///
+    /// Metric-fix: the gene set is the FUNCTIONAL one (`functional_links` —
+    /// enabled, on an input→output path), not every stored link. Disabled
+    /// splits and dead-end add_links inflate the raw genome, so counting them
+    /// let inert bloat found its own species and draw fitness-sharing
+    /// protection — selection on innovation-count, not function (Goodhart).
     pub fn compatibility_distance(a: &Cppn, b: &Cppn) -> f32 {
         const C_EXCESS: f32 = 1.0;
         const C_DISJOINT: f32 = 1.0;
         const C_WEIGHT: f32 = 0.4;
-        let max_inv_a = a.iter_links().map(|l| l.innovation).max().unwrap_or(0);
-        let max_inv_b = b.iter_links().map(|l| l.innovation).max().unwrap_or(0);
+        let a_links = a.functional_links();
+        let b_links = b.functional_links();
+        let max_inv_a = a_links.keys().copied().max().unwrap_or(0);
+        let max_inv_b = b_links.keys().copied().max().unwrap_or(0);
         let cutoff = max_inv_a.min(max_inv_b);
         let mut excess: u32 = 0;
         let mut disjoint: u32 = 0;
         let mut weight_diff_sum: f32 = 0.0;
         let mut matching: u32 = 0;
-        let a_links: rustc_hash::FxHashMap<u32, &CppnLink> =
-            a.iter_links().map(|l| (l.innovation, l)).collect();
-        let b_links: rustc_hash::FxHashMap<u32, &CppnLink> =
-            b.iter_links().map(|l| (l.innovation, l)).collect();
         for (inv, la) in a_links.iter() {
             if let Some(lb) = b_links.get(inv) {
                 weight_diff_sum += (la.weight - lb.weight).abs();
@@ -611,7 +701,7 @@ impl Cppn {
                 disjoint += 1;
             }
         }
-        let n = (a.num_links.max(b.num_links) as f32).max(1.0);
+        let n = (a_links.len().max(b_links.len()) as f32).max(1.0);
         let w_avg = if matching > 0 {
             weight_diff_sum / matching as f32
         } else {

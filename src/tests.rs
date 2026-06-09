@@ -87,6 +87,8 @@ fn dummy_genome() -> Genome {
         bond_inherit_pref: 0.0,
         division_angle: 0.0,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
+        predict_w: [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT],
+        predict_b: [0.0; BRAIN_PREDICT],
     }
 }
 
@@ -130,6 +132,7 @@ fn zero_cfg() -> MutationConfig {
         sigma_predation_size_ratio: 0.0,
         sigma_defense_contribution: 0.0,
         sigma_reward_weights: [0.0; N_REWARD_KINDS],
+        sigma_predict: 0.0,
     }
 }
 
@@ -191,6 +194,8 @@ fn mutation_with_zero_sigma_is_identity() {
         bond_inherit_pref: 0.0,
         division_angle: 0.0,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
+        predict_w: [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT],
+        predict_b: [0.0; BRAIN_PREDICT],
     };
     let m = g.mutate(&mut rng, &zero_cfg());
     assert_eq!(m.max_speed, 50.0);
@@ -252,6 +257,7 @@ fn mutation_keeps_genes_in_valid_ranges() {
         sigma_predation_size_ratio: 10.0,
         sigma_defense_contribution: 10.0,
         sigma_reward_weights: [10.0; N_REWARD_KINDS],
+        sigma_predict: 0.0,
     };
     for _ in 0..1000 {
         let m = g.mutate(&mut rng, &cfg);
@@ -972,6 +978,11 @@ fn base_cell() -> Cell {
         last_inputs: [0.0; BRAIN_INPUTS],
         last_hidden: [0.0; BRAIN_HIDDEN],
         last_outputs: [0.0; BRAIN_OUTPUTS],
+        predicted_sensory: [0.0; BRAIN_PREDICT],
+        predict_w_live: [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT],
+        predict_b_live: [0.0; BRAIN_PREDICT],
+        pred_advantage: 0.0,
+        pred_skill: 0.0,
         last_emit: [0.0; N_PHEROMONE_CHANNELS],
         burst_accum: [0.0; N_PHEROMONE_CHANNELS],
         pooled_hidden: [0.0; BRAIN_HIDDEN],
@@ -1228,6 +1239,8 @@ fn crossover_picks_genes_from_either_parent() {
         bond_inherit_pref: 0.0,
         division_angle: 0.0,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
+        predict_w: [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT],
+        predict_b: [0.0; BRAIN_PREDICT],
     };
     let b = Genome {
         max_speed: 90.0,
@@ -1270,6 +1283,8 @@ fn crossover_picks_genes_from_either_parent() {
         bond_inherit_pref: 0.0,
         division_angle: 0.0,
         reward_weights: REWARD_WEIGHT_DEFAULTS,
+        predict_w: [[0.0; BRAIN_HIDDEN]; BRAIN_PREDICT],
+        predict_b: [0.0; BRAIN_PREDICT],
     };
     for _ in 0..100 {
         let c = Genome::crossover(&a, &b, &mut rng);
@@ -2179,6 +2194,7 @@ fn shell_mutation_clamps_to_range() {
         sigma_predation_size_ratio: 0.0,
         sigma_defense_contribution: 0.0,
         sigma_reward_weights: [0.0; N_REWARD_KINDS],
+        sigma_predict: 0.0,
     };
     for _ in 0..1000 {
         let m = g.mutate(&mut rng, &cfg);

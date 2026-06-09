@@ -163,6 +163,24 @@ pub fn make_mating_child_no_brain(
         ],
         None => mid_pos,
     };
+    // S228 Baldwin (tested, disabled at BALDWIN_LEAK=0 — see the constant): a
+    // child can inherit a leaked copy of its parents' within-life learned readout
+    // (mean of the two × leak). Rejected because the readout is brain-specific and
+    // a sexual child's brain differs from both parents' → inherited readout is
+    // mistuned. Guarded so the disabled path costs nothing; infrastructure kept
+    // for a possible brain-matched (clonal-only) variant.
+    let leak = crate::BALDWIN_LEAK;
+    let mut child_pw = [[0.0_f32; BRAIN_HIDDEN]; BRAIN_PREDICT];
+    let mut child_pb = [0.0_f32; BRAIN_PREDICT];
+    if leak > 0.0 {
+        for k in 0..BRAIN_PREDICT {
+            for h in 0..BRAIN_HIDDEN {
+                child_pw[k][h] =
+                    leak * 0.5 * (parent_a.predict_w_live[k][h] + parent_b.predict_w_live[k][h]);
+            }
+            child_pb[k] = leak * 0.5 * (parent_a.predict_b_live[k] + parent_b.predict_b_live[k]);
+        }
+    }
     let child_phenotype = Phenotype::from_genome(&child_genome);
     Cell {
         position: pos,
@@ -181,6 +199,11 @@ pub fn make_mating_child_no_brain(
         last_inputs: [0.0; BRAIN_INPUTS],
         last_hidden: [0.0; BRAIN_HIDDEN],
         last_outputs: [0.0; BRAIN_OUTPUTS],
+        predicted_sensory: [0.0; BRAIN_PREDICT],
+        predict_w_live: child_pw,
+        predict_b_live: child_pb,
+        pred_advantage: 0.0,
+        pred_skill: 0.0,
         last_emit: [0.0; N_PHEROMONE_CHANNELS],
         burst_accum: [0.0; N_PHEROMONE_CHANNELS],
         pooled_hidden: [0.0; BRAIN_HIDDEN],
